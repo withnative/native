@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit agent-sessions probe</title>
+</head>
+<body>
+<main>
+<h1>Kit agent-sessions probe</h1>
+<p id="surface">pending</p>
+</main>
+<script>
+// App contract v2 (Paseo agent sessions): native.agentSessions exists only when
+// the host offers app.agent-sessions.v2. `window.probe` drives it from the test
+// and records every timeline event each follower hears.
+const heard = {};
+const disposers = {};
+const pending = {};
+const frozenDeep = (value) => Object.isFrozen(value) && (!Array.isArray(value) || value.every((item) => Object.isFrozen(item)));
+window.probe = {
+  surface: () => {
+    const native = window.native;
+    const api = native && native.agentSessions;
+    return {
+      artifactSessions: typeof window.nativeArtifact.agentSessions,
+      native: typeof native,
+      nativeSessions: typeof api,
+      protocolVersion: api ? api.protocolVersion : null,
+      methods: api ? Object.keys(api).sort() : null,
+      same: api ? api === window.nativeArtifact.agentSessions : null,
+      frozen: api ? Object.isFrozen(api) : null,
+    };
+  },
+  list: async (input) => {
+    const result = input === undefined ? await window.native.agentSessions.list() : await window.native.agentSessions.list(input);
+    return { result, frozen: Object.isFrozen(result) && (result.ok !== true || Object.isFrozen(result.value)) };
+  },
+  startList: (name, input) => { pending[name] = input === undefined ? window.native.agentSessions.list() : window.native.agentSessions.list(input); },
+  finish: async (name) => {
+    const result = await pending[name];
+    return { result, frozen: Object.isFrozen(result) && (result.ok !== true || Object.isFrozen(result.value)) };
+  },
+  follow: (name, input) => {
+    heard[name] = [];
+    pending[name] = window.native.agentSessions.follow(input, (event) => heard[name].push({ event, frozen: Object.isFrozen(event) }));
+  },
+  followResult: async (name) => {
+    const result = await pending[name];
+    return { ok: result.ok, code: result.code, hasDispose: !!(result.value && typeof result.value.dispose === "function") };
+  },
+  heard: (name) => heard[name],
+  dispose: (name) => { disposers[name](); },
+  rememberDisposer: async (name) => { disposers[name] = (await pending[name]).value.dispose; },
+  send: async (input) => {
+    const result = await window.native.agentSessions.send(input);
+    return { result, frozen: Object.isFrozen(result) && (result.ok !== true || Object.isFrozen(result.value)) };
+  },
+  startSend: (name, input) => { pending[name] = window.native.agentSessions.send(input); },
+  markRead: (input) => window.native.agentSessions.markRead(input),
+  openInPaseo: (input) => window.native.agentSessions.openInPaseo(input),
+  openConversation: (input, options) => window.native.agentSessions.openConversation(input, options),
+  followup: (method, input) => window.native.agentSessions.followup[method](input),
+  followupSurface: () => { const f = window.native.agentSessions.followup; return f ? { methods: Object.keys(f).sort(), frozen: Object.isFrozen(f) } : null; },
+  getPermissionForm: (input) => window.native.agentSessions.getPermissionForm(input),
+  respondToPermission: (input) => window.native.agentSessions.respondToPermission(input),
+  startWatch: (name) => { heard[name] = []; pending[name] = window.native.agentSessions.watchList((hint) => heard[name].push(hint)); },
+  watchResult: async (name) => { const result = await pending[name]; if (result.ok) disposers[name] = result.value.dispose; return { ok: result.ok, code: result.code, hasDispose: !!disposers[name] }; },
+  badLists: () => Promise.all([{ cursor: 5 }, { cursor: "" }, { cursor: null }, { cursor: [] }, { cursor: "x".repeat(4097) }].map((input) => window.native.agentSessions.list(input))),
+  badFollows: () => {
+    const cb = () => {};
+    return Promise.all([undefined, null, {}, { sessionId: "" }, { sessionId: "has space" }, { sessionId: "x".repeat(129) }].map((input) => window.native.agentSessions.follow(input, cb)));
+  },
+  throwsOnFollow: () => { try { window.native.agentSessions.follow({ sessionId: "s1" }, "nope"); return null; } catch (error) { return `${error.name}`; } },
+  badSends: () => Promise.all([
+    undefined, null, {}, { sessionId: "s1", text: "hi" }, { sessionId: "s1", text: "hi", requestId: "" },
+    { sessionId: "s1", text: "hi", requestId: "x".repeat(129) }, { sessionId: "has space", text: "hi", requestId: "r1" },
+    { sessionId: "s1", text: "   ", requestId: "r1" }, { sessionId: "s1", text: "x".repeat(17 * 1024), requestId: "r1" },
+  ].map((input) => window.native.agentSessions.send(input))),
+  catalog: async () => {
+    const result = await window.native.agentSessions.catalog();
+    return { result, frozen: Object.isFrozen(result) && (result.ok !== true || Object.isFrozen(result.value)) };
+  },
+  create: async (input) => {
+    const result = await window.native.agentSessions.create(input);
+    return { result, frozen: Object.isFrozen(result) && (result.ok !== true || Object.isFrozen(result.value)) };
+  },
+  startCreate: (name, input) => { pending[name] = window.native.agentSessions.create(input); },
+  createResult: async (name) => pending[name],
+  // Slice C1/C2: present only with app.agent-sessions.adopted.v1.
+  createStatus: (requestId) => window.native.agentSessions.createStatus({ requestId }),
+  cancel: (requestId) => window.native.agentSessions.cancel({ requestId }),
+  sendWith: (input) => window.native.agentSessions.send(input),
+  pagehide: () => window.dispatchEvent(new Event("pagehide")),
+};
+window.nativeArtifact.ready.then(() => {
+  const surface = window.probe.surface();
+  document.getElementById("surface").textContent = `sessions:${surface.nativeSessions}`;
+});
+</script>
+</body>
+</html>

@@ -909,7 +909,9 @@ pub(crate) fn configure_preview_launch() {
             "http://localhost:8080",
             "http://artifact.localhost:8080",
         )
-        .expect("preview test HTML runtime configuration"),
+        .expect("preview test HTML runtime configuration")
+        .with_parent_origins(["native-ui://app"])
+        .expect("explicit desktop parent test allowlist"),
     );
 }
 
@@ -1267,6 +1269,84 @@ async fn preview_renders_pinned_bytes_against_sample_input_only() {
             .await
             .unwrap();
     assert_eq!(events, 0);
+}
+
+#[tokio::test]
+async fn package_marked_bundle_over_the_ordinary_limit_installs_and_previews() {
+    // A 600 KB bundle needs the package marker at write time; with it, the
+    // install pin and the sample-only preview (which re-validate the source)
+    // accept it. The marker cannot be dropped while the body stays that large.
+    configure_preview_launch();
+    let (db, registry) = fixture().await;
+    let body = PREVIEW_BODY.replacen(
+        "</main>",
+        &format!("<!--{}--></main>", "x".repeat(600_000)),
+        1,
+    );
+    assert!(body.len() > native_ce::artifact_html::BODY_LIMIT);
+    let create = |facets: Value| {
+        json!({
+            "id": ARTIFACT_A, "type": "Document", "kind": "artifact", "name": ARTIFACT_A,
+            "body": body, "facets": facets, "reason": "Package bundle over 512 KiB."
+        })
+    };
+    let error = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        create(json!({ "runtime": "native.html.v1" })),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("html_source_too_large"), "{error}");
+    call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        create(json!({ "runtime": "native.html.v1", "app_package": "true" })),
+    )
+    .await
+    .unwrap();
+    grant(&db, ARTIFACT_A, ALICE, Capability::View).await;
+    let error = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "update_record",
+        json!({ "id": ARTIFACT_A, "facets": { "app_package": null }, "reason": "Drop the marker." }),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("html_source_too_large"), "{error}");
+
+    let source_revision = preview_source_revision(&db, ARTIFACT_A).await;
+    let digest = preview_digest(&body);
+    let installed = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        install_exact_args(ARTIFACT_A, &source_revision, &digest),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed["install"]["status"], "installed");
+    let args = preview_args(ARTIFACT_A, &source_revision, &digest);
+    let preview = call_as(
+        &registry,
+        &db,
+        attested_preview_caller(ALICE, &args),
+        "manage_alpha_tabs",
+        args,
+    )
+    .await
+    .unwrap();
+    assert_eq!(preview["preview"]["digest"], digest);
+    assert!(preview["receipt"]["receipt_id"].is_string());
 }
 
 #[tokio::test]
@@ -1804,6 +1884,38 @@ async fn launch_binds_verified_install_and_refuses_stale_or_revoked_state() {
     )
     .await
     .unwrap();
+    // The desktop parent is a deployment opt-in; it cannot widen arbitrary custom origins.
+    let mut desktop_args = launch_args(adopted_event);
+    desktop_args["parent_origin"] = json!("native-ui://app");
+    let desktop = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        desktop_args,
+    )
+    .await
+    .unwrap();
+    assert_eq!(desktop["install_event_id"], adopted_event);
+    assert_ne!(desktop["launch"]["url"], launch["launch"]["url"]);
+    for parent in [
+        "native-ui://evil",
+        "native-ui://app/",
+        "https://unlisted.example",
+    ] {
+        let mut args = launch_args(adopted_event);
+        args["parent_origin"] = json!(parent);
+        let error = call_as(
+            &registry,
+            &db,
+            Caller::authenticated(ALICE),
+            "manage_alpha_tabs",
+            args,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("parent"), "{error}");
+    }
     assert_eq!(launch["install_event_id"], adopted_event);
     assert_eq!(launch["pin"]["digest"], digest);
     assert_eq!(launch["pin"]["source_revision"], source_revision);
@@ -3698,9 +3810,37 @@ const SEARCH_NEEDS: [&str; 2] = ["records.search.v1", "records.resolve_reference
 /// arbitrary consented declaration; returns the verified install event.
 /// Callers pass unsorted multi-entry declarations on purpose: install must
 /// store the same canonical declaration digest that adopt recomputes.
-async fn adopted_with_declaration(registry: &ToolRegistry, db: &Db, declaration: Value) -> String {
+pub(crate) async fn adopted_with_declaration(
+    registry: &ToolRegistry,
+    db: &Db,
+    declaration: Value,
+) -> String {
     configure_preview_launch();
     adopt_fixture_artifact(registry, db).await;
+    adopted_with_declaration_as(registry, db, ALICE, declaration).await
+}
+
+/// [`adopted_with_declaration`] for any account with View on the fixture
+/// artifact (which must already exist), returning that account's verified
+/// install event.
+pub(crate) async fn adopted_with_declaration_as(
+    registry: &ToolRegistry,
+    db: &Db,
+    account: &str,
+    declaration: Value,
+) -> String {
+    adopted_package_with_declaration_as(registry, db, account, "agent.search", declaration).await
+}
+
+/// [`adopted_with_declaration_as`] for a named package at version 0.1.0 over
+/// the same fixture artifact.
+pub(crate) async fn adopted_package_with_declaration_as(
+    registry: &ToolRegistry,
+    db: &Db,
+    account: &str,
+    package: &str,
+    declaration: Value,
+) -> String {
     let source_revision = preview_source_revision(db, ARTIFACT_A).await;
     let digest = {
         use native_ce::mcp::tools::alpha_tabs::{
@@ -3713,7 +3853,7 @@ async fn adopted_with_declaration(registry: &ToolRegistry, db: &Db, declaration:
         )
     };
     let pin = json!({
-        "package": "agent.search", "version": "0.1.0", "digest": digest,
+        "package": package, "version": "0.1.0", "digest": digest,
         "artifact_id": ARTIFACT_A, "source_revision": source_revision,
         "declaration": declaration,
     });
@@ -3726,7 +3866,7 @@ async fn adopted_with_declaration(registry: &ToolRegistry, db: &Db, declaration:
     let installed = call_as(
         registry,
         db,
-        Caller::authenticated(ALICE),
+        Caller::authenticated(account),
         "manage_alpha_tabs",
         with("install", "Install a search package pin."),
     )
@@ -3740,7 +3880,7 @@ async fn adopted_with_declaration(registry: &ToolRegistry, db: &Db, declaration:
     let previewed = call_as(
         registry,
         db,
-        attested_preview_caller(ALICE, &preview),
+        attested_preview_caller(account, &preview),
         "manage_alpha_tabs",
         preview,
     )
@@ -3754,7 +3894,7 @@ async fn adopted_with_declaration(registry: &ToolRegistry, db: &Db, declaration:
     let adopted = call_as(
         registry,
         db,
-        attested_adopt_caller(ALICE, &adopt),
+        attested_adopt_caller(account, &adopt),
         "manage_alpha_tabs",
         adopt,
     )
@@ -4948,6 +5088,371 @@ async fn batched_read_refuses_bad_batches_before_the_gate() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("1..=16"), "{error}");
+}
+
+// `records.body.current.v1` (task `9be4011`, slice 6): one record's current
+// body and the digest a body save compares, from one snapshot.
+
+const BODY_NOTE: &str = "a1d00000-0000-4000-8000-0000000000b1";
+const BODY_NOTE_TWO: &str = "a1d00000-0000-4000-8000-0000000000b2";
+const BODY_CURRENT: &str = "records.body.current.v1";
+
+fn body_current_declaration() -> Value {
+    json!({"needs": [SEARCH_NEEDS[0], BODY_CURRENT], "effects": []})
+}
+
+async fn body_note(registry: &ToolRegistry, db: &Db, id: &str, body: &str) {
+    call_as(
+        registry,
+        db,
+        Caller::local(),
+        "create_record",
+        json!({
+            "id": id, "type": "Document", "kind": "note", "name": id, "body": body,
+            "reason": "Fixture note for the body-current read.",
+        }),
+    )
+    .await
+    .unwrap();
+    grant(db, id, ALICE, Capability::View).await;
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// The text and its digest come back together, and the digest is exactly
+/// the save digest of that text; `include_body: false` is the same answer
+/// without the text; and a batch answers each form as its single read does.
+#[tokio::test]
+async fn body_current_reads_text_and_save_digest_together() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, body_current_declaration()).await;
+    let text = "First line\nsecond line, with \"quotes\" and ünïcode";
+    body_note(&registry, &db, BODY_NOTE, text).await;
+
+    let read = declared_read(
+        &registry,
+        &db,
+        &event,
+        BODY_CURRENT,
+        json!({"record_id": BODY_NOTE}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read["params"],
+        json!({"record_id": BODY_NOTE, "include_body": true})
+    );
+    let answer = &read["result"];
+    assert_eq!(answer["status"], "found");
+    assert_eq!(answer["record_id"], BODY_NOTE);
+    assert_eq!(answer["body"], text);
+    assert_eq!(answer["body_bytes"], text.len());
+    assert_eq!(answer["body_digest"], sha256_hex(text));
+    assert_eq!(
+        answer["body_digest"],
+        native_ce::mcp::tools::lifecycle::body_digest(Some(text))
+    );
+    assert!(answer.get("body_omitted").is_none(), "{answer}");
+
+    let probe = declared_read(
+        &registry,
+        &db,
+        &event,
+        BODY_CURRENT,
+        json!({"record_id": BODY_NOTE, "include_body": false}),
+    )
+    .await
+    .unwrap();
+    let probed = &probe["result"];
+    assert_eq!(probed["body"], Value::Null);
+    assert_eq!(probed["body_omitted"], "not_requested");
+    assert_eq!(probed["body_digest"], answer["body_digest"]);
+    assert_eq!(probed["body_bytes"], answer["body_bytes"]);
+
+    let items = [
+        (BODY_CURRENT, json!({"record_id": BODY_NOTE})),
+        (
+            BODY_CURRENT,
+            json!({"record_id": BODY_NOTE, "include_body": false}),
+        ),
+        ("records.search.v1", json!({"query": "zebra"})),
+    ];
+    let batch = batch_read(&registry, &db, &event, batch_items(&items))
+        .await
+        .unwrap();
+    for (result, (need, params)) in batch["results"].as_array().unwrap().iter().zip(&items) {
+        let single = declared_read(&registry, &db, &event, need, params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], as_item(single), "{need} {params}");
+    }
+}
+
+/// A record the viewer cannot see, a deleted one and a missing one answer the
+/// same bare `not_found`; View is checked on every read.
+#[tokio::test]
+async fn body_current_answers_not_found_for_hidden_deleted_and_missing_records() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, body_current_declaration()).await;
+    body_note(&registry, &db, BODY_NOTE, "Visible to Alice, for now").await;
+    body_note(&registry, &db, BODY_NOTE_TWO, "About to be deleted").await;
+    let read = |id: &'static str| {
+        let (registry, db, event) = (&registry, db.clone(), event.clone());
+        async move {
+            declared_read(
+                registry,
+                &db,
+                &event,
+                BODY_CURRENT,
+                json!({"record_id": id}),
+            )
+            .await
+            .unwrap()["result"]
+                .clone()
+        }
+    };
+    let not_found = |id: &str| json!({"status": "not_found", "record_id": id});
+
+    assert_eq!(read(BODY_NOTE).await["status"], "found");
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        BODY_NOTE,
+        vec![AllowEntry::account(BEA, Capability::View)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(BODY_NOTE).await, not_found(BODY_NOTE));
+    grant(&db, BODY_NOTE, ALICE, Capability::View).await;
+    assert_eq!(read(BODY_NOTE).await["status"], "found");
+
+    call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "delete_record",
+        json!({"id": BODY_NOTE_TWO, "reason": "Retire the fixture note."}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(BODY_NOTE_TWO).await, not_found(BODY_NOTE_TWO));
+    let missing = "a1d00000-0000-4000-8000-0000000000ff";
+    assert_eq!(read(missing).await, not_found(missing));
+}
+
+/// A record created without a body reads as the empty body, whose digest is
+/// the empty-body save digest; a short reference resolves the same way in a
+/// single read and in a batch; and a hidden record answers the same bare
+/// `not_found` inside a batch as on its own.
+#[tokio::test]
+async fn body_current_handles_empty_bodies_short_references_and_hidden_batch_items() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, body_current_declaration()).await;
+    let empty = "b0d1e5c0-0000-4000-8000-0000000000b9";
+    call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "create_record",
+        json!({
+            "id": empty, "type": "Document", "kind": "note", "name": "No body yet",
+            "reason": "Fixture note without a body.",
+        }),
+    )
+    .await
+    .unwrap();
+    grant(&db, empty, ALICE, Capability::View).await;
+    let read = declared_read(
+        &registry,
+        &db,
+        &event,
+        BODY_CURRENT,
+        json!({"record_id": empty}),
+    )
+    .await
+    .unwrap();
+    let answer = &read["result"];
+    assert_eq!(answer["status"], "found");
+    assert_eq!(answer["body"], "");
+    assert_eq!(answer["body_bytes"], 0);
+    assert_eq!(answer["body_digest"], sha256_hex(""));
+    assert_eq!(
+        answer["body_digest"],
+        native_ce::mcp::tools::lifecycle::body_digest(None)
+    );
+
+    // `b0d1e5c` is a unique prefix: it resolves to the full id, alone and
+    // batched, before the read runs.
+    let short = &empty[..7];
+    let single = declared_read(
+        &registry,
+        &db,
+        &event,
+        BODY_CURRENT,
+        json!({"record_id": short}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(single["result"]["status"], "found");
+    assert_eq!(single["result"]["record_id"], empty);
+
+    body_note(&registry, &db, BODY_NOTE, "Hidden from Alice").await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        BODY_NOTE,
+        vec![AllowEntry::account(BEA, Capability::View)],
+    )
+    .await
+    .unwrap();
+    let items = [
+        (BODY_CURRENT, json!({"record_id": short})),
+        (BODY_CURRENT, json!({"record_id": BODY_NOTE})),
+    ];
+    let batch = batch_read(&registry, &db, &event, batch_items(&items))
+        .await
+        .unwrap();
+    let results = batch["results"].as_array().unwrap();
+    assert_eq!(results[0]["ok"]["result"]["record_id"], empty);
+    assert_eq!(
+        results[1]["ok"]["result"],
+        json!({"status": "not_found", "record_id": BODY_NOTE})
+    );
+    for (result, (need, params)) in results.iter().zip(&items) {
+        let single = declared_read(&registry, &db, &event, need, params.clone())
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], as_item(single), "{params}");
+    }
+}
+
+/// Over the body-set maximum, or past the bridge's answer budget once
+/// JSON-escaped, the text is left out but its digest and size still come
+/// back; a body exactly at the maximum is carried.
+#[tokio::test]
+async fn body_current_omits_text_past_the_size_bounds_but_keeps_the_digest() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, body_current_declaration()).await;
+    let cap = native_ce::mcp::tools::alpha_tabs::BODY_CURRENT_MAX_BODY_BYTES;
+    let cases = [
+        // At the cap: carried.
+        (
+            "a1d00000-0000-4000-8000-0000000000c1",
+            "a".repeat(cap),
+            true,
+        ),
+        // One byte over the cap: digest only.
+        (
+            "a1d00000-0000-4000-8000-0000000000c2",
+            "a".repeat(cap + 1),
+            false,
+        ),
+        // Under the cap in bytes, but every quote escapes to two characters,
+        // which passes the 786,432-character answer budget.
+        (
+            "a1d00000-0000-4000-8000-0000000000c3",
+            "\"".repeat(400_000),
+            false,
+        ),
+    ];
+    // The large bodies are written straight into the projection: the read
+    // only looks at `records.body`, and an ordinary write of half a
+    // megabyte costs minutes in a debug build.
+    let pool = crate::common::fixture_write_pool(&db).await;
+    for (id, body, carried) in &cases {
+        body_note(&registry, &db, id, "small").await;
+        sqlx::query("UPDATE records SET body = ? WHERE id = ?")
+            .bind(body)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let read = declared_read(
+            &registry,
+            &db,
+            &event,
+            BODY_CURRENT,
+            json!({"record_id": id}),
+        )
+        .await
+        .unwrap();
+        let answer = &read["result"];
+        assert_eq!(answer["status"], "found", "{id}");
+        assert_eq!(answer["body_bytes"], body.len(), "{id}");
+        assert_eq!(answer["body_digest"], sha256_hex(body), "{id}");
+        if *carried {
+            assert_eq!(answer["body"].as_str(), Some(body.as_str()), "{id}");
+            assert!(answer.get("body_omitted").is_none(), "{id}");
+        } else {
+            assert_eq!(answer["body"], Value::Null, "{id}");
+            assert_eq!(answer["body_omitted"], "too_large", "{id}");
+        }
+    }
+}
+
+/// Refusals keep the declared-read order: the gate first (a stale token or
+/// lost View on the tab), then consent, then the parameters.
+#[tokio::test]
+async fn body_current_refusals_keep_their_order() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, body_current_declaration()).await;
+    body_note(&registry, &db, BODY_NOTE, "Body").await;
+    let refused = |result: native_ce::Result<Value>, code: &str| {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(&format!("[{code}]")), "{error}");
+    };
+    for params in [
+        json!({}),
+        json!({"record_id": ""}),
+        json!({"record_id": BODY_NOTE, "include_body": "yes"}),
+        json!({"record_id": BODY_NOTE, "cursor": "c"}),
+    ] {
+        refused(
+            declared_read(&registry, &db, &event, BODY_CURRENT, params.clone()).await,
+            "invalid_params",
+        );
+        // The gate refuses before the parameters are looked at.
+        refused(
+            declared_read(
+                &registry,
+                &db,
+                "not-the-install-event",
+                BODY_CURRENT,
+                params,
+            )
+            .await,
+            "cas_mismatch",
+        );
+    }
+    grant(&db, ARTIFACT_A, BEA, Capability::View).await;
+    refused(
+        declared_read(
+            &registry,
+            &db,
+            &event,
+            BODY_CURRENT,
+            json!({"record_id": BODY_NOTE}),
+        )
+        .await,
+        "unauthorized",
+    );
+    grant(&db, ARTIFACT_A, ALICE, Capability::View).await;
+
+    // Without consent the read is undeclared, before its parameters.
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(
+        &registry,
+        &db,
+        json!({"needs": [SEARCH_NEEDS[0]], "effects": []}),
+    )
+    .await;
+    refused(
+        declared_read(&registry, &db, &event, BODY_CURRENT, json!({})).await,
+        "undeclared_need",
+    );
 }
 
 #[tokio::test]
@@ -12910,10 +13415,13 @@ const GOLDEN_PREBRIDGE_BOOTSTRAP_SHA: &str =
 /// control independently of the current delivery bytes.
 const GOLDEN_REVEAL_INCREMENT_BOOTSTRAP_SHA: &str =
     "0f8b6ecf4b68028210412cd488c61c44565a957bc7cd26ffd0165b446c9295da";
-/// Golden current Body-attempt delivery evidence: independently measured
-/// as 67704 bytes, hardcoded so a silent bytes change fails the test.
+/// Golden current delivery evidence (Body attempt, app calls, multi-host agent sessions v2,
+/// floating-chat presentation, bounded session unread/request/detail projections,
+/// supplied core kit, draft-aware close reporting, host-injected app skins, and the optional
+/// adopted-app folder chooser), hardcoded so a silent bytes change fails the test.
+/// No byte count is quoted: it goes stale.
 const GOLDEN_NEW_BOOTSTRAP_SHA: &str =
-    "f4a0cfb3da85ea40b076914c776a2d73aca65428c1d28f8e9a492487ebc8d4aa";
+    "949dd85a45308648b938ba716f39a0c72c545a78a3c617390c04015639f5d1fa";
 /// Fixed c851-baseline install pin digest for the fixture below.
 /// Provenance, two independent derivations that agree:
 /// - Rust: executing the pin formula (`alpha_tab_digest` over
@@ -14292,6 +14800,285 @@ async fn tab_read_cost_baseline() {
     db.close().await;
 }
 
+// Passage anchors for Docs and Spaces (task fd58445): `comment_anchors`
+// reaches a tab through an ordinary `sql.snapshot.v1` need, under the
+// comments' own visibility. Each viewer's snapshot equals her direct
+// `query_sql`; Alice never sees the anchor of a comment on Bea's page.
+const ANCHORS_SQL: &str = "SELECT annotation_id, target_record_id, purpose, selectors \
+     FROM comment_anchors ORDER BY annotation_id LIMIT 200";
+
+#[tokio::test]
+async fn sql_snapshot_reads_comment_anchors_under_comment_visibility() {
+    const D_SHARED: &str = "fd58445f-0000-4000-8000-000000000001";
+    const D_BEA: &str = "fd58445f-0000-4000-8000-000000000002";
+    const C_SHARED: &str = "fd58445f-0000-4000-8000-00000000000a";
+    const C_BEA: &str = "fd58445f-0000-4000-8000-00000000000b";
+    let (db, registry) = fixture().await;
+    configure_preview_launch();
+    adopt_fixture_artifact(&registry, &db).await;
+    for (id, body, viewers) in [
+        (D_SHARED, "Folders expand lazily.", vec![ALICE, BEA]),
+        (D_BEA, "Bea's private plan.", vec![BEA]),
+    ] {
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": id, "type": "Document", "kind": "note", "name": id,
+                    "body": body, "reason": "Anchor fixture page.",
+                }),
+            )
+            .await
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            id,
+            viewers
+                .into_iter()
+                .map(|viewer| AllowEntry::account(viewer, Capability::View))
+                .collect(),
+        )
+        .await
+        .unwrap();
+    }
+    for (id, bearer, exact) in [
+        (C_SHARED, D_SHARED, "expand lazily"),
+        (C_BEA, D_BEA, "private plan"),
+    ] {
+        registry
+            .call(db.clone(), Caller::local(), "create_record", json!({
+                "id": id, "type": "Annotation", "kind": "comment", "name": "Comment",
+                "body": "On this passage.", "reason": "Anchor fixture comment.",
+                "links": [{ "target_id": bearer, "relationship": "part_of" }],
+                "target": { "target_record_id": bearer, "source_slot": "body", "purpose": "comment_context",
+                    "selectors": [{ "type": "text_quote", "exact": exact }] },
+            }))
+            .await
+            .unwrap();
+    }
+    let declaration =
+        json!({ "needs": [sql_need("page.anchors", "Anchors", ANCHORS_SQL)], "effects": [] });
+    let alice_event =
+        adopted_with_package(&registry, &db, ALICE, "agent.anchors", declaration.clone()).await;
+    let bea_event = adopted_with_package(&registry, &db, BEA, "agent.anchors", declaration).await;
+    let mut seen = Vec::new();
+    for (account, event) in [(ALICE, alice_event.as_str()), (BEA, bea_event.as_str())] {
+        let snapshot = sql_snapshot(&registry, &db, account, "agent.anchors", event)
+            .await
+            .unwrap();
+        let rows = snapshot["input"]["sql"]["page.anchors"]["rows"].clone();
+        let direct = direct_sql(&registry, &db, account, ANCHORS_SQL)
+            .await
+            .unwrap();
+        assert_eq!(rows, direct["rows"], "{account}");
+        seen.push(rows);
+    }
+    let ids = |rows: &Value| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["annotation_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&seen[0]),
+        vec![C_SHARED],
+        "Alice sees only the anchor on the page she can see"
+    );
+    assert_eq!(ids(&seen[1]), vec![C_SHARED, C_BEA]);
+    assert_eq!(seen[0][0]["target_record_id"], D_SHARED);
+    assert!(seen[0][0]["selectors"]
+        .as_str()
+        .unwrap()
+        .contains("expand lazily"));
+    assert!(!seen[0].to_string().contains("private plan"));
+}
+
+// The shipped Docs and Spaces `links` needs (read from their declaration
+// files, never copied) run through both real transports: the v1 tab SQL path
+// (install admission and on-request execution) and the v2 app's own
+// `query_sql` with its positional parameters, which must return the same
+// rows. Each comment row carries its passage anchor from `comment_anchors`;
+// an unanchored comment and a plain link carry none, and an anchor stored
+// past the needs' 2,560-character read cap is returned as none.
+#[tokio::test]
+async fn shipped_docs_and_spaces_links_needs_return_comment_anchors() {
+    const PAGE: &str = "fd58445f-0000-4000-8000-000000000101";
+    const LINKED: &str = "fd58445f-0000-4000-8000-000000000102";
+    const C_ANCHORED: &str = "fd58445f-0000-4000-8000-00000000010a";
+    const C_PAGE: &str = "fd58445f-0000-4000-8000-00000000010b";
+    const C_LONG: &str = "fd58445f-0000-4000-8000-00000000010c";
+    let long: String = (0..400).map(|i| format!("long{i} ")).collect();
+    let long = long.trim_end().to_string();
+    let page_body = format!("Folders expand lazily.\n\n{long}\n");
+    let long_start = page_body.find(&long).unwrap();
+    let (db, registry) = fixture().await;
+    configure_preview_launch();
+    adopt_fixture_artifact(&registry, &db).await;
+    for (id, body) in [(PAGE, page_body.as_str()), (LINKED, "Linked page.")] {
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": id, "type": "Document", "kind": "note", "name": id,
+                    "body": body, "reason": "Shipped links need fixture.",
+                }),
+            )
+            .await
+            .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            id,
+            vec![AllowEntry::account(ALICE, Capability::View)],
+        )
+        .await
+        .unwrap();
+    }
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "manage_links",
+            json!({
+                "action": "add", "source_id": PAGE, "target_id": LINKED, "relationship": "mentions",
+            }),
+        )
+        .await
+        .unwrap();
+    for (id, target) in [
+        (
+            C_ANCHORED,
+            Some(
+                json!({ "target_record_id": PAGE, "source_slot": "body", "purpose": "comment_context",
+            "selectors": [{ "type": "text_quote", "exact": "expand lazily" }, { "type": "data_position", "start": 8, "end": 21 }] }),
+            ),
+        ),
+        (C_PAGE, None),
+        (
+            C_LONG,
+            Some(
+                json!({ "target_record_id": PAGE, "source_slot": "body", "purpose": "comment_context",
+            "selectors": [{ "type": "text_quote", "exact": long }, { "type": "data_position", "start": long_start, "end": long_start + long.len() }] }),
+            ),
+        ),
+    ] {
+        let mut args = json!({
+            "id": id, "type": "Annotation", "kind": "comment", "name": "Comment",
+            "body": "A comment.", "reason": "Shipped links need fixture.",
+            "links": [{ "target_id": PAGE, "relationship": "part_of" }],
+        });
+        if let Some(target) = target {
+            args["target"] = target;
+        }
+        registry
+            .call(db.clone(), Caller::local(), "create_record", args)
+            .await
+            .unwrap();
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/apps/src/apps");
+    for (app, params, positional) in [
+        (
+            "docs",
+            json!({ "record_id": PAGE, "section": "details" }),
+            json!([{ "type": "text", "value": PAGE }, { "type": "text", "value": "details" }]),
+        ),
+        (
+            "spaces",
+            json!({ "record_id": PAGE, "section": "details" }),
+            json!([{ "type": "text", "value": PAGE }, { "type": "text", "value": "details" }]),
+        ),
+    ] {
+        let declaration: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(app).join("declaration.json")).unwrap(),
+        )
+        .unwrap();
+        let key = format!("{app}.links");
+        let need = declaration["needs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|need| need["key"] == json!(key))
+            .expect("shipped links need")
+            .clone();
+        assert!(
+            need["sql"].as_str().unwrap().contains("comment_anchors"),
+            "{app}"
+        );
+        let package = format!("agent.{app}-links");
+        let event = adopted_with_package(
+            &registry,
+            &db,
+            ALICE,
+            &package,
+            json!({ "needs": [need], "effects": [] }),
+        )
+        .await;
+        let read = sql_param_read(&registry, &db, ALICE, &package, &event, &key, params)
+            .await
+            .unwrap_or_else(|error| panic!("{app}: shipped links need refused: {error}"));
+        // App contract v2 runs the same declared SQL as the person through
+        // `query_sql`, binding its parameters positionally (appV2.ts).
+        let direct = direct_param_sql(
+            &registry,
+            &db,
+            ALICE,
+            need["sql"].as_str().unwrap(),
+            positional,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{app}: v2 query_sql refused: {error}"));
+        assert_eq!(
+            read["result"]["columns"], direct["columns"],
+            "{app} columns"
+        );
+        assert_eq!(read["result"]["rows"], direct["rows"], "{app} rows");
+        for (transport, rows) in [
+            ("v1", read["result"]["rows"].as_array().unwrap()),
+            ("v2", direct["rows"].as_array().unwrap()),
+        ] {
+            let row = |id: &str| {
+                rows.iter()
+                    .find(|row| row["id"] == json!(id))
+                    .unwrap_or_else(|| panic!("{app} {transport}: {id} in {rows:?}"))
+            };
+            let anchor = row(C_ANCHORED)["anchor"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{app} {transport}: anchor {rows:?}"));
+            assert!(
+                anchor.contains("expand lazily") && anchor.contains("data_position"),
+                "{app} {transport}: {anchor}"
+            );
+            assert_eq!(row(C_PAGE)["anchor"], Value::Null, "{app} {transport}");
+            assert_eq!(row(LINKED)["anchor"], Value::Null, "{app} {transport}");
+            // Stored, but past the read cap: the comment is listed, unanchored.
+            assert_eq!(row(C_LONG)["anchor"], Value::Null, "{app} {transport}");
+            assert_eq!(row(C_LONG)["excerpt"], "A comment.", "{app} {transport}");
+            assert_eq!(
+                row(C_ANCHORED)["excerpt"],
+                "A comment.",
+                "{app} {transport}"
+            );
+        }
+    }
+    // The long anchor is stored, so it is the read cap that withholds it.
+    let stored = direct_param_sql(
+        &registry,
+        &db,
+        ALICE,
+        "SELECT length(selectors) AS n FROM comment_anchors WHERE annotation_id = ?1",
+        json!([{ "type": "text", "value": C_LONG }]),
+    )
+    .await
+    .unwrap();
+    assert!(stored["rows"][0]["n"].as_i64().unwrap() > 2560, "{stored}");
+}
+
 // `artifact.render.v1` (task `51e8571`, slice A): a declared, read-only
 // live render of one MDX artifact as the viewer, projected display-only.
 // The tree is the viewer's own `render_artifact` tree by construction, so
@@ -14453,6 +15240,48 @@ fn table_names(tree: &Value) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+#[tokio::test]
+async fn batched_artifact_render_matches_single_reads_and_refuses_private_or_prefix_targets() {
+    let (db, registry) = fixture().await;
+    configure_preview_launch();
+    adopt_fixture_artifact(&registry, &db).await;
+    render_fixture(&registry, &db).await;
+    for account in [ALICE, BEA] {
+        let event =
+            adopted_with_package(&registry, &db, account, "agent.docs", render_declaration()).await;
+        let params = [
+            json!({"artifact_id": RENDER_STANDALONE_V2}),
+            json!({"artifact_id": RENDER_ALICE_ONLY_V2}),
+            json!({"artifact_id": &RENDER_STANDALONE_V2[..8]}),
+        ];
+        let reads: Vec<Value> = params
+            .iter()
+            .map(|params| json!({"need":"artifact.render.v1", "params":params}))
+            .collect();
+        let batch = call_as(&registry, &db, Caller::authenticated(account), "manage_alpha_tabs",
+            json!({"action":"live_read", "package":"agent.docs", "expected_install_event_id":event, "reads":reads})).await.unwrap();
+        for (item, params) in batch["results"].as_array().unwrap().iter().zip(params) {
+            match render_read(&registry, &db, account, "agent.docs", &event, params).await {
+                Ok(single) => assert_eq!(item["ok"], as_item(single)),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        message.contains(&format!("[{}]", item["error"]["code"].as_str().unwrap())),
+                        "{message}: {item}"
+                    );
+                }
+            }
+        }
+        assert_eq!(batch["results"][2]["error"]["code"], "invalid_params");
+        if account == BEA {
+            assert_eq!(batch["results"][1]["error"]["code"], "not_found");
+        }
+        let refused = call_as(&registry, &db, Caller::authenticated(account), "manage_alpha_tabs",
+            json!({"action":"live_read", "package":"agent.docs", "expected_install_event_id":"stale", "reads":[{"need":"artifact.render.v1","params":{"artifact_id":RENDER_STANDALONE_V2}}]})).await.unwrap_err().to_string();
+        assert!(refused.contains("[cas_mismatch]"), "{refused}");
+    }
 }
 
 #[tokio::test]
@@ -14902,3 +15731,176 @@ async fn batched_read_answers_artifact_render_like_its_single_read() {
         }
     }
 }
+
+// --- App contract v2 install marker (task 0a1a4ef, increment I3) ---
+
+pub(crate) fn v2_declaration() -> Value {
+    json!({"contract": "native.app.v2", "needs": [], "effects": []})
+}
+
+pub(crate) async fn install_with_declaration(
+    registry: &ToolRegistry,
+    db: &Db,
+    declaration: Value,
+) -> native_ce::Result<Value> {
+    let source_revision = preview_source_revision(db, ARTIFACT_A).await;
+    call_as(
+        registry,
+        db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({
+            "action": "install", "package": "agent.search", "version": "0.1.0",
+            "digest": DIGEST_A, "artifact_id": ARTIFACT_A,
+            "source_revision": source_revision, "declaration": declaration,
+            "reason": "Install a contract-marker package pin."
+        }),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn app_v2_install_adopts_and_launches_with_zero_needs_and_effects() {
+    let (db, registry) = fixture().await;
+    let event = adopted_with_declaration(&registry, &db, v2_declaration()).await;
+    let launch = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action": "launch", "package": "agent.search", "expected_install_event_id": event}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(launch["install_event_id"], event);
+    assert!(launch["launch"]["url"]
+        .as_str()
+        .unwrap()
+        .contains("/artifact-runtime/v1/launch/"));
+
+    // Inspect and list both carry the contract in the consented declaration,
+    // so the host can tell the install is v2 without a new field.
+    let inspected = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action": "inspect", "package": "agent.search"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inspected["install"]["adoption"], "shell_adopt.v1");
+    assert_eq!(
+        inspected["install"]["consented_declaration"],
+        v2_declaration()
+    );
+    assert_eq!(
+        inspected["install"]["launch_binding"]["reason"],
+        "launch_request_required"
+    );
+    let listed = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action": "list"}),
+    )
+    .await
+    .unwrap();
+    let entry = listed["installs"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["package"] == "agent.search"))
+        .unwrap_or_else(|| panic!("{listed:#}"));
+    assert_eq!(entry["consented_declaration"]["contract"], "native.app.v2");
+    assert_eq!(entry["consented_declaration"]["needs"], json!([]));
+    assert_eq!(entry["consented_declaration"]["effects"], json!([]));
+}
+
+#[tokio::test]
+async fn app_v2_contract_is_bound_into_the_declaration_digest() {
+    use native_ce::mcp::tools::alpha_tabs::{
+        alpha_tab_canonical_declaration, alpha_tab_declaration_digest,
+    };
+    let v1 = json!({"needs": [], "effects": []});
+    assert_eq!(
+        alpha_tab_canonical_declaration(&v2_declaration()).unwrap(),
+        v2_declaration()
+    );
+    assert_eq!(alpha_tab_canonical_declaration(&v1).unwrap(), v1);
+    assert_ne!(
+        alpha_tab_declaration_digest(&v2_declaration()).unwrap(),
+        alpha_tab_declaration_digest(&v1).unwrap(),
+        "an install cannot flip between v1 and v2 without changing its pin"
+    );
+}
+
+#[tokio::test]
+async fn app_v2_install_refuses_unknown_contract_and_non_empty_declarations() {
+    let (db, registry) = fixture().await;
+    adopt_fixture_artifact(&registry, &db).await;
+    for declaration in [
+        json!({"contract": "native.app.v3", "needs": [], "effects": []}),
+        json!({"contract": "", "needs": [], "effects": []}),
+        json!({"contract": "NATIVE.APP.V2", "needs": [], "effects": []}),
+        json!({"contract": 2, "needs": [], "effects": []}),
+        json!({"contract": null, "needs": [], "effects": []}),
+        json!({"contract": ["native.app.v2"], "needs": [], "effects": []}),
+        // A v2 install declares nothing: the single Adopt is the consent.
+        json!({"contract": "native.app.v2", "needs": ["attention.query.v1"], "effects": []}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": ["task.triage-set.v1"]}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": [], "sessions": []}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": [], "sessions": [
+            {"session": "session.body.v1", "key": "k", "scope": {"type": "A", "kind": "note"},
+             "mode": "edit", "presence": true}
+        ]}),
+    ] {
+        let refused = install_with_declaration(&registry, &db, declaration.clone())
+            .await
+            .expect_err(&format!("{declaration} must be refused"))
+            .to_string();
+        assert!(
+            refused.contains("invalid_contract"),
+            "{declaration}: {refused}"
+        );
+    }
+    let listed = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action": "list"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["installs"], json!([]), "refusals stored nothing");
+}
+
+#[tokio::test]
+async fn v1_declarations_keep_their_shape_and_carry_no_contract() {
+    let (db, registry) = fixture().await;
+    let declaration = json!({"needs": ["attention.query.v1"], "effects": []});
+    let event = adopted_with_declaration(&registry, &db, declaration.clone()).await;
+    let inspected = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "manage_alpha_tabs",
+        json!({"action": "inspect", "package": "agent.search"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inspected["install"]["event_id"], event);
+    assert_eq!(inspected["install"]["consented_declaration"], declaration);
+    assert!(inspected["install"]["consented_declaration"]
+        .get("contract")
+        .is_none());
+    use native_ce::mcp::tools::alpha_tabs::alpha_tab_canonical_declaration;
+    assert_eq!(
+        alpha_tab_canonical_declaration(&declaration).unwrap(),
+        json!({"needs": ["attention.query.v1"], "effects": []}),
+        "legacy canonical bytes stay identical"
+    );
+}
+
+#[path = "alpha_tabs_prepare_install.rs"]
+mod prepare_install_tests;

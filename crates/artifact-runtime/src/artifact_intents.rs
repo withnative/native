@@ -267,6 +267,42 @@ impl FacetVersion {
     }
 }
 
+/// A facet compare-and-set token that names its state by content event id
+/// instead of by sequence: `rev:<event id>` (record granularity, the event
+/// that last touched the record) or `obsv:<event id>` (open facet, the
+/// observation's event). Both accept `origin` for "no events yet". The host
+/// resolves the id to the `FacetVersion` it stands for; this crate only
+/// recognises the shape. Nothing here emits these tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventFacetVersion<'a> {
+    Record { event_id: &'a str },
+    Observation { event_id: &'a str },
+}
+
+impl<'a> EventFacetVersion<'a> {
+    pub fn parse(token: &'a str) -> Option<Self> {
+        let (event_id, record) = match token.strip_prefix("rev:") {
+            Some(id) => (id, true),
+            None => (token.strip_prefix("obsv:")?, false),
+        };
+        let shaped = !event_id.is_empty()
+            && event_id.len() <= 64
+            && event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        shaped.then_some(if record {
+            Self::Record { event_id }
+        } else {
+            Self::Observation { event_id }
+        })
+    }
+}
+
+/// Whether a token is any host-issued facet version: sequence or event id.
+pub fn is_facet_version_token(token: &str) -> bool {
+    FacetVersion::parse(token).is_some() || EventFacetVersion::parse(token).is_some()
+}
+
 /// Reserved observed-map key carrying a comment thread's target-state token.
 /// Ordinary facet tokens (`obs:`/`rec:`) remain valid under this key, so
 /// legacy facet-only artifacts keep validating; the `ct:` token below is
@@ -346,7 +382,7 @@ impl ArtifactInvocation {
             }
             for (key, token) in keys {
                 validate_identity(key, "observed facet key is blank or too long")?;
-                let admitted = FacetVersion::parse(token).is_some()
+                let admitted = is_facet_version_token(token)
                     || (key == COMMENT_TARGET_KEY && parse_comment_token(token).is_some());
                 if !admitted {
                     return Err("observed facet version is not a host-issued token");
@@ -469,7 +505,7 @@ impl ArtifactIntentResult {
                 // map: `obs:`/`rec:` anywhere, `ct:` already constrained to
                 // its reserved key at envelope validation. No new fields,
                 // statuses, or protocol version here.
-                if FacetVersion::parse(current_version).is_none()
+                if !is_facet_version_token(current_version)
                     && parse_comment_token(current_version).is_none()
                 {
                     return Err("conflict version is not a host-issued token");
@@ -830,6 +866,37 @@ mod tests {
             serde_json::from_value::<ArtifactInvocation>(encoded).unwrap(),
             invocation()
         );
+    }
+
+    #[test]
+    fn event_id_version_tokens_are_recognised_by_shape_only() {
+        let id = "3f2b8c1e-5d4a-4b6c-9e7f-0a1b2c3d4e5f";
+        assert_eq!(
+            EventFacetVersion::parse(&format!("rev:{id}")),
+            Some(EventFacetVersion::Record { event_id: id })
+        );
+        assert_eq!(
+            EventFacetVersion::parse(&format!("obsv:{id}")),
+            Some(EventFacetVersion::Observation { event_id: id })
+        );
+        assert_eq!(
+            EventFacetVersion::parse("rev:origin"),
+            Some(EventFacetVersion::Record { event_id: "origin" })
+        );
+        for bad in [
+            "rev:",
+            "obsv:",
+            "rev:a b",
+            "rev:12;drop",
+            "rec:4",
+            "obs:4",
+            "ct:ab",
+            id,
+        ] {
+            assert_eq!(EventFacetVersion::parse(bad), None, "{bad}");
+        }
+        assert!(is_facet_version_token("rev:abc") && is_facet_version_token("obs:4"));
+        assert!(!is_facet_version_token("revision:4"));
     }
 
     #[test]

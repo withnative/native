@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit agents probe</title>
+</head>
+<body>
+<main>
+<h1>Kit agents probe</h1>
+<p id="surface">pending</p>
+</main>
+<script>
+// App contract v2 (ask an agent): native.agents exists only when the host
+// offers app.agents.v2. `window.probe` drives it from the test and records
+// every status each subscriber hears.
+const heard = {};
+const unsubscribes = {};
+const pending = {};
+const frozenDeep = (value) => Object.isFrozen(value) && (!Array.isArray(value) || value.every((item) => Object.isFrozen(item)));
+window.probe = {
+  surface: () => {
+    const native = window.native;
+    return {
+      artifactAgents: typeof window.nativeArtifact.agents,
+      native: typeof native,
+      nativeAgents: typeof (native && native.agents),
+      methods: native && native.agents ? Object.keys(native.agents).sort() : null,
+      same: native && native.agents ? native.agents === window.nativeArtifact.agents : null,
+      frozen: native && native.agents ? Object.isFrozen(native.agents) : null,
+    };
+  },
+  list: async () => { const agents = await window.native.agents.list(); return { agents, frozen: frozenDeep(agents) }; },
+  // Two lists started together share one request.
+  listTwice: async () => { const a = window.native.agents.list(), b = window.native.agents.list(); return { same: a === b, agents: await a }; },
+  ask: async (request) => { const result = await window.native.agents.ask(request); return { result, frozen: Object.isFrozen(result) }; },
+  // Starts an ask without waiting for it, so several can be in flight at once.
+  start: (name, request) => { pending[name] = window.native.agents.ask(request); },
+  finish: (name) => pending[name],
+  onStatus: (name) => {
+    heard[name] = [];
+    unsubscribes[name] = window.native.agents.onStatus((status) => heard[name].push({ ...status, frozen: Object.isFrozen(status) }));
+  },
+  unsubscribe: (name) => { unsubscribes[name](); unsubscribes[name](); },
+  heard: (name) => heard[name],
+  // Requests a test cannot send over evaluate(): hostile objects.
+  badAsks: () => {
+    const revoked = Proxy.revocable({ to: "claude", comment_id: "c-1" }, {});
+    revoked.revoke();
+    return Promise.all([undefined, null, [], "claude", {}, { to: "claude" }, { comment_id: "c-1" }, { to: "", comment_id: "c-1" },
+      { to: "claude", comment_id: "has space" }, { to: "x".repeat(65), comment_id: "c-1" }, { to: "claude", comment_id: "c".repeat(129) },
+      { to: 5, comment_id: "c-1" }, revoked.proxy].map((request) => window.native.agents.ask(request)));
+  },
+  throwsOnStatus: () => { try { window.native.agents.onStatus("nope"); return null; } catch (error) { return `${error.name}: ${error.message}`; } },
+  // The frame is going away: the bridge treats pagehide as the host port closing.
+  pagehide: () => window.dispatchEvent(new Event("pagehide")),
+};
+window.nativeArtifact.ready.then(() => {
+  const surface = window.probe.surface();
+  document.getElementById("surface").textContent = `agents:${surface.nativeAgents}`;
+});
+</script>
+</body>
+</html>

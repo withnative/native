@@ -311,8 +311,8 @@ async fn personal_alpha_registry_schema79_complete_column_coverage() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    // Schema82 preserves the exact alpha-tab columns introduced by schema79.
-    assert_eq!(version, 82);
+    // The current schema preserves the exact alpha-tab columns introduced by schema79.
+    assert_eq!(version, crate::CURRENT_ENGINE_SCHEMA_VERSION);
     // Independent current-DDL expectation: an omitted encoder column must fail.
     let expected = [
         "account_id",

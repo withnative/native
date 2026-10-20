@@ -22,6 +22,9 @@ const USAGE = `alpha-tab-kit <command> <descriptor.json> [options]
       --html <file>         bundle path (default: descriptor.bundle, relative to the descriptor)
       --no-strict / --strict  <main>/<h1>/heading order as warnings (current source) or
                             errors (hosted before ffd9c76cd); default: strict (see README)
+      --package / --no-package  validate as an installed app package bundle (up to the
+                            1 MiB package body limit; the default, since every install
+                            plan marks its bundle) or as ordinary HTML held to 512 KiB
       --json                machine-readable findings
   digest <descriptor>     print alpha-tab-digest.v1 digests; --write stores them in the descriptor
   install-plan <descriptor> --home <folder id> --reason <text>
@@ -29,8 +32,12 @@ const USAGE = `alpha-tab-kit <command> <descriptor.json> [options]
       [--raw-body | --body-encoding utf8|base64|gzip+base64]
       [--bind <input port>=<collection id>]... [--allow-unbound]
       [--update <current install event id> | --replace <current install event id> | --after-removal <removal event id>] [--out <dir>]
-                          print (or write, one file per call) the exact MCP calls of the
-                          whole-body, digest-guarded install route (or explicit --chunked).
+      [--reset-presentation]  with --update, use descriptor name/icon and no skin
+                          print (or write, one file per step) the MCP call plan for the
+                          whole-body, digest-guarded route (or explicit --chunked).
+                          On --update, presentation steps resolve at run time through
+                          install-run; step files alone are not resolved MCP calls.
+                          --name with --update requires --reset-presentation.
                           Every input port the manifest reads needs --bind (binds the new
                           source and grants it input.read); otherwise the plan is refused
                           unless --allow-unbound, because an unbound tab cannot render or Save
@@ -73,7 +80,8 @@ switch (command) {
   case "validate": {
     const { descriptor, html, bundlePath } = loadPackage(need(descriptorPath, "validate needs a descriptor"), option("--html"));
     const strict = flag("--no-strict") ? false : flag("--strict") ? true : STRICT_DEFAULT;
-    const result = validatePackage({ descriptor, html, strict });
+    if (flag("--package") && flag("--no-package")) { console.error("--package and --no-package are mutually exclusive"); process.exit(2); }
+    const result = validatePackage({ descriptor, html, strict, ...(flag("--no-package") ? { package: false } : {}) });
     if (flag("--json")) {
       console.log(JSON.stringify({ ok: result.ok, bundle: bundlePath, digests: result.digests, findings: result.findings, not_mirrored: result.notMirrored }, null, 2));
     } else {
@@ -83,7 +91,11 @@ switch (command) {
       console.log(`${result.ok ? "ok" : "FAILED"}: ${descriptor.package} ${descriptor.version}, ${errors} error(s), ${warnings} warning(s)${result.digests ? `; ${result.digests.digest}` : ""}`);
       console.log(`not mirrored locally (the real query_sql / install is the authority): ${result.notMirrored.map((item) => item.rule).join(", ")}`);
     }
-    process.exit(result.ok ? 0 : 1);
+    // Not process.exit(): on Node 24 an explicit exit right after this much work intermittently
+    // never completes (all threads waiting, output already written), which hangs any caller
+    // that waits for the process. Letting it end by itself exits normally.
+    process.exitCode = result.ok ? 0 : 1;
+    break;
   }
   case "digest": {
     const path = need(descriptorPath, "digest needs a descriptor");
@@ -113,6 +125,9 @@ switch (command) {
     try {
       const transitions = ["--update", "--replace", "--after-removal"].filter(flag);
       if (transitions.length > 1) throw new Error(`${transitions.join(" and ")} are mutually exclusive`);
+      if (flag("--name") && flag("--update") && !flag("--reset-presentation")) {
+        throw new Error("--name with --update requires --reset-presentation");
+      }
       plan = planInstall({
         descriptor,
         html,
@@ -124,6 +139,7 @@ switch (command) {
         bodyEncoding: flag("--raw-body") ? "utf8" : option("--body-encoding"),
         chunkBytes: option("--chunk-bytes") ? Number(option("--chunk-bytes")) : undefined,
         updateInstallEventId: flag("--update") ? need(option("--update"), "--update needs a current install event id") : undefined,
+        resetPresentation: flag("--reset-presentation"),
         replaceInstallEventId: flag("--replace") ? need(option("--replace"), "--replace needs a current install event id") : undefined,
         afterRemovalEventId: flag("--after-removal") ? need(option("--after-removal"), "--after-removal needs a removal event id") : undefined,
         bindings,
@@ -135,7 +151,9 @@ switch (command) {
     } catch (error) {
       console.error(error.message);
       for (const item of error.findings ?? []) console.error(formatFinding(item));
-      process.exit(1);
+      // exitCode, not process.exit() (see validate): leave the switch and let the process end itself.
+      process.exitCode = 1;
+      break;
     }
     const out = option("--out");
     if (out) {
@@ -144,7 +162,8 @@ switch (command) {
         writeFileSync(join(out, `${String(index + 1).padStart(2, "0")}-${step.step}.json`), `${JSON.stringify(step, null, 2)}\n`);
       });
       writeFileSync(join(out, "plan.json"), `${JSON.stringify(plan, null, 2)}\n`);
-      console.log(`${plan.steps.length} calls written to ${out}; digest ${plan.digests.digest}`);
+      console.log(`${plan.steps.length} plan steps written to ${out}; digest ${plan.digests.digest}`);
+      if (flag("--update")) console.log("Update presentation steps resolve at run time through install-run; step files alone are not resolved MCP calls.");
     } else {
       console.log(JSON.stringify(plan, null, 2));
     }
@@ -233,7 +252,7 @@ switch (command) {
     } catch (error) {
       console.error(error.message);
       if (client.runKey) console.error(`run ${client.runKey}`);
-      process.exit(1);
+      process.exitCode = 1;
     }
     break;
   }

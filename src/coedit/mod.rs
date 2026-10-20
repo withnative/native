@@ -20,14 +20,23 @@
 
 #[allow(dead_code)] // Inactive stage-1 consumer; no public ingress until follow-on review.
 pub(crate) mod driver;
+pub mod live;
+#[cfg(test)]
+mod live_tests;
 mod refusal;
 mod registry;
+/// Span-authorship core (task `632ddcc`): ownership ledger, span-map builder
+/// and validator, consumed by `registry`'s apply path and unit tests.
+#[allow(dead_code)]
+pub(crate) mod span_map;
 #[cfg(test)]
 mod tests;
+mod text_diff;
 pub(crate) mod version_metadata;
 
 pub use refusal::{RefusalCode, Refused};
 pub use registry::{
-    Ack, AcknowledgedContributor, DrainOutcome, OpenOk, OpenParams, PeerId, PeerKind, SessionId,
-    SessionRegistry, VersionSnapshot, MAX_ATTRIBUTED_IDENTITIES, MAX_ATTRIBUTED_IDENTITY_BYTES,
+    Ack, AcknowledgedContributor, AppAttribution, DrainOutcome, OpenOk, OpenParams, PeerId,
+    PeerKind, SessionId, SessionRegistry, VersionSnapshot, MAX_ATTRIBUTED_IDENTITIES,
+    MAX_ATTRIBUTED_IDENTITY_BYTES, MAX_CUT_SNAPSHOT_BYTES,
 };

@@ -70,3 +70,10 @@ mod v2_contract_smoke;
 
 #[path = "kernel/workspace_rule_storage.rs"]
 mod workspace_rule_storage;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel/v2_structured_values.rs"]
+mod v2_structured_values;
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "kernel/v2_structured_values_text_formats.rs"]
+mod v2_structured_values_text_formats;

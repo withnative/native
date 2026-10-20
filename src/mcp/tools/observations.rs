@@ -35,12 +35,14 @@ enum ManageFacetObservationsArgs {
         vocab_ref: Option<String>,
         as_of: String,
         reason: String,
+        idempotency_key: Option<String>,
     },
     Unset {
         record_id: String,
         key: String,
         as_of: String,
         reason: String,
+        idempotency_key: Option<String>,
     },
     List {
         record_id: String,
@@ -79,6 +81,39 @@ async fn record_shape_context_in(
     Ok((row.try_get("type")?, row.try_get("kind")?))
 }
 
+/// Replay renderer for a keyed `set`/`unset` (keyed-replay contract,
+/// `keyed_replay`). The receipt is a pure function of the one observation
+/// event the command appended, its act, and the record's position before it.
+async fn replay_observation_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    replay: &super::keyed_replay::KeyedReplay,
+    record_id: &str,
+    key: &str,
+) -> Result<Value> {
+    let [event] = replay.content() else {
+        return Err(Error::engine(
+            "manage_facet_observations: idempotent receipt is incomplete",
+        ));
+    };
+    let status = if event.event_type == "facet.set" {
+        "set"
+    } else {
+        "unset"
+    };
+    let as_of = event.payload["as_of"].as_str().unwrap_or_default();
+    let previous_seq = replay.previous_seq_in(tx, record_id).await?;
+    Ok(crate::domain_transaction::observation_write_response(
+        status,
+        record_id,
+        key,
+        as_of,
+        event.seq,
+        previous_seq,
+        replay.act(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn write_observation(
     db: Db,
     caller: Caller,
@@ -87,8 +122,11 @@ async fn write_observation(
     value: Option<(Value, Option<String>)>,
     as_of: String,
     reason: String,
+    idempotency_key: Option<String>,
+    provenance_arguments: Value,
 ) -> Result<Value> {
     const TOOL: &str = "manage_facet_observations";
+    let keyed = super::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?.is_some();
     require_nonblank_reason(TOOL, &reason)?;
     let as_of = normalize_timestamp(TOOL, "as_of", &as_of)?;
     assert_open_facet_key(TOOL, &key)?;
@@ -110,6 +148,18 @@ async fn write_observation(
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &record_id, Capability::Edit).await?;
+    // Keyed replay: after authorization, before any state-dependent check.
+    if keyed {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            let receipt = replay_observation_in(&mut tx, &replay, &record_id, &key).await?;
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
+    }
     let previous_seq = previous_record_seq_in(&mut tx, &record_id).await?;
     let (record_type, kind) = record_shape_context_in(&mut tx, &record_id).await?;
     if let Some(facet) = facet.as_mut() {
@@ -162,6 +212,7 @@ async fn write_observation(
         &mut act_alloc,
     )
     .await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     Ok(crate::domain_transaction::observation_write_response(
         status,
@@ -266,6 +317,8 @@ async fn list_observations(
 }
 
 async fn manage_facet_observations(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     match parse_args("manage_facet_observations", arguments)? {
         ManageFacetObservationsArgs::Set {
             record_id,
@@ -274,6 +327,7 @@ async fn manage_facet_observations(db: Db, caller: Caller, arguments: Value) -> 
             vocab_ref,
             as_of,
             reason,
+            idempotency_key,
         } => {
             write_observation(
                 db,
@@ -283,6 +337,8 @@ async fn manage_facet_observations(db: Db, caller: Caller, arguments: Value) -> 
                 Some((value, vocab_ref)),
                 as_of,
                 reason,
+                idempotency_key,
+                provenance_arguments,
             )
             .await
         }
@@ -291,7 +347,21 @@ async fn manage_facet_observations(db: Db, caller: Caller, arguments: Value) -> 
             key,
             as_of,
             reason,
-        } => write_observation(db, caller, record_id, key, None, as_of, reason).await,
+            idempotency_key,
+        } => {
+            write_observation(
+                db,
+                caller,
+                record_id,
+                key,
+                None,
+                as_of,
+                reason,
+                idempotency_key,
+                provenance_arguments,
+            )
+            .await
+        }
         ManageFacetObservationsArgs::List {
             record_id,
             key,
@@ -344,7 +414,8 @@ pub fn register_observation_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "value": { "type": ["string", "number"], "description": "Preserve JSON numbers for facets declared type:number." },
                     "vocab_ref": { "type": "string", "description": "Optional vocabulary reference, checked against the governing shape." },
                     "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
-                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                    "idempotency_key": super::keyed_replay::idempotency_key_schema()
                 },
                 "required": ["action", "record_id", "key", "value", "as_of", "reason"],
                 "additionalProperties": false
@@ -359,7 +430,8 @@ pub fn register_observation_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "record_id": { "type": "string" },
                     "key": { "type": "string", "minLength": 1, "description": "One open facet key; spine and engine-reserved facets are rejected." },
                     "as_of": { "type": "string", "description": "Required RFC3339 valid-time timestamp." },
-                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                    "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                    "idempotency_key": super::keyed_replay::idempotency_key_schema()
                 },
                 "required": ["action", "record_id", "key", "as_of", "reason"],
                 "additionalProperties": false
@@ -379,7 +451,15 @@ pub fn register_observation_tools(registry: &mut ToolRegistry) -> Result<()> {
             "Set or unset one valid-time open-facet observation without changing the record's current facet value, or list one bounded series oldest-first. Writes require RFC3339 as_of and normalize it to UTC milliseconds. List bounds are inclusive; after_as_of is an exclusive keyset cursor; limit defaults to {DEFAULT_LIMIT} and is capped at {MAX_LIMIT}. Numeric values are returned as stored strings. {PREVIOUS_SEQ_DESCRIPTION} {ACT_DESCRIPTION}"
         ),
         action_schema,
-        manage_facet_observations,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_facet_observations(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     Ok(())
 }

@@ -22,7 +22,8 @@ use crate::mcp::record_ref::with_record_selector_aliases;
 #[serde(deny_unknown_fields)]
 struct RecordVersionDiffArgs {
     record_id: String,
-    before_seq: i64,
+    before_seq: Option<i64>,
+    before_event_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -41,7 +42,35 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
         Capability::View,
     )
     .await?;
-    if args.before_seq < 1 {
+    let before_seq = match (args.before_seq, args.before_event_id.as_deref()) {
+        (Some(seq), None) => seq,
+        // Through the lens resolver, not the bare position lookup: it also
+        // applies the holding floor, so a position below a finite window is
+        // refused with the same numberless text as an unknown id.
+        (None, Some(event_id)) => {
+            crate::query::lens::resolve_as_of_for(
+                &db,
+                caller.counter_footing(),
+                crate::query::lens::AsOfSelector::EventId(crate::query::lens::EventIdSelector {
+                    event_id: event_id.to_owned(),
+                }),
+            )
+            .await?
+            .resolved_content_seq
+        }
+        _ => {
+            return Err(Error::engine(
+                "render_record_version_diff takes exactly one of before_seq or before_event_id",
+            ))
+        }
+    };
+    if before_seq < 1 {
+        // `origin` names the empty prefix: no version of the record to diff
+        // from, and below the floor under a finite window. Either way it reads
+        // as the one unknown-position refusal rather than a window-dependent one.
+        if args.before_event_id.is_some() {
+            return Err(crate::position::unknown_position());
+        }
         return Err(Error::engine(
             "render_record_version_diff before_seq must be positive",
         ));
@@ -52,14 +81,27 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
     let current_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
         .fetch_one(db.write_pool())
         .await?;
-    if args.before_seq > current_seq {
+    // A non-owner who named the position by event id gets no sequence numbers
+    // back: not the resolved position, the head, or the event rows' counters.
+    let numberless = args.before_event_id.is_some() && !caller.counter_footing().is_owner();
+    if before_seq > current_seq {
+        if numberless {
+            return Err(crate::position::unknown_position());
+        }
         return Err(Error::engine(format!(
             "render_record_version_diff before_seq {} is after the current content head {}",
-            args.before_seq, current_seq
+            before_seq, current_seq
         )));
     }
-    let (before, after) =
-        record_versions_at(&db, &caller, &args.record_id, args.before_seq, current_seq).await?;
+    let (before, after) = record_versions_at(
+        &db,
+        &caller,
+        &args.record_id,
+        before_seq,
+        current_seq,
+        numberless,
+    )
+    .await?;
     let rows = sqlx::query(
         "SELECT seq, id, record_id, type, payload, actor, run_key, parent_key, intent, created_at, act
            FROM content_events
@@ -67,7 +109,7 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
           ORDER BY seq",
     )
     .bind(&args.record_id)
-    .bind(args.before_seq)
+    .bind(before_seq)
     .bind(current_seq)
     .fetch_all(db.write_pool())
     .await?;
@@ -97,7 +139,15 @@ async fn render_record_version_diff(db: Db, caller: Caller, arguments: Value) ->
     let actor_names = super::history::resolve_actor_names(&db, &events).await;
     let events = events
         .iter()
-        .map(|event| super::history::event_to_value(event, &actor_names))
+        .map(|event| {
+            let mut value = super::history::event_to_value(event, &actor_names);
+            if numberless {
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("local_seq");
+                }
+            }
+            value
+        })
         .collect::<Vec<_>>();
     Ok(json!({
         "view": "record_version_diff",
@@ -189,9 +239,10 @@ pub fn register_history_app_tool(registry: &mut ToolRegistry) -> Result<()> {
             "type": "object",
             "properties": {
                 "record_id": { "type": "string" },
-                "before_seq": { "type": "integer", "minimum": 1 }
+                "before_seq": { "type": "integer", "minimum": 1 },
+                "before_event_id": { "type": "string" }
             },
-            "required": ["record_id", "before_seq"],
+            "required": ["record_id"],
             "additionalProperties": false
         })),
         AppMetadata::model_and_app(RECORD_VERSION_DIFF_URI),

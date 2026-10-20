@@ -361,6 +361,33 @@ pub(crate) async fn mutate_with_reserved_attestation_in(
     draft: &crate::provenance::ActionAttestationDraft,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<(Value, Vec<crate::provenance::ActionOutput>)> {
+    mutate_with_reserved_attestation_noted_in(
+        tx, caller, source_id, target_id, token, note, add, operation, None, draft, act_alloc,
+    )
+    .await
+}
+
+/// [`mutate_with_reserved_attestation_in`] with a note appended to the
+/// assertion's rationale (`"<operation> compatibility add; <note>"`). Undo of
+/// an app's writes records the package it reverted here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn mutate_with_reserved_attestation_noted_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &crate::mcp::registry::Caller,
+    source_id: &str,
+    target_id: &str,
+    token: &str,
+    note: Option<String>,
+    add: bool,
+    operation: &str,
+    rationale_note: Option<&str>,
+    draft: &crate::provenance::ActionAttestationDraft,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<(Value, Vec<crate::provenance::ActionOutput>)> {
+    let rationale = |verb: &str| match rationale_note {
+        Some(extra) => format!("{operation} compatibility {verb}; {extra}"),
+        None => format!("{operation} compatibility {verb}"),
+    };
     let origin: String =
         sqlx::query_scalar("SELECT origin_db_id FROM database_identity WHERE singleton=1")
             .fetch_one(&mut **tx)
@@ -442,11 +469,7 @@ pub(crate) async fn mutate_with_reserved_attestation_in(
             stance: stance.into(),
             semantic_claimant: caller.credential().into(),
             on_behalf_of: None,
-            rationale: Some(if add {
-                format!("{operation} compatibility add")
-            } else {
-                format!("{operation} compatibility remove")
-            }),
+            rationale: Some(rationale(if add { "add" } else { "remove" })),
             valid_from: None,
             valid_until: None,
             causal_parents: parents,
@@ -523,7 +546,7 @@ pub(crate) async fn mutate_with_reserved_attestation_in(
             stance: stance.into(),
             semantic_claimant: caller.credential().into(),
             on_behalf_of: None,
-            rationale: Some(format!("{operation} compatibility add")),
+            rationale: Some(rationale("add")),
             valid_from: None,
             valid_until: None,
             causal_parents: Vec::new(),

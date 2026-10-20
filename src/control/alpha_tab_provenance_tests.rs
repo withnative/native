@@ -446,28 +446,7 @@ fn migrate_77_and_compare(db: &Db) -> impl std::future::Future<Output = ()> + '_
     Box::pin(async move {
         let expected = provenance(db).await;
         let mut conn = db.write_pool().acquire().await.unwrap();
-        sqlx::query("DROP TABLE facet_value_json_nodes")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE schema_config_json_nodes")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE workspace_rule_installations")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=77")
-            .execute(&mut *conn)
+        crate::schema::step_down::step_down(&mut conn, 77)
             .await
             .unwrap();
         assert_eq!(
@@ -582,6 +561,118 @@ fn migrate_77_and_compare(db: &Db) -> impl std::future::Future<Output = ()> + '_
         assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 82)
             .await
             .unwrap());
+        // Persona participants arrive at 83; finish on the current shape so the
+        // canonical exports these tests take afterwards see every table.
+        let edge83 = crate::migrations::EngineMigrationRegistry::production()
+            .pending(82, 83)
+            .unwrap()
+            .pop()
+            .unwrap();
+        edge83.preflight(&mut conn).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        edge83.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=83")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 83)
+            .await
+            .unwrap());
+        let edge84 = crate::migrations::EngineMigrationRegistry::production()
+            .pending(83, 84)
+            .unwrap()
+            .pop()
+            .unwrap();
+        edge84.preflight(&mut conn).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        edge84.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=84")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 84)
+            .await
+            .unwrap());
+        let edge85 = crate::migrations::EngineMigrationRegistry::production()
+            .pending(84, 85)
+            .unwrap()
+            .pop()
+            .unwrap();
+        edge85.preflight(&mut conn).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        edge85.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=85")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 85)
+            .await
+            .unwrap());
+        let edge86 = crate::migrations::EngineMigrationRegistry::production()
+            .pending(85, 86)
+            .unwrap()
+            .pop()
+            .unwrap();
+        edge86.preflight(&mut conn).await.unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        edge86.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=86")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 86)
+            .await
+            .unwrap());
+        let edge87 = crate::migrations::EngineMigrationRegistry::production()
+            .pending(86, 87)
+            .unwrap()
+            .pop()
+            .unwrap();
+        edge87.preflight(&mut conn).await.unwrap();
+        // The records rebuild runs with foreign keys fenced off, as the runner does.
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        edge87.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=87")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 87)
+            .await
+            .unwrap());
+        // Preserve the historical engine-87 proof, then restore all later
+        // production edges before lifecycle checks and canonical exports.
+        for edge in crate::migrations::EngineMigrationRegistry::production()
+            .pending(87, crate::CURRENT_ENGINE_SCHEMA_VERSION)
+            .unwrap()
+        {
+            edge.preflight(&mut conn).await.unwrap();
+            let mut tx = conn.begin().await.unwrap();
+            edge.apply(&mut tx).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version={}", edge.to()))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert!(crate::db::validate_engine_shape_on_for_test(
+            &mut conn,
+            crate::CURRENT_ENGINE_SCHEMA_VERSION,
+        )
+        .await
+        .unwrap());
     })
 }
 

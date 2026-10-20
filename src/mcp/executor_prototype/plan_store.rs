@@ -6,21 +6,19 @@
 //! SQLite file avoids silently extending the user database schema and can be
 //! shared by multiple local executor processes that open the same database.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use base64::Engine as _;
 use futures::future::BoxFuture;
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 
@@ -30,8 +28,10 @@ const HOSTED_KEY_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const HOSTED_KEY_READINESS_DOMAIN: &str = "native.mcp-executor.hosted-key-readiness.v1";
 const HOSTED_STORED_PLAN_FORMAT: &str = "native.hosted-write-plan-envelope.v1";
 const HOSTED_RETAINED_KEY_DOMAIN: &str = "native.mcp-executor.retained-key.v1";
+#[cfg(test)]
 const DEPLOYMENT_KEYRING_MAX_BYTES: usize = 16 * 1024;
 pub(super) const HOSTED_MAX_RETAINED_KEYS: usize = 16;
+#[cfg(test)]
 const DEPLOYMENT_KEY_BYTES: usize = 32;
 pub(super) const EXPIRED_PLAN_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 type HmacSha256 = Hmac<Sha256>;
@@ -104,8 +104,7 @@ pub trait HostedPlanCatalogue: Send + Sync {
 /// never exposes key ids or material. A managed remote KMS implementation of
 /// [`HostedPlanKeyProvider`] remains the production-scale boundary.
 pub struct DeploymentPlanKeyring {
-    active_key_id: String,
-    keys: BTreeMap<String, Zeroizing<[u8; DEPLOYMENT_KEY_BYTES]>>,
+    inner: native_artifact_runtime::deployment_keyring::DeploymentKeyring,
 }
 
 impl std::fmt::Debug for DeploymentPlanKeyring {
@@ -114,103 +113,33 @@ impl std::fmt::Debug for DeploymentPlanKeyring {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeploymentKeyringInput {
-    active_key_id: String,
-    keys: Vec<DeploymentKeyInput>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeploymentKeyInput {
-    id: String,
-    key: String,
-}
-
 impl DeploymentPlanKeyring {
     /// Parse the bounded JSON supplied by the hosting secret configuration.
     /// Validation errors intentionally identify only shape, never secret data.
+    /// Parsing lives in the shared artifact-runtime keyring; this cover
+    /// preserves the historic plan messages byte-for-byte.
     pub fn from_json(raw: &str) -> Result<Self> {
-        if raw.len() > DEPLOYMENT_KEYRING_MAX_BYTES {
-            return Err(Error::engine(
-                "hosted write plan keyring exceeds the 16 KiB limit",
-            ));
-        }
-        let mut input: DeploymentKeyringInput = serde_json::from_str(raw)
-            .map_err(|_| Error::engine("hosted write plan keyring is invalid JSON or shape"))?;
-        if input.keys.is_empty() || input.keys.len() > HOSTED_MAX_RETAINED_KEYS {
-            return Err(Error::engine(
-                "hosted write plan keyring must contain 1-16 keys",
-            ));
-        }
-        validate_deployment_key_id(&input.active_key_id)?;
-        let mut keys = BTreeMap::new();
-        for mut entry in input.keys.drain(..) {
-            validate_deployment_key_id(&entry.id)?;
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(entry.key.as_bytes())
-                .map_err(|_| Error::engine("hosted write plan keyring contains an invalid key"));
-            entry.key.zeroize();
-            let mut decoded = decoded?;
-            if decoded.len() != DEPLOYMENT_KEY_BYTES {
-                decoded.zeroize();
-                return Err(Error::engine(
-                    "hosted write plan keyring keys must decode to exactly 32 bytes",
-                ));
-            }
-            let mut secret = [0_u8; DEPLOYMENT_KEY_BYTES];
-            secret.copy_from_slice(&decoded);
-            decoded.zeroize();
-            if keys.insert(entry.id, Zeroizing::new(secret)).is_some() {
-                return Err(Error::engine(
-                    "hosted write plan keyring contains a duplicate key id",
-                ));
-            }
-        }
-        if !keys.contains_key(&input.active_key_id) {
-            return Err(Error::engine(
-                "hosted write plan keyring active key id is not retained",
-            ));
-        }
-        Ok(Self {
-            active_key_id: input.active_key_id,
-            keys,
-        })
+        native_artifact_runtime::deployment_keyring::DeploymentKeyring::from_json(raw)
+            .map(|inner| Self { inner })
+            .map_err(|error| Error::engine(error.message()))
     }
-}
-
-fn validate_deployment_key_id(id: &str) -> Result<()> {
-    if id.is_empty()
-        || id.len() > 64
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(Error::engine(
-            "hosted write plan key ids must be 1-64 safe ASCII characters",
-        ));
-    }
-    Ok(())
 }
 
 impl HostedPlanKeyProvider for DeploymentPlanKeyring {
     fn active_key_id(&self) -> BoxFuture<'static, Result<String>> {
-        let active_key_id = self.active_key_id.clone();
+        let active_key_id = self.inner.active_key_id().to_owned();
         Box::pin(async move { Ok(active_key_id) })
     }
 
     fn seal(&self, key_id: String, payload: Value) -> BoxFuture<'static, Result<String>> {
-        let secret = (key_id == self.active_key_id)
-            .then(|| self.keys.get(&key_id).map(|secret| **secret))
+        let secret = (key_id == self.inner.active_key_id())
+            .then(|| self.inner.secret(&key_id))
             .flatten();
         Box::pin(async move {
-            let mut secret = secret.ok_or_else(|| {
+            let secret = secret.ok_or_else(|| {
                 Error::engine("hosted write plan active signing key is unavailable")
             })?;
-            let result = sign(&secret, &payload);
-            secret.zeroize();
-            result
+            sign(secret.as_slice(), &payload)
         })
     }
 
@@ -220,14 +149,12 @@ impl HostedPlanKeyProvider for DeploymentPlanKeyring {
         payload: Value,
         signature: String,
     ) -> BoxFuture<'static, Result<()>> {
-        let secret = self.keys.get(&key_id).map(|secret| **secret);
+        let secret = self.inner.secret(&key_id);
         Box::pin(async move {
-            let mut secret = secret.ok_or_else(|| {
+            let secret = secret.ok_or_else(|| {
                 Error::engine("hosted write plan verification key is unavailable")
             })?;
-            let result = verify_signature(&secret, &payload, &signature);
-            secret.zeroize();
-            result
+            verify_signature(secret.as_slice(), &payload, &signature)
         })
     }
 }
@@ -332,6 +259,19 @@ pub(super) enum ClaimOutcome {
 }
 
 impl PlanStore {
+    #[cfg(test)]
+    pub(super) async fn block_completion_for_test(&self, blocked: bool) -> Result<()> {
+        let PlanStoreBackend::Local(pool) = &self.backend else {
+            return Err(Error::engine("local fixture only"));
+        };
+        sqlx::query(if blocked { "CREATE TRIGGER test_block_completion BEFORE UPDATE OF state ON write_plans WHEN NEW.state = 'completed' BEGIN SELECT RAISE(ABORT, 'fixture completion storage failure'); END" } else { "DROP TRIGGER test_block_completion" }).execute(pool).await?;
+        Ok(())
+    }
+
+    pub(super) fn is_local(&self) -> bool {
+        matches!(self.backend, PlanStoreBackend::Local(_))
+    }
+
     pub(super) async fn open_for_database(database_path: &Path) -> Result<Self> {
         let path = sidecar_path(database_path)?;
         prepare_sidecar_file(&path)?;

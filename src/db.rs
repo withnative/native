@@ -71,7 +71,11 @@ use crate::schema::DDL_STATEMENTS;
 use crate::write_contention::WriteDomain;
 
 mod candidate_read_only;
-pub use candidate_read_only::open_current_database_wal_read_only_at;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub use candidate_read_only::open_marked_v2_database_read_only_at;
+pub use candidate_read_only::{
+    open_current_database_read_only_at, open_current_database_wal_read_only_at,
+};
 mod control_commit_test;
 #[doc(hidden)]
 pub use control_commit_test::{
@@ -161,7 +165,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 82;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 90;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -426,6 +430,21 @@ pub(crate) const ENGINE_75_SHAPE_CONTRACT_SHA256: &str =
 /// Released main269 engine78 shape. Measured by the schema79 Rust contract harness.
 pub(crate) const ENGINE_78_SHAPE_CONTRACT_SHA256: &str =
     "243dd69acbd554d4080ffce4d10c7cd577f8348afcfd1a1ae7538646307667ff";
+/// SQLite file marker for the v2 owned-schema engine (ASCII `NKV2`).
+/// Independent of the v1 source-history application-id range.
+pub const V2_APPLICATION_ID: i64 = 0x4e4b_5632;
+
+/// Refuse v2 before any v1 schema/identity access or mutation.
+pub async fn refuse_v2_database(connection: &mut SqliteConnection) -> Result<()> {
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(connection)
+        .await?;
+    if marker == V2_APPLICATION_ID {
+        return Err(Error::engine("this is a v2 database; use a v2 engine path"));
+    }
+    Ok(())
+}
+
 /// A read-only classification of an on-disk SQLite database.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
@@ -433,6 +452,7 @@ pub enum DatabaseVersionState {
     Empty,
     Known(i64),
     UnversionedNonEmpty,
+    KernelV2,
     Future(i64),
     Missing,
     Unreadable(String),
@@ -449,10 +469,56 @@ pub(crate) const ENGINE_79_SHAPE_CONTRACT_SHA256: &str =
 pub(crate) const ENGINE_80_SHAPE_CONTRACT_SHA256: &str =
     "a5c0e65d4d1f709940ab7cd8b158b2d2d885e086af6771780310bd728528aab5";
 
-/// Engine81 shape before the facet-value node table, measured by the
-/// authoritative Rust shape harness on the released schema81 tree.
+/// Released schema81, independently measured against its canonical DDL.
 pub(crate) const ENGINE_81_SHAPE_CONTRACT_SHA256: &str =
     "4929a4a2b0286f781161c738216dab424eb784d7bc27d8e6fa2062e4a1c54aa4";
+
+/// Released main 69c97fa8f schema82 with the facet-value node carrier.
+/// Measured from its canonical production DDL; persona identity follows at83.
+pub(crate) const ENGINE_82_SHAPE_CONTRACT_SHA256: &str =
+    "5093687503b62ea5463bb2a82297455916b02a4b7ace7d7e2ea1ce7f655b5ce3";
+
+/// Engine83 (persona participants) before the app-attribution side table,
+/// measured by the Rust shape harness on the engine-83 DDL.
+pub(crate) const ENGINE_83_SHAPE_CONTRACT_SHA256: &str =
+    "c212fc0fe47fbedeb9604ce837d556701cdebcf8ca6161563f16eaa255a3674b";
+
+/// Engine84 (app-attribution side table) before the facet-observation node
+/// table, measured by `schema84_measure_contracts` on the engine-84 DDL.
+pub(crate) const ENGINE_84_SHAPE_CONTRACT_SHA256: &str =
+    "6c936b67e11ef45b485f27fed1dd6ef4a2b5ad8e4081253ba15a16faa1ff6ce1";
+
+/// Engine85 (facet-observation node table) before the record-body node
+/// table. BEFORE-new-DDL authority from the retained baseline binary
+/// (`schema84_measure_contracts`, 1 pass): current_ddl_statements 367,
+/// current_ddl_sha256 301ab0b68906a9d480998f384d4f2444266ef52db43455b67d6dc8918658bfc2.
+pub(crate) const ENGINE_85_SHAPE_CONTRACT_SHA256: &str =
+    "f3f7e3ebaf73a1a8a38c30d1a4830b9141d42f434af33ece7841871b5f43bcd1";
+
+/// Engine86 (record-body node table) before the `Configuration` spine type
+/// widened the `records.type` CHECK (task 6ec81db). Measured from the unchanged
+/// engine-86 DDL on `origin/main` cea30903c: 368 statements, ddl sha256
+/// 1412b6bd893f80f3942e77ff34ba571eb30fc21263301ce527f72cc566ddc93f.
+pub(crate) const ENGINE_86_SHAPE_CONTRACT_SHA256: &str =
+    "ad7659536817b764881f98d289b541b82a6fabdd469b40cf194d514319ed270f";
+
+/// Engine87 measured from unchanged d742a584ab DDL before the private read
+/// preference column: schema84_measure_contracts with its current connection
+/// at 87, 368 statements, ddl a97a9543..., shape e6ab709b....
+pub(crate) const ENGINE_87_SHAPE_CONTRACT_SHA256: &str =
+    "e6ab709b36fd42ba9a92d5e6024cce7e2a41bd5fb9353914d417e0f31da854e3";
+
+/// Engine88 measured from main d50aac632's whole production DDL before
+/// account configs: 368 statements, ddl cc931539..., shape 075e3ffe....
+/// The measurement reproduces the engine87 frozen shape before measuring 88;
+/// the production 87→88 migration test independently validates this digest.
+pub(crate) const ENGINE_88_SHAPE_CONTRACT_SHA256: &str =
+    "075e3ffe71dd54d1736ad7b7c2c832364580ee562ae086f142866483c156bfd8";
+
+/// Measured from baseline 92c71ade before the receipt-table edge. The same
+/// measurement reproduces the independently frozen engine88 pin.
+pub(crate) const ENGINE_89_SHAPE_CONTRACT_SHA256: &str =
+    "73d242e180f0f3d3830c25f4000188b5664d9b5448eec7d947686c53a04bd603";
 
 /// The SQLite authority granted to an open [`Db`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -475,6 +541,7 @@ impl std::fmt::Display for DatabaseVersionState {
         match self {
             Self::Empty => write!(f, "empty"),
             Self::Known(version) => write!(f, "schema {version}"),
+            Self::KernelV2 => write!(f, "this is a v2 database; use a v2 engine path"),
             Self::UnversionedNonEmpty => write!(f, "unversioned non-empty"),
             Self::Future(version) => write!(f, "future schema {version}"),
             Self::Missing => write!(f, "missing"),
@@ -582,6 +649,9 @@ pub struct Db {
     /// the caller to drain live handles first; this memo offers no
     /// cross-handle invalidation by design.
     database_id_cache: Arc<tokio::sync::OnceCell<String>>,
+    /// Canonical file path keying this database's live co-edit sessions
+    /// (`coedit::live`), resolved once per handle. Clones share it.
+    live_session_key: Arc<OnceLock<std::path::PathBuf>>,
     /// Keeps the ephemeral temp dir alive for `:memory:` databases.
     _tmp: Option<Arc<TempDir>>,
 }
@@ -1134,7 +1204,7 @@ mod write_contention_measurement_tests {
     /// Wait for the connection's section to close. The close runs when SQLx
     /// returns the connection to its pool, which is not guaranteed to be this
     /// task, so the sample can land just after `commit()` resolves.
-    async fn closed_section(key: usize) -> (WriteDomain, Duration) {
+    async fn closed_section(key: usize) -> (WriteDomain, Option<&'static str>, Duration) {
         for _ in 0..200 {
             if let Some(section) = section_for(key) {
                 return section;
@@ -1166,7 +1236,7 @@ mod write_contention_measurement_tests {
         assert_eq!(observations.begins.len(), 1);
         assert_eq!(observations.begins[0].domain, WriteDomain::Workspace);
         assert!(!observations.begins[0].failed);
-        let (domain, held) = closed_section(key).await;
+        let (domain, _operation, held) = closed_section(key).await;
         assert_eq!(domain, WriteDomain::Workspace);
         assert!(
             held >= Duration::from_millis(30),
@@ -1309,7 +1379,33 @@ mod write_contention_measurement_tests {
         .await;
         assert_eq!(observations.begins.len(), 1);
         assert_eq!(observations.begins[0].domain, WriteDomain::HostCatalog);
-        assert_eq!(closed_section(key).await.0, WriteDomain::HostCatalog);
+        let (domain, operation, _held) = closed_section(key).await;
+        assert_eq!(domain, WriteDomain::HostCatalog);
+        assert_eq!(
+            operation,
+            Some(HOST_CATALOG_OP_OTHER),
+            "an unlabelled catalog write attributes its hold to `other`"
+        );
+    }
+
+    #[tokio::test]
+    async fn labelled_catalog_writes_carry_their_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog-labelled.db");
+        let pool = open_pool(path.to_str().unwrap(), true, WritePoolKind::HostCatalog)
+            .await
+            .unwrap();
+        let mut transaction = begin_host_control_plane_sqlite_write_with_operation(
+            &pool,
+            HOST_CATALOG_OP_SQL_COMMIT_GUARD,
+        )
+        .await
+        .unwrap();
+        let key = connection_key(&mut transaction).await.unwrap();
+        transaction.commit().await.unwrap();
+        let (domain, operation, _held) = closed_section(key).await;
+        assert_eq!(domain, WriteDomain::HostCatalog);
+        assert_eq!(operation, Some(HOST_CATALOG_OP_SQL_COMMIT_GUARD));
     }
 }
 
@@ -1663,6 +1759,21 @@ impl Db {
         self.handle_id
     }
 
+    /// Whether both values are clones of the same physical pool handle.
+    #[doc(hidden)]
+    pub fn same_handle(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.location, &other.location)
+    }
+
+    /// The storage identity live co-edit sessions are keyed by: the canonical
+    /// file path (falling back to the path as given if it cannot be
+    /// canonicalised), resolved once per handle.
+    pub(crate) fn live_session_key(&self) -> &std::path::Path {
+        self.live_session_key.get_or_init(|| {
+            std::fs::canonicalize(self.path()).unwrap_or_else(|_| self.path().to_path_buf())
+        })
+    }
+
     pub(crate) fn owned_portability_policy_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
         self.portability_policy_gate.clone()
     }
@@ -1764,6 +1875,7 @@ impl Db {
         enrolled::phase(enrolled::Phase::AfterCommit).await;
         crate::provenance::confirm_committed_attestations(&committed_attestations);
         self.complete_realtime_commit();
+        crate::coedit::live::after_commit(self);
         Ok(())
     }
 
@@ -1789,6 +1901,7 @@ impl Db {
         })?;
         crate::provenance::confirm_committed_attestations(&committed_attestations);
         self.complete_realtime_commit();
+        crate::coedit::live::after_commit(self);
         Ok(())
     }
 
@@ -1868,6 +1981,19 @@ impl Db {
     /// invalidation after durability. The wake is latency machinery only and
     /// never constitutes presentation, acknowledgement, or delivery.
     pub(crate) async fn commit_awareness(
+        &self,
+        tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    ) -> Result<()> {
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    /// Commit native kernel facts and their domain-owned attribution together.
+    /// Kernel projections do not use the v1 provenance tables. Wake the same
+    /// durable tailer after commit, without issuing a v1 action attestation.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn commit_kernel_content(
         &self,
         tx: sqlx::Transaction<'static, sqlx::Sqlite>,
     ) -> Result<()> {
@@ -3105,7 +3231,44 @@ mod close_tests {
 pub(crate) async fn begin_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-    begin_write_in(pool, WriteDomain::Workspace).await
+    begin_write_in(pool, WriteDomain::Workspace, WRITER_DEADLINE, None).await
+}
+
+pub(crate) const SQL_WORKSPACE_BUSY: &str = "sql_write: workspace busy; prepare again after the writer is available (this plan remains claimed; retry it only for receipt recovery)";
+
+/// Fixed operation labels for hosted control-plane catalog lock attribution.
+///
+/// The `write-contention` slow-hold and over-cap lines carry one of these so
+/// a slow hold can be traced to its kind of operation. The set is
+/// deliberately small; a catalog write not named here records as
+/// [`HOST_CATALOG_OP_OTHER`]. Labels are fixed server-side strings: never
+/// tenant or request data.
+#[doc(hidden)]
+pub const HOST_CATALOG_OP_OTHER: &str = "other";
+/// The SQL-commit membership guard transaction, which holds the catalog
+/// write lock across the whole guarded dispatch.
+#[doc(hidden)]
+pub const HOST_CATALOG_OP_SQL_COMMIT_GUARD: &str = "sql_commit_guard";
+/// One-time-code sign-in writes (issue, verify, consume).
+#[doc(hidden)]
+pub const HOST_CATALOG_OP_SIGN_IN: &str = "sign_in";
+/// Membership, invitation and signup writes.
+#[doc(hidden)]
+pub const HOST_CATALOG_OP_MEMBERSHIP: &str = "membership";
+
+/// Short acquisition budget for a workspace writer under a hosted catalog guard.
+/// Timeout covers pool admission and individual SQLite busy waits as well as
+/// the ordinary retry loop; shortening retries alone cannot bound those waits.
+pub(crate) async fn begin_write_with_deadline(
+    pool: &SqlitePool,
+    deadline: Duration,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    tokio::time::timeout(
+        deadline,
+        begin_write_in(pool, WriteDomain::Workspace, deadline, None),
+    )
+    .await
+    .map_err(|_| Error::engine(SQL_WORKSPACE_BUSY))?
 }
 
 /// [`begin_write`], told which pool it is opening on.
@@ -3120,14 +3283,15 @@ pub(crate) async fn begin_write(
 async fn begin_write_in(
     pool: &SqlitePool,
     domain: WriteDomain,
+    retry_for: Duration,
+    operation: Option<&'static str>,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
     #[cfg(test)]
     BEFORE_BEGIN_WRITE_NOTIFICATION
         .try_with(|notification| notification.notify_one())
         .ok();
     let started_at = Instant::now();
-    let begun =
-        begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), WRITER_DEADLINE).await;
+    let begun = begin_write_attempts_with(|| pool.begin_with("BEGIN IMMEDIATE"), retry_for).await;
     let wait = started_at.elapsed();
     let (retries, failed) = match &begun {
         Ok(success) => (success.retries, false),
@@ -3151,7 +3315,7 @@ async fn begin_write_in(
     // and drops alike. Not every ending reaches it; `write_contention`'s module
     // doc names the cases that do not and how they are counted.
     if let Some(key) = connection_key(&mut transaction).await {
-        crate::write_contention::open_critical_section(domain, key, None);
+        crate::write_contention::open_critical_section(domain, key, operation);
     }
     if let Err(error) = crate::storage_profile::enforce_write_boundary(&mut transaction).await {
         let _ = transaction.rollback().await;
@@ -3231,11 +3395,32 @@ pub(crate) async fn begin_capture_write(pool: &SqlitePool) -> Result<CaptureBegi
 /// [`Db`]. This purpose-specific boundary preserves the engine's exact
 /// `BEGIN IMMEDIATE`, bounded retry, and write-profile enforcement without
 /// exposing either [`Db::write_pool`] or a general public transaction helper.
+///
+/// The hold is attributed to [`HOST_CATALOG_OP_OTHER`]; callers with a fixed
+/// label use [`begin_host_control_plane_sqlite_write_with_operation`].
 #[doc(hidden)]
 pub async fn begin_host_control_plane_sqlite_write(
     pool: &SqlitePool,
 ) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-    begin_write_in(pool, WriteDomain::HostCatalog).await
+    begin_host_control_plane_sqlite_write_with_operation(pool, HOST_CATALOG_OP_OTHER).await
+}
+
+/// [`begin_host_control_plane_sqlite_write`], attributing the held lock to a
+/// fixed [`HOST_CATALOG_OP_OTHER`] label such as
+/// [`HOST_CATALOG_OP_SQL_COMMIT_GUARD`]. The operation must be a fixed
+/// server-side label, never tenant or request data.
+#[doc(hidden)]
+pub async fn begin_host_control_plane_sqlite_write_with_operation(
+    pool: &SqlitePool,
+    operation: &'static str,
+) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+    begin_write_in(
+        pool,
+        WriteDomain::HostCatalog,
+        WRITER_DEADLINE,
+        Some(operation),
+    )
+    .await
 }
 
 /// A hosted control-plane write carrying bounded-BEGIN diagnostics through its
@@ -3947,18 +4132,25 @@ fn immutable_read_only_connect_options(path: &str) -> Result<SqliteConnectOption
 // connection from retaining a dangling public view if the contract changes.
 // Trailing entries are helper tables, dropped as tables rather than views;
 // VIEW_COUNT below must stay in step with their number.
-const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
+pub(crate) const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "records",
     "record_lifecycle_interpretations",
     "content_events",
     "body_blocks",
+    "body_block_headings",
     "links",
     "facet_values",
+    "facet_value_json_nodes",
+    "content_event_apps",
     "facet_observations",
+    "facet_observation_json_nodes",
+    "record_body_json_nodes",
     "bindings",
     "blobs",
     "vocabularies",
     "vocabulary_values",
+    "vocabulary_value_json_nodes",
+    "schema_config_json_nodes",
     "schema_config",
     "effective_relationships",
     "effective_relationship_endpoints",
@@ -3968,8 +4160,12 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "runs",
     "run_intents",
     "messages_awaiting_reply",
+    "my_participants",
+    "message_speakers",
     "my_message_state",
     "my_mentions",
+    "comment_anchors",
+    "message_reactions",
     "facet_times",
     "body_task_items",
     "catalog_relations",
@@ -3989,8 +4185,12 @@ const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "_query_sql_claim_releases",
     "_query_sql_disclosable_actors",
     "_query_sql_visible_ids",
+    "_query_sql_reaction_winners",
+    // Per-execution serving snapshot table for `catalog_operations`
+    // (a table, not a view, so it closes the tables group).
+    "catalog_operations",
 ];
-const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 10;
+pub(crate) const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 12;
 
 #[cfg(test)]
 mod wal_journal_size_limit_tests {
@@ -4357,37 +4557,44 @@ async fn sanitize_released_write_connection(
         Ok(true) => {}
         Err(_) => return Ok(false),
     }
-    for view in &QUERY_SQL_TEMP_CONTRACT_OBJECTS[..QUERY_SQL_TEMP_VIEW_COUNT] {
-        let statement = format!("DROP VIEW IF EXISTS temp.{view}");
-        if sqlx::query(&statement)
-            .execute(&mut *connection)
-            .await
-            .is_err()
-        {
-            return Ok(false);
-        }
-    }
-    for table in [
-        "_query_sql_lifecycle_interpretations",
-        "_query_sql_principal",
-        "_query_sql_activity_observations",
-        "_query_sql_activity_capture",
-        "_query_sql_activity_members",
-        "_query_sql_messages_awaiting_reply",
-        "_query_sql_claim_candidates",
-        "_query_sql_claim_releases",
-        "_query_sql_disclosable_actors",
-        "_query_sql_visible_ids",
-    ] {
-        if sqlx::query(&format!("DROP TABLE IF EXISTS temp.{table}"))
-            .execute(&mut *connection)
-            .await
-            .is_err()
-        {
-            return Ok(false);
-        }
+    // One script, in the same order; SQLite stops at the first failing drop
+    // and any failure discards the connection, as before.
+    if sqlx::query(released_temp_contract_teardown_script())
+        .persistent(false)
+        .execute(&mut *connection)
+        .await
+        .is_err()
+    {
+        return Ok(false);
     }
     Ok(true)
+}
+
+/// The release hook's drops of a left-behind governed TEMP contract, as one
+/// script: every view, then every table.
+fn released_temp_contract_teardown_script() -> &'static str {
+    static SCRIPT: OnceLock<String> = OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        let views = QUERY_SQL_TEMP_CONTRACT_OBJECTS[..QUERY_SQL_TEMP_VIEW_COUNT]
+            .iter()
+            .map(|view| format!("DROP VIEW IF EXISTS temp.{view};\n"));
+        let tables = [
+            "catalog_operations",
+            "_query_sql_lifecycle_interpretations",
+            "_query_sql_principal",
+            "_query_sql_activity_observations",
+            "_query_sql_activity_capture",
+            "_query_sql_activity_members",
+            "_query_sql_messages_awaiting_reply",
+            "_query_sql_claim_candidates",
+            "_query_sql_claim_releases",
+            "_query_sql_disclosable_actors",
+            "_query_sql_visible_ids",
+            "_query_sql_reaction_winners",
+        ]
+        .map(|table| format!("DROP TABLE IF EXISTS temp.{table};\n"));
+        views.chain(tables).collect()
+    })
 }
 
 #[cfg(test)]
@@ -4470,6 +4677,7 @@ mod released_write_connection_tests {
                 "body_task_items",
                 "my_message_state",
                 "my_mentions",
+                "message_reactions",
                 "record_lifecycle_interpretations",
             ] {
                 sqlx::query(&format!(
@@ -4485,6 +4693,10 @@ mod released_write_connection_tests {
             .execute(&mut *connection)
             .await
             .unwrap();
+            sqlx::query("CREATE TEMP TABLE temp._query_sql_reaction_winners (event_seq INTEGER)")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
             sqlx::query("CREATE TEMP VIEW temp.catalog_columns AS SELECT 1 AS column_position")
                 .execute(&mut *connection)
                 .await
@@ -4691,13 +4903,84 @@ async fn open_immutable_read_pool(path: &str) -> Result<SqlitePool> {
         .await?)
 }
 
+/// Physically read-only, but not `immutable`: the standby's current generation
+/// may be advanced in place by its refresh controller, so readers must take
+/// SQLite's shared locks and notice committed changes.
+async fn open_standby_read_pool(path: &str) -> Result<SqlitePool> {
+    Ok(SqlitePoolOptions::new()
+        .max_connections(5)
+        .before_acquire(count_read_pool_reuse)
+        .after_connect(|connection, metadata| {
+            Box::pin(async move {
+                count_read_pool_new_connection(connection, metadata).await?;
+                install_enrolled_guard(connection, true).await
+            })
+        })
+        // A delta commit waits up to 60 s for shared locks to clear, and new
+        // reads wait behind its pending lock: give them longer than that.
+        .connect_with(read_only_connect_options(path)?.busy_timeout(Duration::from_secs(90)))
+        .await?)
+}
+
 /// Open a database. Pass a path (or `file:` URL) for a real on-disk file, or
 /// `:memory:` for an ephemeral one backed by a temp file that is removed when
 /// the last handle drops — used by tests and the rebuild-and-diff harness.
 ///
 /// Both are WAL-journalled with foreign keys enforced.
+///
+/// This is a raw opener: unmanaged marked v2 files are accepted without
+/// admitting their schema for serving. Managed custody retains v1 schema
+/// admission here. V1 callers must use [`open_v1_database`] or
+/// [`open_existing_database`]; v2 serving uses the kernel's verified opener,
+/// including for managed files.
 pub async fn open_database(url: &str) -> Result<Db> {
-    open_database_with_write_pool_kind(url, WritePoolKind::Workspace).await
+    open_database_with_write_pool_kind(url, WritePoolKind::Workspace, true, WorkspaceSchema::V1)
+        .await
+}
+
+/// Raw open/create for v1 callers, refusing a marked v2 file before opening
+/// writable pools. This does not replace [`open_existing_database`]'s full v1
+/// schema admission when serving an existing workspace.
+pub async fn open_v1_database(url: &str) -> Result<Db> {
+    if url != ":memory:" {
+        let options = read_only_connect_options(url)?;
+        if options.get_filename().try_exists()? {
+            let mut connection = SqliteConnection::connect_with(&options).await?;
+            let admitted = refuse_v2_database(&mut connection).await;
+            let closed = connection.close().await;
+            admitted?;
+            closed?;
+        }
+    }
+    let db = Box::pin(open_database(url)).await?;
+    let admitted = async {
+        let mut connection = db.pool().acquire().await?;
+        refuse_v2_database(&mut connection).await
+    }
+    .await;
+    if let Err(error) = admitted {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
+/// Raw existing-file open for the owned v2 schema. No schema initialization or
+/// v1 identity reconciliation; SQLite itself enforces non-creation.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn open_existing_v2_file(url: &str) -> Result<Db> {
+    if url == ":memory:" {
+        return Err(Error::engine(
+            "v2 serving requires an existing on-disk database",
+        ));
+    }
+    open_database_with_write_pool_kind(
+        url,
+        WritePoolKind::Workspace,
+        false,
+        WorkspaceSchema::KernelV2,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -4729,6 +5012,7 @@ async fn open_database_read_pool(path: &str, _write_pool: &SqlitePool) -> Result
 async fn open_database_companion_pools(
     path: &str,
     write_pool: &SqlitePool,
+    create_if_missing: bool,
 ) -> Result<(SqlitePool, SqlitePool)> {
     let read_pool = match open_database_read_pool(path, write_pool).await {
         Ok(pool) => pool,
@@ -4737,7 +5021,7 @@ async fn open_database_companion_pools(
             return Err(error);
         }
     };
-    let governed_pool = match open_governed_pool(path, true).await {
+    let governed_pool = match open_governed_pool(path, create_if_missing).await {
         Ok(pool) => pool,
         Err(error) => {
             tokio::join!(
@@ -4750,14 +5034,26 @@ async fn open_database_companion_pools(
     Ok((read_pool, governed_pool))
 }
 
-async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> Result<Db> {
+enum WorkspaceSchema {
+    V1,
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    KernelV2,
+}
+
+async fn open_database_with_write_pool_kind(
+    url: &str,
+    kind: WritePoolKind,
+    create_if_missing: bool,
+    schema: WorkspaceSchema,
+) -> Result<Db> {
     if url == ":memory:" {
         let (path, tmp) = ephemeral_file()?;
         let pending_commit_probes = matches!(kind, WritePoolKind::Workspace)
             .then(|| Arc::new(control_commit_test::PoolProbeRegistry::default()));
         let write_pool =
             open_pool_with_probes(&path, true, kind, pending_commit_probes.clone()).await?;
-        let (read_pool, governed_pool) = open_database_companion_pools(&path, &write_pool).await?;
+        let (read_pool, governed_pool) =
+            open_database_companion_pools(&path, &write_pool, true).await?;
         let execution_owner = match crate::managed_custody::execution_for_filename(
             write_pool.connect_options().get_filename(),
         ) {
@@ -4803,13 +5099,16 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
             portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
             capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
             database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+            live_session_key: Arc::new(OnceLock::new()),
             _tmp: Some(tmp),
         });
     }
     let pending_commit_probes = matches!(kind, WritePoolKind::Workspace)
         .then(|| Arc::new(control_commit_test::PoolProbeRegistry::default()));
-    let write_pool = open_pool_with_probes(url, true, kind, pending_commit_probes.clone()).await?;
-    let (read_pool, governed_pool) = open_database_companion_pools(url, &write_pool).await?;
+    let write_pool =
+        open_pool_with_probes(url, create_if_missing, kind, pending_commit_probes.clone()).await?;
+    let (read_pool, governed_pool) =
+        open_database_companion_pools(url, &write_pool, create_if_missing).await?;
     let execution_owner = match crate::managed_custody::execution_for_filename(
         write_pool.connect_options().get_filename(),
     ) {
@@ -4855,12 +5154,19 @@ async fn open_database_with_write_pool_kind(url: &str, kind: WritePoolKind) -> R
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(OnceLock::new()),
         _tmp: None,
     };
     if db.is_enrolled() {
         let validation = async {
-            validate_current_engine_shape_read_only(db.path()).await?;
-            require_reconciled_meta_tier(&db).await
+            match schema {
+                WorkspaceSchema::V1 => {
+                    validate_current_engine_shape_read_only(db.path()).await?;
+                    require_reconciled_meta_tier(&db).await
+                }
+                #[cfg(any(test, feature = "v2-kernel-probe"))]
+                WorkspaceSchema::KernelV2 => crate::kernel::verify_v2_ready(&db).await,
+            }
         }
         .await;
         if let Err(error) = validation {
@@ -4886,9 +5192,13 @@ pub async fn open_database_at(path: &Path) -> Result<Db> {
 /// test tracing uses separate, dedicated pools and never shares this pool.
 #[doc(hidden)]
 pub async fn open_host_control_plane_sqlite_pool(path: &Path) -> Result<SqlitePool> {
-    let database =
-        open_database_with_write_pool_kind(&path.to_string_lossy(), WritePoolKind::HostCatalog)
-            .await?;
+    let database = open_database_with_write_pool_kind(
+        &path.to_string_lossy(),
+        WritePoolKind::HostCatalog,
+        true,
+        WorkspaceSchema::V1,
+    )
+    .await?;
     Ok(retain_host_control_plane_sqlite_pool(database).await)
 }
 
@@ -5031,7 +5341,10 @@ macro_rules! probe_database_body {
             Ok(connection) => connection,
             Err(err) => return DatabaseVersionState::Unreadable(err.to_string()),
         };
-        let result: Result<(i64, i64)> = async {
+        let result: Result<(i64, i64, i64)> = async {
+            let application_id: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut connection)
+                .await?;
             let version: i64 = sqlx::query("PRAGMA user_version")
                 .fetch_one(&mut connection)
                 .await?
@@ -5050,16 +5363,19 @@ macro_rules! probe_database_body {
                     "SQLite quick_check failed: {integrity}"
                 )));
             }
-            Ok((version, objects))
+            Ok((application_id, version, objects))
         }
         .await;
         let _ = connection.close().await;
         match result {
             Err(err) => DatabaseVersionState::Unreadable(err.to_string()),
-            Ok((0, 0)) => DatabaseVersionState::Empty,
-            Ok((0, _)) => DatabaseVersionState::UnversionedNonEmpty,
-            Ok((version, _)) if version > current_version => DatabaseVersionState::Future(version),
-            Ok((version, _)) => DatabaseVersionState::Known(version),
+            Ok((V2_APPLICATION_ID, _, _)) => DatabaseVersionState::KernelV2,
+            Ok((_, 0, 0)) => DatabaseVersionState::Empty,
+            Ok((_, 0, _)) => DatabaseVersionState::UnversionedNonEmpty,
+            Ok((_, version, _)) if version > current_version => {
+                DatabaseVersionState::Future(version)
+            }
+            Ok((_, version, _)) => DatabaseVersionState::Known(version),
         }
     }};
 }
@@ -5067,10 +5383,6 @@ macro_rules! probe_database_body {
 /// Probe an existing SQLite file without creating it.
 pub async fn probe_database(path: &Path, current_version: i64) -> DatabaseVersionState {
     probe_database_body!(path, current_version, false)
-}
-
-async fn probe_database_immutable(path: &Path, current_version: i64) -> DatabaseVersionState {
-    probe_database_body!(path, current_version, true)
 }
 
 /// Validate every current engine table/column/index/trigger against a fresh
@@ -5091,6 +5403,7 @@ macro_rules! validate_current_engine_shape_body {
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
         let mut actual = SqliteConnection::connect_with(&actual_options).await?;
+        refuse_v2_database(&mut actual).await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut actual)
             .await?;
@@ -5132,6 +5445,7 @@ pub(crate) async fn validate_supported_engine_migration_source(
     connection: &mut SqliteConnection,
     version: i64,
 ) -> Result<()> {
+    refuse_v2_database(connection).await?;
     let actual_version: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&mut *connection)
         .await?;
@@ -5361,6 +5675,46 @@ pub(crate) async fn validate_engine_shape_on(
     if version == 81 {
         return Ok(
             schema_shape_contract_sha256(&actual_contract) == ENGINE_81_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 82 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_82_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 83 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_83_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 84 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_84_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 85 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_85_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 86 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_86_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 87 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_87_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 88 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_88_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 89 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_89_SHAPE_CONTRACT_SHA256
         );
     }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
@@ -5695,7 +6049,9 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             (DatabaseVersionState::Known(version), Some(baseline))
                 if (baseline..CURRENT_ENGINE_SCHEMA_VERSION).contains(version)
         );
-        let remedy = if migratable {
+        let remedy = if state == DatabaseVersionState::KernelV2 {
+            "v1 serving cannot open v2 databases; select the v2 engine rather than migrating or resetting; v1 engine schema is"
+        } else if migratable {
             "ordinary serving does not migrate; run `operator migrate-db` to bring it to engine schema"
         } else {
             "it is outside the supported schema window; reset or recreate this database at engine schema"
@@ -5756,6 +6112,7 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(OnceLock::new()),
         _tmp: None,
     };
     let revision_violations = crate::authorization_revision::state_violations(&db).await?;
@@ -5820,6 +6177,11 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
 /// pools opened with SQLite's physical `SQLITE_OPEN_READONLY` flag. This path
 /// never creates a missing database and deliberately skips migrations, repair,
 /// seed reconciliation, and every other startup write.
+///
+/// The connections are deliberately not `immutable`: the standby refresh
+/// controller advances the current generation in place with whole-act deltas
+/// (see [`open_standby_head_writer`]). Ordinary SQLite locking then gives every
+/// read either the state before a delta or the state after it.
 pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
     if url == ":memory:" {
         return Err(crate::error::Error::engine(
@@ -5827,7 +6189,7 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         ));
     }
     let path = path_from_url(url);
-    let state = probe_database_immutable(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
+    let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
     if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
         return Err(crate::error::Error::engine(format!(
             "refusing standby read-only open of {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
@@ -5835,11 +6197,11 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         )));
     }
 
-    validate_current_engine_shape_immutable(path).await?;
+    validate_current_engine_shape_read_only(path).await?;
 
     let pending_commit_probes = None;
-    let write_pool = open_immutable_read_pool(url).await?;
-    let read_pool = match open_immutable_read_pool(url).await {
+    let write_pool = open_standby_read_pool(url).await?;
+    let read_pool = match open_standby_read_pool(url).await {
         Ok(pool) => pool,
         Err(error) => {
             write_pool.close().await;
@@ -5849,9 +6211,9 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
     // Standby keeps today's behaviour exactly: the governed path acquires from
     // the same physically read-only tier as the write pool does, so governed
     // SQL neither gains nor loses capability in standby mode. A dedicated
-    // read-write governed pool here would be the only writable handle on an
-    // immutable open.
-    let governed_pool = match open_immutable_read_pool(url).await {
+    // read-write governed pool here would be the only writable handle on a
+    // read-only open.
+    let governed_pool = match open_standby_read_pool(url).await {
         Ok(pool) => pool,
         Err(error) => {
             write_pool.close().await;
@@ -5893,6 +6255,7 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(OnceLock::new()),
         _tmp: None,
     };
     for (label, violations) in [
@@ -5930,6 +6293,89 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         }
     }
     Ok(db)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets a test shorten the writer's wait on a reader's lock.
+    pub(crate) static STANDBY_HEAD_WRITER_BUSY_TIMEOUT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn standby_head_writer_busy_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeout) = STANDBY_HEAD_WRITER_BUSY_TIMEOUT.with(std::cell::Cell::get) {
+        return timeout;
+    }
+    Duration::from_secs(60)
+}
+
+/// Open a standby's current generation for the refresh controller to apply
+/// one whole-act delta in place.
+///
+/// This is the only writable handle a standby ever opens on a generation, and
+/// it is used only by the refresh controller, never by the MCP read surface.
+/// It keeps SQLite's rollback journal (`DELETE`) rather than WAL so that the
+/// serving process, which reads the same file through physically read-only
+/// connections, never needs `-wal`/`-shm` sidecars it cannot create. One
+/// connection serves every tier; nothing is migrated, repaired or seeded.
+pub(crate) async fn open_standby_head_writer(path: &Path) -> Result<Db> {
+    let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
+    if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
+        return Err(crate::error::Error::engine(format!(
+            "refusing standby head write to {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
+            path.display()
+        )));
+    }
+    validate_current_engine_shape_read_only(path).await?;
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .journal_mode(SqliteJournalMode::Delete)
+        .foreign_keys(true)
+        .with_regexp()
+        // A commit waits for in-flight serving reads to release their shared
+        // locks; give long reads room before the delta defers and retries.
+        .busy_timeout(standby_head_writer_busy_timeout());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    Ok(Db {
+        execution_owner: None,
+        execution_jobs: Arc::new(enrolled::HandleJobs::default()),
+        body_jobs: Arc::new(enrolled::BodyHandleJobs::default()),
+        body_retirement: Arc::new(OnceLock::new()),
+        capture_pool: Arc::new(tokio::sync::OnceCell::new()),
+        write_pool: pool.clone(),
+        pending_commit_probes: None,
+        read_pool: pool.clone(),
+        governed_pool: pool,
+        location: Arc::new(DatabaseLocation {
+            path: path.to_path_buf(),
+            open_mode: DatabaseOpenMode::ReadWrite,
+        }),
+        handle_id: uuid::Uuid::new_v4(),
+        embedder: None,
+        advisors: AdvisorRegistry::default(),
+        rollup_cache: Arc::new(Mutex::new(RollupCache::default())),
+        visible_set_cache: Arc::new(Mutex::new(
+            crate::visible_set_cache::VisibleSetCache::default(),
+        )),
+        inbox_snapshots: Arc::new(Mutex::new(HashMap::new())),
+        realtime_hub: None,
+        workspace_index: Arc::new(tokio::sync::RwLock::new(None)),
+        workspace_index_fold: Arc::new(AtomicBool::new(false)),
+        workspace_index_refused: Arc::new(Mutex::new(None)),
+        workspace_snapshots: Arc::new(Mutex::new(
+            crate::workspace_snapshot::SnapshotStore::default(),
+        )),
+        portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
+        capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
+        database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(OnceLock::new()),
+        _tmp: None,
+    })
 }
 
 /// Whether a table name belongs to the compiled member profile (shipped or
@@ -5978,6 +6424,16 @@ pub async fn open_member_database_read_only(url: &str) -> Result<Db> {
             "member copy read-only open requires an existing database file",
         ));
     }
+    // Observe a live WAL marker as well as a standalone file header, without
+    // adding an integrity scan to ordinary member-copy opens.
+    let marker_options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true);
+    let mut marker_connection = SqliteConnection::connect_with(&marker_options).await?;
+    let marker_check = refuse_v2_database(&mut marker_connection).await;
+    marker_connection.close().await?;
+    marker_check?;
     let pending_commit_probes = None;
     let write_pool = open_immutable_read_pool(url).await?;
     let read_pool = match open_immutable_read_pool(url).await {
@@ -6061,6 +6517,7 @@ pub async fn open_member_database_read_only(url: &str) -> Result<Db> {
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::spawn(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(OnceLock::new()),
         _tmp: None,
     })
 }
@@ -6213,6 +6670,7 @@ pub async fn apply_schema(db: &Db) -> Result<()> {
     // Statements are ordered so every FK target exists before its referrer;
     // applied in one write transaction (the libSQL client's `batch('write')`).
     let mut tx = begin_write(&db.write_pool).await?;
+    refuse_v2_database(&mut tx).await?;
     for statement in DDL_STATEMENTS {
         sqlx::query(statement).execute(&mut *tx).await?;
     }
@@ -6252,13 +6710,50 @@ pub async fn create_database(url: &str) -> Result<Db> {
 /// The name is written by the genesis batch itself, so the database is never
 /// briefly named something else and the event log carries no synthetic rename.
 pub async fn create_database_named(url: &str, workspace_name: &str) -> Result<Db> {
-    let db = open_database(url).await?;
-    apply_schema(&db).await?;
-    seed_meta_tier(&db).await?;
-    seed_content_tier_named(&db, workspace_name).await?;
-    crate::policy::seed_root_policy(&db).await?;
-    crate::identity::seed_database_identity(&db).await?;
+    // Each step is built in its own never-inlined frame and awaited through a
+    // box. Inline, this frame reserved room for every step's (large) future
+    // in a debug build; it sits on the hosted sign-up path (verify-otp ->
+    // provision -> create), which runs on a 2 MiB server worker stack.
+    let db = boxed_open_database(url).await?;
+    boxed_apply_schema(&db).await?;
+    boxed_seed_meta_tier(&db).await?;
+    boxed_seed_content_tier_named(&db, workspace_name).await?;
+    boxed_seed_root_policy(&db).await?;
+    boxed_seed_database_identity(&db).await?;
     Ok(db)
+}
+
+#[inline(never)]
+fn boxed_open_database(url: &str) -> futures::future::BoxFuture<'_, Result<Db>> {
+    Box::pin(open_v1_database(url))
+}
+
+#[inline(never)]
+fn boxed_apply_schema(db: &Db) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(apply_schema(db))
+}
+
+#[inline(never)]
+fn boxed_seed_meta_tier(db: &Db) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(seed_meta_tier(db))
+}
+
+#[inline(never)]
+fn boxed_seed_content_tier_named<'a>(
+    db: &'a Db,
+    workspace_name: &'a str,
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    Box::pin(seed_content_tier_named(db, workspace_name))
+}
+
+#[inline(never)]
+fn boxed_seed_root_policy(db: &Db) -> futures::future::BoxFuture<'_, Result<()>> {
+    Box::pin(crate::policy::seed_root_policy(db))
+}
+
+#[inline(never)]
+fn boxed_seed_database_identity(db: &Db) -> futures::future::BoxFuture<'_, Result<String>> {
+    Box::pin(crate::identity::seed_database_identity(db))
 }
 
 /// Install the deterministic engine-owned root folders in a schema-only

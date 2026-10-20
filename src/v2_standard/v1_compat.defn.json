@@ -1,0 +1,63 @@
+{
+  "family": "native.v1.record",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "V1",
+  "kinds": [
+    {
+      "token": "record",
+      "description": "A carried v1 record of any type/kind with no first-class v2 definition (everything except Document:note). The v1 type and kind are preserved verbatim in v1_type/v1_kind; title, summary and lifecycle carry the v1 short prose and state. The record body is not a field: bodies live in the kernel body lane.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "v1_type",
+          "type": "text",
+          "required": true,
+          "description": "The v1 record type, preserved verbatim."
+        },
+        {
+          "name": "v1_kind",
+          "type": "text",
+          "required": true,
+          "description": "The v1 record kind, preserved verbatim."
+        },
+        {
+          "name": "title",
+          "type": "text",
+          "required": false,
+          "description": "Short human title. May be absent: importers omit empty v1 names and no title is invented."
+        },
+        {
+          "name": "summary",
+          "type": "text",
+          "required": false,
+          "description": "Short v1 summary, when the v1 record carries one."
+        },
+        {
+          "name": "lifecycle",
+          "type": "text",
+          "required": false,
+          "description": "Free-text v1 lifecycle state (open, in_progress, blocked, done, cancelled, ...). No enumeration is enforced: the v1 vocabulary is open."
+        }
+      ],
+      "links": [
+        {
+          "relationship_ref": {
+            "namespace": "native.relationship",
+            "package": "relates-to",
+            "version": 1,
+            "relationship": "relates_to.v1"
+          },
+          "target": {
+            "any_record": true
+          },
+          "direction": "either",
+          "cardinality": "many"
+        }
+      ]
+    }
+  ]
+}

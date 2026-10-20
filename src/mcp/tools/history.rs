@@ -436,7 +436,7 @@ where
 /// An event row rendered for tool output: `payload` is parsed JSON, not the
 /// stored text (handlers return structured data; a JSON-in-a-string field
 /// would push parsing onto every caller).
-pub(super) fn event_to_value(event: &EventRow, actor_names: &HashMap<String, String>) -> Value {
+pub(crate) fn event_to_value(event: &EventRow, actor_names: &HashMap<String, String>) -> Value {
     let payload = event
         .payload
         .as_deref()
@@ -1017,7 +1017,7 @@ pub(super) async fn redact_event_payload_in(
 
 /// What payload redaction does beneath one object key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RedactionKeyRule {
+pub(crate) enum RedactionKeyRule {
     /// The value is replaced by null, unread: identity keys always, and
     /// claim keys unless the viewer is the claim's holder.
     Erase,
@@ -1030,7 +1030,7 @@ pub(super) enum RedactionKeyRule {
 
 /// The one rule payload redaction applies per key, shared by every walk
 /// that must agree with it.
-pub(super) fn redaction_key_rule(key: &str, claim_holder_visible: bool) -> RedactionKeyRule {
+pub(crate) fn redaction_key_rule(key: &str, claim_holder_visible: bool) -> RedactionKeyRule {
     let identity_key = matches!(key, "actor" | "account_id" | "email" | "owner_id");
     let record_key = key == "id" || key.ends_with("_id") || matches!(key, "owner" | "home");
     let claim_identity_key = matches!(
@@ -1881,7 +1881,7 @@ async fn require_public_history_record_in_pool(
     Ok(())
 }
 
-async fn get_history(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(super) async fn get_history(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let args: GetHistoryArgs = parse_args("get_history", arguments)?;
     if args.include_child_runs && args.for_run.is_none() {
         return Err(Error::engine(
@@ -4024,24 +4024,34 @@ pub(crate) async fn record_versions_at(
     record_id: &str,
     before_seq: i64,
     after_seq: i64,
+    numberless: bool,
 ) -> Result<(Value, Value)> {
     if before_seq < 1 || after_seq < before_seq {
         return Err(Error::engine("get_record_version seq must be positive"));
     }
+    // A caller who named the position by event id never supplied a number, so
+    // a refusal here (a position that left the window between the caller's
+    // resolution and this one) must not introduce one.
+    let numberless_refusal = |error: Error| match error {
+        Error::NotHeld(_) if numberless => crate::position::unknown_position(),
+        other => other,
+    };
     let before_resolved = lens::resolve_as_of(
         db,
         AsOfSelector::ContentSeq(ContentSeqSelector {
             content_seq: before_seq,
         }),
     )
-    .await?;
+    .await
+    .map_err(numberless_refusal)?;
     let after_resolved = lens::resolve_as_of(
         db,
         AsOfSelector::ContentSeq(ContentSeqSelector {
             content_seq: after_seq,
         }),
     )
-    .await?;
+    .await
+    .map_err(numberless_refusal)?;
     let events = events::log_prefix(db, after_resolved.resolved_content_seq).await?;
     let split = events.partition_point(|event| event.local_seq <= before_seq);
 
@@ -4049,9 +4059,19 @@ pub(crate) async fn record_versions_at(
     let result: Result<(Value, Value)> = async {
         apply_schema(&scratch).await?;
         lens::replay_projection_events(&scratch, &events[..split]).await?;
-        let before = read_record_version(db, &scratch, caller, record_id, &before_resolved).await?;
+        let before = read_record_version(
+            db,
+            &scratch,
+            caller,
+            record_id,
+            &before_resolved,
+            numberless,
+        )
+        .await?;
         lens::replay_projection_events(&scratch, &events[split..]).await?;
-        let after = read_record_version(db, &scratch, caller, record_id, &after_resolved).await?;
+        let after =
+            read_record_version(db, &scratch, caller, record_id, &after_resolved, numberless)
+                .await?;
         Ok((before, after))
     }
     .await;
@@ -4065,6 +4085,7 @@ async fn read_record_version(
     caller: &Caller,
     record_id: &str,
     resolved: &lens::ResolvedAsOf,
+    numberless: bool,
 ) -> Result<Value> {
     let read_lens = ReadLens::historical(scratch, live, resolved);
     let record = read::get_record_with_lens_as(
@@ -4084,8 +4105,15 @@ async fn read_record_version(
                 read::EnrichOptions::default(),
             )
             .await?;
-            Ok(json!({ "as_of_seq": resolved.resolved_content_seq, "record": record }))
+            if numberless {
+                Ok(json!({ "record": record }))
+            } else {
+                Ok(json!({ "as_of_seq": resolved.resolved_content_seq, "record": record }))
+            }
         }
+        None if numberless => Err(Error::engine(format!(
+            "record {record_id} has no state at that position"
+        ))),
         None => Err(Error::engine(format!(
             "record {} has no state as of seq {}",
             record_id, resolved.resolved_content_seq

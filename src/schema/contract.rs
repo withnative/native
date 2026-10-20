@@ -29,7 +29,7 @@ pub struct SpineTypeMeaning {
 /// Schema numbers used during development are not support baselines; only the
 /// current DDL and constants below are authoritative until a baseline is
 /// deliberately activated. `kind` remains the open-additive extension point.
-pub const SPINE_TYPE_MEANINGS: [SpineTypeMeaning; 10] = [
+pub const SPINE_TYPE_MEANINGS: [SpineTypeMeaning; 11] = [
     SpineTypeMeaning {
         name: "Document",
         short_gloss: "content",
@@ -80,6 +80,11 @@ pub const SPINE_TYPE_MEANINGS: [SpineTypeMeaning; 10] = [
         short_gloss: "Commentary",
         gloss: "Commentary or a proposed change attached to another record. Kinds distinguish comments, suggestions, and other annotation forms without widening the spine.",
     },
+    SpineTypeMeaning {
+        name: "Configuration",
+        short_gloss: "authored definition",
+        gloss: "A named, authored definition that tells an app or the host how to behave or where to open, such as a saved view, a preference, or an app setting. Unlike a Document, its value is not what it says but what it configures. Kinds distinguish the forms of definition without widening the spine.",
+    },
 ];
 
 /// Concise agent-facing meanings for the closed spine types.
@@ -87,7 +92,7 @@ pub const SPINE_TYPE_MEANINGS: [SpineTypeMeaning; 10] = [
 /// The write contract uses these compact forms while the record-types guide
 /// uses the full glosses from the same ordered entries. Keeping both forms in
 /// one catalog prevents either surface from growing a second vocabulary.
-pub const SPINE_TYPE_GLOSSES: [(&str, &str); 10] = [
+pub const SPINE_TYPE_GLOSSES: [(&str, &str); 11] = [
     (
         SPINE_TYPE_MEANINGS[0].name,
         SPINE_TYPE_MEANINGS[0].short_gloss,
@@ -128,17 +133,23 @@ pub const SPINE_TYPE_GLOSSES: [(&str, &str); 10] = [
         SPINE_TYPE_MEANINGS[9].name,
         SPINE_TYPE_MEANINGS[9].short_gloss,
     ),
+    (
+        SPINE_TYPE_MEANINGS[10].name,
+        SPINE_TYPE_MEANINGS[10].short_gloss,
+    ),
 ];
 
 /// Inline-alternatives limit for governance failure messages. When the valid
 /// set holds this many entries or fewer, refusals and warnings name the
 /// alternatives inline; larger sets name the exact `schema_read`
 /// `preview_record_shape` / `manage_vocabularies.list_values` call instead.
-/// Sized at 10 so the closed spine-type set always lists inline.
+/// Sized at 10, the spine-type count when it was chosen. Spine-type refusals now
+/// enumerate `SPINE_TYPES` directly, so this limit applies only to kind and
+/// vocabulary-value sets and is deliberately not tied to the type count.
 pub const GOVERNANCE_INLINE_ALTERNATIVES_LIMIT: usize = 10;
 
 /// Name-only compatibility projection for validation and schema enumeration.
-pub const SPINE_TYPES: [&str; 10] = [
+pub const SPINE_TYPES: [&str; 11] = [
     SPINE_TYPE_MEANINGS[0].name,
     SPINE_TYPE_MEANINGS[1].name,
     SPINE_TYPE_MEANINGS[2].name,
@@ -149,6 +160,7 @@ pub const SPINE_TYPES: [&str; 10] = [
     SPINE_TYPE_MEANINGS[7].name,
     SPINE_TYPE_MEANINGS[8].name,
     SPINE_TYPE_MEANINGS[9].name,
+    SPINE_TYPE_MEANINGS[10].name,
 ];
 
 /// Direction contract for a guaranteed generic graph link.
@@ -335,7 +347,7 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 133] = [
+pub const REQUIRED_TABLES: [&str; 138] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
@@ -348,9 +360,11 @@ pub const REQUIRED_TABLES: [&str; 133] = [
     "replicated_message_references",
     "provenance_interaction_receipts",
     "provenance_action_attestations",
+    "sql_write_receipts",
     "provenance_local_attestation_authority",
     "provenance_action_events",
     "provenance_action_outputs",
+    "provenance_action_app_attributions",
     "webhook_endpoints",
     "webhook_credentials",
     "webhook_deliveries",
@@ -397,6 +411,8 @@ pub const REQUIRED_TABLES: [&str; 133] = [
     "message_audiences",
     "message_origin_state",
     "message_origin_principals",
+    "personas",
+    "message_speakers",
     "message_conversations",
     "awareness_events",
     "awareness_command_intents",
@@ -447,6 +463,7 @@ pub const REQUIRED_TABLES: [&str; 133] = [
     "policy_entries",
     "authorization_revision",
     "member_contexts",
+    "account_configs",
     "instruction_bindings",
     "onboarding_programmes",
     "onboarding_programme_sources",
@@ -767,15 +784,47 @@ pub(crate) fn alpha_tab_installs_create_for_version(statement: &str, version: i6
 /// not record or imply support for any historical engine schema. A future
 /// support baseline must deliberately add its own fixture and fingerprint as
 /// part of the activation checklist in `docs/schema-migrations.md`.
-// Measured from this tree's whole production modules with pinned Rust 1.98.0:
-// 358 statements, with independent canonical-byte SHA agreement and the same
-// DDL output from the schema-measurement harness.
+// Measured from 373 production statements, including engine90 SQL receipts.
 pub const FROZEN_DDL_SHA256: &str =
+    "87ba5084e86528d8c73a969da076dc314d842ad70d2e2ccab06d26ae97a9b21f";
+
+/// Engine89 before internal SQL batch receipts.
+pub const FROZEN_DDL_SHA256_PRE_90: &str =
+    "d53a87fd794050c11f66bc3e3054d356b18724800c1b14ab43fb21a686ea35ea";
+
+/// Accepted main engine88 before account configs.
+pub const FROZEN_DDL_SHA256_PRE_89: &str =
+    "cc931539d2a3fc0e588007a2f703d49b165ea153d9291d641ccb46361c202a53";
+
+/// Unchanged engine87 DDL measured before the nullable private read override.
+pub const FROZEN_DDL_SHA256_PRE_88: &str =
+    "a97a954351e9a7504d4515ca64e07c242f528eaf8b796c45405b35d0e1f41801";
+
+/// Engine86 before the Configuration spine type widened records.type.
+pub const FROZEN_DDL_SHA256_PRE_87: &str =
+    "1412b6bd893f80f3942e77ff34ba571eb30fc21263301ce527f72cc566ddc93f";
+
+/// Engine85 DDL before the record-body node table: 367 statements, the
+/// BEFORE-new-DDL authority from the retained baseline binary
+/// (current_ddl_statements 367, current_ddl_sha256 301ab0b6...).
+pub const FROZEN_DDL_SHA256_PRE_86: &str =
+    "301ab0b68906a9d480998f384d4f2444266ef52db43455b67d6dc8918658bfc2";
+
+/// Engine84 DDL before the facet-observation node table: 366 statements,
+/// the app-attribution pin from main.
+pub const FROZEN_DDL_SHA256_PRE_85: &str =
+    "7dc77b83a29a23c0d2d6fc31716c4ec1c274aaba132873483633b7cbfada5a3a";
+
+/// Engine83 DDL before the app-attribution side table: 362 statements,
+/// the persona-participants pin from main.
+pub const FROZEN_DDL_SHA256_PRE_84: &str =
+    "0c61a8941133059923fda3e2d14e0cbe9a80f39a3b753d7d0d786e8d2ed34aba";
+
+/// Released main69c97fa8f schema82, before persona participants.
+pub const FROZEN_DDL_SHA256_PRE_83: &str =
     "0209d608f9d5b9bd88bde3b8da411057cfc7396149ba5f4918b0921207a10a9c";
 
-/// Engine81 DDL before the facet-value node table. Measured from exact
-/// ce3f5694's whole production modules with pinned Rust 1.98.0:
-/// 357 statements / 150715 bytes, independently canonical-byte hashed.
+/// Released schema81 before persona participants.
 pub const FROZEN_DDL_SHA256_PRE_82: &str =
     "be2bb309ab44f48c5196b31b0bb1f263da29d6340adf7cfcf44557dcecd10bfd";
 
@@ -869,6 +918,32 @@ pub const FROZEN_DDL_SHA256_PRE_66: &str =
 pub(crate) fn historical_ddl_for_test(version: i64) -> String {
     let mut statements = Vec::new();
     for statement in DDL_STATEMENTS {
+        if version < 90
+            && (statement.starts_with("CREATE TABLE sql_write_receipts")
+                || statement.starts_with("CREATE INDEX idx_sql_write_receipts")
+                || statement.starts_with("CREATE TRIGGER sql_write_receipts"))
+        {
+            continue;
+        }
+        if version < 88 && statement.starts_with("CREATE TABLE message_preferences") {
+            let historical = statement.replace(
+                "     unread_override    INTEGER CHECK (unread_override IN (0,1)),\n",
+                "",
+            );
+            statements.push(historical);
+            continue;
+        }
+        if version < 89 && statement.starts_with("CREATE TABLE account_configs") {
+            continue;
+        }
+        if version < 83
+            && (statement.contains("CREATE TABLE personas")
+                || statement.contains("CREATE INDEX idx_personas_")
+                || statement.contains("CREATE TABLE message_speakers")
+                || statement.contains("CREATE INDEX idx_message_speakers_"))
+        {
+            continue;
+        }
         if version < 80 && statement.contains("workspace_rule_installations") {
             continue;
         }
@@ -941,6 +1016,15 @@ pub(crate) fn historical_ddl_for_test(version: i64) -> String {
         if version < 82 && statement.starts_with("CREATE TABLE facet_value_json_nodes") {
             continue;
         }
+        if version < 85 && statement.starts_with("CREATE TABLE facet_observation_json_nodes") {
+            continue;
+        }
+        if version < 86 && statement.starts_with("CREATE TABLE record_body_json_nodes") {
+            continue;
+        }
+        if version < 84 && statement.contains("provenance_action_app_attributions") {
+            continue;
+        }
         if version < 76 && statement.starts_with("CREATE TABLE vocabulary_value_json_nodes") {
             continue;
         }
@@ -962,6 +1046,11 @@ pub(crate) fn historical_ddl_for_test(version: i64) -> String {
             continue;
         }
         let mut statement = statement.to_owned();
+        // Engine 87 (task 6ec81db) widens the closed `records.type` CHECK with
+        // the `Configuration` spine type.
+        if version < 87 && statement.starts_with("CREATE TABLE records (") {
+            statement = statement.replace(",'Annotation','Configuration')", ",'Annotation')");
+        }
         if version < 67 && statement.starts_with("CREATE TABLE records (") {
             statement = statement.replace(
                 "     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),\n",
@@ -1045,6 +1134,14 @@ mod tests {
                 historical(79),
                 historical(80),
                 historical(81),
+                historical(82),
+                historical(83),
+                historical(84),
+                historical(85),
+                historical(86),
+                historical(87),
+                historical(88),
+                historical(89),
             ],
             [
                 "b418f5ea746c5e791df9ec07041dbb4fdd3a5098b828de3dc3e983a456a9c755",
@@ -1091,6 +1188,14 @@ mod tests {
                 FROZEN_DDL_SHA256_PRE_80,
                 FROZEN_DDL_SHA256_PRE_81,
                 FROZEN_DDL_SHA256_PRE_82,
+                FROZEN_DDL_SHA256_PRE_83,
+                FROZEN_DDL_SHA256_PRE_84,
+                FROZEN_DDL_SHA256_PRE_85,
+                FROZEN_DDL_SHA256_PRE_86,
+                FROZEN_DDL_SHA256_PRE_87,
+                FROZEN_DDL_SHA256_PRE_88,
+                FROZEN_DDL_SHA256_PRE_89,
+                FROZEN_DDL_SHA256_PRE_90,
             ]
         );
     }

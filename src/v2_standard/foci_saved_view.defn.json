@@ -1,0 +1,201 @@
+{
+  "family": "native.foci.saved_view",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "Configuration",
+  "kinds": [
+    {
+      "token": "record_view",
+      "description": "A saved view opening one record. v1 string patterns and lengths (uuid v4/v7 ids, app/format patterns, 1-60 code-point names) are NOT enforced by the store in this revision; they must be enforced by a Foci consumer, and store-level text formats are pending. Cardinality one on member_of is not enforced by the store; one Focus per view belongs to a Foci consumer. No audience-change guard exists yet: a write is not fenced against a concurrent change to the home's access policy.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "name",
+          "type": "text",
+          "required": true,
+          "description": "Human name shown in the sidebar. v1's name limits must be enforced by a Foci consumer; this package does not enforce them. The interpreter's 4,096-byte text ceiling still applies."
+        },
+        {
+          "name": "definition",
+          "type": "object",
+          "required": true,
+          "description": "The pinned view definition: which app opens which record.",
+          "fields": [
+            {
+              "name": "app",
+              "type": "text",
+              "required": true,
+              "description": "Owning app id. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+            },
+            {
+              "name": "target",
+              "type": "object",
+              "required": true,
+              "description": "The record this view opens.",
+              "fields": [
+                {
+                  "name": "record_id",
+                  "type": "text",
+                  "required": true,
+                  "description": "Target record id. The shape must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "links": [
+        {
+          "predicate": "member_of",
+          "target": {
+            "family": "native.foci.focus",
+            "kind": "focus"
+          },
+          "direction": "out",
+          "cardinality": "one"
+        }
+      ]
+    },
+    {
+      "token": "query_view",
+      "description": "A saved view running a stored query. v1 string patterns and lengths (app/format/field patterns, 1-60 code-point names) are NOT enforced by the store in this revision; they must be enforced by a Foci consumer, and store-level text formats are pending. Cardinality one on member_of is not enforced by the store; one Focus per view belongs to a Foci consumer. No audience-change guard exists yet: a write is not fenced against a concurrent change to the home's access policy.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "name",
+          "type": "text",
+          "required": true,
+          "description": "Human name shown in the sidebar. v1's name limits must be enforced by a Foci consumer; this package does not enforce them. The interpreter's 4,096-byte text ceiling still applies."
+        },
+        {
+          "name": "definition",
+          "type": "object",
+          "required": true,
+          "description": "The pinned query definition.",
+          "fields": [
+            {
+              "name": "app",
+              "type": "text",
+              "required": true,
+              "description": "Owning app id. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+            },
+            {
+              "name": "format",
+              "type": "text",
+              "required": true,
+              "description": "Query format id. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+            },
+            {
+              "name": "text",
+              "type": "text",
+              "required": false,
+              "description": "Optional free-text query. v1's length limits must be enforced by a Foci consumer; this package does not enforce them. The interpreter's 4,096-byte text ceiling still applies."
+            },
+            {
+              "name": "filter",
+              "type": "object",
+              "required": true,
+              "description": "Conjunctive filter terms.",
+              "fields": [
+                {
+                  "name": "combine",
+                  "type": "choice",
+                  "required": true,
+                  "values": [
+                    "all"
+                  ],
+                  "description": "How terms combine. Only all exists in this revision."
+                },
+                {
+                  "name": "terms",
+                  "type": "list",
+                  "required": true,
+                  "max_items": 16,
+                  "items": {
+                    "type": "object",
+                    "fields": [
+                      {
+                        "name": "field",
+                        "type": "text",
+                        "required": true,
+                        "description": "Field path the term matches. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+                      },
+                      {
+                        "name": "op",
+                        "type": "choice",
+                        "required": true,
+                        "values": [
+                          "eq",
+                          "neq"
+                        ],
+                        "description": "Equality or inequality match."
+                      },
+                      {
+                        "name": "value",
+                        "type": "text",
+                        "required": true,
+                        "description": "Value to compare against."
+                      }
+                    ]
+                  },
+                  "description": "Filter terms. May be empty."
+                }
+              ]
+            },
+            {
+              "name": "sort",
+              "type": "list",
+              "required": true,
+              "max_items": 8,
+              "items": {
+                "type": "object",
+                "fields": [
+                  {
+                    "name": "field",
+                    "type": "text",
+                    "required": true,
+                    "description": "Field path to sort by. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+                  },
+                  {
+                    "name": "direction",
+                    "type": "choice",
+                    "required": true,
+                    "values": [
+                      "asc",
+                      "desc"
+                    ],
+                    "description": "Sort direction."
+                  }
+                ]
+              },
+              "description": "Sort order. May be empty."
+            },
+            {
+              "name": "group_by",
+              "type": "text",
+              "required": false,
+              "description": "Optional field path to group by. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+            }
+          ]
+        }
+      ],
+      "links": [
+        {
+          "predicate": "member_of",
+          "target": {
+            "family": "native.foci.focus",
+            "kind": "focus"
+          },
+          "direction": "out",
+          "cardinality": "one"
+        }
+      ]
+    }
+  ]
+}

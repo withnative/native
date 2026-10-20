@@ -336,6 +336,43 @@ impl StandbySnapshotManifest {
         Ok(())
     }
 
+    /// Whether an earlier engine revision wrote this manifest: its engine
+    /// schema or DDL differ from this build's, so [`Self::validate`] refuses
+    /// it by design. Such a generation cannot be served or compared with
+    /// current rows, but it may still be replaced by a whole snapshot.
+    pub fn is_other_engine_revision(&self) -> bool {
+        self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
+            || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256
+    }
+
+    /// What a replacement needs to trust about a manifest that
+    /// [`Self::is_other_engine_revision`]: its contract, database identity
+    /// and times, never its engine identity.
+    pub fn validate_other_revision_for_replacement(&self) -> Result<()> {
+        if self.contract != STANDBY_SNAPSHOT_MANIFEST_CONTRACT || self.version != 1 {
+            return Err(Error::engine("unknown standby snapshot manifest contract"));
+        }
+        if self.hosted_route_database_id.trim().is_empty()
+            || self.hosted_route_database_id.len() > 256
+            || !crate::identity::is_database_id(&self.origin_database_id)
+        {
+            return Err(Error::engine(
+                "standby snapshot database identity is invalid",
+            ));
+        }
+        if self.head_act.is_some_and(|head| head < 0) {
+            return Err(Error::engine(
+                "standby generation act frontier must be nonnegative",
+            ));
+        }
+        if self.engine.schema_version >= 59 && self.head_act.is_none() {
+            return Err(Error::engine(
+                "act-capable standby generation is missing its act frontier",
+            ));
+        }
+        Ok(())
+    }
+
     /// Scalar precheck for promotion. A true result still requires deep
     /// database proof: prefix inclusion for unsequenced append-only domains,
     /// governed projection validation, and the applicable rules for unfenced
@@ -431,6 +468,7 @@ pub(crate) async fn manifest_from_completed_export(
         .read_only(true)
         .immutable(true);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    crate::db::refuse_v2_database(&mut connection).await?;
     let row = sqlx::query(
         "SELECT
          (SELECT origin_db_id FROM database_identity WHERE singleton=1) origin_database_id,
@@ -510,6 +548,7 @@ pub(crate) async fn validate_completed_export_manifest(
         .create_if_missing(false)
         .read_only(true);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    crate::db::refuse_v2_database(&mut connection).await?;
     let row = sqlx::query("SELECT
       (SELECT origin_db_id FROM database_identity WHERE singleton=1) origin_database_id,
       (SELECT user_version FROM pragma_user_version) schema_version,
@@ -557,6 +596,51 @@ pub(crate) async fn validate_completed_export_manifest(
         return Err(Error::engine(
             "standby manifest does not describe staged snapshot",
         ));
+    }
+    Ok(())
+}
+
+/// Producer-side relational check on the final exported image, before its
+/// manifest is published.
+///
+/// `integrity_check` proves the file is structurally sound, and the byte hash
+/// proves the bytes that ship are the bytes that were hashed. Neither proves
+/// the export's rows still reference each other: a filter or copy bug that
+/// drops a parent row (or fabricates a child) leaves an integrity-clean file
+/// whose self-derived manifest still describes it exactly, and the hash then
+/// authenticates the damage. `pragma_foreign_key_check` catches exactly that
+/// class on the exported file alone — no source queries, no writer lock — and
+/// the empty-embeddings rule mirrors device admission: the portable image
+/// carries no embeddings rows (that seam stays dormant per the export
+/// constraint in note 6c7d211).
+///
+/// What this does not catch, honestly: silent row loss that preserves
+/// referential integrity (deleting a whole cascade subtree, or dropping tail
+/// rows). That needs a source-anchored digest; not covered in this slice.
+///
+/// Bounded cost estimate (shared Linux host, cache uncontrolled): on a
+/// 2.2 GB accepted schema83 copy the exact read-only queries below ran
+/// combined in 0.931s with zero violations — a real-snapshot pass at
+/// realistic size, not a live-hosted export timing, which this slice does
+/// not measure.
+pub(crate) async fn validate_standby_export_relations(path: &Path) -> Result<()> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .immutable(true);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    crate::db::refuse_v2_database(&mut connection).await?;
+    let violation: i64 =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
+            .fetch_one(&mut connection)
+            .await?;
+    let embeddings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+        .fetch_one(&mut connection)
+        .await?;
+    connection.close().await?;
+    if violation != 0 || embeddings != 0 {
+        return Err(Error::engine("standby export relational validation failed"));
     }
     Ok(())
 }

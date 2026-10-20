@@ -534,6 +534,259 @@ async fn guard_failure_on_last_item_writes_nothing() {
     assert_eq!(facet_value(&db, REC_B, "batch_probe").await, None);
 }
 
+/// Late refusal must roll back content, owned relationships and their retry authority
+/// together. This is transaction rollback evidence, not process-crash coverage.
+#[tokio::test]
+async fn keyed_mixed_domain_guard_failure_rolls_back_and_can_retry() {
+    use sqlx::{Column, TypeInfo, ValueRef};
+
+    // Fixed durable surfaces affected by this cohort, in explicit unique-key order.
+    // Read/capture telemetry is disposable and intentionally absent. Keep raw values:
+    // equality must detect any surviving row, not just matching row counts or hashes.
+    async fn durable_state(db: &Db) -> Vec<(&'static str, Vec<Value>)> {
+        let pool = crate::common::fixture_write_pool(db).await;
+        let mut state = Vec::new();
+        for (table, order) in [
+            ("content_events", "seq"),
+            ("records", "id"),
+            ("links", "id"),
+            ("facet_values", "record_id, key"),
+            ("facet_observations", "record_id, key, as_of"),
+            ("facet_value_json_nodes", "facet_id, ordinal"),
+            ("facet_observation_json_nodes", "observation_id, ordinal"),
+            ("relationship_events", "seq"),
+            ("relationships", "relationship_origin_db_id, relationship_id"),
+            ("relationship_endpoints", "relationship_origin_db_id, relationship_id, ordinal"),
+            ("relationship_assertion_heads", "issuer_origin_db_id, assertion_id"),
+            ("relationship_local_admissions", "issuer_origin_db_id, assertion_id"),
+            ("effective_relationships", "relationship_origin_db_id, relationship_id"),
+            ("relationship_endpoint_activity", "relationship_origin_db_id, relationship_id, event_issuer_origin_db_id, event_id, endpoint_ordinal"),
+            ("provenance_action_attestations", "id"),
+            ("provenance_local_attestation_authority", "attestation_id"),
+            ("provenance_action_events", "action_attestation_id, ordinal"),
+            ("provenance_action_outputs", "action_attestation_id, ordinal"),
+            ("act_state", "singleton"),
+        ] {
+            let rows = sqlx::query(&format!("SELECT * FROM {table} ORDER BY {order}"))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let values = rows.iter().map(|row| {
+                let mut fields = serde_json::Map::new();
+                for column in row.columns() {
+                    let index = column.ordinal();
+                    let raw = row.try_get_raw(index).unwrap();
+                    let value = if raw.is_null() {
+                        Value::Null
+                    } else {
+                        match raw.type_info().name() {
+                            "INTEGER" => json!(row.try_get::<i64, _>(index).unwrap()),
+                            "REAL" => json!(row.try_get::<f64, _>(index).unwrap()),
+                            "TEXT" => json!(row.try_get::<String, _>(index).unwrap()),
+                            other => panic!("unexpected {table}.{} type {other}", column.name()),
+                        }
+                    };
+                    fields.insert(column.name().to_owned(), value);
+                }
+                Value::Object(fields)
+            }).collect();
+            state.push((table, values));
+        }
+        state
+    }
+
+    async fn homes_and_anchors(db: &Db) -> Vec<(String, Option<String>, Option<String>)> {
+        sqlx::query(
+            "SELECT id, home_id, policy_anchor_id FROM records WHERE id IN (?, ?) ORDER BY id",
+        )
+        .bind(REC_D)
+        .bind(REC_E)
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row.get("id"),
+                row.get("home_id"),
+                row.get("policy_anchor_id"),
+            )
+        })
+        .collect()
+    }
+
+    let registry = registry();
+    let db = seeded(&registry).await;
+    for (id, name) in [(REC_H1, "old home"), (REC_H2, "new home")] {
+        call(
+            &registry,
+            &db,
+            "create_record",
+            json!({
+                "type": "Collection", "kind": "folder", "id": id, "name": name,
+            }),
+        )
+        .await;
+        let policy = call(
+            &registry,
+            &db,
+            "manage_record_policy",
+            json!({ "action": "list", "record_id": id }),
+        )
+        .await;
+        let replaced = call(&registry, &db, "manage_record_policy", json!({
+            "action": "replace", "record_id": id,
+            "entries": [{ "subject": { "kind": "members" }, "capability": "edit" }],
+            "if_policy_revision": policy["policy_revision"],
+            "reason": "Give each parent a real explicit policy boundary for subtree relocation.",
+        })).await;
+        assert_eq!(replaced["boundary_created"], true);
+    }
+    for (id, record_type, kind, name, home) in [
+        (REC_D, "Collection", "folder", "moving folder", REC_H1),
+        (REC_E, "Document", "note", "moving child", REC_D),
+    ] {
+        call(
+            &registry,
+            &db,
+            "create_record",
+            json!({
+                "type": record_type, "kind": kind, "id": id, "name": name, "home_id": home,
+            }),
+        )
+        .await;
+    }
+    // Trusted local caller isolates rollback; policies were installed publicly,
+    // and both records must inherit distinguishable, real parent identities.
+    assert_eq!(
+        homes_and_anchors(&db).await,
+        vec![
+            (
+                REC_D.to_owned(),
+                Some(REC_H1.to_owned()),
+                Some(REC_H1.to_owned())
+            ),
+            (
+                REC_E.to_owned(),
+                Some(REC_D.to_owned()),
+                Some(REC_H1.to_owned())
+            ),
+        ]
+    );
+    let current_c: String = sqlx::query_scalar("SELECT updated_at FROM records WHERE id = ?")
+        .bind(REC_C)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let mut args = json!({
+        "reason": REASON,
+        "idempotency_key": "mixed-domain-rollback-key",
+        "items": [
+            { "op": "update", "id": REC_D, "home_id": REC_H2,
+              "name": "moved folder", "facets": { "batch_probe": "done" } },
+            { "op": "add_link", "source_id": REC_B, "target_id": REC_T,
+              "relationship": "depends_on", "note": "rollback cohort dependency" },
+            { "op": "update", "id": REC_C, "summary": "corrected cohort",
+              "if_unmodified_since": "2000-01-01T00:00:00Z" },
+        ],
+    });
+    db.drain_captures_for_tests().await;
+    let before = durable_state(&db).await;
+    let error = call_err(&registry, &db, "batch_write", args.clone()).await;
+    assert!(error.contains("[2]"), "{error}");
+    assert!(error.contains("conflicted=1"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
+    assert_eq!(
+        durable_state(&db).await,
+        before,
+        "late conflict left durable residue"
+    );
+
+    // Correct only the stale guard. Reusing the SAME key must execute freshly:
+    // neither per-item authority nor a command reservation may survive refusal.
+    args["items"][2]["if_unmodified_since"] = json!(current_c);
+    let committed = call(&registry, &db, "batch_write", args.clone()).await;
+    assert_eq!(committed["changed"], 3, "{committed}");
+    for result in committed["results"].as_array().unwrap() {
+        assert_eq!(result["status"], "changed", "{result}");
+    }
+    assert_eq!(
+        record_name(&db, &registry, REC_D).await.as_deref(),
+        Some("moved folder")
+    );
+    assert_eq!(
+        facet_value(&db, REC_D, "batch_probe").await.as_deref(),
+        Some("done")
+    );
+    assert_eq!(
+        homes_and_anchors(&db).await,
+        vec![
+            (
+                REC_D.to_owned(),
+                Some(REC_H2.to_owned()),
+                Some(REC_H2.to_owned())
+            ),
+            (
+                REC_E.to_owned(),
+                Some(REC_D.to_owned()),
+                Some(REC_H2.to_owned())
+            ),
+        ]
+    );
+    let summary: Option<String> = sqlx::query_scalar("SELECT summary FROM records WHERE id = ?")
+        .bind(REC_C)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(summary.as_deref(), Some("corrected cohort"));
+
+    // Check the actual owned domain, not just a receipt or legacy links row.
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM relationships r
+         JOIN effective_relationships e USING (relationship_origin_db_id, relationship_id)
+         JOIN relationship_endpoints s USING (relationship_origin_db_id, relationship_id)
+         JOIN relationship_endpoints t USING (relationship_origin_db_id, relationship_id)
+         WHERE r.relationship_type = 'depends_on' AND r.type_definition_id = 'legacy_link.v1'
+           AND r.endpoint_semantics = 'directed'
+           AND s.role = 'source' AND s.record_id = ?
+           AND t.role = 'target' AND t.record_id = ?
+           AND e.effective_state = 'active' AND e.support_count > 0",
+    )
+    .bind(REC_B)
+    .bind(REC_T)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        owned, 1,
+        "corrected batch must create an effective owned dependency"
+    );
+    let relationship_outputs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM provenance_action_outputs o
+         JOIN relationship_events e ON e.id = o.output_event_id
+         WHERE o.output_domain = 'relationship' AND e.act = ?",
+    )
+    .bind(committed["act"].as_i64().unwrap())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        relationship_outputs > 0,
+        "batch must append attested relationship-domain effects"
+    );
+
+    db.drain_captures_for_tests().await;
+    let after_commit = durable_state(&db).await;
+    assert_ne!(after_commit, before);
+    let repeated = call(&registry, &db, "batch_write", args).await;
+    assert_eq!(repeated, committed);
+    assert_eq!(
+        durable_state(&db).await,
+        after_commit,
+        "keyed retry appended an effect"
+    );
+}
+
 #[tokio::test]
 async fn keyed_reuse_after_partial_change_is_refused() {
     let registry = registry();

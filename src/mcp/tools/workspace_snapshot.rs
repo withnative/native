@@ -1,8 +1,9 @@
-//! Tool — `get_workspace_snapshot` (M3, epic 6b1f3c2).
+//! Tool — `get_workspace_snapshot` (M3, epic 6b1f3c2; resume S1 task 679d792).
 //!
-//! One tool with three actions sharing one response vocabulary. `open` pins
+//! One tool with four actions sharing one response vocabulary. `open` pins
 //! the caller's filtered public snapshot under a token; `page` reads sections
-//! of that pin; `catch_up` diffs the pin against a fresh M2 view. Every answer
+//! of that pin; `catch_up` diffs the pin against a fresh M2 view; `resume`
+//! reconciles a bounded client key/digest manifest against the current view. Every answer
 //! carries the stamp triple plus exactly one of a payload, `restart_required`,
 //! or `unavailable` — the last being the honest generic signal for M2 `None`,
 //! which must never read as an empty workspace.
@@ -36,6 +37,29 @@ struct WorkspaceSnapshotArgs {
     /// instead of `restart_required`. Defaults to false (today's restarts).
     #[serde(default)]
     accept_fence_moved: bool,
+    /// Resume manifest for `action: "resume"`: the client's bounded key +
+    /// digest inventory of its cached rows (see `RESUME_MANIFEST_PROFILE`
+    /// in `crate::workspace_snapshot`). Untrusted comparison hints only.
+    #[serde(default)]
+    manifest: Option<Value>,
+}
+
+fn delta_payload(delta: &crate::workspace_snapshot::SnapshotDelta) -> Value {
+    json!({
+        "snapshot_token": delta.token,
+        "content_seq": delta.content_seq,
+        "authorization_epoch": delta.authorization_epoch,
+        "relationship_seq": delta.relationship_seq,
+        "upsert_records": delta.upsert_records,
+        "delete_record_ids": delta.delete_record_ids,
+        "upsert_facets": delta.upsert_facets,
+        "delete_facet_ids": delta.delete_facet_ids,
+        "delete_facet_keys": delta.delete_facet_keys,
+        "upsert_links": delta.upsert_links,
+        "delete_link_ids": delta.delete_link_ids,
+        "delete_link_keys": delta.delete_link_keys,
+        "content_events": delta.content_events,
+    })
 }
 
 fn unavailable() -> Value {
@@ -116,21 +140,7 @@ async fn get_workspace_snapshot(db: Db, caller: Caller, arguments: Value) -> Res
                 CatchUpOutcome::Delta(delta) => {
                     // `fence_moved` is emitted only when the caller opted in:
                     // an opt-out delta carries exactly the keys main has.
-                    let mut out = json!({
-                        "snapshot_token": delta.token,
-                        "content_seq": delta.content_seq,
-                        "authorization_epoch": delta.authorization_epoch,
-                        "relationship_seq": delta.relationship_seq,
-                        "upsert_records": delta.upsert_records,
-                        "delete_record_ids": delta.delete_record_ids,
-                        "upsert_facets": delta.upsert_facets,
-                        "delete_facet_ids": delta.delete_facet_ids,
-                        "delete_facet_keys": delta.delete_facet_keys,
-                        "upsert_links": delta.upsert_links,
-                        "delete_link_ids": delta.delete_link_ids,
-                        "delete_link_keys": delta.delete_link_keys,
-                        "content_events": delta.content_events,
-                    });
+                    let mut out = delta_payload(&delta);
                     if args.accept_fence_moved {
                         out["fence_moved"] = json!(delta.fence_moved);
                     }
@@ -140,8 +150,21 @@ async fn get_workspace_snapshot(db: Db, caller: Caller, arguments: Value) -> Res
                 CatchUpOutcome::Unavailable => Ok(unavailable()),
             }
         }
+        "resume" => {
+            let manifest = args
+                .manifest
+                .as_ref()
+                .ok_or_else(|| Error::engine("get_workspace_snapshot resume requires manifest"))?;
+            match db.resume_workspace_snapshot(principal, manifest).await? {
+                // Same upsert/delete shape as catch_up, always without
+                // `fence_moved`: resume restarts on any fence race instead.
+                CatchUpOutcome::Delta(delta) => Ok(delta_payload(&delta)),
+                CatchUpOutcome::Restart { reason } => Ok(restart(reason)),
+                CatchUpOutcome::Unavailable => Ok(unavailable()),
+            }
+        }
         other => Err(Error::engine(format!(
-            "get_workspace_snapshot unknown action '{other}': expected open|page|catch_up"
+            "get_workspace_snapshot unknown action '{other}': expected open|page|catch_up|resume"
         ))),
     }
 }
@@ -155,20 +178,23 @@ pub fn register_workspace_snapshot_tool(registry: &mut ToolRegistry) -> Result<(
          open pins the caller's filtered records/facets/links plus stamps, \
          page reads one section of that pin across calls, catch_up diffs the \
          pin against a fresh view with exact row upserts/deletes and a new \
+          token, resume reconciles a bounded client key/digest manifest \
+          against the current view with the same delta shape and a new \
           token. Fence moves, expired tokens, or wide gaps return \
-          restart_required (discard and re-open); catch_up with \
-          accept_fence_moved:true returns the exact diff with fence_moved:true \
-          on a fence move instead; an unavailable index returns \
+         restart_required (discard and re-open); catch_up with \
+         accept_fence_moved:true returns the exact diff with fence_moved:true \
+         on a fence move instead; an unavailable index returns \
          unavailable with retry_hint (use the governed read path, never an \
          empty model).",
         json!({
             "type": "object",
             "properties": {
-                "action": { "type": "string", "enum": ["open", "page", "catch_up"], "description": "open pins a fresh snapshot; page reads one section of a token; catch_up diffs a token against the current view." },
+                "action": { "type": "string", "enum": ["open", "page", "catch_up", "resume"], "description": "open pins a fresh snapshot; page reads one section of a token; catch_up diffs a token against the current view; resume reconciles a client manifest against the current view." },
                 "snapshot_token": { "type": "string", "description": "Opaque pin from open (required for page and catch_up)." },
                 "section": { "type": "string", "description": "Page section for action=page: records|facets|links|content_events." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Max rows in this page (default 500)." },
                 "after_id": { "type": "string", "description": "Resume cursor from the previous page's after_id." },
+                "manifest": { "type": "object", "description": "Key/digest inventory for action=resume: {version:1, profile, records:[[id,digest]], facets:[[record_id,key,digest]], links:[[source,target,relationship,digest]]}." },
                 "accept_fence_moved": { "type": "boolean", "description": "For action=catch_up: return the exact diff with fence_moved:true when authorization/relationship/unit fences moved instead of restart_required. Defaults to false." }
             },
             "required": ["action"],
@@ -495,5 +521,108 @@ mod tests {
         let denied = call(&db, alice.clone(), json!({ "action": "open" })).await;
         assert_eq!(denied["unavailable"], true);
         assert!(denied.get("snapshot_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_resume_returns_catch_up_shaped_delta() {
+        let db = fixture().await;
+        let alice = Caller::authenticated("alice");
+        let manifest = json!({
+            "version": 1,
+            "profile": "workspace-snapshot-resume/v1",
+            "records": [],
+            "facets": [],
+            "links": [],
+        });
+        let delta = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "resume", "manifest": manifest }),
+        )
+        .await;
+        assert!(delta.get("restart_required").is_none());
+        assert!(delta.get("unavailable").is_none());
+        assert!(
+            delta.get("fence_moved").is_none(),
+            "resume never sets the fence flag"
+        );
+        let mut keys: Vec<&str> = delta
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "authorization_epoch",
+                "content_events",
+                "content_seq",
+                "delete_facet_ids",
+                "delete_facet_keys",
+                "delete_link_ids",
+                "delete_link_keys",
+                "delete_record_ids",
+                "relationship_seq",
+                "run_context",
+                "snapshot_token",
+                "upsert_facets",
+                "upsert_links",
+                "upsert_records",
+            ],
+            "resume carries the opt-out catch_up shape"
+        );
+        let upserted: Vec<&str> = delta["upsert_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_str().unwrap())
+            .collect();
+        assert!(upserted.contains(&COMMON_ID));
+        assert!(upserted.contains(&ALICE_ID));
+        assert!(!upserted.contains(&BEA_ID));
+        // The returned token is an ordinary pin: it pages.
+        let token = delta["snapshot_token"].as_str().unwrap().to_string();
+        let page = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "page", "snapshot_token": token, "section": "records" }),
+        )
+        .await;
+        assert!(page.get("restart_required").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_resume_restarts_malformed_manifest_with_no_rows() {
+        let db = fixture().await;
+        let alice = Caller::authenticated("alice");
+        let bad = call(
+            &db,
+            alice.clone(),
+            json!({ "action": "resume", "manifest": { "version": 1, "profile": "nope", "records": [], "facets": [], "links": [] } }),
+        )
+        .await;
+        assert_eq!(bad["restart_required"], true);
+        assert_eq!(bad["reason"], "manifest_profile_mismatch");
+        assert!(bad.get("upsert_records").is_none());
+        assert!(bad.get("snapshot_token").is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_resume_requires_manifest() {
+        let db = fixture().await;
+        let alice = Caller::authenticated("alice");
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        assert!(registry
+            .call(
+                db.clone(),
+                alice.clone(),
+                "get_workspace_snapshot",
+                json!({ "action": "resume" })
+            )
+            .await
+            .is_err());
     }
 }

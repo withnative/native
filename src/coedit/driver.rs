@@ -309,6 +309,9 @@ pub(crate) async fn execute(db: Db, admitted: AdmittedCommand) -> Result<Reply> 
             let contributor = AcknowledgedContributor {
                 principal: identity.principal().into(),
                 executor_kind: identity.executor_kind().into(),
+                run_key: None,
+                app: None,
+                channel: None,
             };
             let mut state = owner
                 .sessions

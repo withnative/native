@@ -1,0 +1,238 @@
+{
+  "profile": "workspace-snapshot-resume/v1",
+  "codec": "fixed field order per domain; per field 0x00=null-or-missing, else 0x01 + u32 big-endian UTF-8 byte length + raw UTF-8; sha256 over domain tag (with trailing NUL) + encoded fields, lowercase hex. Missing and null encode identically by construction; empty string is a distinct present claim.",
+  "domains": {
+    "record": [
+      "id",
+      "type",
+      "kind",
+      "name",
+      "home_id",
+      "lifecycle",
+      "persistence",
+      "maturity",
+      "summary",
+      "last_activity_at",
+      "created_at",
+      "updated_at",
+      "deleted_at"
+    ],
+    "facet": [
+      "record_id",
+      "key",
+      "value"
+    ],
+    "link": [
+      "source_id",
+      "target_id",
+      "relationship",
+      "note"
+    ]
+  },
+  "vectors": [
+    {
+      "name": "record-ascii",
+      "domain": "record",
+      "fields": [
+        "9e795001-0000-4000-8000-000000000001",
+        "Document",
+        "note",
+        "Common",
+        "native:root",
+        "open",
+        "enduring",
+        null,
+        "A summary",
+        "2026-05-01T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+        "2026-06-01T12:00:00Z",
+        null
+      ],
+      "digest": "8cd656b245cbc13521eaac3681635ecc329d4ceb4761ea7645b8b125e6fbbf93"
+    },
+    {
+      "name": "record-unicode",
+      "domain": "record",
+      "fields": [
+        "9e795001-0000-4000-8000-000000000002",
+        "Document",
+        "note",
+        "\ud834\udd1e Clef cafe\u0301",
+        "\ud83d\ude00",
+        null,
+        "enduring",
+        "draft",
+        "\u65e5\u672c\u8a9e\u306e\u8981\u7d04 \ud83c\udf89",
+        null,
+        "2026-01-01T00:00:00Z",
+        "2026-06-01T12:00:00Z",
+        null
+      ],
+      "digest": "61690d1d0481f1c92a816cf1c30e9b6fc2a5f222605da49924135c8e4ed4ef18"
+    },
+    {
+      "name": "record-delimiters",
+      "domain": "record",
+      "fields": [
+        "9e795001-0000-4000-8000-000000000001",
+        "Document",
+        "we|ird",
+        "a\u0000b\nc\td\"e\\f",
+        null,
+        null,
+        "enduring",
+        null,
+        "x\u0000y",
+        null,
+        "2026-01-01T00:00:00Z",
+        "2026-06-01T12:00:00Z",
+        null
+      ],
+      "digest": "ccc4c09fe0a18a9d469f075eca796e39de6aea58d51daf58c61cdc97592b0090"
+    },
+    {
+      "name": "record-null-kind",
+      "domain": "record",
+      "fields": [
+        "9e795001-0000-4000-8000-000000000001",
+        "Document",
+        null,
+        "K",
+        null,
+        null,
+        "enduring",
+        null,
+        null,
+        null,
+        "2026-01-01T00:00:00Z",
+        "2026-06-01T12:00:00Z",
+        null
+      ],
+      "digest": "c09ae723fa04958514cd3c4b8e89944860a16b284b506f6ae10355fbd351ad25"
+    },
+    {
+      "name": "record-empty-kind",
+      "domain": "record",
+      "fields": [
+        "9e795001-0000-4000-8000-000000000001",
+        "Document",
+        "",
+        "K",
+        null,
+        null,
+        "enduring",
+        null,
+        null,
+        null,
+        "2026-01-01T00:00:00Z",
+        "2026-06-01T12:00:00Z",
+        null
+      ],
+      "digest": "724958da6b5e237f81e5ca5c4d6aaf5f00dda2a768227fe769c35278c9925c74"
+    },
+    {
+      "name": "record-order-permuted",
+      "domain": "record",
+      "fields": [
+        null,
+        "2026-06-01T12:00:00Z",
+        "2026-01-01T00:00:00Z",
+        "2026-05-01T00:00:00Z",
+        "A summary",
+        "enduring",
+        "open",
+        "native:root",
+        "Common",
+        "note",
+        "Document",
+        "9e795001-0000-4000-8000-000000000001",
+        null
+      ],
+      "digest": "6fbe7680e21d609f162d6d6232549b8a267af469848da2aa399c4b894d56ea7f"
+    },
+    {
+      "name": "facet-value",
+      "domain": "facet",
+      "fields": [
+        "rec-1",
+        "priority",
+        "high"
+      ],
+      "digest": "3bf22b147f29a702c8769b91bc4382fdf33d96bd069e9199a880954f2255537e"
+    },
+    {
+      "name": "facet-null-value",
+      "domain": "facet",
+      "fields": [
+        "rec-1",
+        "priority",
+        null
+      ],
+      "digest": "480f0ec3ae80d30da1042eb72b84c4af2242e9b697030cbf4650ef7611d9c76b"
+    },
+    {
+      "name": "facet-empty-value",
+      "domain": "facet",
+      "fields": [
+        "rec-1",
+        "priority",
+        ""
+      ],
+      "digest": "6980dbd359e48e5a9933e002a6bed491fdba0e7d444c162de5e9c7c1f1e1c4cb"
+    },
+    {
+      "name": "facet-unicode",
+      "domain": "facet",
+      "fields": [
+        "rec-1",
+        "cle\u0301 \ud834\udd1e",
+        "val\tue\n"
+      ],
+      "digest": "4c94b6b6b9509faa31c9462ecbf3e350e18c0a7c2bc63da2ff916817f248fe8d"
+    },
+    {
+      "name": "link-full",
+      "domain": "link",
+      "fields": [
+        "s-1",
+        "t-1",
+        "mentions",
+        "see\nalso\t!"
+      ],
+      "digest": "804c619c2faa16468d6f4901c87e6f80ceac53862210948f2cc49ac5b658126a"
+    },
+    {
+      "name": "link-null-relationship",
+      "domain": "link",
+      "fields": [
+        "s-1",
+        "t-1",
+        null,
+        "orphan"
+      ],
+      "digest": "9d380517a4903745b214b9a3ddd990c8193e3016c708d092761975db10ef3fc8"
+    },
+    {
+      "name": "link-null-note",
+      "domain": "link",
+      "fields": [
+        "s-1",
+        "t-1",
+        "relates_to",
+        null
+      ],
+      "digest": "89ba38d07881c3446a94335ace20bbba5178f1e90d56def1ddaccdf2f731c80b"
+    },
+    {
+      "name": "link-empty-note",
+      "domain": "link",
+      "fields": [
+        "s-1",
+        "t-1",
+        "relates_to",
+        ""
+      ],
+      "digest": "da05ffb94a6451bc0db208dfab93721443d5909c544dca5457b538824e5f61ec"
+    }
+  ]
+}

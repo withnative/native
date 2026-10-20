@@ -602,7 +602,7 @@ async fn resolve_reference_with<E: DomainStatementExecutor>(
 /// colliding UUIDs is not reachable in practice; if it ever were, the extra
 /// rows only make an already-ambiguous prefix ambiguous, which is the correct
 /// answer anyway.
-const MAX_CANDIDATES: i64 = 32;
+pub(crate) const MAX_CANDIDATES: i64 = 32;
 
 /// Exclusive upper bound character for the prefix range scan.
 ///
@@ -626,7 +626,7 @@ const MAX_CANDIDATES: i64 = 32;
 /// outside this range. That is harmless only because such an id is not
 /// canonical-UUID-shaped and is therefore not a candidate by rule 2. Widen the
 /// shape gate and this sentinel becomes wrong.
-const PREFIX_SENTINEL: char = 'g';
+pub(crate) const PREFIX_SENTINEL: char = 'g';
 
 /// JSON keys whose value addresses an **existing** record.
 ///
@@ -802,6 +802,30 @@ pub(crate) async fn resolve_record_ids(
                     Err(error)
                 }
             }
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        EngineHandle::KernelV2(db) => {
+            let principal = super::kernel_v2::principal(db, caller).await?;
+            let mut resolved = HashMap::new();
+            for (input, prefix) in abbreviations {
+                // Indexed prefix lookup: one bounded primary-key range scan
+                // per abbreviation instead of loading every visible record.
+                // Exact identity still wins (see resolve_prefix_as), so an
+                // unmatched prefix falls through to the handler unchanged.
+                if let Some(id) = crate::kernel::search_v2::resolve_prefix_as(
+                    db, &principal, tool, &input, &prefix,
+                )
+                .await?
+                {
+                    resolved.insert(input, id);
+                }
+            }
+            walk(&mut arguments, true, tool, &mut |text| {
+                if let Some(id) = resolved.get(text.as_str()) {
+                    text.clone_from(id);
+                }
+            });
+            Ok(arguments)
         }
         #[cfg(feature = "postgres")]
         EngineHandle::Postgres(db) => {
@@ -1272,7 +1296,7 @@ async fn display_references_with<E: DomainStatementExecutor>(
 /// which is lowercase, and an uppercase id could only have arrived through
 /// caller-supplied `create_record.id` — the caller-chosen namespace, which
 /// rule 2 keeps out of prefix matching entirely.
-fn canonical_prefix(input: &str) -> Option<String> {
+pub(crate) fn canonical_prefix(input: &str) -> Option<String> {
     let mut hex = String::with_capacity(UUID_HEX);
     for byte in input.bytes() {
         match byte {
@@ -1342,6 +1366,9 @@ fn walk_object(
     tool: &str,
     visit: &mut impl FnMut(&mut String),
 ) {
+    let batch_read = top_level
+        && tool == "manage_alpha_tabs"
+        && map.get("action").and_then(Value::as_str) == Some("live_read");
     // A mention's `target_id` is a principal, not a record, when its sibling
     // discriminator says so. This is the one place on the surface where an
     // allowlisted key changes namespace, and it is read off the same object
@@ -1351,6 +1378,19 @@ fn walk_object(
         Some("principal")
     );
     for (key, entry) in map.iter_mut() {
+        if batch_read && key == "reads" {
+            // Artifact renders keep the single read's exact-target boundary:
+            // the install gates precede any target lookup, and prefixes are
+            // item-level invalid_params. Other needs retain normal resolution.
+            if let Value::Array(items) = entry {
+                for item in items {
+                    if item.get("need").and_then(Value::as_str) != Some("artifact.render.v1") {
+                        walk(item, false, tool, visit);
+                    }
+                }
+            }
+            continue;
+        }
         let addresses_a_record = if top_level && tool == "update_record" && key == "ids" {
             // The bounded homogeneous form deliberately requires exact full
             // target ids. Keep singular update_record.id and its human-friendly
@@ -2618,6 +2658,30 @@ mod tests {
             ),
             ["destination"],
             "multi-target ids remain exact while the shared destination keeps ordinary resolution"
+        );
+    }
+
+    #[test]
+    fn batched_artifact_targets_are_exact_while_other_needs_keep_resolution() {
+        assert_eq!(
+            collected(
+                "manage_alpha_tabs",
+                json!({"action":"live_read", "reads":[
+                    {"need":"artifact.render.v1", "params":{"artifact_id":"exact-only"}},
+                    {"need":"lane.by_id", "params":{"record_id":"ordinary-prefix"}},
+                    {"need":"canvas.scene.v1", "params":{"canvas_id":"canvas-prefix"}}
+                ]})
+            ),
+            ["ordinary-prefix"],
+            "artifact targets bypass pre-gate resolution without changing other needs"
+        );
+        assert_eq!(
+            collected(
+                "manage_alpha_tabs",
+                json!({"action":"preview", "artifact_id":"ordinary-prefix"})
+            ),
+            ["ordinary-prefix"],
+            "install actions keep their existing prefix resolution"
         );
     }
 }

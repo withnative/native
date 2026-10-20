@@ -43,11 +43,14 @@ fn delivery() -> crate::artifact_html::LaunchDelivery {
 }
 const BODY: &str = "\u{feff}<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Producer</title></head><body>Producer é😀</body></html>";
 async fn fixture() -> (Db, Caller, Value) {
+    fixture_with_body(BODY).await
+}
+async fn fixture_with_body(body: &str) -> (Db, Caller, Value) {
     let db = crate::create_database(":memory:").await.unwrap();
     let caller = Caller::local();
     let artifact = crate::store::create_record(
         &db,
-        json!({"type":"Document","kind":"artifact","name":"Producer source","body":BODY}),
+        json!({"type":"Document","kind":"artifact","name":"Producer source","body":body}),
     )
     .await
     .unwrap();
@@ -74,7 +77,7 @@ async fn fixture() -> (Db, Caller, Value) {
     let d = json!({"needs":[{"need":BODY_READ_NEED,"scope":BODY_READ_SCOPE}],"effects":[]});
     let dd = "b543054776df55c1cee9a703a50ea398e88ac3df40f322e437264ab6d450cae4";
     let v = json!({"action":"install","package":"fixture.private-producer","version":"1.0.0",
-        "digest":alpha_tab_digest(&alpha_tab_bundle_digest(BODY),dd,"native.html.v1"),
+        "digest":alpha_tab_digest(&alpha_tab_bundle_digest(body),dd,"native.html.v1"),
         "artifact_id":artifact,"source_revision":source,"declaration":d,"reason":"Genuine private install",
         "idempotency_key":"producer-install"});
     (db, caller, v)
@@ -128,6 +131,27 @@ fn confirm(v: &Value, p: &Value) -> Value {
 async fn state(db: &Db) -> (i64, String, Option<String>) {
     sqlx::query_as("SELECT (SELECT COUNT(*) FROM control_events),event_id,body_read_admission_event_id FROM alpha_tab_installs")
         .fetch_one(db.pool()).await.unwrap()
+}
+
+#[tokio::test]
+async fn supplied_kit_policy_refuses_hosted_preview_before_receipt() {
+    if isolated_receipt_process().await {
+        return;
+    }
+    let body = BODY.replace("</head>", r#"<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":2}</script></head>"#);
+    let (db, caller, value) = fixture_with_body(&body).await;
+    let outcome = installed(&db, &caller, &value).await;
+    let before = state(&db).await;
+    let value = preview_request(&value, &outcome.event_id);
+    let request = request(&value);
+    let ingress =
+        unsafe { Ingress::from_verified_host(&db, &caller, &request, Instant::now()) }.unwrap();
+    let failure = preview(&ingress, &delivery()).await.err().unwrap();
+    assert!(failure.to_string().contains("kit_major_unavailable"));
+    assert!(failure.to_string().contains("major 2"));
+    assert!(failure.to_string().contains("choose an admitted major"));
+    assert!(preview_receipt_store().lock().unwrap().is_empty());
+    assert_eq!(state(&db).await, before);
 }
 
 #[tokio::test]
@@ -1065,4 +1089,27 @@ async fn new_feature_receipt_capacity_refuses_without_evicting_older_live_receip
         }
     }
     preview_receipt_store().lock().unwrap().remove(&original);
+}
+
+#[tokio::test]
+async fn supplied_kit_policy_hosted_preview_metadata_is_exact() {
+    if isolated_receipt_process().await {
+        return;
+    }
+    let body=BODY.replace("</head>",r#"<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script></head>"#);
+    let (db, caller, value) = fixture_with_body(&body).await;
+    let outcome = installed(&db, &caller, &value).await;
+    let before = state(&db).await;
+    let preview = previewed(&db, &caller, &preview_request(&value, &outcome.event_id)).await;
+    let release = &preview["preview"]["launch"]["kit_release"];
+    assert_eq!(release["version"], "1.1.0");
+    assert_eq!(
+        release["js_sha256"],
+        "060abc96efa6d41cce9889904a23c4861f9f2c1af6619f34a052f8659d35d8db"
+    );
+    assert_eq!(
+        release["types_sha256"],
+        "64935eb9aa0ef6b1b09b597892240f007cdfc6d3fef36a2c5b9cde73e86161fd"
+    );
+    assert_eq!(state(&db).await, before);
 }

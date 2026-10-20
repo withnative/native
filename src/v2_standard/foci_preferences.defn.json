@@ -1,0 +1,53 @@
+{
+  "family": "native.foci.preferences",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "Configuration",
+  "kinds": [
+    {
+      "token": "focus_preferences",
+      "description": "Per-person sidebar preferences. List order is sidebar order. One record per person is not enforced by this definition; a host-owned per-person slot is planned for that. Focus id shapes are NOT enforced by the store in this revision; they must be enforced by a Foci consumer. Tier is a closed choice (now, background) enforced by the store. No audience-change guard exists yet: a write is not fenced against a concurrent change to the home's access policy.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "foci",
+          "type": "list",
+          "required": true,
+          "max_items": 128,
+          "items": {
+            "type": "object",
+            "fields": [
+              {
+                "name": "focus_id",
+                "type": "text",
+                "required": true,
+                "description": "Focus id. The shape must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+              },
+              {
+                "name": "tier",
+                "type": "choice",
+                "required": true,
+                "values": [
+                  "now",
+                  "background"
+                ],
+                "description": "Sidebar tier for this focus."
+              },
+              {
+                "name": "hidden",
+                "type": "boolean",
+                "required": true,
+                "description": "Whether this focus is hidden in the sidebar."
+              }
+            ]
+          },
+          "description": "Sidebar foci in display order. May be empty."
+        }
+      ],
+      "links": []
+    }
+  ]
+}

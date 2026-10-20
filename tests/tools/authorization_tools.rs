@@ -3186,7 +3186,7 @@ async fn diagnostics_scan_facets_and_work_context_use_only_visible_related_rows(
 
 #[test]
 fn every_registered_tool_kind_has_an_authorization_disposition() {
-    assert_eq!(ToolKind::ALL.len(), 87);
+    assert_eq!(ToolKind::ALL.len(), 90);
     let mut registry = ToolRegistry::new();
     register_builtin_tools(&mut registry).unwrap();
     register_surface_tools(&mut registry).unwrap();
@@ -3202,6 +3202,7 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
         missing,
         vec![
             ToolKind::StandbyStatus,
+            ToolKind::OutboxStatus,
             ToolKind::ExportSnapshot,
             ToolKind::ManageMemberships,
             ToolKind::WorkspaceRead,
@@ -3213,6 +3214,10 @@ fn every_registered_tool_kind_has_an_authorization_disposition() {
     );
     assert_eq!(
         ToolKind::StandbyStatus.authorization(),
+        AuthorizationDisposition::NoRecord
+    );
+    assert_eq!(
+        ToolKind::OutboxStatus.authorization(),
         AuthorizationDisposition::NoRecord
     );
     assert_eq!(
@@ -3888,3 +3893,327 @@ async fn workspace_snapshot_serves_only_visible_rows_and_restarts_on_revoke() {
     assert!(paged.get("rows").is_none());
     db.close().await;
 }
+
+#[tokio::test]
+async fn workspace_snapshot_resume_reconciles_manifest_without_disclosure() {
+    let (db, registry, alice, _bea) = fixture().await;
+    let common = create_local(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Common" }),
+    )
+    .await;
+    let alice_only = create_local(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Alice only", "owner_id": alice }),
+    )
+    .await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &common,
+        vec![
+            AllowEntry::account("acct:alice", Capability::View),
+            AllowEntry::account("acct:bea", Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &alice_only,
+        vec![AllowEntry::account("acct:alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let alice_caller = || {
+        Caller::authenticated("acct:alice")
+            .with_hosting_context("host:alice", "db:test")
+            .with_hosting_owner(false)
+    };
+    let bea_caller = || {
+        Caller::authenticated("acct:bea")
+            .with_hosting_context("host:bea", "db:test")
+            .with_hosting_owner(false)
+    };
+    let zeros = "0".repeat(64);
+    let manifest = || {
+        json!({
+            "version": 1,
+            "profile": "workspace-snapshot-resume/v1",
+            "records": [[&common, &zeros], [&alice_only, &zeros]],
+            "facets": [],
+            "links": [],
+        })
+    };
+    // Positive: an authorized manifest reconciles visible rows into repairs.
+    let delta = call_as(
+        &registry,
+        &db,
+        alice_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "resume", "manifest": manifest() }),
+    )
+    .await
+    .unwrap();
+    assert!(delta.get("restart_required").is_none());
+    assert!(delta["snapshot_token"].as_str().is_some());
+    let upserted: Vec<&str> = delta["upsert_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(upserted.contains(&common.as_str()) && upserted.contains(&alice_only.as_str()));
+    // Negative: bea names the alice-only row; it resolves to a delete
+    // address, never to rows, while her shared row still repairs.
+    let bea_delta = call_as(
+        &registry,
+        &db,
+        bea_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "resume", "manifest": manifest() }),
+    )
+    .await
+    .unwrap();
+    assert!(bea_delta.get("restart_required").is_none());
+    let bea_deletes: Vec<&str> = bea_delta["delete_record_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    assert!(bea_deletes.contains(&alice_only.as_str()));
+    let bea_upserted: Vec<&str> = bea_delta["upsert_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(!bea_upserted.contains(&alice_only.as_str()));
+    assert!(bea_upserted.contains(&common.as_str()));
+    // Negative: a malformed manifest restarts with no rows and no token.
+    let bad = call_as(
+        &registry,
+        &db,
+        alice_caller(),
+        "get_workspace_snapshot",
+        json!({ "action": "resume", "manifest": { "version": 1, "profile": "nope", "records": [], "facets": [], "links": [] } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(bad["restart_required"], true);
+    assert!(bad.get("upsert_records").is_none());
+    assert!(bad.get("snapshot_token").is_none());
+    db.close().await;
+}
+
+async fn admit_saved_session_lifecycle_fixture(db: &Db, registry: &ToolRegistry) {
+    let proposal: Value = serde_json::from_str(include_str!(
+        "../../src/node/saved-session-lifecycle-proposal.json"
+    ))
+    .unwrap();
+    let kind = &proposal["kind"];
+    let proposed=registry.call(db.clone(),Caller::local(),"manage_vocabularies",json!({"action":"propose_value","vocabulary":kind["vocabulary"],"value":kind["value"],"gloss":kind["gloss"],"metadata":kind["metadata"]})).await.unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "manage_vocabularies",
+            json!({"action":"promote_value","value_id":proposed["value_id"]}),
+        )
+        .await
+        .unwrap();
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "manage_vocabularies",
+            json!({"action":"create_vocabulary","name":proposal["vocabulary"]["name"]}),
+        )
+        .await
+        .unwrap();
+    for value in proposal["vocabulary"]["values"].as_array().unwrap() {
+        let proposed=registry.call(db.clone(),Caller::local(),"manage_vocabularies",json!({"action":"propose_value","vocabulary":proposal["vocabulary"]["name"],"value":value["value"],"gloss":value["gloss"],"terminality":value["terminality"]})).await.unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_vocabularies",
+                json!({"action":"promote_value","value_id":proposed["value_id"]}),
+            )
+            .await
+            .unwrap();
+    }
+    registry
+        .call(
+            db.clone(),
+            Caller::local(),
+            "manage_schema_config",
+            json!({"action":"write","data":proposal["shape_patch"]}),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn multi_target_lifecycle_and_facets_share_the_same_guard_and_keyed_receipt() {
+    let (db, registry, alice, _) = fixture().await;
+    admit_saved_session_lifecycle_fixture(&db, &registry).await;
+    let record=create_local(&registry,&db,json!({"type":"Document","kind":"agent-session","name":"Session","owner_id":alice,"lifecycle":"open","facets":{"native.session.writer_generation":1,"native.session.state":"saving"}})).await;
+    let args = json!({"ids":[record],"reason":"End fixture session","lifecycle":"closed","facets":{"native.session.writer_generation":2,"native.session.state":"ended"},"if_facets":{"native.session.writer_generation":1},"idempotency_key":"fixture-lifecycle-close"});
+    call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct:alice"),
+        "update_record",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    let closed: String = sqlx::query_scalar("SELECT lifecycle FROM records WHERE id=?")
+        .bind(&record)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(closed, "closed");
+    let stale = json!({"ids":[record],"reason":"Late fixture state","lifecycle":"open","facets":{"native.session.state":"saving"},"if_facets":{"native.session.writer_generation":1},"idempotency_key":"fixture-stale-open"});
+    assert!(call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct:alice"),
+        "update_record",
+        stale.clone()
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT lifecycle FROM records WHERE id=?")
+            .bind(&record)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        "closed"
+    );
+    let resumed = json!({"ids":[record],"reason":"Resume fixture session","lifecycle":"open","facets":{"native.session.writer_generation":3,"native.session.state":"saving"},"if_facets":{"native.session.writer_generation":2},"idempotency_key":"fixture-resume-open"});
+    call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct:alice"),
+        "update_record",
+        resumed,
+    )
+    .await
+    .unwrap();
+    // The close receipt replays before today's changed generation guard;
+    // replay confirms the old command, never closes the resumed session.
+    call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct:alice"),
+        "update_record",
+        args,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT lifecycle FROM records WHERE id=?")
+            .bind(&record)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        "open"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn multi_target_lifecycle_authorization_failure_rolls_back_every_field_and_facet() {
+    let (db, registry, alice, bea) = fixture().await;
+    admit_saved_session_lifecycle_fixture(&db, &registry).await;
+    let first=create_local(&registry,&db,json!({"type":"Document","kind":"agent-session","name":"Owned","owner_id":alice,"lifecycle":"open","facets":{"fixture.generation":1}})).await;
+    let second=create_local(&registry,&db,json!({"type":"Document","kind":"agent-session","name":"View only","owner_id":bea,"lifecycle":"open","facets":{"fixture.generation":1}})).await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &second,
+        vec![AllowEntry::account("acct:alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let args = json!({"ids":[first,second],"reason":"Atomic lifecycle fixture","lifecycle":"closed","facets":{"fixture.generation":2},"if_facets":{"fixture.generation":1},"idempotency_key":"fixture-cohort-close"});
+    assert!(call_as(
+        &registry,
+        &db,
+        Caller::authenticated("acct:alice"),
+        "update_record",
+        args
+    )
+    .await
+    .is_err());
+    for record in [&first, &second] {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT lifecycle FROM records WHERE id=?")
+                .bind(record)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "open"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT value FROM facet_values WHERE record_id=? AND key='fixture.generation'"
+            )
+            .bind(record)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            "1"
+        );
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn multi_target_lifecycle_keeps_suggestion_resolution_rules_and_atomic_rollback() {
+    let (db, registry, _, _) = fixture().await;
+    admit_saved_session_lifecycle_fixture(&db, &registry).await;
+    let note = create_local(
+        &registry,
+        &db,
+        json!({"type":"Document","kind":"agent-session","name":"First target","lifecycle":"open"}),
+    )
+    .await;
+    let suggestion=create_local(&registry,&db,json!({"type":"Annotation","kind":"suggestion","name":"Proposed change","lifecycle":"open","body":"Review this proposal","facets":{"proposal.precondition":"none"},"links":[{"target_id":note,"relationship":"part_of"}]})).await;
+    let error=call_as(&registry,&db,Caller::local(),"update_record",json!({"ids":[note,suggestion],"lifecycle":null,"facets":{"fixture.stage":"advanced"},"reason":"Cannot bypass suggestion resolver","idempotency_key":"fixture-suggestion-cohort"})).await.unwrap_err().to_string();
+    assert!(
+        error.contains("lifecycle cannot be cleared"),
+        "ordinary lifecycle validation must run: {error}"
+    );
+    for record in [&note, &suggestion] {
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT lifecycle FROM records WHERE id=?")
+                .bind(record)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "open"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM facet_values WHERE record_id=? AND key='fixture.stage'"
+            )
+            .bind(record)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+    }
+    db.close().await;
+}
+
+#[path = "saved_session_sharing_tools.rs"]
+mod saved_session_sharing_tools;

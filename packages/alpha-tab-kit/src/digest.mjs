@@ -7,7 +7,7 @@ import { canonicalBodyFeatureDeclaration } from "./body-feature-digest.mjs";
 // and src/canonical_json.rs (RFC 8785 JCS + SHA-256).
 import { createHash } from "node:crypto";
 import { canonicalJson, compareUtf8 } from "./jcs.mjs";
-import { BODY_SET_EFFECT, parseBodySetBounds, parseCommentCreateBound, parseFacetSetBound, parseMessageReactBound, parseSqlNeedEntry, parseTitleSetBound } from "./declaration.mjs";
+import { APP_CONTRACT_V2, BODY_SET_EFFECT, parseBodySetBounds, parseCommentCreateBound, parseFacetSetBound, parseMessageReactBound, parseSqlNeedEntry, parseTitleSetBound } from "./declaration.mjs";
 import { LIMITS } from "./limits.mjs";
 
 export const DIGEST_VERSION = LIMITS.digest.version;
@@ -33,6 +33,22 @@ function canonicalParams(params) {
  * canonical shape only: current engine install/write parity is unqualified.
  */
 export function canonicalDeclaration(declaration) {
+  // `contract` is bound iff present, exactly as Rust does, so declarations
+  // without it keep their historical bytes. Only native.app.v2 is accepted.
+  const contract = Object.getOwnPropertyDescriptor(declaration ?? {}, "contract");
+  if (contract) {
+    if (!Object.hasOwn(contract, "value") || contract.value !== APP_CONTRACT_V2) {
+      throw new Error(`declaration 'contract' must be '${APP_CONTRACT_V2}' [invalid_contract]`);
+    }
+    const { contract: _contract, ...rest } = Object.getOwnPropertyDescriptors(declaration);
+    // A v2 marker declares nothing: empty needs and effects, no sessions member
+    // (mirrors Rust `validate_declaration_contract`).
+    const emptyArray = (key) => Object.hasOwn(rest[key] ?? {}, "value") && Array.isArray(rest[key].value) && rest[key].value.length === 0;
+    if (!emptyArray("needs") || !emptyArray("effects") || Object.hasOwn(rest, "sessions")) {
+      throw new Error(`a '${APP_CONTRACT_V2}' declaration must hold empty 'needs' and 'effects' and no 'sessions' [invalid_contract]`);
+    }
+    return { ...canonicalDeclaration(Object.defineProperties({}, rest)), contract: APP_CONTRACT_V2 };
+  }
   const sessions = Object.getOwnPropertyDescriptor(declaration ?? {}, "sessions");
   const attemptedDescriptor = Array.isArray(declaration?.needs) && declaration.needs.some(entry =>
     entry !== null && typeof entry === "object" && !Array.isArray(entry) && entry.need === "records.body.read.v1");

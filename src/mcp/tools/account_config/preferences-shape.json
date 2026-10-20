@@ -1,0 +1,50 @@
+{
+  "type": "object",
+  "required": true,
+  "json_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "version": {
+        "type": "integer",
+        "enum": [
+          1
+        ]
+      },
+      "foci": {
+        "type": "array",
+        "maxItems": 128,
+        "items": {
+          "type": "object",
+          "properties": {
+            "focus_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "tier": {
+              "type": "string",
+              "enum": [
+                "now",
+                "background"
+              ]
+            },
+            "hidden": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "focus_id",
+            "tier",
+            "hidden"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "version",
+      "foci"
+    ],
+    "additionalProperties": false
+  }
+}

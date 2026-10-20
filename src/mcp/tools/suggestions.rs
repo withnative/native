@@ -60,28 +60,32 @@ struct ResolveSuggestionsArgs {
     reason: String,
     #[serde(default)]
     dry_run: bool,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug)]
-struct Suggestion {
-    id: String,
-    target_id: String,
-    lifecycle: Option<String>,
-    replacement: Option<String>,
+pub(crate) struct Suggestion {
+    pub(crate) id: String,
+    pub(crate) target_id: String,
+    pub(crate) lifecycle: Option<String>,
+    pub(crate) replacement: Option<String>,
+    /// An archived suggestion (withdrawn by its author or hidden by anyone with
+    /// Manage) is not pending, whatever its lifecycle still says.
+    pub(crate) archived: bool,
 }
 
 #[derive(Debug)]
-enum Precondition {
+pub(crate) enum Precondition {
     None { old: Option<String> },
     Span { old: String },
     Digest { expected: String },
 }
 
-fn sha256_hex(value: &str) -> String {
+pub(super) fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
-fn authoring_error(id: &str, message: impl AsRef<str>) -> Error {
+pub(crate) fn authoring_error(id: &str, message: impl AsRef<str>) -> Error {
     Error::engine(format!(
         "{TOOL}: suggestion {id} has an invalid authored shape: {}",
         message.as_ref()
@@ -95,7 +99,7 @@ async fn read_suggestions_in(
     let mut suggestions = Vec::with_capacity(ids.len());
     for id in ids {
         let row = sqlx::query(
-            "SELECT id, type, kind, lifecycle, body, deleted_at
+            "SELECT id, type, kind, lifecycle, body, deleted_at, archived
                FROM records WHERE id = ?",
         )
         .bind(id)
@@ -148,6 +152,7 @@ async fn read_suggestions_in(
             target_id: targets[0].clone(),
             lifecycle: row.try_get("lifecycle")?,
             replacement: row.try_get("body")?,
+            archived: row.try_get::<i64, _>("archived")? != 0,
         });
     }
     Ok(suggestions)
@@ -179,89 +184,104 @@ async fn read_preconditions_in(
                 row.try_get::<Option<String>, _>("value")?,
             );
         }
-        let declared = facets
-            .get(PRECONDITION_FACET)
-            .and_then(Option::as_deref)
-            .ok_or_else(|| {
-                authoring_error(
-                    &suggestion.id,
-                    format!("missing required facet '{PRECONDITION_FACET}'"),
-                )
-            })?;
-        let precondition = match declared {
-            "none" => {
-                let old = facets.get(OLD_FACET).and_then(Option::as_deref);
-                if old == Some("") {
-                    return Err(authoring_error(
-                        &suggestion.id,
-                        format!("facet '{OLD_FACET}' must not be empty when present"),
-                    ));
-                }
-                Precondition::None {
-                    old: old.map(String::from),
-                }
-            }
-            "span" => {
-                let old = facets
-                    .get(OLD_FACET)
-                    .and_then(Option::as_deref)
-                    .filter(|old| !old.is_empty())
-                    .ok_or_else(|| {
-                        authoring_error(
-                            &suggestion.id,
-                            format!("span requires non-empty facet '{OLD_FACET}'"),
-                        )
-                    })?;
-                Precondition::Span { old: old.into() }
-            }
-            "digest" => {
-                let expected = facets
-                    .get(DIGEST_FACET)
-                    .and_then(Option::as_deref)
-                    .ok_or_else(|| {
-                        authoring_error(
-                            &suggestion.id,
-                            format!("digest requires facet '{DIGEST_FACET}'"),
-                        )
-                    })?;
-                if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    return Err(authoring_error(
-                        &suggestion.id,
-                        format!("facet '{DIGEST_FACET}' must be a SHA-256 hex digest"),
-                    ));
-                }
-                Precondition::Digest {
-                    expected: expected.to_ascii_lowercase(),
-                }
-            }
-            "field_equals" | "seq" => {
-                return Err(authoring_error(
-                    &suggestion.id,
-                    format!("precondition '{declared}' is unsupported for body suggestions in v1"),
-                ))
-            }
-            other => {
-                return Err(authoring_error(
-                    &suggestion.id,
-                    format!(
-                        "facet '{PRECONDITION_FACET}' must be none, span, or digest; got '{other}'"
-                    ),
-                ))
-            }
-        };
-        out.push(precondition);
+        out.push(parse_precondition(suggestion, &facets)?);
     }
     Ok(out)
 }
 
-fn lifecycle_conflict(suggestions: &[Suggestion], target_id: &str) -> Option<Value> {
+pub(crate) fn parse_precondition(
+    suggestion: &Suggestion,
+    facets: &HashMap<String, Option<String>>,
+) -> Result<Precondition> {
+    if suggestion.replacement.is_none() {
+        return Err(authoring_error(&suggestion.id, "body is required"));
+    }
+    let declared = facets
+        .get(PRECONDITION_FACET)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| {
+            authoring_error(
+                &suggestion.id,
+                format!("missing required facet '{PRECONDITION_FACET}'"),
+            )
+        })?;
+    let precondition = match declared {
+        "none" => {
+            let old = facets.get(OLD_FACET).and_then(Option::as_deref);
+            if old == Some("") {
+                return Err(authoring_error(
+                    &suggestion.id,
+                    format!("facet '{OLD_FACET}' must not be empty when present"),
+                ));
+            }
+            Precondition::None {
+                old: old.map(String::from),
+            }
+        }
+        "span" => {
+            let old = facets
+                .get(OLD_FACET)
+                .and_then(Option::as_deref)
+                .filter(|old| !old.is_empty())
+                .ok_or_else(|| {
+                    authoring_error(
+                        &suggestion.id,
+                        format!("span requires non-empty facet '{OLD_FACET}'"),
+                    )
+                })?;
+            Precondition::Span { old: old.into() }
+        }
+        "digest" => {
+            let expected = facets
+                .get(DIGEST_FACET)
+                .and_then(Option::as_deref)
+                .ok_or_else(|| {
+                    authoring_error(
+                        &suggestion.id,
+                        format!("digest requires facet '{DIGEST_FACET}'"),
+                    )
+                })?;
+            if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(authoring_error(
+                    &suggestion.id,
+                    format!("facet '{DIGEST_FACET}' must be a SHA-256 hex digest"),
+                ));
+            }
+            Precondition::Digest {
+                expected: expected.to_ascii_lowercase(),
+            }
+        }
+        "field_equals" | "seq" => {
+            return Err(authoring_error(
+                &suggestion.id,
+                format!("precondition '{declared}' is unsupported for body suggestions in v1"),
+            ))
+        }
+        other => {
+            return Err(authoring_error(
+                &suggestion.id,
+                format!(
+                    "facet '{PRECONDITION_FACET}' must be none, span, or digest; got '{other}'"
+                ),
+            ))
+        }
+    };
+    Ok(precondition)
+}
+
+pub(crate) fn lifecycle_conflict(suggestions: &[Suggestion], target_id: &str) -> Option<Value> {
     let causes: Vec<Value> = suggestions
         .iter()
-        .filter(|suggestion| suggestion.lifecycle.as_deref() != Some("open"))
+        .filter(|suggestion| suggestion.archived || suggestion.lifecycle.as_deref() != Some("open"))
         .map(|suggestion| {
             json!({
                 "suggestion_id": suggestion.id,
-                "code": "lifecycle_not_open",
+                // Archiving leaves the lifecycle `open`, so check it on its own.
+                "code": if suggestion.archived {
+                    "suggestion_archived"
+                } else {
+                    "lifecycle_not_open"
+                },
                 "current_lifecycle": suggestion.lifecycle,
             })
         })
@@ -317,7 +337,7 @@ async fn mark_stale_in(
     Ok(())
 }
 
-fn stale_causes(
+pub(crate) fn stale_causes(
     suggestions: &[Suggestion],
     preconditions: &[Precondition],
     target_body: Option<&str>,
@@ -359,7 +379,7 @@ fn stale_causes(
     stale
 }
 
-fn simulate(
+pub(crate) fn simulate(
     suggestions: &[Suggestion],
     preconditions: &[Precondition],
     current: &str,
@@ -405,6 +425,33 @@ async fn accept(
     reason: String,
     dry_run: bool,
 ) -> Result<Value> {
+    // Single-writer rule: the live-session guard must be taken before the
+    // write transaction, so the target is read once up front and re-checked
+    // inside the transaction. With a live session on the target, the accept
+    // is evaluated against the live text and applied as a diff (contract M2).
+    let expected_target: Option<String> = match ids.first() {
+        Some(first) => sqlx::query_scalar(
+            "SELECT target_id FROM links WHERE source_id = ? AND relationship = 'part_of' LIMIT 1",
+        )
+        .bind(first)
+        .fetch_optional(db.pool())
+        .await?,
+        None => None,
+    };
+    // A dry run takes no guard (it can never cut a version or discard a
+    // session); it previews against the in-memory live text instead.
+    let mut live_write = if dry_run {
+        None
+    } else {
+        Some(
+            crate::coedit::live::begin_body_write(
+                &db,
+                expected_target.as_deref().unwrap_or(""),
+                &caller,
+            )
+            .await?,
+        )
+    };
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     let mut authorized_targets = Vec::with_capacity(ids.len());
@@ -445,6 +492,11 @@ async fn accept(
             conflict["status"] = json!("would_conflict");
         }
         return Ok(conflict);
+    }
+    if expected_target.as_deref() != Some(target_id.as_str()) {
+        return Err(Error::engine(format!(
+            "{TOOL}: the suggestion's target changed during the call; retry"
+        )));
     }
     let preconditions = read_preconditions_in(&mut tx, &suggestions).await?;
     if suggestions.len() > 1
@@ -493,7 +545,14 @@ async fn accept(
         );
     }
 
-    let target_body: Option<String> = target.try_get("body")?;
+    let live_text = match live_write.as_ref() {
+        Some(write) => write.live_body().map(str::to_owned),
+        None => crate::coedit::live::live_text(&db, &target_id),
+    };
+    let target_body: Option<String> = match live_text {
+        Some(live) => Some(live),
+        None => target.try_get("body")?,
+    };
     let current = target_body.clone().unwrap_or_default();
     let stale = stale_causes(&suggestions, &preconditions, target_body.as_deref());
     if !stale.is_empty() {
@@ -543,18 +602,30 @@ async fn accept(
 
     validate_lifecycle_destination_in(&mut tx, "accepted").await?;
 
+    let mut base = serde_json::Map::new();
+    base.insert("reason".into(), json!(reason));
+    let payload = live_write
+        .as_mut()
+        .ok_or_else(|| Error::engine(format!("{TOOL}: missing live-session guard")))?
+        .body_payload(&caller, &prospective, &reason, base)
+        .await?;
     append_in(
         &db,
         &mut tx,
         AppendSpec {
             record_id: target_id.clone(),
             event_type: "record.updated".into(),
-            payload: json!({ "body": prospective, "reason": reason }),
+            payload: Value::Object(payload),
             actor: Some(caller.actor().into()),
         },
         &mut act_alloc,
     )
     .await?;
+    let routed_event = if live_write.as_ref().is_some_and(|write| write.is_routed()) {
+        Some(crate::coedit::live::latest_event_in(&mut tx, &target_id).await?)
+    } else {
+        None
+    };
     for suggestion in &suggestions {
         append_in(
             &db,
@@ -570,6 +641,9 @@ async fn accept(
         .await?;
     }
     db.commit_content(tx).await?;
+    if let (Some((event_id, seq)), Some(write)) = (routed_event, live_write) {
+        write.finish(&event_id, seq).await;
+    }
     echo_act(
         json!({
         "status": "accepted",
@@ -580,7 +654,14 @@ async fn accept(
     )
 }
 
-async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Value> {
+async fn reject(
+    db: Db,
+    caller: Caller,
+    id: String,
+    reason: String,
+    keyed: bool,
+    provenance_arguments: Value,
+) -> Result<Value> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     let target: Option<String> = sqlx::query_scalar(
@@ -597,8 +678,36 @@ async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Va
     {
         return Err(Error::engine(format!("{TOOL}: suggestion does not exist")));
     }
+    // Keyed replay: after the target-edit check, before the lifecycle check
+    // the first rejection's own effect would now trip as a conflict.
+    if keyed {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            if replay.content().len() != 1 {
+                return Err(Error::engine(format!(
+                    "{TOOL}: idempotent receipt is incomplete"
+                )));
+            }
+            let receipt = echo_act(
+                json!({
+                "status": "rejected",
+                "target_id": target,
+                "suggestion_ids": [id],
+                }),
+                replay.act(),
+            )?;
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
+    }
     let suggestions = read_suggestions_in(&mut tx, std::slice::from_ref(&id)).await?;
     let suggestion = &suggestions[0];
+    // A conflict is a structured outcome that embeds the suggestion's live
+    // lifecycle, so it is returned unanchored: a keyed retry judges the world
+    // again rather than replaying a snapshot of it.
     if let Some(conflict) = lifecycle_conflict(&suggestions, &suggestion.target_id) {
         return Ok(conflict);
     }
@@ -620,6 +729,7 @@ async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Va
         &mut act_alloc,
     )
     .await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     echo_act(
         json!({
@@ -631,9 +741,13 @@ async fn reject(db: Db, caller: Caller, id: String, reason: String) -> Result<Va
     )
 }
 
-async fn resolve_suggestions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(super) async fn resolve_suggestions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ResolveSuggestionsArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
     if args.suggestion_ids.is_empty() {
         return Err(Error::engine(format!(
             "{TOOL}: 'suggestion_ids' must not be empty"
@@ -651,12 +765,26 @@ async fn resolve_suggestions(db: Db, caller: Caller, arguments: Value) -> Result
         )));
     }
     match args.action.as_str() {
+        // Accept is not keyed: it can route the body into a live editing
+        // session, and its stale and conflict outcomes embed the target's live
+        // digest and match counts, which a replay could not pin.
+        "accept" if keyed => Err(Error::engine(format!(
+            "{TOOL}: accept does not accept idempotency_key yet; retry without a key"
+        ))),
         "accept" => accept(db, caller, args.suggestion_ids, args.reason, args.dry_run).await,
         "reject" if args.dry_run => Err(Error::engine(format!(
             "{TOOL}: dry_run is only valid with action accept"
         ))),
         "reject" if args.suggestion_ids.len() == 1 => {
-            reject(db, caller, args.suggestion_ids[0].clone(), args.reason).await
+            reject(
+                db,
+                caller,
+                args.suggestion_ids[0].clone(),
+                args.reason,
+                keyed,
+                provenance_arguments,
+            )
+            .await
         }
         "reject" => Err(Error::engine(format!(
             "{TOOL}: reject takes exactly one suggestion id"
@@ -683,11 +811,106 @@ pub fn register_suggestion_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "description": "Accept preserves this request order. Reject requires exactly one id."
                 },
                 "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
-                "dry_run": { "type": "boolean", "default": false, "description": "For accept only: run identical preconditions and ordered simulation, returning the prospective body without writing." }
+                "dry_run": { "type": "boolean", "default": false, "description": "For accept only: run identical preconditions and ordered simulation, returning the prospective body without writing." },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["action", "suggestion_ids", "reason"],
             "additionalProperties": false
         }),
-        resolve_suggestions,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(resolve_suggestions(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::create_database;
+    use crate::mcp::{register_builtin_tools, register_surface_tools};
+
+    /// Through the same registry `/mcp` dispatches: an archived suggestion is
+    /// not pending. Archiving leaves its lifecycle `open`, so without a check of
+    /// its own the resolver would still apply it.
+    #[tokio::test]
+    async fn an_archived_suggestion_is_a_lifecycle_conflict_and_is_never_applied() {
+        let db = create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_builtin_tools(&mut registry).unwrap();
+        register_surface_tools(&mut registry).unwrap();
+        let caller = Caller::local();
+        let call = |name: &'static str, arguments: Value| {
+            let (registry, db, caller) = (&registry, db.clone(), caller.clone());
+            async move {
+                Box::pin(registry.call(db, caller, name, arguments))
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let target = call(
+            "create_record",
+            json!({ "type": "Document", "kind": "note", "name": "t", "body": "hello world",
+                    "reason": "fixture" }),
+        )
+        .await;
+        let target = target["id"].as_str().unwrap().to_string();
+        let suggestion = call(
+            "create_record",
+            json!({ "type": "Annotation", "kind": "suggestion", "lifecycle": "open",
+                    "body": "hello there",
+                    "links": [{ "target_id": target, "relationship": "part_of" }],
+                    "facets": { "proposal.precondition": "digest",
+                                "anchor.base_digest": sha256_hex("hello world") },
+                    "reason": "fixture" }),
+        )
+        .await;
+        let suggestion = suggestion["id"].as_str().unwrap().to_string();
+        call(
+            "archive_record",
+            json!({ "id": suggestion, "reason": "withdrawn" }),
+        )
+        .await;
+
+        for action in ["accept", "reject"] {
+            let outcome = call(
+                "resolve_suggestions",
+                json!({ "action": action, "suggestion_ids": [suggestion], "reason": "try" }),
+            )
+            .await;
+            assert_eq!(outcome["status"], "conflict", "{action}: {outcome}");
+            assert_eq!(
+                outcome["causes"][0]["code"], "suggestion_archived",
+                "{outcome}"
+            );
+        }
+        let (body, lifecycle): (String, String) = (
+            sqlx::query_scalar("SELECT body FROM records WHERE id = ?")
+                .bind(&target)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            sqlx::query_scalar("SELECT lifecycle FROM records WHERE id = ?")
+                .bind(&suggestion)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+        );
+        assert_eq!((body.as_str(), lifecycle.as_str()), ("hello world", "open"));
+
+        // Restoring it makes it pending again.
+        call(
+            "archive_record",
+            json!({ "id": suggestion, "archived": false, "reason": "restored" }),
+        )
+        .await;
+        let outcome = call(
+            "resolve_suggestions",
+            json!({ "action": "accept", "suggestion_ids": [suggestion], "reason": "try" }),
+        )
+        .await;
+        assert_eq!(outcome["status"], "accepted", "{outcome}");
+    }
 }

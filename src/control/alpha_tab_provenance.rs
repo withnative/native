@@ -474,6 +474,29 @@ async fn update_adoption(
     Ok((outcome.0.to_owned(), outcome.1.to_owned(), outcome.2))
 }
 
+/// Predict adoption in a read snapshot using the authoritative update calculation.
+pub(crate) async fn prepare_update_adoption_in(
+    conn: &mut SqliteConnection,
+    account_id: &str,
+    package: &str,
+    declaration_digest: &str,
+) -> Result<bool> {
+    let row = sqlx::query("SELECT * FROM alpha_tab_installs WHERE account_id=? AND package=?")
+        .bind(account_id)
+        .bind(package)
+        .fetch_one(&mut *conn)
+        .await?;
+    let pin = projection_pin(&row)?;
+    let token: String = row.try_get("event_id")?;
+    if canonical_digest(&pin.consented_declaration)? != pin.declaration_digest {
+        return Err(Error::engine(
+            "alpha tab predecessor declaration digest mismatch",
+        ));
+    }
+    let (_, basis, _) = update_adoption(conn, &row, &pin, &token, declaration_digest).await?;
+    Ok(basis == "carried")
+}
+
 /// Fill server-derived predecessor and consent fields while holding the same
 /// write transaction that appends the event. Fold independently repeats this
 /// calculation and checks the entire supplied outcome.

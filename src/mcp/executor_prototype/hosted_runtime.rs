@@ -20,9 +20,11 @@ use super::{
     PinnedLensExecutorCatalogue,
 };
 use crate::mcp::protocol::{add_modern_result_fields, call_error_content};
+use crate::mcp::registry::{EngineHandle, EngineKind};
 use crate::mcp::OperationAccess;
 use crate::mcp::{
-    Caller, DeploymentPersistenceLease, ExperimentalExecutors, LensDispatch, ToolRegistry,
+    Caller, DeploymentPersistenceLease, ExperimentalExecutors, LensDispatch, McpSurfaceMode,
+    ToolRegistry,
 };
 use crate::DeploymentReadOnlyOperation;
 
@@ -38,16 +40,42 @@ pub struct HostedExecutorAdmission {
 
 impl HostedExecutorAdmission {
     pub fn new(registry: &ToolRegistry, experimental: &ExperimentalExecutors) -> Result<Self> {
+        Self::new_for_surface(registry, experimental, McpSurfaceMode::Executor)
+    }
+
+    /// Classification for the ordinary catalogue the upstream serves: the
+    /// full executor catalogue or its lean projection. Lens classification
+    /// is unchanged by the surface.
+    pub fn new_for_surface(
+        registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
+        surface: McpSurfaceMode,
+    ) -> Result<Self> {
         Ok(Self {
-            ordinary: ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            ordinary: ExecutorPrototypeStdioServer::pin_hosted_catalogue_for_surface(
                 registry,
                 experimental,
+                surface,
             )?,
             lens: ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
                 registry,
                 experimental,
             )?,
         })
+    }
+
+    /// Exact contract identity for dark outbox acceptance/replay. The caller
+    /// must pass this release's pinned catalogue, not a journal-supplied one.
+    #[doc(hidden)]
+    pub fn deferred_contract_identity(
+        &self,
+        executor: &str,
+        operation: &str,
+    ) -> Option<(&str, &str)> {
+        self.ordinary
+            .contracts
+            .get(&(executor.into(), operation.into()))
+            .map(|contract| (super::CONTRACT_VERSION, contract.digest.as_str()))
     }
 
     pub fn classify_call(
@@ -64,6 +92,46 @@ impl HostedExecutorAdmission {
                 .map(|(_, access)| access)
         }
     }
+
+    /// Classify one `tools/call` by tool name and raw envelope. On a lean
+    /// ordinary catalogue a `call_executor` envelope classifies as its
+    /// target; lens routes never unwrap (lean is ordinary-only).
+    pub fn classify_tools_call(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+        lens: bool,
+    ) -> Option<OperationAccess> {
+        if lens {
+            let operation = arguments
+                .and_then(|arguments| arguments.get("operation"))
+                .and_then(Value::as_str)
+                .or_else(|| (name == "bootstrap").then_some("bootstrap"));
+            return self.lens.classify_call(name, operation);
+        }
+        let (executor, operation) = self.ordinary.call_target(name, arguments)?;
+        let operation = operation.or_else(|| (executor == "bootstrap").then_some("bootstrap"));
+        self.ordinary
+            .classify_call(executor, operation)
+            .map(|(_, access)| access)
+    }
+
+    /// The lean direct-call refusal for an ordinary route, rendered by the
+    /// proxy itself instead of forwarding. Lens routes never project lean.
+    pub fn lean_direct_refusal(
+        &self,
+        id: Value,
+        modern: bool,
+        name: &str,
+        arguments: Option<&Value>,
+        lens: bool,
+    ) -> Option<Value> {
+        if lens {
+            return None;
+        }
+        self.ordinary
+            .lean_direct_refusal(id, modern, name, arguments)
+    }
 }
 
 /// Fully initialized hosted executor state shared by one HTTP router.
@@ -77,11 +145,16 @@ pub struct HostedExecutorRuntime {
     authority: Arc<dyn HostedExecutorAuthority>,
     keys: Arc<dyn HostedPlanKeyProvider>,
     ordinary: Arc<PinnedExecutorCatalogue>,
+    #[cfg(feature = "v2-kernel-probe")]
+    v2_ordinary: Arc<PinnedExecutorCatalogue>,
+    #[cfg(feature = "v2-kernel-probe")]
+    v2_telemetry: std::sync::OnceLock<BoundExecutorTelemetry>,
     lens_admission: Arc<PinnedLensExecutorCatalogue>,
     ordinary_telemetry: BoundExecutorTelemetry,
     lenses: PinnedLensCatalogueCache,
     telemetry: Arc<ExecutorTelemetryContext>,
     experimental: ExperimentalExecutors,
+    sql_commit: bool,
 }
 
 #[derive(Clone)]
@@ -97,6 +170,17 @@ struct PinnedLensCatalogueCache {
 }
 
 impl HostedExecutorRuntime {
+    /// Deployment consent for qualified ordinary SQLite commit plans. Each
+    /// preparation still needs signed commit consent. Lens writes are excluded.
+    pub fn with_sql_commit(mut self) -> Result<Self> {
+        if !self.experimental.contains("sql_write") {
+            return Err(Error::engine(
+                "hosted SQL commit requires the sql_write experimental allowlist",
+            ));
+        }
+        self.sql_commit = true;
+        Ok(self)
+    }
     /// Initialize the production structured-log runtime. Retained-key
     /// validation completes before telemetry construction or catalogue pinning
     /// so a bad deployment cannot begin serving or emit a loaded manifest.
@@ -160,12 +244,65 @@ impl HostedExecutorRuntime {
         super::validate_hosted_plan_keys_for_catalogue(keys, &catalogue).await
     }
 
+    /// Initialize for one executor-serving surface, with an optional
+    /// injected telemetry context (the production structured log when
+    /// `None`). `Executor` is exactly the historical constructors; `Lean`
+    /// pins the lean projection of the same ordinary catalogue. Key
+    /// validation still precedes every catalogue pin and telemetry binding.
+    pub async fn new_for_surface(
+        registry: Arc<ToolRegistry>,
+        authority: Arc<dyn HostedExecutorAuthority>,
+        keys: Arc<dyn HostedPlanKeyProvider>,
+        telemetry: Option<Arc<ExecutorTelemetryContext>>,
+        experimental: ExperimentalExecutors,
+        surface: McpSurfaceMode,
+    ) -> Result<Self> {
+        if !surface.serves_executors() {
+            return Err(Error::engine(format!(
+                "the {surface} MCP surface has no hosted executor runtime"
+            )));
+        }
+        Self::validate_keys(&authority, &keys).await?;
+        let telemetry = match telemetry {
+            Some(telemetry) => telemetry,
+            None => ExecutorTelemetryContext::structured_log()?,
+        };
+        Self::from_validated_for_surface(
+            registry,
+            authority,
+            keys,
+            telemetry,
+            experimental,
+            surface,
+        )
+        .await
+    }
+
     async fn from_validated(
         registry: Arc<ToolRegistry>,
         authority: Arc<dyn HostedExecutorAuthority>,
         keys: Arc<dyn HostedPlanKeyProvider>,
         telemetry: Arc<ExecutorTelemetryContext>,
         experimental: ExperimentalExecutors,
+    ) -> Result<Self> {
+        Self::from_validated_for_surface(
+            registry,
+            authority,
+            keys,
+            telemetry,
+            experimental,
+            McpSurfaceMode::Executor,
+        )
+        .await
+    }
+
+    async fn from_validated_for_surface(
+        registry: Arc<ToolRegistry>,
+        authority: Arc<dyn HostedExecutorAuthority>,
+        keys: Arc<dyn HostedPlanKeyProvider>,
+        telemetry: Arc<ExecutorTelemetryContext>,
+        experimental: ExperimentalExecutors,
+        surface: McpSurfaceMode,
     ) -> Result<Self> {
         let maintenance_admission = match registry.deployment_mutation_barrier() {
             Some(barrier) => match barrier.admit(
@@ -189,12 +326,23 @@ impl HostedExecutorRuntime {
             )
             .await?;
         }
-        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_for_surface(
             &registry,
             &experimental,
+            surface,
         )?;
-        let ordinary_telemetry =
-            telemetry.bind_hosted_manifest(ordinary.manifest_digest(), ordinary.descriptor_bytes());
+        let ordinary_telemetry = telemetry.bind_hosted_manifest_for_surface(
+            super::telemetry::TelemetrySurface::for_ordinary_catalogue(ordinary.is_lean()),
+            ordinary.manifest_digest(),
+            ordinary.descriptor_bytes(),
+        );
+        #[cfg(feature = "v2-kernel-probe")]
+        let v2_ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue_for_engine(
+            &registry,
+            &experimental,
+            surface,
+            EngineKind::KernelV2,
+        )?;
         // Principal-neutral contracts use the same immutable registry and
         // allowlist as each authoritative lens-revision pin. Classification
         // does not allocate a lens pin or claim an authorization decision.
@@ -205,11 +353,16 @@ impl HostedExecutorRuntime {
             authority,
             keys,
             ordinary,
+            #[cfg(feature = "v2-kernel-probe")]
+            v2_ordinary,
+            #[cfg(feature = "v2-kernel-probe")]
+            v2_telemetry: std::sync::OnceLock::new(),
             lens_admission,
             ordinary_telemetry,
             lenses: PinnedLensCatalogueCache::default(),
             telemetry,
             experimental,
+            sql_commit: false,
         })
     }
 
@@ -221,7 +374,7 @@ impl HostedExecutorRuntime {
         database_id: String,
         message: Value,
     ) -> Result<Option<Value>> {
-        self.handle_ordinary_inner(db, caller, database_id, message, None)
+        self.handle_ordinary_inner(db.into(), caller, database_id, message, None)
             .await
     }
 
@@ -239,7 +392,7 @@ impl HostedExecutorRuntime {
         message: Value,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> Result<Option<Value>> {
-        self.handle_ordinary_inner(db, caller, database_id, message, persistence_lease)
+        self.handle_ordinary_inner(db.into(), caller, database_id, message, persistence_lease)
             .await
     }
 
@@ -252,6 +405,49 @@ impl HostedExecutorRuntime {
         operation: Option<&str>,
     ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
         self.ordinary.classify_call(executor, operation)
+    }
+
+    /// Pre-auth classification by tool name and raw envelope: on a lean
+    /// runtime a `call_executor` envelope is unwrapped to the target it will
+    /// dispatch, so admission (and a freeze) apply to that operation. Other
+    /// calls classify exactly as [`Self::classify_call`].
+    pub fn classify_tools_call(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
+        self.ordinary.classify_tools_call(name, arguments)
+    }
+
+    /// Lean only: refuse a direct call to an operation the lean catalogue
+    /// does not advertise directly, before the transport admits it or
+    /// authenticates the caller. Returns the rendered `tools/call` error
+    /// result (the same diagnostic and `call_executor` repair dispatch
+    /// renders, without run context), or `None` when the call is not such a
+    /// call. The refused target is recorded as a rejected selection with
+    /// its resolved executor and operation; no request is dispatched.
+    pub fn lean_direct_refusal(
+        &self,
+        id: Value,
+        modern: bool,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Option<Value> {
+        let (executor, operation) = self.ordinary.lean_hidden_direct_target(name, arguments)?;
+        let body = self
+            .ordinary
+            .lean_direct_refusal(id, modern, name, arguments)?;
+        let request = self
+            .ordinary_telemetry
+            .request(Some(&executor), Some(&operation), None);
+        self.ordinary_telemetry.emit(super::telemetry::EventSpec {
+            request: Some(request),
+            phase: super::telemetry::TelemetryPhase::OperationSelected,
+            outcome: super::telemetry::TelemetryOutcome::Rejected,
+            error_class: Some(super::telemetry::TelemetryErrorClass::SelectionError),
+            ..super::telemetry::EventSpec::default()
+        });
+        Some(body)
     }
 
     /// Classify against the lens contracts, which differ from the ordinary
@@ -281,31 +477,124 @@ impl HostedExecutorRuntime {
         json!({"jsonrpc": "2.0", "id": id, "result": result})
     }
 
-    async fn handle_ordinary_inner(
+    /// Dispatch the engine paired with the router handle, using an immutable
+    /// catalogue pinned for that physical implementation.
+    pub async fn handle_engine_with_persistence(
         &self,
-        db: Db,
+        engine: EngineHandle,
         caller: Caller,
         database_id: String,
         message: Value,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> Result<Option<Value>> {
+        self.handle_ordinary_inner(engine, caller, database_id, message, persistence_lease)
+            .await
+    }
+
+    async fn handle_ordinary_inner(
+        &self,
+        engine: EngineHandle,
+        caller: Caller,
+        database_id: String,
+        message: Value,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> Result<Option<Value>> {
+        crate::mcp::scope_database_persistence(
+            database_id.clone(),
+            self.handle_ordinary_scoped_inner(
+                engine,
+                caller,
+                database_id,
+                message,
+                persistence_lease,
+            ),
+        )
+        .await
+    }
+
+    async fn handle_ordinary_scoped_inner(
+        &self,
+        engine: EngineHandle,
+        caller: Caller,
+        database_id: String,
+        message: Value,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> Result<Option<Value>> {
+        let (catalogue, telemetry) = match engine.kind() {
+            EngineKind::Sqlite => (&self.ordinary, &self.ordinary_telemetry),
+            #[cfg(feature = "v2-kernel-probe")]
+            EngineKind::KernelV2 => (
+                &self.v2_ordinary,
+                self.v2_telemetry.get_or_init(|| {
+                    self.telemetry.bind_hosted_manifest_for_surface(
+                        super::telemetry::TelemetrySurface::for_ordinary_catalogue(
+                            self.v2_ordinary.is_lean(),
+                        ),
+                        self.v2_ordinary.manifest_digest(),
+                        self.v2_ordinary.descriptor_bytes(),
+                    )
+                }),
+            ),
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(Error::engine(
+                    "hosted executor does not support this engine",
+                ))
+            }
+        };
+        #[cfg(feature = "v2-kernel-probe")]
+        if matches!(&engine, EngineHandle::KernelV2(db) if db.has_enrolled_execution())
+            && message["method"] == "tools/call"
+            && self
+                .ordinary
+                .classify_tools_call(
+                    message["params"]["name"].as_str().unwrap_or(""),
+                    message.pointer("/params/arguments"),
+                )
+                .is_some_and(|(_, access)| access == super::OperationAccess::Mutation)
+        {
+            return Err(Error::engine("managed-custody v2 writes not yet supported"));
+        }
+        if engine.kind() != EngineKind::Sqlite && message["method"] == "tools/call" {
+            let name = message
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let arguments = message.pointer("/params/arguments");
+            if let Some((executor, Some(operation))) = self.ordinary.call_target(name, arguments) {
+                if super::write_operations::requires_plan(executor, operation) {
+                    let Some(id) = message.get("id").cloned() else {
+                        return Ok(None);
+                    };
+                    let error = Error::engine("this is a v2 database; plan-required operations are unavailable until v2 write plans are qualified");
+                    let mut result = call_error_content(&error, Value::Null, None);
+                    if crate::mcp::protocol::is_modern_request(&message) {
+                        add_modern_result_fields(&mut result);
+                    }
+                    return Ok(Some(json!({"jsonrpc":"2.0", "id":id, "result":result})));
+                }
+            }
+        }
         // Preserve the transport contract: successful authorization is
         // observed before plan-store/server construction, including when that
         // later construction fails.
-        self.ordinary_telemetry.authorization_accepted();
+        telemetry.authorization_accepted();
         let mut server = ExecutorPrototypeStdioServer::new_hosted_with_pinned_catalogue(
             Arc::clone(&self.registry),
-            db,
+            engine,
             caller,
             HostedExecutorConstruction {
                 authority: Arc::clone(&self.authority),
                 database_id,
                 keys: Arc::clone(&self.keys),
-                catalogue: Arc::clone(&self.ordinary),
-                telemetry: Some(self.ordinary_telemetry.clone()),
+                catalogue: Arc::clone(catalogue),
+                telemetry: Some(telemetry.clone()),
             },
         )
         .await?;
+        if self.sql_commit && server.engine.kind() == EngineKind::Sqlite {
+            server = server.with_hosted_sql_commit()?;
+        }
         if let Some(lease) = persistence_lease {
             server = server.with_persistence_lease(lease);
         }
@@ -344,6 +633,7 @@ impl HostedExecutorRuntime {
     /// is known even though no request server is constructed.
     pub fn observe_ordinary_authorization_denied(&self) {
         self.telemetry.observe_hosted_authorization_denied(
+            super::telemetry::TelemetrySurface::for_ordinary_catalogue(self.ordinary.is_lean()),
             Some(self.ordinary.manifest_digest()),
             crate::FULL_GIT_SHA,
         );
@@ -352,8 +642,11 @@ impl HostedExecutorRuntime {
     /// Record a lens refusal that occurred before authoritative resolution.
     /// No lens manifest is pinned or claimed for this event.
     pub fn observe_lens_authorization_denied(&self) {
-        self.telemetry
-            .observe_hosted_authorization_denied(None, crate::FULL_GIT_SHA);
+        self.telemetry.observe_hosted_authorization_denied(
+            super::telemetry::TelemetrySurface::Executor,
+            None,
+            crate::FULL_GIT_SHA,
+        );
     }
 
     pub fn telemetry_health(&self) -> ExecutorTelemetryHealth {

@@ -7,7 +7,7 @@ import { LIMITS } from "./limits.mjs";
 import { finding, warning } from "./findings.mjs";
 import { parseDeclaration } from "./declaration.mjs";
 import { lintSql, NOT_MIRRORED } from "./sql-lint.mjs";
-import { validateHtml, STRICT_DEFAULT } from "./html.mjs";
+import { validateHtml, STRICT_DEFAULT, descriptorKitPolicyFindings } from "./html.mjs";
 import { completenessAnalysis } from "./completeness-lint.mjs";
 import { computeDigests } from "./digest.mjs";
 
@@ -65,9 +65,14 @@ function topLevelLimit(sql) {
  * `{ ok, findings, digests, notMirrored }`; `ok` is false when any finding
  * is an error. `completenessBudget` overrides the advisory completeness
  * lint's work bounds (`LINT_BUDGET`); exhausting them is only a warning.
+ *
+ * The HTML is validated as an installed app package bundle (the package body
+ * limit, `PACKAGE_LINT_BUDGET`) unless `package: false`: every install plan
+ * marks its bundle record with the package facet. Use `validateHtml(html)`
+ * for an ordinary document.
  */
 export function validatePackage(input) {
-  return validatePackageWith(input, parseDeclaration);
+  return validatePackageWith({ ...input, package: input?.package ?? true }, parseDeclaration);
 }
 
 // Explicit pure author feature validation, never host admission.
@@ -75,7 +80,7 @@ export function validateBodyFeaturePackage(input) {
   return validatePackageWith(input, parseBodyFeatureDeclaration);
 }
 
-function validatePackageWith({ descriptor, html, strict = STRICT_DEFAULT, completenessBudget }, parse) {
+function validatePackageWith({ descriptor, html, strict = STRICT_DEFAULT, completenessBudget, package: isPackage = false }, parse) {
   const findings = [];
   const d = descriptor ?? {};
   for (const key of ["package", "version", "runtime", "declaration"]) {
@@ -108,8 +113,9 @@ function validatePackageWith({ descriptor, html, strict = STRICT_DEFAULT, comple
 
   let digests = null;
   if (typeof html === "string") {
-    findings.push(...validateHtml(html, { strict }));
-    findings.push(...completenessAnalysis(html, parsed.sqlNeeds, completenessBudget).findings);
+    findings.push(...validateHtml(html, { strict, package: isPackage }));
+    findings.push(...descriptorKitPolicyFindings(d, html));
+    findings.push(...completenessAnalysis(html, parsed.sqlNeeds, completenessBudget, { package: isPackage }).findings);
     try {
       digests = computeDigests(html, d.declaration, d.runtime ?? I.runtime);
     } catch (error) {

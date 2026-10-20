@@ -8,12 +8,13 @@ const REDEEMED: u8 = 2;
 const INVALID: u8 = 3;
 const RECORD_BYTES: usize = 512;
 const META_BYTES: usize = 65536;
-const DELIVERED_BYTES: usize = 1048576;
+const DELIVERED_BYTES: usize = kit_delivery::DELIVERED_MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyDeliveryFailure {
     Busy,
     Invalid,
+    KitMajorUnavailable(u32),
     Expired,
     Cancelled,
     Closed,
@@ -59,13 +60,20 @@ impl BodyMountMeta {
     }
 }
 pub struct BodyLaunchContext {
+    kit: Arc<KitDelivery>,
     store: Arc<BodyStore>,
     parent: String,
 }
 pub struct PreparedLaunch {
+    kit_release: Option<KitRelease>,
     store: std::sync::Weak<BodyStore>,
     html: String,
     headers: HeaderMap,
+}
+impl PreparedLaunch {
+    pub fn kit_release(&self) -> Option<&KitRelease> {
+        self.kit_release.as_ref()
+    }
 }
 pub struct PublishedLaunch {
     url: String,
@@ -133,29 +141,39 @@ impl BodyState {
 }
 impl BodyLaunchContext {
     /// CPU work: the trusted caller must retain its registered physical job.
-    pub fn prepare(self, source: String, expected_bundle: [u8; 32]) -> BodyResult<PreparedLaunch> {
-        if source.len() > BODY_LIMIT || self.store.closed.load(Ordering::SeqCst) {
+    ///
+    /// `body_limit` is [`BODY_LIMIT`], or [`PACKAGE_BODY_LIMIT`] when the
+    /// source record carries the package marker; a larger value is refused.
+    pub fn prepare(
+        self,
+        source: String,
+        expected_bundle: [u8; 32],
+        body_limit: usize,
+    ) -> BodyResult<PreparedLaunch> {
+        if body_limit > PACKAGE_BODY_LIMIT
+            || source.len() > body_limit
+            || self.store.closed.load(Ordering::SeqCst)
+        {
             return Err(BodyDeliveryFailure::Invalid);
         }
-        let manifest = validate(&source).map_err(|_| BodyDeliveryFailure::Invalid)?;
+        let manifest =
+            validate_with_limit(&source, body_limit).map_err(|_| BodyDeliveryFailure::Invalid)?;
         if manifest.body_digest != hex::encode(expected_bundle) {
             return Err(BodyDeliveryFailure::Invalid);
         }
-        let bootstrap = BOOTSTRAP.replace(
-            "__NATIVE_WORKBENCH_ORIGIN__",
-            &serde_json::to_string(&self.parent).map_err(|_| BodyDeliveryFailure::Invalid)?,
-        );
-        let bytes = source
-            .len()
-            .checked_add("<script>".len())
-            .and_then(|n| n.checked_add("</script>".len()))
-            .and_then(|n| n.checked_add(bootstrap.len()))
-            .ok_or(BodyDeliveryFailure::Invalid)?;
-        if bytes > DELIVERED_BYTES {
-            return Err(BodyDeliveryFailure::Invalid);
-        }
-        let html = inject(&source, &self.parent).map_err(|_| BodyDeliveryFailure::Invalid)?;
-        if html.len() != bytes {
+        let (html, kit_release) =
+            self.kit
+                .compose(&source, &self.parent, &manifest)
+                .map_err(|e| {
+                    if e.code == "kit_major_unavailable" {
+                        BodyDeliveryFailure::KitMajorUnavailable(
+                            manifest.kit_policy.as_ref().expect("requested kit").major,
+                        )
+                    } else {
+                        BodyDeliveryFailure::Invalid
+                    }
+                })?;
+        if html.len() > DELIVERED_BYTES {
             return Err(BodyDeliveryFailure::Invalid);
         }
         let mut headers = HeaderMap::new();
@@ -180,6 +198,7 @@ impl BodyLaunchContext {
             HeaderValue::from_str(&csp(&self.parent)).map_err(|_| BodyDeliveryFailure::Invalid)?,
         );
         Ok(PreparedLaunch {
+            kit_release,
             store: Arc::downgrade(&self.store),
             html,
             headers,
@@ -244,9 +263,9 @@ impl BodyReservation {
 }
 impl LaunchDelivery {
     pub fn body_context(&self, parent_origin: &str) -> BodyResult<BodyLaunchContext> {
-        if parent_origin.len() > 256
+        if parent_origin.len() > kit_delivery::ORIGIN_MAX
             || !parent_origin.is_ascii()
-            || self.config.artifact_origin.len() > 256
+            || self.config.artifact_origin.len() > kit_delivery::ORIGIN_MAX
         {
             return Err(BodyDeliveryFailure::Invalid);
         }
@@ -258,6 +277,7 @@ impl LaunchDelivery {
             return Err(BodyDeliveryFailure::Closed);
         }
         Ok(BodyLaunchContext {
+            kit: self.kit.clone(),
             store: self.body.0.clone(),
             parent,
         })
@@ -486,6 +506,19 @@ mod tests {
             RuntimeConfig::new("https://parent.test", "https://artifact.test").unwrap(),
         )
     }
+    #[test]
+    fn kit_policy_refuses_typed_body_preparation() {
+        let source = r#"<!doctype html><html lang="en"><head><title>Kit</title><script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":2}</script></head><body>Kit</body></html>"#.to_owned();
+        let digest = Sha256::digest(source.as_bytes()).into();
+        let d = delivery();
+        assert!(matches!(
+            d.body_context("https://parent.test")
+                .unwrap()
+                .prepare(source, digest, BODY_LIMIT),
+            Err(BodyDeliveryFailure::KitMajorUnavailable(2))
+        ));
+    }
+
     fn meta(id: u8, started: Instant) -> BodyMountMeta {
         BodyMountMeta::checked(
             [id; 32],
@@ -500,6 +533,7 @@ mod tests {
     // Direct output fixture isolates metadata ownership, not HTML validation.
     fn output(d: &LaunchDelivery) -> PreparedLaunch {
         PreparedLaunch {
+            kit_release: None,
             store: Arc::downgrade(&d.body.0),
             html: "fixture".into(),
             headers: HeaderMap::new(),
@@ -681,6 +715,44 @@ mod tests {
         assert!(context.store.closed.load(Ordering::SeqCst));
     }
     #[test]
+    fn kit_delivery_body_preparation_pins_release_and_source_identity() {
+        let source =
+            include_str!("../../../../packages/alpha-tab-kit/test/fixtures/core-source.html")
+                .to_owned();
+        let digest = Sha256::digest(source.as_bytes()).into();
+        let config = RuntimeConfig::new("https://parent.test", "https://artifact.test").unwrap();
+        let a = LaunchDelivery::with_kit(config.clone(), KitDelivery::fixture("1.0.0", 0));
+        let b = a.with_kit_selection(KitDelivery::fixture("1.0.1", 0));
+        let old = a
+            .body_context("https://parent.test")
+            .unwrap()
+            .prepare(source.clone(), digest, BODY_LIMIT)
+            .unwrap();
+        let new = b
+            .body_context("https://parent.test")
+            .unwrap()
+            .prepare(source.clone(), digest, BODY_LIMIT)
+            .unwrap();
+        assert_eq!(old.kit_release().unwrap().version, "1.0.0");
+        assert_eq!(new.kit_release().unwrap().version, "1.0.1");
+        assert_ne!(old.html, new.html);
+        assert_eq!(
+            old.html,
+            KitDelivery::fixture("1.0.0", 0)
+                .compose(&source, "https://parent.test", &validate(&source).unwrap())
+                .unwrap()
+                .0
+        );
+        let t = Instant::now();
+        let bytes = old.html.len();
+        let reservation = a
+            .reserve_body_pair(old, meta(91, t), t + TICKET_TTL)
+            .unwrap();
+        assert_eq!(a.body.0.state.lock().unwrap().html_bytes, bytes);
+        drop(reservation);
+        assert_eq!(a.body.0.state.lock().unwrap().html_bytes, 0);
+    }
+    #[test]
     fn uncached_preparation_matches_exact_seventeen_tag_byte_preflight() {
         let d = delivery();
         let source=r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Fixture</title><style>body{margin:0}</style></head><body><main><h1>Hello é😀</h1></main></body></html>"#.to_owned();
@@ -688,18 +760,58 @@ mod tests {
         let prepared = d
             .body_context("https://parent.test")
             .unwrap()
-            .prepare(source.clone(), digest)
+            .prepare(source.clone(), digest, BODY_LIMIT)
             .unwrap();
-        let bootstrap = BOOTSTRAP.replace(
-            "__NATIVE_WORKBENCH_ORIGIN__",
-            &serde_json::to_string("https://parent.test").unwrap(),
-        );
+        let bootstrap = BOOTSTRAP
+            .replace(
+                "__NATIVE_WORKBENCH_ORIGIN__",
+                &serde_json::to_string("https://parent.test").unwrap(),
+            )
+            .replace("__NATIVE_KIT_FACTORY__", "null")
+            .replace("__NATIVE_KIT_RELEASE__", "null");
         assert_eq!(prepared.html.len(), source.len() + 17 + bootstrap.len());
         assert!(prepared.html.len() <= DELIVERED_BYTES);
         assert!(matches!(
             d.body_context("https://parent.test")
                 .unwrap()
-                .prepare(source, [0; 32]),
+                .prepare(source, [0; 32], BODY_LIMIT),
+            Err(BodyDeliveryFailure::Invalid)
+        ));
+    }
+    fn padded_source(len: usize) -> String {
+        let head = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Package</title></head><body><!--";
+        let tail = "--></body></html>";
+        format!("{head}{}{tail}", "a".repeat(len - head.len() - tail.len()))
+    }
+    fn prepare_padded(len: usize, body_limit: usize) -> BodyResult<PreparedLaunch> {
+        let source = padded_source(len);
+        assert_eq!(source.len(), len);
+        let digest: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        delivery()
+            .body_context("https://parent.test")
+            .unwrap()
+            .prepare(source, digest, body_limit)
+    }
+    #[test]
+    fn package_limit_delivers_a_package_body_and_leaves_the_ordinary_limit() {
+        // A 600 KB package body is delivered under the package limit and
+        // refused under the ordinary one.
+        let prepared = prepare_padded(600_000, PACKAGE_BODY_LIMIT).unwrap();
+        assert!(prepared.html.len() <= DELIVERED_BYTES);
+        assert!(matches!(
+            prepare_padded(600_000, BODY_LIMIT),
+            Err(BodyDeliveryFailure::Invalid)
+        ));
+        // The package limit itself delivers (source plus bootstrap fits the
+        // delivered-byte cap); one byte past it does not.
+        assert!(prepare_padded(PACKAGE_BODY_LIMIT, PACKAGE_BODY_LIMIT).is_ok());
+        assert!(matches!(
+            prepare_padded(PACKAGE_BODY_LIMIT + 1, PACKAGE_BODY_LIMIT),
+            Err(BodyDeliveryFailure::Invalid)
+        ));
+        // A limit above the package limit is never honoured.
+        assert!(matches!(
+            prepare_padded(PACKAGE_BODY_LIMIT + 1, PACKAGE_BODY_LIMIT + 1),
             Err(BodyDeliveryFailure::Invalid)
         ));
     }
@@ -729,7 +841,11 @@ mod router_correction_tests {
         let output = d
             .body_context("https://parent.test")
             .unwrap()
-            .prepare(SOURCE.into(), Sha256::digest(SOURCE.as_bytes()).into())
+            .prepare(
+                SOURCE.into(),
+                Sha256::digest(SOURCE.as_bytes()).into(),
+                BODY_LIMIT,
+            )
             .unwrap();
         let guard = d
             .reserve_body_pair(output, metadata(id, t), t + TICKET_TTL)

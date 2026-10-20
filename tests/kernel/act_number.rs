@@ -33,10 +33,13 @@ async fn call(
     tool: &str,
     args: Value,
 ) -> native_ce::Result<Value> {
+    // An owner-marked local caller: these tests pin the exact act an owner's
+    // receipt echoes. An unhosted authenticated caller is a non-owner and gets
+    // no act (design 08b4c21 §4 S2a; `tests/tools/act_receipts.rs`).
     registry
         .call(
             db.clone(),
-            Caller::authenticated(account),
+            Caller::local_owner(account),
             tool,
             crate::common::with_test_reason(tool, args),
         )

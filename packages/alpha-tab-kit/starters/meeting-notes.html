@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Meeting notes</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;color:#243047;max-width:65rem}input,textarea,select,button{font:inherit;padding:.5rem}label{display:block;margin:.8rem 0}textarea{width:95%;min-height:8rem}.columns{display:grid;grid-template-columns:1fr 2fr;gap:2rem}li{margin:.6rem 0}.kit-error{color:#9c2630}.kit-record-link{cursor:pointer}pre{white-space:pre-wrap}button:disabled{opacity:.6}@media(max-width:650px){.columns{display:block}}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const FOLDERS = [{ id: 'native:unfiled', name: 'Unfiled' }, { id: 'native:root', name: 'Workspace root' }]; // Replace with real folder ids/names.
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact) root.textContent = 'Open in Native with core kit 1.1.0.';
+else {
+  const { html, render, useState, useRef, useQueryFeed, Loading, Empty, ErrorState, RecordLink, Markdown } = kit.preact;
+  // SQL query rows arrive as objects keyed by column name: use row.id, never row[0].
+  function NoteView({ id, folder }) {
+    const feed = useQueryFeed({
+      sql: "SELECT id, substr(name, 1, 160) AS name, substr(body, 1, 120000) AS body FROM records WHERE id = ?1 AND home_id = ?2 AND type = 'Document' AND kind = 'note' AND deleted_at IS NULL AND archived = 0 ORDER BY id ASC LIMIT 1",
+      params: [{ type: 'text', value: id }, { type: 'text', value: folder }]
+    });
+    const result = feed.status === 'ready' ? feed.result : feed.last;
+    const note = result?.rows[0];
+    return html`<article>
+      ${feed.status === 'loading' && html`<${Loading} what="selected note" />`}
+      ${feed.status === 'unsupported' && html`<p role="alert">${feed.message}</p>`}
+      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`}
+      ${feed.status === 'error' && note && html`<p>Last good body; may be out of date.</p>`}
+      ${note ? html`<h2>${note.name}</h2><p>Body preview, up to 120,000 characters.</p><${RecordLink} id=${note.id}>Open record<//><${Markdown} source=${note.body || ''} />`
+        : result && html`<${Empty}>Note unavailable in this folder.<//>`}
+    </article>`;
+  }
+  function App() {
+    const [folder, setFolder] = useState(FOLDERS[0].id);
+    const [filter, setFilter] = useState('');
+    const [selected, setSelected] = useState(null);
+    const [title, setTitle] = useState('');
+    const [body, setBody] = useState('');
+    const [save, setSave] = useState({ status: 'idle' });
+    const attempt = useRef(null);
+    const feed = useQueryFeed({
+      sql: "SELECT id, substr(name, 1, 160) AS name, substr(body, 1, 160) AS excerpt FROM records WHERE home_id = ?1 AND type = 'Document' AND kind = 'note' AND deleted_at IS NULL AND archived = 0 ORDER BY updated_at_ms DESC, id ASC LIMIT 50",
+      params: [{ type: 'text', value: folder }]
+    });
+    const result = feed.status === 'ready' ? feed.result : feed.last;
+    const rows = result?.rows || [];
+    const visible = rows.filter(row => (row.name || '').toLowerCase().includes(filter.toLowerCase()));
+    const locked = save.status === 'pending' || save.status === 'uncertain';
+    async function create() {
+      if (save.status === 'pending') return;
+      setSave({ status: 'pending' });
+      try {
+        // Key generation can fail before dispatch; report it as not dispatched.
+        if (!attempt.current) {
+          let key;
+          try { key = crypto.randomUUID(); }
+          catch { throw { code: 'tool_not_dispatched', message: 'Secure random key unavailable. Open this app in a secure Native host.' }; }
+          attempt.current = {
+            type: 'Document', kind: 'note', name: title.trim(), body, home_id: folder,
+            reason: 'Create meeting note from inbox', idempotency_key: key
+          };
+        }
+        await window.native.call('create_record', attempt.current).confirmed;
+        attempt.current = null;
+        setTitle(''); setBody(''); setSave({ status: 'saved' }); feed.retry();
+      } catch (error) {
+        // A refused retry cannot settle the earlier uncertain dispatch.
+        const notWritten = error?.applied !== true && (error?.status === 'refused' || ['tool_not_dispatched', 'effect_not_dispatched'].includes(error?.code));
+        const uncertain = save.status === 'uncertain' || !notWritten;
+        if (!uncertain) attempt.current = null;
+        setSave({ status: uncertain ? 'uncertain' : 'error', error });
+      }
+    }
+    return html`<section><h1>Meeting notes</h1>
+      <label>Folder <select id="folder" value=${folder} disabled=${locked} onChange=${e => { setFolder(e.currentTarget.value); setSelected(null); setSave({ status: 'idle' }); }}>${FOLDERS.map(f => html`<option value=${f.id}>${f.name}</option>`)}</select></label>
+      <p>Newest 50 notes. Filter covers delivered titles; list excerpts are capped at 160 characters.</p>
+      <label>Filter <input id="filter" value=${filter} onInput=${e => setFilter(e.currentTarget.value)} /></label>
+      ${feed.status === 'loading' && html`<${Loading} what="notes" />`}
+      ${feed.status === 'unsupported' && html`<p role="alert">${feed.message}</p>`}
+      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`}
+      ${feed.status === 'error' && result && html`<p>Last good rows; may be out of date.</p>`}
+      ${result?.truncated && html`<p>More notes exist than delivered.</p>`}
+      <div class="columns"><nav aria-label="Notes">${visible.length ? html`<ul>${visible.map(row => html`<li key=${row.id}><button onClick=${() => setSelected(row.id)}>${row.name || row.id}</button><p>${(row.excerpt || '').slice(0, 160)}</p></li>`)}</ul>` : result && html`<${Empty}>No matching notes.<//>`}</nav>
+        ${selected ? html`<${NoteView} key=${folder + ':' + selected} id=${selected} folder=${folder} />` : html`<article><p>Select a note to read its preview.</p></article>`}</div>
+      <h2>New note</h2>
+      <div>
+        <label>Title <input id="title" required value=${title} disabled=${locked} onInput=${e => { setTitle(e.currentTarget.value); setSave({ status: 'idle' }); }} /></label>
+        <label>Notes <textarea id="body" value=${body} disabled=${locked} onInput=${e => { setBody(e.currentTarget.value); setSave({ status: 'idle' }); }} /></label>
+        <button id="create" type="button" onClick=${create} disabled=${locked || !title.trim() || typeof window.native.call !== 'function'}>Create note</button>
+      </div>
+      ${typeof window.native.call !== 'function' && html`<p role="alert">This host does not offer app-v2 writes.</p>`}
+      ${save.status === 'pending' && html`<p role="status">Saving… waiting for confirmation.</p>`}
+      ${save.status === 'saved' && html`<p role="status">Saved.</p>`}
+      ${save.status === 'uncertain' && html`<p>Outcome uncertain. Keep this app open and retry the same note; fields are locked to preserve its key and payload.</p>`}
+      ${save.error && html`<${ErrorState} error=${save.error} onRetry=${create} />`}
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

@@ -1234,7 +1234,7 @@ pub(crate) struct BearerTargetMemo {
     resolved: HashMap<String, (String, usize)>,
 }
 
-async fn authorization_target_with<E: DomainStatementExecutor>(
+pub(crate) async fn authorization_target_with<E: DomainStatementExecutor>(
     state: &mut E,
     record_id: &str,
     include_initial_tombstone: bool,
@@ -1615,6 +1615,7 @@ pub(crate) async fn replace_explicit_policy_on_with_reason(
     reason: &str,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<crate::policy::PolicyEventRow> {
+    crate::persona::require_unregistered(tx, record_id, "manage_record_policy").await?;
     crate::policy::validate_authored_actor(actor)?;
     let entries = normalize_entries(entries)?;
     let exists: bool = sqlx::query_scalar(
@@ -1672,6 +1673,7 @@ pub(crate) async fn restore_inheritance_on_with_reason(
     reason: &str,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<crate::policy::PolicyEventRow> {
+    crate::persona::require_unregistered(tx, record_id, "manage_record_policy").await?;
     crate::policy::validate_authored_actor(actor)?;
     if record_id == ROOT_RECORD_ID {
         return Err(Error::engine("the canonical root policy cannot inherit"));

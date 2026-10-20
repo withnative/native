@@ -12,7 +12,9 @@
 //! all. The universal snapshot tool is registered separately because its
 //! runtime mechanism is captured through [`SnapshotSourceRef`].
 
+pub mod account_config;
 pub mod alpha_tabs;
+pub mod app_undo;
 pub mod apps;
 pub mod artifact_input_cache;
 pub mod artifact_interactions;
@@ -39,11 +41,13 @@ pub mod experimental_agent_intents;
 pub mod exploration;
 pub mod export;
 pub mod facets;
+pub mod hcp;
 pub mod history;
 pub mod identity;
 pub mod instructions;
 pub mod intent;
 pub mod interventions;
+pub(crate) mod keyed_replay;
 pub mod lifecycle;
 pub mod links;
 pub mod live_scheduler;
@@ -52,7 +56,9 @@ pub mod meta;
 pub mod mint;
 pub mod observations;
 pub mod orientation;
+pub mod participants;
 pub mod policy;
+mod private_create;
 pub mod querying;
 pub mod quickstart;
 pub mod record_shape;
@@ -65,6 +71,11 @@ pub mod surface_bindings;
 pub mod tab_effect_catalogue;
 pub mod work;
 pub mod workspace_snapshot;
+
+#[cfg(test)]
+mod keyed_replay_bound_tests;
+#[cfg(test)]
+mod keyed_replay_scale_tests;
 
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -96,11 +107,13 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     history::register_history_tools(registry)?;
     identity::register_identity_tools(registry)?;
     policy::register_policy_tools(registry)?;
+    account_config::register_account_config_tool(registry)?;
     instructions::register_instruction_tools(registry)?;
     apps::register_history_app_tool(registry)?;
     links::register_link_tools(registry)?;
     relationships::register_relationship_tools(registry)?;
     messaging::register_messaging_tools(registry)?;
+    participants::register_participant_tools(registry)?;
     interventions::register_intervention_tools(registry)?;
     artifacts::register_artifact_tools(registry)?;
     surface_bindings::register_surface_binding_tools(registry)?;
@@ -124,6 +137,18 @@ pub fn register_surface_tools(registry: &mut ToolRegistry) -> Result<()> {
     intent::register_intent_tool(registry)?;
     record_shape::register_record_shape_tool(registry)?;
     canvas::register_canvas_tools(registry)?;
+    Ok(())
+}
+
+/// Install only on a host with an owned outbox or retained status service.
+/// Ordinary engine/hosted registries keep their existing discovery surface.
+pub fn register_outbox_status_tool(registry: &mut ToolRegistry) -> Result<()> {
+    registry.register(super::interactions::ToolKind::OutboxStatus,
+        "Read durable maintenance outbox status for your authenticated account. Select journal_entry, or list your entries with an exclusive cursor. Pending work is not canonical and search does not include it.",
+        serde_json::json!({"type":"object","properties":{
+            "journal_entry":{"type":"string"},"cursor":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":100}
+        },"additionalProperties":false}),
+        |_db, _caller, _args| async { Err::<serde_json::Value, _>(crate::Error::engine("hosted outbox status is unavailable on this host")) })?;
     Ok(())
 }
 
@@ -188,8 +213,8 @@ pub(crate) const REASON_DESCRIPTION: &str =
 /// identical makes the compensating-forward recovery path discoverable at the
 /// moment an agent is deciding whether an in-place write is safe.
 pub(crate) const PREVIOUS_SEQ_DESCRIPTION: &str =
-    "Returns previous_seq, the pre-write record event seq. Use get_record with \
-     as_of.content_seq to reconstruct prior state; see the lifecycle guide.";
+    "Returns previous_seq/previous_event_id (the pre-write record event). get_record \
+     as_of.content_seq or as_of.event_id reconstructs prior state; see the lifecycle guide.";
 
 /// Shared response contract for every write that allocates an act. Keeping
 /// the wording identical tells the caller, at the moment it decides what to
@@ -659,6 +684,12 @@ pub(crate) fn echo_previous_seq(mut result: Value, previous_seq: Option<i64>) ->
 
 /// Add the produced act to an existing structured write result, in the same
 /// per-tool payload position as `previous_seq`.
+///
+/// This is the engine's *internal* receipt composition: the act stays on the
+/// handler's value so `create_many`, `committed_creation` and keyed replay can
+/// consume it. Whether a caller is shown it is decided once, at the registry's
+/// dispatch return, by `counter_fence::withhold_receipt_acts` (design 08b4c21
+/// §4 S2a); owners keep it, every other footing gets the receipt without it.
 ///
 /// A write that allocated no act (an idempotent or no-op write that appended
 /// nothing canonical) omits the field entirely: `None` leaves the object

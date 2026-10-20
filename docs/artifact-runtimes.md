@@ -994,3 +994,69 @@ timeout and four-in-flight queue apply as for any on-request read.
 **Liveness.** The answer carries no revision token. An app re-reads when its
 own signal (for example a SQL pulse need) says something changed, and can
 compare `plan.provenance.render_sha256` to skip redrawing an unchanged tree.
+
+## Reading a record's body with its save digest (`records.body.current.v1`)
+
+An app tab that edits a record's body needs two things from the same moment:
+the text it will edit, and the digest a body save compares against
+(`expected_body_digest`, or `if_body_digest` on `update_record`). Reading
+them separately is unsafe. If a write lands between the two reads, the tab
+holds older text with a newer digest, and its save passes the check and
+overwrites that write. The host-named, on-request need
+`records.body.current.v1` answers both from one snapshot, so the tab no
+longer needs to hash the text itself. The consent card reads "Read the
+current text of a record you can see, with a fingerprint of that exact text,
+so the tab can tell when it changes and save against what it read (text over
+512 KiB, or very heavily escaped text, comes without the text). Read-only."
+
+It is declared as a plain string, like the other host needs:
+`{"needs": ["records.body.current.v1"], "effects": []}`. The frame asks with
+`nativeArtifact.read("records.body.current.v1", { record_id, include_body })`.
+`record_id` is 1 to 128 characters. A full id may carry surrounding
+whitespace, which is trimmed. A short reference (a unique prefix of a record
+id) is also accepted, exactly as written: the host resolves it among the
+records the viewer can see before the read runs, as for `records.changes.v1`,
+and the answer's `record_id` is the full id. A short reference with
+surrounding whitespace is not resolved, and answers `not_found`.
+`include_body` is optional, defaults to `true`, and must be a boolean. Any
+other parameter is refused `invalid_params`.
+
+**Authority.** The tab's gates (install generation, adoption, the viewer's
+View on the tab's own artifact) and its consent are checked first. The
+viewer's own View on the record, the body and its digest are then all read
+in the same read-only snapshot. The tab adds no authority.
+
+**Answer.** A record the viewer can see answers:
+
+```json
+{
+  "status": "found",
+  "record_id": "<id>",
+  "body_digest": "<64 lowercase hex>",
+  "body_bytes": 1234,
+  "body": "<text> | null",
+  "body_omitted": "not_requested | too_large"
+}
+```
+
+- **`body_digest`** is the lowercase hex SHA-256 of the body text, with an
+  absent body counted as empty. It is the same digest `get_record` reports
+  and body saves compare.
+- **`body_bytes`** is the body's length in UTF-8 bytes.
+- **`body_omitted`** appears only when `body` is `null`:
+  - `not_requested` when `include_body` is `false`. This is a cheap change
+    probe: equal digests mean an unchanged body.
+  - `too_large` when the body is over 524,288 bytes (the body-set maximum),
+    or when its JSON escaping would pass the bridge's 786,432-character
+    answer budget. Text heavy in quotes, backslashes or control characters
+    can do that well under 512 KiB. Read the body page by page with `records.body.read.v1`
+    instead; the digest and size still come back.
+
+A record the viewer cannot see, a deleted one and a missing one all answer
+the same `{"status": "not_found", "record_id": "<id>"}`. The answer carries
+no sequence or revision counter: compare digests.
+
+**Batching.** In a batched `live_read` (`reads: [...]`) these items run in
+the host group, on the same read-only snapshot as the batch's gate. A tab
+opening a document can therefore ask for its page data and its body with
+digest in one round trip.

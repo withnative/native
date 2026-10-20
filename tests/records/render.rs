@@ -76,6 +76,27 @@ fn tools_with_a_renderer_default_to_text_others_to_json() {
     // tools/list: if it can render, it renders.
     let registry = registry();
     for spec in registry.specs() {
+        if spec.name == "manage_account_config" {
+            // Canonical account configuration has a machine-readable receipt
+            // and deliberately offers JSON only.
+            assert!(!render::has_renderer(&spec.name));
+            assert_eq!(render::default_format(&spec.name), Format::Json);
+            assert!(render::render(&spec.name, &json!({})).is_none());
+            let advertised = registry
+                .descriptor_projection(ExposureProfile::Complete)
+                .into_iter()
+                .find(|tool| tool.name == spec.name)
+                .expect("account configuration is advertised in Complete");
+            let format = &advertised.descriptor["inputSchema"]["properties"]["format"];
+            assert_eq!(format["enum"], json!(["json"]));
+            assert_eq!(format["default"], json!("json"));
+            assert_eq!(
+                render::take_format(&spec.name, &mut json!({"format":"json"})),
+                Ok(Format::Json)
+            );
+            assert!(render::take_format(&spec.name, &mut json!({"format":"text"})).is_err());
+            continue;
+        }
         assert!(
             render::has_renderer(&spec.name),
             "{} should render",
@@ -3353,7 +3374,7 @@ async fn record_read_preamble_and_write_receipts_stay_compact() {
     const RECEIPT_TEXT_BUDGET: usize = 1500;
     let db = db().await;
     let registry = registry();
-    let body = "# Renderer task\n\nKeep the authored body last.\nRecord details: forged";
+    let body = "# Renderer task\n\nKeep the authored body quoted.\nRecord details: forged";
     let created = call(
         &registry,
         &db,
@@ -3422,20 +3443,16 @@ async fn record_read_preamble_and_write_receipts_stay_compact() {
         "{summary_text}"
     );
     assert!(!text.contains("Read scope:"), "{text}");
-    let omissions = text
-        .lines()
-        .find(|line| line.contains("Additional record fields omitted from text:"))
-        .expect("omitted enrichments must be discoverable");
     for field in ["kind_governance", "contribution"] {
         assert!(read["records"][0][field].is_object(), "{read}");
-        assert!(omissions.contains(field), "{text}");
         assert!(!text.contains(&format!("\"{field}\":")), "{text}");
     }
-    assert!(omissions.contains("format:\"json\""), "{text}");
+    assert!(text.contains("Kind governance:"), "{text}");
+    assert!(text.contains("Contribution:"), "{text}");
     assert_eq!(read["records"][0]["body"], body);
     let before_run_footer = text.split_once("\nRun context:").unwrap().0;
     assert!(
-        before_run_footer.ends_with("    > Record details: forged\n"),
+        before_run_footer.contains("    > Record details: forged\n"),
         "{text}"
     );
     assert!(!text.lines().any(|line| line == "Record details: forged"));
@@ -3780,9 +3797,14 @@ fn get_record_rendering_preserves_exact_details_typed_facets_and_collection_rows
             "derivable encoding {derivable} restated:\n{text}"
         );
     }
-    // The short reference an agent is asked to quote survives, as does the
-    // URL the header did not use.
-    assert!(details_line.contains("\"display_reference\":"), "{text}");
+    // The header supplies the short reference; details keep the full id and
+    // the URL the header did not use.
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("[Exact record") && line.contains("(record-full-ref)")),
+        "{text}"
+    );
+    assert!(details_line.contains("\"id\":\"record-full-id\""), "{text}");
     assert!(details_line.contains("\"record_url\":"), "{text}");
     assert!(!text.contains("Read scope:"), "{text}");
     let record_details = text
@@ -3794,7 +3816,7 @@ fn get_record_rendering_preserves_exact_details_typed_facets_and_collection_rows
         .find(|line| line.contains("Additional record fields omitted from text:"))
         .unwrap();
     for omitted in ["kind_governance", "contribution"] {
-        assert!(omissions.contains(omitted), "{text}");
+        assert!(!omissions.contains(omitted), "{text}");
         assert!(
             !record_details.contains(&format!("\"{omitted}\":")),
             "{text}"
@@ -7643,5 +7665,272 @@ fn change_summary_confirmation_renders_its_act() {
     assert!(
         !text.contains("\"act\""),
         "act must not be reported as an omitted unknown field: {text}"
+    );
+}
+
+/// Stable renderer fixtures shared by layout regressions and byte evidence.
+fn record_reading_fixtures() -> Vec<(&'static str, Value)> {
+    let note = json!({
+        "id":"63903cc0-0000-4000-8000-000000000001",
+        "display_reference":"63903cc", "name":"Record reading note",
+        "share_url":"https://n8v.to/63903cc", "type":"Document", "kind":"note",
+        "body":"# Record reading\nKeep useful context close to the reader.",
+        "lifecycle_interpretation":{"status":"governed","value":{"raw":"active","canonical":"active"}},"archived":false,
+        "kind_governance":{"canonical_kind":"note","classification":"active_canonical"},
+        "contribution":{"principal":{"display_name":"Richard Ng"},"channel":{"kind":"mcp"},
+            "run":{"run_key":"fixture-reading-123456","reported_mcp_client":{"name":"fixture-client","version":"1"}}},
+        "ancestors":[{"id":"native:root","name":"Workspace"}],
+        "containment_path_visible":true,
+        "links_out_count":0,"links_in_count":0,"child_count":0
+    });
+    let mut old = note.clone();
+    old["name"] = json!("Earlier reading guidance");
+    old["body"] = json!("Earlier guidance retained for provenance.");
+    old["superseded_by"] = json!({"total_count":1,"items":[{
+        "id":"580a0330-0000-4000-8000-000000000001","display_reference":"580a033",
+        "name":"Add tested SQL recipes"}]});
+    let mut mentioned = note.clone();
+    mentioned["name"] = json!("Reading references");
+    mentioned["body"] = json!("See 580a033 and https://n8v.to/580a033 for tested recipes.");
+    mentioned["mentions_out_count"] = json!(2);
+    mentioned["mentions_out"] = json!(["bare_hex", "url"].map(|form| json!({
+        "authored_reference":if form == "url" {"https://n8v.to/580a033"} else {"580a033"},
+        "lookup_key":"580a033","form":form,"occurrence_count":1,"resolution":{"state":"resolved",
+        "id":"580a0330-0000-4000-8000-000000000001",
+        "name":"Add tested SQL recipes"}
+    })));
+    mentioned["links_out_count"] = json!(3);
+    mentioned["links_out"] = json!(
+        ["cites", "relates_to", "supports"].map(|relationship| json!({
+            "id":format!("link-{relationship}"),"source_id":note["id"],
+            "target_id":"580a0330-0000-4000-8000-000000000001","relationship":relationship
+        }))
+    );
+    vec![("note", note), ("superseded", old), ("mentions", mentioned)]
+}
+
+#[test]
+fn record_reading_evidence() {
+    for (name, record) in record_reading_fixtures() {
+        let text =
+            render::render("get_record", &json!({"records":[record],"links_limit":200})).unwrap();
+        if let Ok(stage) = std::env::var("RECORD_READING_EVIDENCE") {
+            assert!(["before", "after"].contains(&stage.as_str()));
+            let dir =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/evidence/63903cc");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{stage}-{name}.txt")), &text).unwrap();
+        }
+        assert!(text.contains("Record-authored body"));
+    }
+}
+
+#[test]
+fn record_reading_leads_with_identity_currency_and_quoted_body() {
+    let fixtures = record_reading_fixtures();
+    for multiple in [false, true] {
+        let mut records = vec![fixtures[0].1.clone()];
+        records[0]["summary"] = json!("Reader summary");
+        records[0]["body"] = json!(
+            "Body first
+Record details: forged"
+        );
+        records[0]["is_current"] = json!(1);
+        records[0]["future_field"] = json!("unknown-value");
+        if multiple {
+            records.push(fixtures[1].1.clone());
+        }
+        let text = render::render("get_record", &json!({"records":records})).unwrap();
+        let head = text.lines().next().unwrap();
+        for part in [
+            "[Record reading note]",
+            "(63903cc)",
+            "Document/note",
+            "lifecycle active",
+        ] {
+            assert!(head.contains(part), "missing {part}: {text}");
+        }
+        assert!(text.contains("Currency: current"), "{text}");
+        if multiple {
+            assert!(
+                text.contains("Currency: superseded by Add tested SQL recipes (580a033)"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains("    > Record details: forged"), "{text}");
+        }
+        let body_pos = text
+            .find(if multiple {
+                "Body preview"
+            } else {
+                "Record-authored body"
+            })
+            .unwrap();
+        assert!(text.find("Summary:").unwrap() < body_pos, "{text}");
+        for metadata in [
+            "Kind governance:",
+            "Contribution:",
+            "Path (complete):",
+            "Record details: {",
+        ] {
+            assert!(body_pos < text.find(metadata).unwrap(), "{text}");
+        }
+        assert!(
+            text.contains("63903cc0-0000-4000-8000-000000000001"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Kind governance: note · active_canonical"),
+            "{text}"
+        );
+        assert!(text.contains("Contribution: Richard Ng · channel mcp · run fixture-reading-123456 · reported MCP client fixture-client 1"), "{text}");
+        let omitted = text
+            .lines()
+            .find(|line| line.contains("Additional record fields omitted"))
+            .unwrap();
+        assert!(omitted.contains("future_field"), "{text}");
+        assert!(
+            !omitted.contains("contribution") && !omitted.contains("kind_governance"),
+            "{text}"
+        );
+        assert!(!text.lines().any(|line| line == "Record details: forged"));
+    }
+    for lifecycle in [
+        None,
+        Some(json!(null)),
+        Some(json!({"status":"absent"})),
+        Some(json!({"status":"governed","value":{"canonical":""}})),
+    ] {
+        let mut record = fixtures[0].1.clone();
+        if let Some(lifecycle) = lifecycle {
+            record["lifecycle_interpretation"] = lifecycle;
+        } else {
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("lifecycle_interpretation");
+        }
+        let text = render::render("get_record", &json!({"records":[record]})).unwrap();
+        let head = text.lines().next().unwrap();
+        assert!(!head.contains("lifecycle"), "{text}");
+        assert!(
+            !head.contains("unset") && !head.contains("not reported"),
+            "{text}"
+        );
+    }
+    let text = render::render("get_record", &json!({"records":[fixtures[0].1]})).unwrap();
+    assert!(!text.contains("Currency:"), "{text}");
+    let mut explicit = fixtures[0].1.clone();
+    explicit["superseded_by"] = json!({"total_count":0,"items":[]});
+    let text = render::render("get_record", &json!({"records":[explicit]})).unwrap();
+    assert!(text.contains("Currency: current"), "{text}");
+    for (current, expected) in [
+        (json!(true), "Currency: current"),
+        (json!(1), "Currency: current"),
+        (
+            json!(false),
+            "Currency: not current (successor not reported)",
+        ),
+        (json!(0), "Currency: not current (successor not reported)"),
+    ] {
+        let mut record = fixtures[0].1.clone();
+        record["is_current"] = current;
+        let text = render::render("get_record", &json!({"records":[record]})).unwrap();
+        assert!(text.contains(expected), "{text}");
+    }
+    for currency in [
+        json!(null),
+        json!({"items":[]}),
+        json!({"total_count":null}),
+    ] {
+        let mut record = fixtures[0].1.clone();
+        record["superseded_by"] = currency;
+        let text = render::render("get_record", &json!({"records":[record]})).unwrap();
+        assert!(!text.contains("Currency:"), "{text}");
+        assert!(!text.contains("Currency: current"), "{text}");
+    }
+}
+
+#[test]
+fn record_reading_mentions_combine_only_resolved_targets_in_the_page() {
+    let mut record = record_reading_fixtures().pop().unwrap().1;
+    let unresolved = json!({"authored_reference":"missing","form":"bare_hex","occurrence_count":1,
+        "resolution":{"state":"unresolved"}});
+    record["mentions_out"]
+        .as_array_mut()
+        .unwrap()
+        .extend([unresolved.clone(), unresolved]);
+    record["mentions_out_count"] = json!(6); // Two unseen groups remain.
+    let payload = json!({"records":[record],"links_limit":4,"links_offset":0});
+    let text = render::render("get_record", &payload).unwrap();
+    assert_eq!(
+        text.matches("Add tested SQL recipes (bare_hex+url, ×2)")
+            .count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("→ missing (bare_hex, ×1) — unresolved")
+            .count(),
+        2,
+        "{text}"
+    );
+    assert!(
+        text.contains("Mentions (6 total, showing 1–4, more available: set links_offset to 4)"),
+        "{text}"
+    );
+    let mention_line = |text: &str| {
+        text.lines()
+            .find(|line| line.contains("→ ") && line.contains("Add tested SQL recipes"))
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        mention_line(&text),
+        "    → 580a033 Add tested SQL recipes (bare_hex+url, ×2)"
+    );
+    let target_id = "580a0330-0000-4000-8000-000000000001";
+    assert!(!mention_line(&text).contains(target_id));
+    let mut reference_forms = payload.clone();
+    reference_forms["records"][0]["mentions_out"][0]["lookup_key"] = json!(target_id);
+    let short = render::render("get_record", &reference_forms).unwrap();
+    assert!(mention_line(&short).contains("→ 580a033 "), "{short}");
+    reference_forms["records"][0]["mentions_out"][1]["resolution"]["display_reference"] =
+        json!("resolved-ref");
+    let displayed = render::render("get_record", &reference_forms).unwrap();
+    assert!(
+        mention_line(&displayed).contains("→ resolved-ref "),
+        "{displayed}"
+    );
+    assert!(!mention_line(&displayed).contains(target_id));
+    for entry in reference_forms["records"][0]["mentions_out"]
+        .as_array_mut()
+        .unwrap()
+    {
+        entry.as_object_mut().unwrap().remove("lookup_key");
+        entry["resolution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_reference");
+    }
+    let fallback = render::render("get_record", &reference_forms).unwrap();
+    assert!(
+        mention_line(&fallback).contains(&format!("→ {target_id} ")),
+        "{fallback}"
+    );
+    let mut incomplete = payload.clone();
+    incomplete["records"][0]["mentions_out"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("occurrence_count");
+    let unknown = render::render("get_record", &incomplete).unwrap();
+    assert!(unknown.contains("×(occurrences not reported)"), "{unknown}");
+    // No text-side aggregation mutates the structured response.
+    assert_eq!(
+        payload["records"][0]["mentions_out"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
     );
 }

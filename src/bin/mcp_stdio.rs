@@ -13,6 +13,7 @@
 //! revalidates an immutable generation from the configured replica store and
 //! opens every SQLite pool physically read-only without startup reconciliation.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -20,7 +21,8 @@ use native_ce::db::DatabaseOpenMode;
 use native_ce::export::{ExportCoordinator, LocalSnapshotSource};
 use native_ce::identity::resolve_stdio_account_identity;
 use native_ce::mcp::standby_stdio::{
-    resolve_standby_account_identity, StandbySessionConfig, StandbyStdioSession,
+    resolve_standby_account_identity, standby_startup_status, StandbySessionConfig,
+    StandbyStdioSession,
 };
 use native_ce::mcp::{
     register_allowlisted_experimental_tools, register_build_enabled_experimental_tools,
@@ -33,9 +35,9 @@ use native_ce::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
 #[cfg(feature = "postgres")]
 use native_ce::postgres::{register_postgres_tools, PostgresRuntimeConfig};
 use native_ce::standby::{
-    observe_installed_consumer_identity, GenerationStore, RefreshCause, StandbyRefreshConfig,
-    StandbyRefreshController, StandbyRefreshOutcome, StandbyRuntimeConfig, StandbyStartupOutcome,
-    StandbyStatusOnly, StandbyStatusProvider,
+    observe_installed_consumer_identity, start_background_refresh_with_store, GenerationStore,
+    RefreshCause, StandbyRefreshConfig, StandbyRefreshController, StandbyRefreshOutcome,
+    StandbyRuntimeConfig, StandbyStatusOnly, StandbyStatusProvider,
 };
 #[cfg(feature = "turso-local")]
 use native_ce::turso_local::{register_turso_local_tools, TursoLocalRuntimeConfig};
@@ -60,28 +62,138 @@ fn print_standby_identity() -> ExitCode {
             println!("{identity}");
             ExitCode::SUCCESS
         }
+        Err(_) => {
+            eprintln!("mcp-stdio: cannot observe standby identity");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Probe-only local kernel MCP server. Explicit binding replaces the v1 owner
+/// discovery (v2 has no portable-account registry). Never initializes a file.
+#[cfg(feature = "v2-kernel-probe")]
+async fn run_kernel_v2(args: &[String]) -> ExitCode {
+    async fn serve(args: &[String]) -> native_ce::Result<()> {
+        let [flag, binding, path] = args else {
+            return Err(native_ce::Error::engine(
+                "usage: mcp-stdio --kernel-v2 --account <auth_binding> <existing-v2.db>",
+            ));
+        };
+        if flag != "--account" || binding.is_empty() || !std::path::Path::new(path).is_file() {
+            return Err(native_ce::Error::engine(
+                "kernel-v2 requires --account <auth_binding> and an existing database file",
+            ));
+        }
+        let db = native_ce::kernel::open_v2_database(path).await?;
+        let result = async {
+            let caller = Caller::authenticated(binding.clone());
+            // Check the principal before exposing the local read server.
+            if native_ce::kernel::resolve_caller_principal_by_binding(&db, binding).await?.is_none() {
+                return Err(native_ce::Error::engine("kernel-v2: caller has no principal auth_binding"));
+            }
+            let mut registry = ToolRegistry::new();
+            native_ce::mcp::register_builtin_tools(&mut registry)?;
+            native_ce::mcp::tools::register_surface_tools(&mut registry)?;
+            native_ce::mcp::kernel_v2::register_kernel_v2_tools(&mut registry)?;
+            eprintln!("mcp-stdio: kernel-v2 probe; ordinary MCP reads, writes, search and coordination; runs and receipts persisted");
+            StdioServer::new(Arc::new(registry), native_ce::mcp::registry::EngineHandle::KernelV2(db.clone()), caller).serve_stdio().await
+        }.await;
+        db.close().await;
+        result
+    }
+    match serve(args).await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mcp-stdio: cannot observe standby identity: {error}");
+            eprintln!("mcp-stdio: {error}");
             ExitCode::FAILURE
         }
     }
 }
 
 const USAGE: &str =
-    "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json> | mcp-stdio --member-copy <path-to-member-copy-config.json>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_MEMBER_COPY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT; member-copy derives its account from the authenticated owner binding and rejects --account/NATIVE_CE_ACCOUNT)";
+    "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json> | mcp-stdio --member-copy <path-to-member-copy-config.json> | mcp-stdio node serve --config <file> | mcp-stdio node connect --socket <path>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_MEMBER_COPY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT; member-copy derives its account from the authenticated owner binding and rejects --account/NATIVE_CE_ACCOUNT)";
 const ENV_MCP_SURFACE: &str = "NATIVE_CE_MCP_SURFACE";
 const ENV_STANDBY_REFRESH_CONFIG: &str = "NATIVE_CE_STANDBY_REFRESH_CONFIG";
 const ENV_MEMBER_COPY_CONFIG: &str = "NATIVE_CE_MEMBER_COPY_CONFIG";
 
-struct BackgroundRefresh {
-    shutdown: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<()>,
+/// Usage line for the one-shot refresh form, including the optional automatic
+/// cause selector. Kept separate from [`USAGE`] because it is only reached by
+/// `--standby-refresh`, not by the serving invocations.
+const STANDBY_REFRESH_USAGE: &str = "usage: mcp-stdio --standby-refresh <standby-config.json> <refresh-config.json> [--cause scheduled|after_admitted_write|network_recovery|wake]";
+
+/// Automatic causes the one-shot `--standby-refresh` CLI may select. The legacy
+/// two-positional form stays [`RefreshCause::Manual`]; `manual` is deliberately
+/// not a selectable token, so an automatic hint can never inherit Manual's
+/// whole-snapshot interval bypass.
+const STANDBY_REFRESH_AUTOMATIC_CAUSES: &[(&str, RefreshCause)] = &[
+    ("scheduled", RefreshCause::Scheduled),
+    ("after_admitted_write", RefreshCause::AfterAdmittedWrite),
+    ("network_recovery", RefreshCause::NetworkRecovery),
+    ("wake", RefreshCause::Wake),
+];
+
+/// Parse the one-shot `--standby-refresh` arguments before any configuration is
+/// read or a controller or network client is created. The legacy two-positional
+/// invocation is preserved exactly: its cause defaults to [`RefreshCause::Manual`].
+fn parse_standby_refresh_args(
+    args: &[String],
+) -> std::result::Result<(PathBuf, PathBuf, RefreshCause), String> {
+    let mut positionals: Vec<&String> = Vec::new();
+    let mut cause: Option<RefreshCause> = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--cause" {
+            if cause.is_some() {
+                return Err("--cause may be given only once".into());
+            }
+            let Some(value) = args.get(index + 1) else {
+                return Err("--cause requires a value".into());
+            };
+            cause = Some(
+                STANDBY_REFRESH_AUTOMATIC_CAUSES
+                    .iter()
+                    .find(|(name, _)| name == value)
+                    .map(|(_, cause)| *cause)
+                    .ok_or_else(|| {
+                        let supported = STANDBY_REFRESH_AUTOMATIC_CAUSES
+                            .iter()
+                            .map(|(name, _)| *name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("unsupported --cause; expected one of: {supported}")
+                    })?,
+            );
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--") {
+            return Err("unrecognized standby refresh option".into());
+        }
+        positionals.push(argument);
+        index += 1;
+    }
+    if positionals.len() != 2 {
+        return Err(STANDBY_REFRESH_USAGE.into());
+    }
+    Ok((
+        PathBuf::from(positionals[0]),
+        PathBuf::from(positionals[1]),
+        cause.unwrap_or(RefreshCause::Manual),
+    ))
 }
 
-impl BackgroundRefresh {
-    async fn stop(self) {
-        let _ = self.shutdown.send(true);
-        let _ = self.task.await;
+/// The human label for a refresh cause in one-shot diagnostics. [`RefreshCause::Manual`]
+/// keeps its existing wording so the desktop classifier is unaffected; the
+/// automatic causes are named honestly rather than mislabelled `manual`.
+fn standby_refresh_cause_label(cause: RefreshCause) -> &'static str {
+    match cause {
+        RefreshCause::Startup => "startup",
+        RefreshCause::Scheduled => "scheduled",
+        RefreshCause::Wake => "wake",
+        RefreshCause::NetworkRecovery => "network recovery",
+        RefreshCause::Manual => "manual",
+        RefreshCause::AfterAdmittedWrite => "after-admitted-write",
     }
 }
 
@@ -276,17 +388,34 @@ fn member_copy_controller_conflict(
             || non_empty(turso_config))
 }
 
+/// The caller for the default SQLite stdio path. Whoever operates the local
+/// database file is its owner, so this carries the narrow local-owner marker
+/// (owner counter footing only); it is not `trusted_local`.
+fn sqlite_owner_caller(account: String) -> Caller {
+    Caller::local_owner(account).with_channel(native_ce::provenance::Channel::Mcp)
+}
+
 fn sqlite_surface(configured: McpSurfaceMode, open_mode: DatabaseOpenMode) -> McpSurfaceMode {
     match open_mode {
         DatabaseOpenMode::ReadWrite => configured,
         // Standby keeps the configured surface. An Executor surface over a
         // verified standby engine selects `new_standby_read_only`, which
         // constructs no plan store or telemetry; an explicit Legacy surface
-        // serves the native surface unchanged.
-        DatabaseOpenMode::StandbyReadOnly => configured,
+        // serves the native surface unchanged. Lean narrows only the
+        // writable ordinary catalogue, so a standby keeps the executor
+        // standby projection.
+        DatabaseOpenMode::StandbyReadOnly => read_only_surface(configured),
         // A member copy is a read-only local surface; keep the configured
         // surface as standby does.
-        DatabaseOpenMode::MemberReadOnly => configured,
+        DatabaseOpenMode::MemberReadOnly => read_only_surface(configured),
+    }
+}
+
+/// Read-only local surfaces (standby, member copy) are unchanged by lean.
+fn read_only_surface(configured: McpSurfaceMode) -> McpSurfaceMode {
+    match configured {
+        McpSurfaceMode::Lean => McpSurfaceMode::Executor,
+        surface => surface,
     }
 }
 
@@ -334,9 +463,56 @@ fn validate_turso_selection(
     Ok(())
 }
 
+fn main() -> ExitCode {
+    #[cfg(unix)]
+    {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        if args.first().is_some_and(|argument| argument == "node")
+            && args.get(1).is_some_and(|argument| argument == "connect")
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("cannot build node shim runtime");
+            let result = runtime.block_on(native_ce::node::run_cli(&args[1..]));
+            // Tokio stdin uses an uncancellable blocking read. A node EOF must
+            // still let this stateless shim exit while the agent holds stdin open.
+            runtime.shutdown_background();
+            return match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("mcp-stdio node: configuration or transport failed: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+    main_async()
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+async fn main_async() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "v2-kernel-probe")]
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--kernel-v2")
+    {
+        return run_kernel_v2(&args[1..]).await;
+    }
+    #[cfg(unix)]
+    if args.first().is_some_and(|argument| argument == "node") {
+        if args.get(1).is_some_and(|argument| argument == "serve") {
+            enable_bounded_verification_diagnostics();
+        }
+        return match native_ce::node::run_cli(&args[1..]).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("mcp-stdio node: configuration or transport failed: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args
         .first()
         .is_some_and(|argument| argument == "--standby-identity")
@@ -351,7 +527,7 @@ async fn main() -> ExitCode {
         .first()
         .is_some_and(|argument| argument == "--standby-refresh")
     {
-        return run_manual_standby_refresh(&args[1..]).await;
+        return run_standby_refresh_once(&args[1..]).await;
     }
     let standby_requested = args.iter().any(|argument| argument == "--standby");
     let surface = match configured_surface(std::env::var(ENV_MCP_SURFACE).ok()) {
@@ -362,7 +538,7 @@ async fn main() -> ExitCode {
         }
     };
     #[cfg(not(feature = "mcp-executor-prototype"))]
-    if surface == McpSurfaceMode::Executor {
+    if surface.serves_executors() {
         eprintln!(
             "mcp-stdio: executor MCP surface is not included in this build; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
         );
@@ -442,7 +618,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
     if let Some(config_path) = turso_config {
-        if surface == McpSurfaceMode::Executor {
+        if surface.serves_executors() {
             eprintln!(
                 "mcp-stdio: executor write plans are not qualified for Turso-local stdio; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
             );
@@ -470,7 +646,7 @@ async fn main() -> ExitCode {
         }
     }
     if let Some(config_path) = postgres_config {
-        if surface == McpSurfaceMode::Executor {
+        if surface.serves_executors() {
             eprintln!(
                 "mcp-stdio: executor write plans are not qualified for Postgres stdio; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
             );
@@ -543,7 +719,7 @@ async fn main() -> ExitCode {
         return run_connected_standby(
             &path,
             selected_account,
-            surface,
+            read_only_surface(surface),
             profile,
             experimental_executors,
             standby_refresh_config.as_deref(),
@@ -609,14 +785,27 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let registry = Arc::new(registry);
-    let caller = Caller::authenticated(account).with_channel(native_ce::provenance::Channel::Mcp);
+    let sql_commit = match std::env::var("NATIVE_CE_SQLITE_SQL_COMMIT").ok().as_deref() {
+        None | Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        Some(_) => {
+            eprintln!("mcp-stdio: NATIVE_CE_SQLITE_SQL_COMMIT must be true/false or 1/0");
+            return ExitCode::FAILURE;
+        }
+    };
+    if sql_commit && (open_mode != DatabaseOpenMode::ReadWrite || surface == McpSurfaceMode::Legacy)
+    {
+        eprintln!("mcp-stdio: SQL commit requires the writable local executor surface");
+        return ExitCode::FAILURE;
+    }
+    let caller = sqlite_owner_caller(account);
     let outcome = match sqlite_surface(surface, open_mode) {
         McpSurfaceMode::Legacy => {
             StdioServer::new(registry, db.clone(), caller)
                 .serve_stdio()
                 .await
         }
-        McpSurfaceMode::Executor => {
+        surface @ (McpSurfaceMode::Executor | McpSurfaceMode::Lean) => {
             #[cfg(feature = "mcp-executor-prototype")]
             {
                 if open_mode == DatabaseOpenMode::StandbyReadOnly {
@@ -635,17 +824,25 @@ async fn main() -> ExitCode {
                 } else {
                     match ExecutorTelemetryContext::structured_log() {
                         Ok(telemetry) => {
-                            match ExecutorPrototypeStdioServer::new_with_telemetry_and_experimental(
+                            match ExecutorPrototypeStdioServer::new_for_surface(
                                 registry,
                                 db.clone(),
                                 caller,
                                 None,
-                                telemetry,
+                                Some(telemetry),
                                 experimental_executors,
+                                surface,
                             )
                             .await
                             {
-                                Ok(server) => server.serve_stdio().await,
+                                Ok(server) => match if sql_commit {
+                                    server.with_local_sql_commit()
+                                } else {
+                                    Ok(server)
+                                } {
+                                    Ok(server) => server.serve_stdio().await,
+                                    Err(error) => Err(error),
+                                },
                                 Err(error) => Err(error),
                             }
                         }
@@ -654,7 +851,10 @@ async fn main() -> ExitCode {
                 }
             }
             #[cfg(not(feature = "mcp-executor-prototype"))]
-            unreachable!("executor availability was checked before opening the database")
+            {
+                let _ = surface;
+                unreachable!("executor availability was checked before opening the database")
+            }
         }
     };
     exports.drain().await;
@@ -668,14 +868,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run_connected_standby(
-    path: &str,
-    selected_account: Option<String>,
-    surface: McpSurfaceMode,
-    profile: ExposureProfile,
-    experimental: ExperimentalExecutors,
-    refresh_config_path: Option<&str>,
-) -> ExitCode {
+fn enable_bounded_verification_diagnostics() {
     use tracing_subscriber::prelude::*;
     // Keep protocol stdout untouched and emit only aggregate verification.
     tracing_subscriber::registry()
@@ -685,21 +878,33 @@ async fn run_connected_standby(
                 .with_ansi(false)
                 .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
                     metadata.target() == "native_ce::standby::verification"
+                        || metadata.target() == "native_ce::standby::vault"
                 })),
         )
         .init();
     native_ce::standby::enable_bounded_verification_diagnostics();
+}
+
+async fn run_connected_standby(
+    path: &str,
+    selected_account: Option<String>,
+    surface: McpSurfaceMode,
+    profile: ExposureProfile,
+    experimental: ExperimentalExecutors,
+    refresh_config_path: Option<&str>,
+) -> ExitCode {
+    enable_bounded_verification_diagnostics();
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("mcp-stdio: cannot read standby runtime config: {error}");
+        Err(_) => {
+            eprintln!("mcp-stdio: cannot read standby runtime config");
             return ExitCode::FAILURE;
         }
     };
     let config = match StandbyRuntimeConfig::from_json(&bytes) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("mcp-stdio: {error}");
+        Err(_) => {
+            eprintln!("mcp-stdio: invalid standby runtime config");
             return ExitCode::FAILURE;
         }
     };
@@ -709,15 +914,15 @@ async fn run_connected_standby(
         Some(config.origin_database_id.clone()),
     ) {
         Ok(store) => store,
-        Err(error) => {
-            eprintln!("mcp-stdio: cannot open standby generation store: {error}");
+        Err(_) => {
+            eprintln!("mcp-stdio: cannot open standby generation store");
             return ExitCode::FAILURE;
         }
     };
     let observed = match observe_installed_consumer_identity() {
         Ok(observed) => observed,
-        Err(error) => {
-            eprintln!("mcp-stdio: standby consumer identity unavailable: {error}");
+        Err(_) => {
+            eprintln!("mcp-stdio: standby consumer identity unavailable");
             let provider = StandbyStatusProvider::for_status_only_reason(
                 config,
                 store,
@@ -745,26 +950,20 @@ async fn run_connected_standby(
     let mut refresh_available = refresh_configured;
     let mut background_refresh = None;
     if let Some(refresh_config_path) = refresh_config_path {
-        match start_background_refresh(&config, &observed, refresh_config_path).await {
-            Ok(refresh) => background_refresh = refresh,
+        match start_background_refresh_with_store(
+            &config,
+            &observed,
+            refresh_config_path,
+            store.clone(),
+        ) {
+            Ok(refresh) => background_refresh = Some(refresh),
             Err(_) => {
                 refresh_available = false;
                 eprintln!("mcp-stdio: standby refresh is unavailable");
             }
         }
     }
-    let status = match &startup {
-        StandbyStartupOutcome::Serving(_) => StandbyStatusOnly {
-            reason: "startup_readiness_pending".into(),
-            candidate_count: 0,
-            unusable_candidate_count: 0,
-        },
-        StandbyStartupOutcome::StatusOnly(status) => StandbyStatusOnly {
-            reason: status.reason.into(),
-            candidate_count: status.candidate_count,
-            unusable_candidate_count: status.unusable_candidate_count,
-        },
-    };
+    let status = standby_startup_status(&startup);
     let provider = StandbyStatusProvider::for_status_only_reason(
         config.clone(),
         store.clone(),
@@ -796,17 +995,7 @@ async fn run_connected_standby(
             return ExitCode::FAILURE;
         }
     };
-    if let StandbyStartupOutcome::Serving(active) = startup {
-        if active.startup_reason.is_some() {
-            eprintln!("mcp-stdio: standby startup recovered with a fallback");
-        }
-        if !active.retention_warnings.is_empty() {
-            eprintln!("mcp-stdio: standby retention warnings present");
-        }
-        if session.install_startup(*active).await.is_err() {
-            eprintln!("mcp-stdio: standby startup readiness unavailable; retaining status-only");
-        }
-    }
+    session.install_startup_outcome(startup).await;
     let outcome = session.serve_stdio().await;
     if let Some(refresh) = background_refresh {
         refresh.stop().await;
@@ -826,51 +1015,46 @@ async fn serve_status_only(provider: StandbyStatusProvider) -> ExitCode {
         .await
     {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("mcp-stdio: {error}");
+        Err(_) => {
+            eprintln!("mcp-stdio: standby configuration or transport failed");
             ExitCode::FAILURE
         }
     }
 }
 
-async fn start_background_refresh(
-    runtime: &StandbyRuntimeConfig,
-    observed: &native_ce::standby_snapshot::ObservedInstalledConsumerIdentity,
-    refresh_config_path: &str,
-) -> native_ce::Result<Option<BackgroundRefresh>> {
-    let bytes = std::fs::read(refresh_config_path)?;
-    let refresh_config = StandbyRefreshConfig::from_json(&bytes)?;
-    let store = GenerationStore::open(
-        &runtime.replica_root,
-        &runtime.hosted_route_database_id,
-        Some(runtime.origin_database_id.clone()),
-    )?;
-    let controller = Arc::new(StandbyRefreshController::new(
-        runtime.clone(),
-        refresh_config,
-        store,
-        observed.clone(),
-    )?);
-    let Some(guard) = controller.try_acquire_daemon()? else {
-        return Ok(None);
-    };
-    let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let task = tokio::spawn(async move {
-        controller.run_daemon_after_startup(guard, receiver).await;
-    });
-    Ok(Some(BackgroundRefresh { shutdown, task }))
+async fn refresh_and_report(
+    controller: &StandbyRefreshController,
+    cause: RefreshCause,
+) -> native_ce::Result<StandbyRefreshOutcome> {
+    controller
+        .refresh_or_request_with_receipt(cause)
+        .await
+        .map_err(|failure| {
+            eprintln!(
+                "mcp-stdio: standby refresh failed {}",
+                failure.receipt.diagnostic()
+            );
+            failure.source
+        })
 }
 
-async fn run_manual_standby_refresh(args: &[String]) -> ExitCode {
-    if args.len() != 2 {
-        eprintln!(
-            "mcp-stdio: --standby-refresh requires <standby-config.json> <refresh-config.json>"
-        );
-        return ExitCode::from(2);
-    }
+async fn run_standby_refresh_once(args: &[String]) -> ExitCode {
+    // Validate the whole command line before touching configuration files,
+    // the generation store, or the network. An invalid selector must cost
+    // nothing.
+    let (standby_config_path, refresh_config_path, cause) = match parse_standby_refresh_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("mcp-stdio: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    // Setup failures use static text; invocation failures use the controller receipt.
+    let mut refresh_diagnosed = false;
     let result = async {
-        let runtime = StandbyRuntimeConfig::from_json(&std::fs::read(&args[0])?)?;
-        let refresh_config = StandbyRefreshConfig::from_json(&std::fs::read(&args[1])?)?;
+        let runtime = StandbyRuntimeConfig::from_json(&std::fs::read(&standby_config_path)?)?;
+        let refresh_config =
+            StandbyRefreshConfig::from_json(&std::fs::read(&refresh_config_path)?)?;
         let observed = observe_installed_consumer_identity()?;
         let store = GenerationStore::open(
             &runtime.replica_root,
@@ -878,12 +1062,8 @@ async fn run_manual_standby_refresh(args: &[String]) -> ExitCode {
             Some(runtime.origin_database_id.clone()),
         )?;
         let controller = StandbyRefreshController::new(runtime, refresh_config, store, observed)?;
-        if let Some(_guard) = controller.try_acquire_daemon()? {
-            controller.refresh_once(RefreshCause::Manual).await
-        } else {
-            let coalesced = !controller.request_manual_refresh()?;
-            Ok(StandbyRefreshOutcome::Accepted { coalesced })
-        }
+        refresh_diagnosed = true;
+        refresh_and_report(&controller, cause).await
     }
     .await;
     match result {
@@ -901,13 +1081,38 @@ async fn run_manual_standby_refresh(args: &[String]) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+        Ok(StandbyRefreshOutcome::Deferred { generation, reason }) => {
+            eprintln!(
+                "mcp-stdio: standby generation {} unchanged; refresh deferred ({reason})",
+                generation.id
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(StandbyRefreshOutcome::Advanced {
+            generation,
+            head_act,
+        }) => {
+            eprintln!(
+                "mcp-stdio: standby generation {} advanced in place to act {head_act}",
+                generation.id
+            );
+            ExitCode::SUCCESS
+        }
         Ok(StandbyRefreshOutcome::Accepted { coalesced }) => {
             let disposition = if coalesced { "coalesced" } else { "accepted" };
-            eprintln!("mcp-stdio: standby manual refresh {disposition}");
+            eprintln!(
+                "mcp-stdio: standby {} refresh {disposition}",
+                standby_refresh_cause_label(cause)
+            );
             ExitCode::SUCCESS
         }
         Err(_) => {
-            eprintln!("mcp-stdio: standby manual refresh failed; see refresh state");
+            if !refresh_diagnosed {
+                eprintln!(
+                    "mcp-stdio: standby {} refresh setup failed: invalid or unavailable local configuration/storage",
+                    standby_refresh_cause_label(cause)
+                );
+            }
             ExitCode::FAILURE
         }
     }
@@ -1104,8 +1309,43 @@ async fn run_postgres(config_path: &str, profile: ExposureProfile) -> ExitCode {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sqlite_stdio_operator_keeps_owner_counter_footing_without_trusted_local() {
+        let caller = sqlite_owner_caller("acct:operator".to_string());
+        assert!(caller.counter_footing().is_owner());
+        assert!(!caller.is_member_copy());
+        // Not a trusted-local bypass: the credential stays the account.
+        assert_eq!(caller.credential(), "acct:operator");
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn lean_surface_is_opt_in_and_read_only_copies_keep_the_executor_projection() {
+        assert_eq!(
+            configured_surface(Some("lean".into())).unwrap(),
+            McpSurfaceMode::Lean
+        );
+        assert_eq!(
+            configured_profile_for_surface(McpSurfaceMode::Lean, Some("focused".into())).unwrap(),
+            ExposureProfile::Complete
+        );
+        // Standby and member copies keep their read-only executor projection.
+        for read_only in [
+            DatabaseOpenMode::StandbyReadOnly,
+            DatabaseOpenMode::MemberReadOnly,
+        ] {
+            assert_eq!(
+                sqlite_surface(McpSurfaceMode::Lean, read_only),
+                McpSurfaceMode::Executor
+            );
+        }
+        assert_eq!(
+            sqlite_surface(McpSurfaceMode::Lean, DatabaseOpenMode::ReadWrite),
+            McpSurfaceMode::Lean
+        );
     }
 
     #[test]
@@ -1663,5 +1903,202 @@ mod tests {
         assert!(!opted_registry
             .specs_for_profile(ExposureProfile::Focused)
             .any(|candidate| candidate.name == "sql_write"));
+    }
+
+    #[test]
+    fn one_shot_refresh_stderr_uses_current_receipt_after_lock_failure() {
+        const CHILD: &str = "NATIVE_TEST_CLI_RECEIPT_CHILD";
+        const SECRET: &str = "old-record-body-credential-SENTINEL";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::one_shot_refresh_stderr_uses_current_receipt_after_lock_failure",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.contains("mcp-stdio: standby refresh failed attempt="),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("cause=Scheduled phase=Preparation class=LocalIo"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("class=Verification"), "{stderr}");
+            assert!(!stderr.contains(SECRET), "{stderr}");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let replica = directory.path().join("replica");
+        let origin = "ndb_00000000000000000000000000000000";
+        let runtime = StandbyRuntimeConfig {
+            replica_root: replica.clone(),
+            hosted_route_database_id: "route-1".into(),
+            origin_database_id: origin.into(),
+        };
+        let config = StandbyRefreshConfig {
+            contract: "native.standby-refresh-config.v1".into(),
+            version: 1,
+            hosted_origin: "http://localhost".into(),
+            credential_file: directory.path().join("credential"),
+            refresh_interval_seconds: None,
+            full_refresh_min_interval_seconds: None,
+            full_refresh_repair_retry_seconds: None,
+        };
+        let store = GenerationStore::open(&replica, "route-1", Some(origin.into())).unwrap();
+        let observed = native_ce::standby_snapshot::ObservedInstalledConsumerIdentity {
+            platform: native_ce::standby_snapshot::StandbyConsumerPlatform::LinuxX8664,
+            source_sha: "a".repeat(40),
+            artifact_sha256: "b".repeat(64),
+            engine_schema_version: native_ce::CURRENT_ENGINE_SCHEMA_VERSION,
+            ddl_sha256: native_ce::schema::FROZEN_DDL_SHA256.into(),
+        };
+        let controller = StandbyRefreshController::new(runtime, config, store, observed).unwrap();
+        let state = native_ce::standby::StandbyRefreshState {
+            last_attempt_id: Some(uuid::Uuid::new_v4().to_string()),
+            last_attempt_at: Some("2099-01-01T00:00:00.000Z".into()),
+            last_attempt_cause: Some(RefreshCause::Manual),
+            last_failure_class: Some(native_ce::standby::RefreshFailureClass::Verification),
+            last_failure: Some(SECRET.into()),
+            last_full_failure_at: Some("2099-01-01T00:00:00.000Z".into()),
+            last_full_failure_detail: Some(SECRET.into()),
+            ..Default::default()
+        };
+        let state_path = replica.join("refresh/state.json");
+        let original = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&state_path, &original).unwrap();
+        std::fs::create_dir(replica.join("refresh/attempt.lock")).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(executor
+            .block_on(refresh_and_report(&controller, RefreshCause::Scheduled))
+            .is_err());
+        assert_eq!(std::fs::read(state_path).unwrap(), original);
+    }
+
+    #[test]
+    fn one_shot_refresh_setup_stderr_never_discloses_config_values() {
+        const CHILD: &str = "NATIVE_TEST_CLI_STDERR_CHILD";
+        const SECRET: &str = "credential-body-SENTINEL-🔐";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::one_shot_refresh_setup_stderr_never_discloses_config_values",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr.matches("refresh setup failed").count(),
+                2,
+                "{stderr}"
+            );
+            assert!(!stderr.contains(SECRET), "{stderr}");
+            assert!(stderr.len() < 1000, "{stderr}");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime_path = directory.path().join("runtime.json");
+        let refresh_path = directory.path().join("refresh.json");
+        let runtime = serde_json::json!({
+            "replica_root": directory.path().join("replica"),
+            "hosted_route_database_id":"route-1",
+            "origin_database_id":"ndb_00000000000000000000000000000000"
+        });
+        let refresh = serde_json::json!({
+            "contract":"native.standby-refresh-config.v1", "version":1,
+            "hosted_origin":"http://localhost", "credential_file": directory.path().join("credential"),
+            "refresh_interval_seconds": SECRET
+        });
+        std::fs::write(&runtime_path, serde_json::to_vec(&runtime).unwrap()).unwrap();
+        std::fs::write(&refresh_path, serde_json::to_vec(&refresh).unwrap()).unwrap();
+        let args = vec![
+            runtime_path.display().to_string(),
+            refresh_path.display().to_string(),
+        ];
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            executor.block_on(run_standby_refresh_once(&args)),
+            ExitCode::FAILURE
+        );
+        std::fs::write(&runtime_path, serde_json::to_vec(&serde_json::json!({"replica_root":SECRET,"hosted_route_database_id":true,"origin_database_id":SECRET})).unwrap()).unwrap();
+        assert_eq!(
+            executor.block_on(run_standby_refresh_once(&args)),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[test]
+    fn one_shot_refresh_defaults_to_manual_and_preserves_positionals() {
+        let (standby, refresh, cause) =
+            parse_standby_refresh_args(&strings(&["a.json", "b.json"])).unwrap();
+        assert_eq!(standby, PathBuf::from("a.json"));
+        assert_eq!(refresh, PathBuf::from("b.json"));
+        assert_eq!(cause, RefreshCause::Manual);
+    }
+
+    #[test]
+    fn one_shot_refresh_selects_each_automatic_cause_in_any_position() {
+        for (token, expected) in STANDBY_REFRESH_AUTOMATIC_CAUSES.iter().copied() {
+            let (_, _, trailing) =
+                parse_standby_refresh_args(&strings(&["a.json", "b.json", "--cause", token]))
+                    .unwrap();
+            assert_eq!(trailing, expected, "trailing {token}");
+            let (_, _, leading) =
+                parse_standby_refresh_args(&strings(&["--cause", token, "a.json", "b.json"]))
+                    .unwrap();
+            assert_eq!(leading, expected, "leading {token}");
+        }
+    }
+
+    #[test]
+    fn one_shot_refresh_rejects_invalid_selectors_and_arity() {
+        // Manual is only reachable through the legacy two-positional form.
+        assert!(
+            parse_standby_refresh_args(&strings(&["a.json", "b.json", "--cause", "manual"]))
+                .is_err()
+        );
+        assert!(
+            parse_standby_refresh_args(&strings(&["a.json", "b.json", "--cause", "soon"])).is_err()
+        );
+        assert!(parse_standby_refresh_args(&strings(&["a.json", "b.json", "--cause"])).is_err());
+        assert!(parse_standby_refresh_args(&strings(&[
+            "a.json", "b.json", "--cause", "wake", "--cause", "wake"
+        ]))
+        .is_err());
+        assert!(parse_standby_refresh_args(&strings(&["a.json", "b.json", "--verbose"])).is_err());
+        assert!(parse_standby_refresh_args(&strings(&["a.json"])).is_err());
+        assert!(parse_standby_refresh_args(&strings(&["a.json", "b.json", "c.json"])).is_err());
+    }
+
+    #[test]
+    fn one_shot_refresh_labels_keep_manual_wording() {
+        assert_eq!(standby_refresh_cause_label(RefreshCause::Manual), "manual");
+        assert_ne!(
+            standby_refresh_cause_label(RefreshCause::AfterAdmittedWrite),
+            "manual"
+        );
     }
 }

@@ -743,6 +743,12 @@ mod tests {
             "SELECT count(*) AS n FROM schema_config_json_nodes WHERE 0",
             "SELECT * FROM schema_config_json_nodes WHERE 0 ORDER BY ordinal LIMIT 0",
             "SELECT EXISTS(SELECT 1 FROM schema_config_json_nodes) AS n",
+            "SELECT facet_id FROM facet_value_json_nodes",
+            "SELECT count(*) AS n FROM facet_value_json_nodes",
+            "SELECT observation_id FROM facet_observation_json_nodes",
+            "SELECT count(*) AS n FROM facet_observation_json_nodes",
+            "SELECT record_id FROM record_body_json_nodes",
+            "SELECT count(*) AS n FROM record_body_json_nodes",
             "SELECT ordinal FROM effective_relationship_endpoints",
             "SELECT count(*) AS n FROM effective_relationship_endpoints",
             "SELECT count(*) AS n FROM actors",
@@ -772,6 +778,12 @@ mod tests {
             "WITH schema_config_json_nodes AS (SELECT 1 AS x) SELECT x FROM schema_config_json_nodes",
             "SELECT 'effective_relationship_endpoints' AS v",
             "WITH effective_relationship_endpoints AS (SELECT 1 AS x) SELECT x FROM effective_relationship_endpoints",
+            "SELECT 'facet_value_json_nodes' AS v",
+            "WITH facet_value_json_nodes AS (SELECT 1 AS x) SELECT x FROM facet_value_json_nodes",
+            "SELECT 'facet_observation_json_nodes' AS v",
+            "WITH facet_observation_json_nodes AS (SELECT 1 AS x) SELECT x FROM facet_observation_json_nodes",
+            "SELECT 'record_body_json_nodes' AS v",
+            "WITH record_body_json_nodes AS (SELECT 1 AS x) SELECT x FROM record_body_json_nodes",
             "SELECT 'schema_config_json_nodes' AS v",
             "SELECT id FROM records -- schema_config_json_nodes",
             "WITH actors AS (SELECT id FROM records) SELECT id FROM actors",
@@ -966,6 +978,9 @@ mod tests {
             !mapped.contains("effective_relationship_endpoints"),
             "{mapped}"
         );
+        assert!(!mapped.contains("facet_value_json_nodes"), "{mapped}");
+        assert!(!mapped.contains("facet_observation_json_nodes"), "{mapped}");
+        assert!(!mapped.contains("record_body_json_nodes"), "{mapped}");
         assert!(
             mapped.contains("Queryable relations on turso-local:"),
             "{mapped}"

@@ -1,0 +1,248 @@
+# Restyling an installed app with a skin
+
+To rename, re-icon or re-theme an installed app ("make the Slack app look like
+Discord") you write ordinary records. There is no rebuild, reinstall or Adopt, and
+the open app repaints in place, keeping its current view and drafts. It needs a host that
+supports `app.skin.v1` (the hosted workbench and Shell); an older host ignores skins. On
+such a host a skin does three separate things, and only one depends on the app:
+
+- **Name and icon** (`display_name`, `icon`) apply to any installed app.
+- **CSS** (`css`) applies to any app, written against whatever selectors it has.
+- **Tokens and labels** only take effect where the app declares them: its `--app-*`
+  properties and `native-skin-labels` table (for Slack, version 0.5.0 or later). An app
+  without those hooks ignores them without error.
+
+So do not refuse a rename, re-icon or CSS-only restyle because the app is not skin-ready.
+
+## What a skin is
+
+A skin is a `Document` record with kind `note`. Its entire body is one JSON object,
+with no Markdown fence or prose around it:
+
+```json
+{
+  "schema": "native.app-skin.v1",
+  "packages": ["agent.slack-workspace-v2"],
+  "display_name": "Discord-like",
+  "icon": "brand:discord",
+  "tokens": {"--app-bg": "#313338", "--app-text": "#f2f3f5"},
+  "css": ".win{border-radius:0}",
+  "labels": {"channels": "Text channels"}
+}
+```
+
+Only `schema` and `packages` are required; unknown fields reject the whole skin.
+
+- `packages`: 1–16 exact package ids that may use this skin. No wildcards.
+- `display_name`: shown instead of the app's record name. Non-blank, at most 128 characters.
+- `icon`: shown instead of the app's `app_icon`. `brand:<slug>` (a Simple Icons slug such as
+  `brand:discord`) or a PascalCase Lucide name such as `Gamepad2`. An unknown but well-formed
+  name shows a monogram tile.
+- `tokens`: replacement values for the app's `--app-*` custom properties.
+- `css`: extra stylesheet, applied inside the app frame only.
+- `labels`: replacement text for the app's published label keys.
+
+Limits: 16 KiB for the whole body, 12 KiB for `css`, at most 128 tokens and 128 labels, at
+most 512 characters per label or token value.
+
+**Token values** are one of: a colour (hex such as `#5865f2`, a CSS colour name, `rgb()`,
+`hsl()`, `oklch()` and similar, or `color-mix(in srgb, <colour> 30%, <colour>)`, which may
+use `var(--app-…)`), a length (`16px`, `0.5rem`, `50%`, `0`), or a font-family list of names
+(`system-ui, "Segoe UI", sans-serif`). Token names look like `--app-name`. Anything else
+(`url(`, `;`, braces, `@`, backslashes, `expression`) rejects the skin.
+
+**Cannot do:** load remote fonts or images (blocked by the app's sandbox), use
+`@import` or `@charset` (rejected), add controls, change what a click does, rename real
+records, channels or people, or touch Native's own chrome around the app. A skin changes
+looks and wording only.
+
+## Find what the app supports, from Native alone
+
+1. **Find the installed app and its exact package id.** The installed app is a
+   `Document` of kind `artifact`; its body is the app's HTML. The host reads the artifact
+   that the install points at, so ask the install, not a search by name. HQ has many
+   artifacts called "Slack" (old versions and candidates) and only one is installed. If you
+   know the package id:
+
+   ```json
+   {"executor": "artifacts_read", "operation": "manage_alpha_tabs.inspect",
+    "arguments": {"package": "agent.slack-workspace-v2"}}
+   ```
+
+   The result has `install.artifact_id` (the record to write to), `install.version` and
+   `install.status`. HQ's Slack is `agent.slack-workspace-v2`. An app older than its
+   skin-ready release (Slack before 0.5.0) has no tokens or label table, so `tokens` and
+   `labels` will not visibly change it until it is updated; `display_name`, `icon` and
+   `css` still apply. If you do not know the
+   package id, call `manage_alpha_tabs.list` with `view:"summary"` to find a package
+   (`package`, `name`, `version`, `status`, `artifact_id`, `event_id`); removed installs
+   stay hidden unless `include_removed:true`. Then `inspect` one package for its full
+   detail (event_id guard, adoption, launch binding).
+   Both reads need hosted Native: they are not served from offline or member copies.
+
+2. **See what presentation is already set** (cheap; it avoids reading the body):
+
+   ```sql
+   SELECT key, value FROM facet_values WHERE record_id = ?1 AND key IN ('app_skin', 'app_icon') ORDER BY key
+   ```
+
+   Pass the artifact id as `?1`. No `app_skin` row means the built-in look. To list existing
+   skins, query by name (for example skins you named `Skin — …`), not by body; `query_sql`
+   cannot read bodies over 256 KiB, and an artifact's body is far larger than that.
+
+3. **Read what the app exposes.** `get_record` with `format: "json"` on the artifact id
+   returns the HTML in `body`. Three things in it are the app's whole skin surface:
+
+   - **Tokens:** the `--app-*` custom properties declared in the `:root { … }` block at the
+     top of the stylesheet. Only these can be set in `tokens`.
+   - **Label keys:** the JSON in
+     `<script type="application/json" id="native-skin-labels">…</script>` in the head. Its
+     keys are the only `labels` the app reads; its values are the defaults. Unknown keys do
+     nothing. If this script is missing, the app is not skinnable for labels.
+   - **Stable selectors:** elements carry `data-skin-region="…"` attributes. Prefer these in
+     `css` over incidental class names.
+
+   An app body is large (Slack's is about 650 KB), and there is no ranged read or SQL access
+   to it. If your client cannot hold that, fetch it to a file or hand it to a helper that
+   greps for `:root`, `native-skin-labels` and `data-skin-region`, or start from the Slack
+   vocabulary below.
+
+**Slack vocabulary (0.5.x).** Confirm against the installed body when you can.
+
+- Twelve common tokens: `--app-bg` (main area), `--app-surface` (cards, composer),
+  `--app-sidebar-bg`, `--app-rail-bg` (also the page behind the window), `--app-text`,
+  `--app-muted`, `--app-faint`, `--app-line`, `--app-hover`, `--app-selected` (selected
+  sidebar row), `--app-accent`, `--app-link`. About a hundred more cover fonts
+  (`--app-font-sans`), radii (`--app-radius`, `--app-avatar-radius`), density, avatars and
+  chrome (`--app-topbar-bg`, `--app-chrome-text`). The body editor takes
+  `--app-editor-bg`, `--app-editor-text` and `--app-editor-link`.
+- Labels: `workspaceName`, `workspaceInitial`, `workspace`, `searchPlaceholder`, `home`,
+  `directMessages`, `activity`, `later`, `more`, `threads`, `draftsAndSent`, `channels`,
+  `directMessagesHeading`, `agents`, `sessions`, `composerPrefix`, `replyPlaceholder`,
+  `sourceName`.
+- Regions: `topbar`, `search`, `rail`, `rail-item`, `workspace-tile`, `window`, `sidebar`,
+  `sidebar-head`, `workspace-name`, `sidebar-section`, `sidebar-section-head`, `nav-row`
+  (with `channel-row`, `dm-row`, `agent-row`, `session-row`), `main`, `channel-header`,
+  `message-list`, `message`, `avatar`, `composer`, `thread-pane`.
+
+## Recipes
+
+Each write takes a `reason`. Name the records you relied on in `sources`.
+
+**Create a skin.** `records_write.create_record`. The body is a JSON string; keep it pure
+JSON. File it in a folder everyone who uses the app can read (default Unfiled is fine
+inside one workspace):
+
+```json
+{"type": "Document", "kind": "note",
+ "name": "Skin — Discord-like — Slack",
+ "body": "{\"schema\":\"native.app-skin.v1\",\"packages\":[\"agent.slack-workspace-v2\"],\"display_name\":\"Discord-like\",\"icon\":\"brand:discord\",\"tokens\":{\"--app-accent\":\"#5865f2\"}}",
+ "reason": "Discord-like look for the Slack app"}
+```
+
+**Activate it.** `records_write.update_record` on the *installed artifact*, not the skin:
+
+```json
+{"id": "<artifact_id>", "facets": {"app_skin": "<skin id>"},
+ "reason": "Use the Discord-like skin", "sources": ["<skin id>"]}
+```
+
+**Edit the active skin live.** Rewrite the skin's body; the app repaints live and
+no pointer write is needed. Body writes need a guard: read the skin with `get_record`
+for its `body_digest`, then:
+
+```json
+{"id": "<skin id>", "body_set": "<complete new JSON>", "if_body_digest": "<digest>",
+ "reason": "Darker sidebar"}
+```
+
+`body_replace` edits a span instead; the guard still applies.
+
+**Switch** to another skin with the same activate call and a different id. **Clear** with
+`{"id": "<artifact_id>", "facets": {"app_skin": null}, "reason": "Back to built-in"}`. The
+skin notes remain in the library for next time.
+
+**Loading takes a moment.** A skin the host has read before paints immediately. A switch to
+one it has not read keeps the previous skin, quietly, until the new note loads, or until its
+first read error, or 3 seconds, whichever comes first. After that the app falls back to the
+built-in look with an "unreadable" notice, and a late successful read still applies the skin.
+An app freshly opened with no skin to retain waits quietly for the read. So a palette that
+has not changed yet, or a momentary notice, is not evidence that the JSON is wrong: re-read
+the note and wait a few seconds before rewriting a valid skin.
+
+**Rename or re-icon only.** Either write a skin with just `schema`, `packages` and
+`display_name` and/or `icon` (reversible with one pointer write), or change the app record
+itself: `update_record` with `name`, or `facets: {"app_icon": "brand:discord"}` (clear with
+`null`). Each field resolves independently: the active skin's `display_name` or `icon`, if
+it has one, wins over the artifact's `name` or `app_icon`, which win over the package
+default. A skin with no `icon` keeps the artifact's.
+
+**Scope.** `app_skin` sits on the artifact, so it is shared by everyone whose install uses
+that artifact; there are no personal skins yet. Updating an app can move the install to a new
+artifact record. After any app update, check the new artifact's name, `app_icon` and
+`app_skin` (the `facet_values` query above) and re-apply whichever were reset. Newer
+alpha-tab-kit versions carry these over, but do not rely on it.
+
+## Worked example: Slack, Discord-like
+
+A condensed version of the real fixture. It sets the twelve common tokens (backgrounds with
+their text), the editor trio, round avatars and server tiles, and five labels:
+
+```json
+{
+  "schema": "native.app-skin.v1",
+  "packages": ["agent.slack-workspace", "agent.slack-workspace-v2"],
+  "display_name": "Discord-like",
+  "icon": "brand:discord",
+  "tokens": {
+    "--app-bg": "#313338", "--app-surface": "#2b2d31", "--app-sidebar-bg": "#2b2d31",
+    "--app-rail-bg": "#1e1f22", "--app-text": "#f2f3f5", "--app-muted": "#b5bac1",
+    "--app-faint": "#949ba4", "--app-line": "#3f4147", "--app-hover": "#2e3035",
+    "--app-selected": "#404249", "--app-accent": "#5865f2", "--app-link": "#00a8fc",
+    "--app-topbar-bg": "#1e1f22", "--app-editor-bg": "#313338",
+    "--app-editor-text": "#f2f3f5", "--app-editor-link": "#00a8fc",
+    "--app-tile-radius": "50%", "--app-avatar-radius": "50%", "--app-avatar-size": "40px"
+  },
+  "css": ":root{color-scheme:dark}.win{margin:0;border-radius:8px 0 0 0;box-shadow:none}.side{border-right:0}.side-head h1{font-size:15px}[data-skin-region=\"composer\"]{border-radius:8px}",
+  "labels": {
+    "workspaceName": "Native community", "workspace": "server", "channels": "Text channels",
+    "directMessages": "Direct messages", "home": "Home"
+  }
+}
+```
+
+For maintainers, the full skin (118 tokens, 16 labels, the complete stylesheet) is
+`packages/native-launcher/test/fixtures/discord-like.skin.json`, with a no-override
+`slack-classic.skin.json` beside it.
+
+## Pitfalls
+
+- **Exact package ids.** The skin is ignored (with a notice) unless the app's package id is
+  listed. HQ's Slack is `agent.slack-workspace-v2`; the plain `agent.slack-workspace` is
+  another id. List every id you want to cover.
+- **Pair backgrounds with text.** A dark `--app-bg` with the default dark `--app-text`
+  is unreadable. Set `--app-bg` with `--app-text`, `--app-sidebar-bg` and
+  `--app-rail-bg` with `--app-chrome-text`, and `--app-accent` with `--app-on-accent`.
+  Always set `--app-editor-bg`, `--app-editor-text` and `--app-editor-link` together; the
+  editor stays a light card otherwise.
+- **Cascade order.** The host appends your token rules, then your `css`, at the end of
+  `<head>`, after the app's own head styles. A style the app places in `<body>` or adds
+  from script can still win at equal specificity. If a rule does not bite, raise its
+  specificity (use the `data-skin-region` attribute) rather than adding `!important`
+  everywhere.
+- **Keep CSS modest.** Stylesheets can break layout (hidden controls, overflow, a search box
+  that no longer fits). Prefer tokens, then small region rules, and have the person look at
+  the result; you cannot see the pixels. Edit the skin body to iterate.
+- **Do not edit the app's own HTML to restyle it.** That changes its digest and needs a new
+  install and consent. A skin never does.
+- **If a skin breaks the app, clear the pointer first.** Accepted CSS can still hide or
+  break things (for example `body{display:none}`) and the host shows no notice for that.
+  Set `app_skin` to `null` on the artifact to restore the built-in look at once, then fix
+  the note and re-attach it.
+- **Rejected or unreadable notes fall back safely.** The host uses the built-in look and
+  shows "App skin unavailable (<reason>)", without hiding workspace data. Reasons: `size`, `json`, `schema`, `packages`,
+  `incompatible` (the app's package id is not listed), `display_name`, `icon`, `tokens`,
+  `labels`, `css`, `css_import`, `missing` (archived, or the wrong type or kind), `malformed`,
+  `pointer` (`app_skin` is not a record UUID), `unreadable`.
+- **Labels change wording, not data.** A label cannot rename a real channel, person or
+  record.

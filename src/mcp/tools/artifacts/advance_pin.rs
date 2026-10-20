@@ -35,6 +35,9 @@ pub(super) struct AdvanceArtifactPortPinArgs {
     #[serde(default)]
     pub(crate) if_body_digest: Option<String>,
     pub(crate) reason: String,
+    /// Parsed only so a key is refused by name, not as an unknown field.
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<Value>,
 }
 
 /// The current catalog contract for one semantic relation identity, if the
@@ -460,6 +463,22 @@ pub(super) async fn advance_artifact_port_pin(
 ) -> Result<Value> {
     const TOOL: &str = "advance_artifact_port_pin";
     let args: AdvanceArtifactPortPinArgs = parse_args(TOOL, arguments)?;
+    // Not keyed (task 8bef361, slice A1b). A repeat is already safe: once the
+    // pins are current it answers "unchanged" and appends nothing. A replay
+    // could not rebuild that first receipt faithfully either: for a no-op or a
+    // query-only advance, `relation_name` and `semantic_version` come from the
+    // live catalog and the port's current declaration, not from the command's
+    // own events.
+    let key_given = match &args.idempotency_key {
+        None | Some(Value::Null) => false,
+        Some(Value::String(key)) => !key.trim().is_empty(),
+        Some(_) => true,
+    };
+    if key_given {
+        return Err(Error::engine(format!(
+            "{TOOL} does not accept idempotency_key; retry without a key (a repeat is safe: once the pins are current it answers 'unchanged')"
+        )));
+    }
     if args.reason.trim().is_empty() {
         return Err(Error::engine(format!("{TOOL}: reason must not be empty")));
     }
@@ -748,6 +767,7 @@ pub(super) async fn advance_artifact_port_pin(
             Some("artifact"),
             Some(&candidate),
             Some(&runtime),
+            None,
         )
         .await?
         .ok_or_else(|| {

@@ -149,7 +149,7 @@ impl EnrichOptions {
     /// Reject out-of-range windows rather than clamping them. A caller that
     /// asks for 5,000 children has a wrong model of this call; silently
     /// handing back 1,000 would let it ship that model.
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         for (name, limit, offset) in [
             ("children", self.children_limit, self.children_offset),
             ("links", self.links_limit, self.links_offset),
@@ -2224,12 +2224,18 @@ pub(crate) async fn ordinary_record_read_eligible_live_in(
     tx: &mut Transaction<'_, Sqlite>,
     id: &str,
 ) -> Result<bool> {
-    let sql = format!("SELECT {RECORD_COLUMNS} FROM records WHERE id = ?");
-    let Some(row) = sqlx::query(&sql).bind(id).fetch_optional(&mut **tx).await? else {
+    // Only a comment needs the whole row, so the body and the other columns
+    // are read just for comments; every other record is decided by its type
+    // and kind. Both reads share the caller's snapshot.
+    let Some(head) = sqlx::query("SELECT type, kind, deleted_at FROM records WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?
+    else {
         return Ok(false);
     };
-    let record_type: String = row.try_get("type")?;
-    let Some(kind) = row.try_get::<Option<String>, _>("kind")? else {
+    let record_type: String = head.try_get("type")?;
+    let Some(kind) = head.try_get::<Option<String>, _>("kind")? else {
         return Ok(true);
     };
     let resolution = crate::meta::kind::resolve_on(tx, &record_type, &kind).await?;
@@ -2239,9 +2245,11 @@ pub(crate) async fn ordinary_record_read_eligible_live_in(
     if !crate::generated::kinds::CoreKind::AnnotationComment.matches(&resolution) {
         return Ok(true);
     }
-    if row.try_get::<Option<String>, _>("deleted_at")?.is_some() {
+    if head.try_get::<Option<String>, _>("deleted_at")?.is_some() {
         return Ok(false);
     }
+    let sql = format!("SELECT {RECORD_COLUMNS} FROM records WHERE id = ?");
+    let row = sqlx::query(&sql).bind(id).fetch_one(&mut **tx).await?;
     valid_comment_live_in(tx, id, &row).await
 }
 

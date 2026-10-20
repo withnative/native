@@ -167,6 +167,9 @@ pub(crate) struct IsolatedProjection {
     /// through to every `QuerySqlResult` executed over this projection so
     /// rows and stamp share one snapshot.
     pub(crate) as_of_seq: i64,
+    /// The caller this projection was materialised for, bound to
+    /// `current_principal()`. `None` only for test projections.
+    pub(crate) principal: Option<String>,
 }
 
 impl IsolatedProjection {
@@ -252,6 +255,7 @@ struct CoreProjection {
     connection: Arc<turso::core::Connection>,
     control: ExecutionControl,
     as_of_seq: i64,
+    principal: Option<String>,
 }
 
 impl CoreProjection {
@@ -336,6 +340,7 @@ impl CoreProjection {
             connection,
             control,
             as_of_seq: projection.as_of_seq,
+            principal: projection.principal,
         })
     }
 
@@ -407,11 +412,29 @@ impl CoreProjection {
             sql_contract::UtcDateLabelEngine::Sqlite,
         )?;
         let time_dependent = now_ms_uses > 0;
+        // `current_principal()` takes the next hidden slot after the clock,
+        // bound to the caller the projection was materialised for.
+        let principal_index = hidden_index + usize::from(time_dependent);
+        let (statement, principal_uses) = sql_contract::rewrite_current_principal_calls(
+            sql_contract::QuerySqlProfile::TursoLocal,
+            &statement,
+            &format!("?{principal_index}"),
+        )?;
         let now_ms_ms: Option<i64> = time_dependent.then(|| chrono::Utc::now().timestamp_millis());
         let mut effective_parameters = request.parameters.clone();
         if let Some(now_ms) = now_ms_ms {
             effective_parameters.push(QuerySqlParameter::Integer {
                 value: Some(now_ms.to_string()),
+            });
+        }
+        if principal_uses > 0 {
+            let principal = self.principal.clone().ok_or_else(|| {
+                contract_violation(
+                    "query_sql: projection carries no principal for current_principal()",
+                )
+            })?;
+            effective_parameters.push(QuerySqlParameter::Text {
+                value: Some(principal),
             });
         }
         // Defensive: the rewritten placeholders must be exactly
@@ -901,6 +924,46 @@ mod tests {
         .unwrap();
         assert!(!plain.time_dependent);
         assert_eq!(plain.now_ms_ms, None);
+    }
+
+    #[test]
+    fn isolated_current_principal_binds_the_projection_caller() {
+        let mut projection = projection_with_records(vec![record("visible", "hello")]);
+        projection.principal = Some("alice".into());
+        let result = execute(
+            projection,
+            request("SELECT now_ms() AS t, current_principal() AS p, CURRENT_PRINCIPAL() AS q"),
+            ExecutionControl::with_timeout(Duration::from_secs(2)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.rows[0]["p"], "alice");
+        assert_eq!(result.rows[0]["q"], "alice");
+        assert!(result.rows[0]["t"].is_i64());
+        // A projection that names no caller refuses rather than binding NULL.
+        let error = execute(
+            projection_with_records(vec![record("visible", "hello")]),
+            request("SELECT current_principal() AS p"),
+            ExecutionControl::with_timeout(Duration::from_secs(2)),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no principal"), "{error}");
+        // A caller cannot name the hidden slot.
+        let mut projection = projection_with_records(vec![record("visible", "hello")]);
+        projection.principal = Some("alice".into());
+        let spoof = execute(
+            projection,
+            QuerySqlRequest {
+                sql: "SELECT current_principal() AS p, ?2 AS q".into(),
+                parameters: vec![QuerySqlParameter::Text {
+                    value: Some("bea".into()),
+                }],
+            },
+            ExecutionControl::with_timeout(Duration::from_secs(2)),
+            false,
+        );
+        assert!(spoof.is_err(), "{spoof:?}");
     }
 
     #[test]

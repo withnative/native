@@ -19,6 +19,11 @@ pub const EXPECTATION_VOCABULARY: &str = "message-expectation";
 pub const EXPECTATION_VOCABULARY_ID: &str = "voc:message-expectation";
 pub const EXPECTATION_DERIVATION_VERSION: &str = "native.message.expectation-state.v1";
 pub const EXPECTATION_VALUES: [&str; 5] = ["none", "ack", "reply", "action", "decision"];
+/// Link relationship carrying a no-longer-relevant mark from its evidence
+/// record to the Message it closes.
+pub const NO_LONGER_RELEVANT_RELATIONSHIP: &str = "resolves";
+/// Link note distinguishing the mark from any other `resolves` link.
+pub const NO_LONGER_RELEVANT_NOTE: &str = "no_longer_relevant";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,12 +41,18 @@ pub enum MessageExpectationEvidenceKind {
     Reply,
     CompletedWorkItem,
     Decision,
+    NoLongerRelevant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageExpectationEvidence {
     pub kind: MessageExpectationEvidenceKind,
     pub record_id: String,
+    /// Only set for [`MessageExpectationEvidenceKind::NoLongerRelevant`]:
+    /// `"recipient"` when the expecting recipient closed their own
+    /// expectation, `"sender"` when the message sender withdrew the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -73,7 +84,7 @@ struct WorkEvidenceRow {
 
 enum ExpectationRead<'a, 'db> {
     Lens(&'a ReadLens<'db>),
-    Live(&'a mut Transaction<'db, Sqlite>),
+    Live(&'a mut sqlx::SqliteConnection),
 }
 
 impl ExpectationRead<'_, '_> {
@@ -85,7 +96,7 @@ impl ExpectationRead<'_, '_> {
                 .await?),
             Self::Live(tx) => Ok(sqlx::query_scalar::<_, String>(sql)
                 .bind(first)
-                .fetch_optional(&mut ***tx)
+                .fetch_optional(&mut **tx)
                 .await?),
         }
     }
@@ -94,7 +105,7 @@ impl ExpectationRead<'_, '_> {
         let query = sqlx::query_scalar(sql).bind(first).bind(second);
         match self {
             Self::Lens(lens) => Ok(query.fetch_one(lens.projection().snapshot_pool()).await?),
-            Self::Live(tx) => Ok(query.fetch_one(&mut ***tx).await?),
+            Self::Live(tx) => Ok(query.fetch_one(&mut **tx).await?),
         }
     }
 
@@ -109,7 +120,48 @@ impl ExpectationRead<'_, '_> {
                 .await?),
             Self::Live(tx) => Ok(sqlx::query_scalar(sql)
                 .bind(recipient_id)
-                .fetch_optional(&mut ***tx)
+                .fetch_optional(&mut **tx)
+                .await?),
+        }
+    }
+
+    /// Portable person record bound to any identifier system (used to map the
+    /// message sender's `native-principal` audience address back to the
+    /// person record that owns sender-authored evidence).
+    async fn binding_record(&mut self, system: &str, identifier: &str) -> Result<Option<String>> {
+        let sql = "SELECT record_id FROM main.bindings
+          WHERE system = ? AND identifier = ? AND is_canonical = 1
+          ORDER BY record_id LIMIT 1";
+        match self {
+            Self::Lens(lens) => Ok(sqlx::query_scalar(sql)
+                .bind(system)
+                .bind(identifier)
+                .fetch_optional(lens.meta().shared_pool())
+                .await?),
+            Self::Live(tx) => Ok(sqlx::query_scalar(sql)
+                .bind(system)
+                .bind(identifier)
+                .fetch_optional(&mut **tx)
+                .await?),
+        }
+    }
+
+    /// Canonical account credential bound to a person record (used to check
+    /// link-event authorship for the sender side of a no-longer-relevant
+    /// mark, mirroring how the recipient side compares event provenance to
+    /// the credential stamped on the content log).
+    async fn account_for_record(&mut self, record_id: &str) -> Result<Option<String>> {
+        let sql = "SELECT identifier FROM main.bindings
+          WHERE system = 'account' AND record_id = ? AND is_canonical = 1
+          ORDER BY identifier LIMIT 1";
+        match self {
+            Self::Lens(lens) => Ok(sqlx::query_scalar(sql)
+                .bind(record_id)
+                .fetch_optional(lens.meta().shared_pool())
+                .await?),
+            Self::Live(tx) => Ok(sqlx::query_scalar(sql)
+                .bind(record_id)
+                .fetch_optional(&mut **tx)
                 .await?),
         }
     }
@@ -146,7 +198,7 @@ impl ExpectationRead<'_, '_> {
         }
         let rows = match self {
             Self::Lens(lens) => query.fetch_all(lens.projection().snapshot_pool()).await?,
-            Self::Live(tx) => query.fetch_all(&mut ***tx).await?,
+            Self::Live(tx) => query.fetch_all(&mut **tx).await?,
         };
         rows.into_iter()
             .map(|row| {
@@ -187,7 +239,7 @@ impl ExpectationRead<'_, '_> {
             Self::Live(tx) => {
                 sqlx::query(&sql)
                     .bind(message_id)
-                    .fetch_all(&mut ***tx)
+                    .fetch_all(&mut **tx)
                     .await?
             }
         };
@@ -209,7 +261,10 @@ impl ExpectationRead<'_, '_> {
             Self::Lens(lens) => {
                 cascade::schema_config_rows_in_pool(lens.meta().snapshot_pool(), None).await
             }
-            Self::Live(tx) => cascade::schema_config_rows_in(tx).await,
+            Self::Live(tx) => {
+                let mut executor = crate::portable_sql::BorrowedSqliteStatementExecutor::new(tx);
+                cascade::schema_config_rows_with(&mut executor).await
+            }
         }
     }
 
@@ -258,7 +313,7 @@ impl ExpectationRead<'_, '_> {
                 .fetch_optional(lens.meta().shared_pool())
                 .await?
                 .flatten()),
-            Self::Live(tx) => Ok(query.fetch_optional(&mut ***tx).await?.flatten()),
+            Self::Live(tx) => Ok(query.fetch_optional(&mut **tx).await?.flatten()),
         }
     }
 
@@ -293,7 +348,7 @@ impl ExpectationRead<'_, '_> {
         .bind(max_seq);
         match self {
             Self::Lens(lens) => Ok(query.fetch_one(lens.content_log().snapshot_pool()).await?),
-            Self::Live(tx) => Ok(query.fetch_one(&mut ***tx).await?),
+            Self::Live(tx) => Ok(query.fetch_one(&mut **tx).await?),
         }
     }
 
@@ -330,7 +385,7 @@ impl ExpectationRead<'_, '_> {
                     .fetch_optional(lens.content_log().snapshot_pool())
                     .await?
             }
-            Self::Live(tx) => query.fetch_optional(&mut ***tx).await?,
+            Self::Live(tx) => query.fetch_optional(&mut **tx).await?,
         };
         let Some(latest) = latest else {
             return Ok(false);
@@ -338,6 +393,23 @@ impl ExpectationRead<'_, '_> {
         Ok(latest.try_get::<String, _>("type")? == "link.added"
             && latest.try_get::<Option<String>, _>("actor")?.as_deref() == Some(actor))
     }
+}
+
+/// Snapshot importer read seam: exactly the v1 evidence evaluator on the
+/// source's pinned read-only connection, without opening another database.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn derive_message_expectation_state_on(
+    conn: &mut sqlx::SqliteConnection,
+    message_id: &str,
+    recipient: &str,
+) -> Result<MessageExpectationDerivation> {
+    derive_message_expectation_state_from(
+        &mut ExpectationRead::Live(conn),
+        message_id,
+        recipient,
+        false,
+    )
+    .await
 }
 
 /// Derive against the live database.
@@ -437,7 +509,7 @@ async fn derive_message_expectation_state_from(
         )
         .bind(message_id)
         .bind(EXPECTATION_FACET_KEY)
-        .fetch_optional(&mut ***tx)
+        .fetch_optional(&mut **tx)
         .await?
         .flatten(),
     };
@@ -596,6 +668,8 @@ async fn finish_expectation_derivation(
         return Ok(result);
     }
 
+    // Real evidence is evaluated first and wins: the mark lookup below runs
+    // only when no real evidence satisfied the expectation.
     let evidence = match expectation {
         "ack" => explicit_acknowledgement(
             source,
@@ -645,6 +719,19 @@ async fn finish_expectation_derivation(
         }
         _ => unreachable!("expectation vocabulary checked above"),
     };
+    let evidence = match evidence {
+        Some(evidence) => Some(evidence),
+        None => {
+            no_longer_relevant(
+                source,
+                message_id,
+                portable_recipient_id,
+                recipient_id,
+                filter_evidence_to_query_viewer,
+            )
+            .await?
+        }
+    };
     result.state = if evidence.is_some() {
         MessageExpectationState::Satisfied
     } else {
@@ -691,6 +778,7 @@ async fn explicit_acknowledgement(
             return Ok(Some(MessageExpectationEvidence {
                 kind: MessageExpectationEvidenceKind::Acknowledgement,
                 record_id: row.id,
+                by: None,
             }));
         }
     }
@@ -725,7 +813,7 @@ async fn reply(
         )
         .await?;
     for row in rows {
-        let delivered_to_sender = source
+        let mut delivered_to_sender = source
             .exists_two(
                 "SELECT EXISTS(SELECT 1 FROM main.message_audiences
                   WHERE message_id = ? AND principal_id = ? AND source = 'addressed_to')",
@@ -733,6 +821,22 @@ async fn reply(
                 &original_sender,
             )
             .await?;
+        // S2 replies to a persona utterance reach it through an explicit
+        // reply_to in the same Collection. S3 will add participant addressing.
+        if !delivered_to_sender {
+            delivered_to_sender = source
+                .exists_two(
+                    "SELECT EXISTS(SELECT 1 FROM main.message_speakers s
+                 JOIN main.message_origin_state original ON original.message_id=s.message_id
+                 JOIN main.message_origin_state reply ON reply.message_id=?
+                 WHERE s.message_id=? AND original.status='declared' AND reply.status='declared'
+                   AND original.origin_type='collection' AND reply.origin_type='collection'
+                   AND original.collection_id=reply.collection_id)",
+                    &row.id,
+                    message_id,
+                )
+                .await?;
+        }
         if delivered_to_sender
             && authored_by_recipient(
                 source,
@@ -754,6 +858,7 @@ async fn reply(
             return Ok(Some(MessageExpectationEvidence {
                 kind: MessageExpectationEvidenceKind::Reply,
                 record_id: row.id,
+                by: None,
             }));
         }
     }
@@ -814,6 +919,7 @@ async fn completed_work(
             return Ok(Some(MessageExpectationEvidence {
                 kind: MessageExpectationEvidenceKind::CompletedWorkItem,
                 record_id: row.id,
+                by: None,
             }));
         }
     }
@@ -867,10 +973,159 @@ async fn decision(
             return Ok(Some(MessageExpectationEvidence {
                 kind: MessageExpectationEvidenceKind::Decision,
                 record_id: row.id,
+                by: None,
             }));
         }
     }
     Ok(None)
+}
+
+/// A live `resolves` link noted `no_longer_relevant` satisfies ANY
+/// expectation value when its author is the expecting recipient (they closed
+/// their own request) or the message sender (they withdrew the request). A
+/// mark by anyone else is recorded and readable but does not satisfy. The
+/// caller evaluates real evidence first, so an actual reply, acknowledgement,
+/// completed WorkItem or decision wins when both exist.
+async fn no_longer_relevant(
+    source: &mut ExpectationRead<'_, '_>,
+    message_id: &str,
+    recipient_owner_id: &str,
+    recipient_actor: &str,
+    filter_evidence_to_query_viewer: bool,
+) -> Result<Option<MessageExpectationEvidence>> {
+    let visibility_join = if filter_evidence_to_query_viewer {
+        "JOIN temp._query_sql_visible_records evidence_visible ON evidence_visible.id = r.id"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT r.id, r.owner_id, r.kind
+           FROM main.links l JOIN main.records r ON r.id = l.source_id
+           {visibility_join}
+          WHERE l.target_id = ? AND l.relationship = ? AND l.note = ?
+            AND r.type = 'Annotation' AND r.kind = 'no_longer_relevant'
+            AND r.deleted_at IS NULL AND r.archived = 0
+          ORDER BY l.created_at, l.id"
+    );
+    let rows = match source {
+        ExpectationRead::Lens(lens) => {
+            sqlx::query(&sql)
+                .bind(message_id)
+                .bind(NO_LONGER_RELEVANT_RELATIONSHIP)
+                .bind(NO_LONGER_RELEVANT_NOTE)
+                .fetch_all(lens.projection().snapshot_pool())
+                .await?
+        }
+        ExpectationRead::Live(tx) => {
+            sqlx::query(&sql)
+                .bind(message_id)
+                .bind(NO_LONGER_RELEVANT_RELATIONSHIP)
+                .bind(NO_LONGER_RELEVANT_NOTE)
+                .fetch_all(&mut **tx)
+                .await?
+        }
+    };
+    let rows: Vec<EvidenceRow> = rows
+        .into_iter()
+        .map(|row| {
+            Ok(EvidenceRow {
+                id: row.try_get("id")?,
+                owner_id: row.try_get("owner_id")?,
+                kind: row.try_get("kind")?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let sender = message_sender_ids(source, message_id).await?;
+    for row in rows {
+        if authored_by_recipient(
+            source,
+            &row.id,
+            row.owner_id.as_deref(),
+            recipient_owner_id,
+            recipient_actor,
+        )
+        .await?
+            && relationship_authored_by_recipient(
+                source,
+                &row.id,
+                message_id,
+                NO_LONGER_RELEVANT_RELATIONSHIP,
+                recipient_actor,
+            )
+            .await?
+        {
+            return Ok(Some(MessageExpectationEvidence {
+                kind: MessageExpectationEvidenceKind::NoLongerRelevant,
+                record_id: row.id,
+                by: Some("recipient".into()),
+            }));
+        }
+        if let Some(sender) = sender.as_ref() {
+            if authored_by_recipient(
+                source,
+                &row.id,
+                row.owner_id.as_deref(),
+                &sender.owner_id,
+                &sender.actor_id,
+            )
+            .await?
+                && relationship_authored_by_recipient(
+                    source,
+                    &row.id,
+                    message_id,
+                    NO_LONGER_RELEVANT_RELATIONSHIP,
+                    &sender.actor_id,
+                )
+                .await?
+            {
+                return Ok(Some(MessageExpectationEvidence {
+                    kind: MessageExpectationEvidenceKind::NoLongerRelevant,
+                    record_id: row.id,
+                    by: Some("sender".into()),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+struct SenderIds {
+    owner_id: String,
+    actor_id: String,
+}
+
+/// Resolve the message sender's portable person record (evidence ownership)
+/// and canonical account credential (link-event provenance) from the frozen
+/// `sender` audience address. Returns `None` when the sender has no usable
+/// binding, in which case only the recipient side can satisfy.
+async fn message_sender_ids(
+    source: &mut ExpectationRead<'_, '_>,
+    message_id: &str,
+) -> Result<Option<SenderIds>> {
+    let Some(principal) = source
+        .first_text(
+            "SELECT principal_id FROM main.message_audiences
+              WHERE message_id = ? AND source = 'sender'
+              ORDER BY event_seq LIMIT 1",
+            message_id,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(owner_id) = source
+        .binding_record("native-principal", &principal)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(actor_id) = source.account_for_record(&owner_id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(SenderIds { owner_id, actor_id }))
 }
 
 async fn authored_by_recipient(
@@ -880,6 +1135,9 @@ async fn authored_by_recipient(
     recipient_owner_id: &str,
     recipient_actor: &str,
 ) -> Result<bool> {
+    if source.exists_two("SELECT EXISTS(SELECT 1 FROM main.message_speakers WHERE message_id=? AND ? IS NOT NULL)", record_id, record_id).await? {
+        return Ok(false);
+    }
     if let Some(owner_id) = owner_id {
         return Ok(owner_id == recipient_owner_id);
     }
@@ -1507,6 +1765,388 @@ mod batch_preload_tests {
                 "error path must stop after binding and record-type reads"
             );
         }
+        db.close().await;
+    }
+
+    /// A live `resolves`/`no_longer_relevant` mark satisfies any expectation
+    /// value for the expecting recipient or the withdrawing sender only. A
+    /// third party's mark, a `resolves` link with any other note, and real
+    /// evidence ordering (real evidence wins) are pinned here; removing the
+    /// mark link reopens the expectation.
+    #[tokio::test]
+    async fn no_longer_relevant_marks_close_for_recipient_or_sender_only() {
+        use crate::events::LinkRemovedPayload;
+        use crate::store::remove_link_as;
+
+        const SENDER_PERSON: &str = "f7ec1000-0000-4000-8000-000000000002";
+        const SENDER_ACCOUNT: &str = "acct:batch-mark-sender";
+        const OTHER_PERSON: &str = "f7ec1000-0000-4000-8000-000000000003";
+        const OTHER_ACCOUNT: &str = "acct:batch-mark-other";
+
+        async fn install_person(db: &crate::db::Db, person: &str, account: &str) {
+            create_record(
+                db,
+                json!({ "id": person, "type": "Entity", "kind": "person", "name": person }),
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+                 VALUES (?, 'account', ?, 1)",
+            )
+            .bind(person)
+            .bind(account)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+
+        async fn add_mark(
+            db: &crate::db::Db,
+            target: &str,
+            owner: &str,
+            actor: &str,
+            relationship: &str,
+            note: Option<&str>,
+        ) -> String {
+            let mark_id = uuid::Uuid::new_v4().to_string();
+            create_record(
+                db,
+                json!({ "id": mark_id, "type": "Annotation", "kind": "no_longer_relevant",
+                        "name": "mark", "body": "", "owner_id": owner }),
+            )
+            .await
+            .unwrap();
+            add_link_as(
+                db,
+                LinkAddedPayload {
+                    id: None,
+                    source_id: mark_id.clone(),
+                    target_id: target.into(),
+                    relationship: relationship.into(),
+                    note: note.map(str::to_owned),
+                },
+                Some(actor),
+            )
+            .await
+            .unwrap();
+            mark_id
+        }
+
+        let db = create_database(":memory:").await.unwrap();
+        install_bound_person(&db).await;
+        install_person(&db, SENDER_PERSON, SENDER_ACCOUNT).await;
+        install_person(&db, OTHER_PERSON, OTHER_ACCOUNT).await;
+        sqlx::query(
+            "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+             VALUES (?, 'native-principal', ?, 1)",
+        )
+        .bind(SENDER_PERSON)
+        .bind(SENDER_PRINCIPAL)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        // Recipient mark closes an ack expectation; removing the link reopens.
+        let ack_target = message_id(700);
+        create_message(&db, &ack_target).await;
+        set_expectation(&db, &ack_target, "ack").await;
+        add_audience(&db, &ack_target, SENDER_PRINCIPAL, "sender").await;
+        let open = derive_message_expectation_state(&db, &ack_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(open.state, MessageExpectationState::Open);
+        let recipient_mark = add_mark(
+            &db,
+            &ack_target,
+            BOUND_PERSON,
+            BOUND_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        let closed = derive_message_expectation_state(&db, &ack_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(closed.state, MessageExpectationState::Satisfied);
+        let evidence = closed.evidence.unwrap();
+        assert_eq!(
+            evidence.kind,
+            MessageExpectationEvidenceKind::NoLongerRelevant
+        );
+        assert_eq!(evidence.record_id, recipient_mark);
+        assert_eq!(evidence.by.as_deref(), Some("recipient"));
+        remove_link_as(
+            &db,
+            LinkRemovedPayload {
+                source_id: recipient_mark,
+                target_id: ack_target.clone(),
+                relationship: "resolves".into(),
+            },
+            Some(BOUND_ACCOUNT),
+        )
+        .await
+        .unwrap();
+        let reopened = derive_message_expectation_state(&db, &ack_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(reopened.state, MessageExpectationState::Open);
+
+        // Real evidence still wins when both exist.
+        let ack_evidence = message_id(701);
+        create_record(
+            &db,
+            json!({ "id": ack_evidence, "type": "Message", "kind": "text",
+                    "name": "ack evidence", "owner_id": BOUND_PERSON }),
+        )
+        .await
+        .unwrap();
+        link_as(
+            &db,
+            &ack_evidence,
+            &ack_target,
+            "acknowledges",
+            BOUND_ACCOUNT,
+        )
+        .await;
+        add_mark(
+            &db,
+            &ack_target,
+            BOUND_PERSON,
+            BOUND_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        let real_first = derive_message_expectation_state(&db, &ack_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(real_first.state, MessageExpectationState::Satisfied);
+        assert_eq!(
+            real_first.evidence.unwrap().kind,
+            MessageExpectationEvidenceKind::Acknowledgement
+        );
+
+        // Sender mark closes a reply expectation as a withdrawal.
+        let reply_target = message_id(702);
+        create_message(&db, &reply_target).await;
+        set_expectation(&db, &reply_target, "reply").await;
+        add_audience(&db, &reply_target, SENDER_PRINCIPAL, "sender").await;
+        add_mark(
+            &db,
+            &reply_target,
+            SENDER_PERSON,
+            SENDER_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        let withdrawn = derive_message_expectation_state(&db, &reply_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(withdrawn.state, MessageExpectationState::Satisfied);
+        let evidence = withdrawn.evidence.unwrap();
+        assert_eq!(
+            evidence.kind,
+            MessageExpectationEvidenceKind::NoLongerRelevant
+        );
+        assert_eq!(evidence.by.as_deref(), Some("sender"));
+
+        // Third-party marks and wrongly noted links do not satisfy.
+        let action_target = message_id(703);
+        create_message(&db, &action_target).await;
+        set_expectation(&db, &action_target, "action").await;
+        add_audience(&db, &action_target, SENDER_PRINCIPAL, "sender").await;
+        add_mark(
+            &db,
+            &action_target,
+            OTHER_PERSON,
+            OTHER_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        add_mark(
+            &db,
+            &action_target,
+            BOUND_PERSON,
+            BOUND_ACCOUNT,
+            "resolves",
+            Some("something_else"),
+        )
+        .await;
+        let still_open = derive_message_expectation_state(&db, &action_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(still_open.state, MessageExpectationState::Open);
+        add_mark(
+            &db,
+            &action_target,
+            BOUND_PERSON,
+            BOUND_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        let closed = derive_message_expectation_state(&db, &action_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(closed.state, MessageExpectationState::Satisfied);
+        assert_eq!(closed.evidence.unwrap().by.as_deref(), Some("recipient"));
+
+        // A recipient-owned mark whose link was added by someone else does
+        // not satisfy: the link-actor check fails.
+        let foreign_link_target = message_id(704);
+        create_message(&db, &foreign_link_target).await;
+        set_expectation(&db, &foreign_link_target, "reply").await;
+        add_audience(&db, &foreign_link_target, SENDER_PRINCIPAL, "sender").await;
+        add_mark(
+            &db,
+            &foreign_link_target,
+            BOUND_PERSON,
+            OTHER_ACCOUNT,
+            "resolves",
+            Some("no_longer_relevant"),
+        )
+        .await;
+        let foreign_link =
+            derive_message_expectation_state(&db, &foreign_link_target, BOUND_ACCOUNT)
+                .await
+                .unwrap();
+        assert_eq!(foreign_link.state, MessageExpectationState::Open);
+
+        // A `resolves`/`no_longer_relevant` link from a non-Annotation
+        // source does not satisfy: only tool-shaped marks count.
+        let note_target = message_id(705);
+        create_message(&db, &note_target).await;
+        set_expectation(&db, &note_target, "reply").await;
+        add_audience(&db, &note_target, SENDER_PRINCIPAL, "sender").await;
+        let note_id = uuid::Uuid::new_v4().to_string();
+        create_record(
+            &db,
+            json!({ "id": note_id, "type": "Document", "kind": "note",
+                    "name": "hand-made note", "body": "", "owner_id": BOUND_PERSON }),
+        )
+        .await
+        .unwrap();
+        add_link_as(
+            &db,
+            LinkAddedPayload {
+                id: None,
+                source_id: note_id,
+                target_id: note_target.clone(),
+                relationship: "resolves".into(),
+                note: Some("no_longer_relevant".into()),
+            },
+            Some(BOUND_ACCOUNT),
+        )
+        .await
+        .unwrap();
+        let handmade = derive_message_expectation_state(&db, &note_target, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(handmade.state, MessageExpectationState::Open);
+        db.close().await;
+    }
+
+    /// Batch and scalar derivations agree on no-longer-relevant marks for the
+    /// recipient, sender and third-party cases, including the `by` label.
+    #[tokio::test]
+    async fn batch_matches_scalar_for_no_longer_relevant_marks() {
+        const SENDER_PERSON: &str = "f7ec1000-0000-4000-8000-000000000002";
+        const SENDER_ACCOUNT: &str = "acct:batch-nlr-sender";
+        const OTHER_PERSON: &str = "f7ec1000-0000-4000-8000-000000000003";
+        const OTHER_ACCOUNT: &str = "acct:batch-nlr-other";
+
+        let db = create_database(":memory:").await.unwrap();
+        install_bound_person(&db).await;
+        for (person, account) in [
+            (SENDER_PERSON, SENDER_ACCOUNT),
+            (OTHER_PERSON, OTHER_ACCOUNT),
+        ] {
+            create_record(
+                &db,
+                json!({ "id": person, "type": "Entity", "kind": "person", "name": person }),
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+                 VALUES (?, 'account', ?, 1)",
+            )
+            .bind(person)
+            .bind(account)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO bindings(record_id, system, identifier, is_canonical)
+             VALUES (?, 'native-principal', ?, 1)",
+        )
+        .bind(SENDER_PERSON)
+        .bind(SENDER_PRINCIPAL)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+
+        let ids: Vec<String> = (800..803).map(message_id).collect();
+        for id in &ids {
+            create_message(&db, id).await;
+            set_expectation(&db, id, "reply").await;
+            add_audience(&db, id, SENDER_PRINCIPAL, "sender").await;
+        }
+        for (id, owner, actor) in [
+            (&ids[0], BOUND_PERSON, BOUND_ACCOUNT),
+            (&ids[1], SENDER_PERSON, SENDER_ACCOUNT),
+            (&ids[2], OTHER_PERSON, OTHER_ACCOUNT),
+        ] {
+            let mark_id = uuid::Uuid::new_v4().to_string();
+            create_record(
+                &db,
+                json!({ "id": mark_id, "type": "Annotation", "kind": "no_longer_relevant",
+                        "name": "mark", "body": "", "owner_id": owner }),
+            )
+            .await
+            .unwrap();
+            // `link_as` carries no note, so link through the event log
+            // directly rather than editing the projection outside it.
+            add_link_as(
+                &db,
+                LinkAddedPayload {
+                    id: None,
+                    source_id: mark_id,
+                    target_id: id.clone(),
+                    relationship: "resolves".into(),
+                    note: Some("no_longer_relevant".into()),
+                },
+                Some(actor),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let scalar = scalar_all(&mut tx, &ids, BOUND_ACCOUNT).await;
+        let batch = derive_message_expectation_states_in(&mut tx, &ids, BOUND_ACCOUNT)
+            .await
+            .unwrap();
+        assert_eq!(batch, scalar);
+        let states: Vec<MessageExpectationState> = scalar.iter().map(|d| d.state).collect();
+        use MessageExpectationState as State;
+        assert_eq!(
+            states,
+            vec![State::Satisfied, State::Satisfied, State::Open]
+        );
+        assert_eq!(
+            scalar[0].evidence.as_ref().unwrap().by.as_deref(),
+            Some("recipient")
+        );
+        assert_eq!(
+            scalar[1].evidence.as_ref().unwrap().by.as_deref(),
+            Some("sender")
+        );
+        tx.rollback().await.unwrap();
         db.close().await;
     }
 }

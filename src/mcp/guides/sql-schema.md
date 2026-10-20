@@ -4,11 +4,13 @@
 
 This is native-ce's exact ordered SQLite DDL contract for a fresh database. It is not Native App's PostgreSQL schema. Projections are rebuildable; the event logs named by the DDL remain their authorities. Use `describe_schema` for a live structured view and `query_sql` only through its documented logical catalog.
 
+`main.message_speakers` below is the physical projection, with frozen owner and event provenance columns. The caller-visible TEMP view named `message_speakers` is a different logical relation: message_id, speaker_kind, speaker_address, display_name and assurance, restricted to visible Messages. `query_sql` exposes only that view; physical tables and private persona profiles are not granted by an utterance.
+
 ## Contract identity
 
-- Engine schema version: `82`
-- Ordered DDL statements: `358`
-- Frozen DDL SHA-256: `0209d608f9d5b9bd88bde3b8da411057cfc7396149ba5f4918b0921207a10a9c`
+- Engine schema version: `90`
+- Ordered DDL statements: `373`
+- Frozen DDL SHA-256: `87ba5084e86528d8c73a969da076dc314d842ad70d2e2ccab06d26ae97a9b21f`
 
 The fingerprint is SHA-256 over the canonical statement sequence joined by `\n;\n`. Generation fails before writing if the compiled sequence and frozen pin disagree.
 
@@ -306,7 +308,7 @@ CREATE TABLE records (
       is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),
       successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),
 
-     CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation')),
+     CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation','Configuration')),
      CHECK ((claimed_by_account IS NULL AND claimed_run_key IS NULL AND claimed_at IS NULL)
          OR (claimed_by_account IS NOT NULL AND claimed_at IS NOT NULL))
    )
@@ -572,6 +574,7 @@ CREATE TABLE message_preferences (
      archived           INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
      last_event_seq     INTEGER NOT NULL REFERENCES awareness_events(seq),
      version            INTEGER NOT NULL CHECK (version > 0),
+     unread_override    INTEGER CHECK (unread_override IN (0,1)),
      PRIMARY KEY (subject_account_id, message_id)
    )
 ;
@@ -1177,6 +1180,38 @@ CREATE TABLE facet_value_json_nodes (
      PRIMARY KEY (facet_id, ordinal)
    )
 ;
+CREATE TABLE facet_observation_json_nodes (
+     observation_id TEXT NOT NULL REFERENCES facet_observations(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (observation_id, ordinal)
+   )
+;
+CREATE TABLE record_body_json_nodes (
+     record_id      TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (record_id, ordinal)
+   )
+;
 CREATE TABLE jobs (
      id          TEXT PRIMARY KEY,
      kind        TEXT NOT NULL,
@@ -1357,6 +1392,14 @@ CREATE TABLE agent_runs (
 ;
 CREATE INDEX idx_agent_runs_account_started
        ON agent_runs(account_id, started_at, activity_id)
+;
+CREATE TABLE account_configs (
+     account_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     record_id TEXT NOT NULL UNIQUE REFERENCES records(id) ON DELETE RESTRICT,
+     created_at TEXT NOT NULL,
+     PRIMARY KEY(account_id,kind)
+   )
 ;
 CREATE TABLE member_contexts (
      account_id       TEXT PRIMARY KEY,
@@ -2772,5 +2815,73 @@ CREATE TABLE workspace_rule_installations (
 CREATE INDEX idx_workspace_rule_installations_root
        ON workspace_rule_installations(root, namespace, name)
 ;
-PRAGMA user_version = 82;
+CREATE TABLE personas (
+     persona_id TEXT PRIMARY KEY REFERENCES records(id),
+     owner_person_id TEXT NOT NULL REFERENCES records(id),
+     owner_principal TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN ('active','retired')),
+     registered_event_seq INTEGER NOT NULL,
+     retired_event_seq INTEGER,
+     updated_at TEXT NOT NULL,
+     CHECK ((state='retired') = (retired_event_seq IS NOT NULL))
+    )
+;
+CREATE INDEX idx_personas_owner ON personas(owner_principal, persona_id)
+;
+CREATE TABLE message_speakers (
+     message_id TEXT PRIMARY KEY REFERENCES records(id),
+     speaker_kind TEXT NOT NULL CHECK (speaker_kind IN ('persona','agent')),
+     persona_id TEXT REFERENCES personas(persona_id),
+     agent_key TEXT,
+     session_hint TEXT,
+     owner_principal TEXT NOT NULL,
+     assurance TEXT NOT NULL CHECK (assurance IN ('host_asserted','client_asserted','correlation_only')),
+     stamp TEXT CHECK (stamp IS NULL OR json_valid(stamp)),
+     event_seq INTEGER NOT NULL,
+     CHECK ((speaker_kind='persona' AND persona_id IS NOT NULL AND agent_key IS NULL AND session_hint IS NULL)
+         OR (speaker_kind='agent' AND persona_id IS NULL AND agent_key IS NOT NULL))
+    )
+;
+CREATE INDEX idx_message_speakers_persona ON message_speakers(persona_id, message_id)
+;
+CREATE TABLE provenance_action_app_attributions (
+     action_attestation_id TEXT PRIMARY KEY REFERENCES provenance_action_attestations(id),
+     package               TEXT NOT NULL CHECK (length(trim(package)) > 0),
+     version               TEXT NOT NULL CHECK (length(trim(version)) > 0),
+     install_event_id      TEXT NOT NULL CHECK (length(trim(install_event_id)) > 0),
+     assertion             TEXT NOT NULL CHECK (assertion IN ('host'))
+   )
+;
+CREATE INDEX idx_provenance_action_app_attributions_app
+       ON provenance_action_app_attributions(package, version, install_event_id)
+;
+CREATE TRIGGER provenance_action_app_attributions_no_update
+       BEFORE UPDATE ON provenance_action_app_attributions
+       BEGIN SELECT RAISE(ABORT, 'provenance_action_app_attributions is append-only'); END
+;
+CREATE TRIGGER provenance_action_app_attributions_no_delete
+       BEFORE DELETE ON provenance_action_app_attributions
+       BEGIN SELECT RAISE(ABORT, 'provenance_action_app_attributions is append-only'); END
+;
+CREATE TABLE sql_write_receipts (
+     principal TEXT NOT NULL CHECK (length(trim(principal)) > 0),
+     plan_id TEXT NOT NULL CHECK (length(trim(plan_id)) > 0),
+     profile TEXT NOT NULL CHECK (profile = 'native.sql-selected-sqlite-commit.v1'),
+     prepared_digest TEXT NOT NULL CHECK (length(prepared_digest) = 64),
+     anchor_id TEXT NOT NULL UNIQUE REFERENCES provenance_action_attestations(id),
+     act INTEGER NOT NULL CHECK (act > 0),
+     envelope TEXT NOT NULL CHECK (json_valid(envelope)),
+     envelope_digest TEXT NOT NULL CHECK (length(envelope_digest) = 64),
+     PRIMARY KEY (principal, plan_id)
+   )
+;
+CREATE INDEX idx_sql_write_receipts_act ON sql_write_receipts(act) WHERE act IS NOT NULL
+;
+CREATE TRIGGER sql_write_receipts_no_update BEFORE UPDATE ON sql_write_receipts
+       BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END
+;
+CREATE TRIGGER sql_write_receipts_no_delete BEFORE DELETE ON sql_write_receipts
+       BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END
+;
+PRAGMA user_version = 90;
 ```

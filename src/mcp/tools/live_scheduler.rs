@@ -172,6 +172,7 @@ impl ProbeComparison<'_> {
 /// on replacement.
 pub struct NeedScheduler {
     hub: Arc<RealtimeHub>,
+    deployment_barrier: Option<crate::mcp::DeploymentMutationBarrier>,
     rotation: usize,
     probe_cursor: usize,
     clock_probe_cursor: usize,
@@ -184,6 +185,7 @@ impl NeedScheduler {
     pub fn new(hub: Arc<RealtimeHub>) -> Self {
         Self {
             hub,
+            deployment_barrier: None,
             rotation: 0,
             probe_cursor: 0,
             clock_probe_cursor: 0,
@@ -191,6 +193,14 @@ impl NeedScheduler {
             start: Instant::now(),
             last_vector: None,
         }
+    }
+
+    pub fn with_deployment_barrier(
+        mut self,
+        barrier: crate::mcp::DeploymentMutationBarrier,
+    ) -> Self {
+        self.deployment_barrier = Some(barrier);
+        self
     }
 
     fn now_ms(&self) -> u64 {
@@ -745,6 +755,29 @@ impl NeedScheduler {
         for token in &tokens {
             self.flush_stale_once(token);
         }
+        {
+            let registry = self
+                .hub
+                .need_registry()
+                .lock()
+                .expect("need registry poisoned");
+            if tokens
+                .iter()
+                .all(|token| registry.peek_dirty(token).is_none())
+            {
+                return;
+            }
+        }
+        let _freeze = match &self.deployment_barrier {
+            Some(barrier) => match barrier.admit(
+                &crate::DeploymentReadOnlyOperation::server("need_scheduler"),
+                crate::mcp::OperationAccess::Mutation,
+            ) {
+                Ok(admission) => Some(admission),
+                Err(_) => return, // Keep dirty work queued until explicit thaw.
+            },
+            None => None,
+        };
         loop {
             let tokens = self
                 .hub

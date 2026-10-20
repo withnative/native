@@ -140,6 +140,13 @@ export function hostNeedRefusal(need, params, limits) {
     if (typeof p.artifact_id !== "string" || !CANONICAL_UUID.test(p.artifact_id)) return "invalid_params";
     return null;
   }
+  if (need === "records.body.current.v1") {
+    if (!only(["record_id", "include_body"])) return "invalid_params";
+    const recordId = typeof p.record_id === "string" ? p.record_id.trim() : null;
+    if (!recordId || [...recordId].length > limits.reads.record_id_max_chars) return "invalid_params";
+    if (p.include_body !== undefined && typeof p.include_body !== "boolean") return "invalid_params";
+    return null;
+  }
   return "unknown_need";
 }
 

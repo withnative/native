@@ -11,14 +11,6 @@ use sqlx::{Row, SqliteConnection};
 use crate::body_blocks::{self, BodyFormat};
 use crate::error::{Error, Result};
 
-pub(crate) fn event_body_value<'a>(event_type: &str, payload: &'a Value) -> Option<&'a Value> {
-    match event_type {
-        "record.created" | "record.updated" | "receipt.committed.v1" => payload.get("body"),
-        "unit.revision.recorded.v1" => payload.get("content")?.get("content"),
-        _ => None,
-    }
-}
-
 pub(crate) fn body_format(value: &Value) -> BodyFormat {
     if value.is_string() {
         BodyFormat::Markdown
@@ -101,11 +93,12 @@ pub(crate) async fn backfill_sqlite(conn: &mut SqliteConnection) -> Result<()> {
         let event_type: String = provenance.try_get("type")?;
         let payload_text: String = provenance.try_get("payload")?;
         let payload: Value = serde_json::from_str(&payload_text)?;
-        let value = event_body_value(&event_type, &payload).ok_or_else(|| {
-            Error::engine(format!(
+        let value =
+            crate::record_body::event_body_value(&event_type, &payload).ok_or_else(|| {
+                Error::engine(format!(
                 "engine-75 backfill cannot identify body value for record {record_id} event {seq}"
             ))
-        })?;
+            })?;
         if crate::record_body::coerce_body(value).as_deref() != Some(body.as_str()) {
             return Err(Error::engine(format!(
                 "engine-75 backfill body bytes disagree with event {seq} for record {record_id}"

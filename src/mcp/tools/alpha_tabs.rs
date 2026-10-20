@@ -76,7 +76,10 @@ use super::{echo_act, parse_args, require_nonblank_reason};
 #[doc(hidden)]
 pub mod adoption_intent;
 mod batch_read;
+mod bundle_delivery;
+pub use bundle_delivery::AppBundleDelivery;
 mod gate_cache;
+mod prepare_install;
 pub use batch_read::LiveReadItem;
 #[doc(hidden)]
 pub mod hosted_producer;
@@ -145,13 +148,14 @@ const PUSH_ONLY_NEEDS: &[&str] = &[SURFACE_REVEAL_NEED];
 /// of them can never address a SQL need, so `do_declared_read` gates it on
 /// the read-only pool; any other name gates on the governed pool its SQL
 /// would run on.
-const HOST_READ_NEEDS: [&str; 6] = [
+const HOST_READ_NEEDS: [&str; 7] = [
     ATTENTION_QUERY_NEED,
     RECORDS_SEARCH_NEED,
     RECORDS_RESOLVE_REFERENCE_NEED,
     CANVAS_SCENE_NEED,
     RECORD_CHANGES_NEED,
     ARTIFACT_RENDER_NEED,
+    RECORDS_BODY_CURRENT_NEED,
 ];
 
 /// Bounds on `records.search.v1` parameters. The limit matches alpha's shell
@@ -218,6 +222,27 @@ pub const ARTIFACT_RENDER_NEED: &str = "artifact.render.v1";
 /// is refused `too_large` rather than cut, because half a document is not a
 /// document.
 pub const ARTIFACT_RENDER_RESULT_MAX_CHARS: usize = 768 * 1024;
+
+/// Declared on-request read: one record's current body with its digest, read
+/// together from one snapshot (task `9be4011`, slice 6). Host-named and
+/// read-only. `body_digest` is exactly the digest a body save's
+/// `expected_body_digest` / `if_body_digest` compares against, so an app can
+/// save against what it read without hashing the text itself. Pairing text
+/// and digest from different reads is unsafe: a write between them would
+/// give newer bytes' digest to older text, and the save would pass its check
+/// and overwrite that write. With `include_body: false` it is a cheap change
+/// probe: equal digests mean an unchanged body. No sequence reaches the tab.
+pub const RECORDS_BODY_CURRENT_NEED: &str = "records.body.current.v1";
+
+/// Largest body `records.body.current.v1` carries: the body-set maximum, so
+/// any body an app can save it can also read with its digest atomically.
+pub const BODY_CURRENT_MAX_BODY_BYTES: usize = BODY_SET_MAX_BODY_BYTES;
+
+/// Size budget for one whole `records.body.current.v1` answer, in the
+/// bridge's measure, as [`CANVAS_SCENE_PAGE_MAX_CHARS`]. A body under
+/// [`BODY_CURRENT_MAX_BODY_BYTES`] whose JSON escaping would still pass it
+/// (newline- or quote-heavy text) is omitted `too_large`, digest kept.
+pub const BODY_CURRENT_RESULT_MAX_CHARS: usize = 768 * 1024;
 
 /// Where a `records.changes.v1` page resumes, sealed.
 ///
@@ -631,6 +656,7 @@ pub(crate) fn parse_sql_need_entry(entry: &Value) -> std::result::Result<SqlNeed
         || key == CANVAS_SCENE_NEED
         || key == RECORD_CHANGES_NEED
         || key == ARTIFACT_RENDER_NEED
+        || key == RECORDS_BODY_CURRENT_NEED
     {
         return Err(format!(
             "{TOOL}: sql need 'key' must not collide with a host need name [invalid_sql_need]"
@@ -703,6 +729,24 @@ pub(crate) fn parse_sql_need_entry(entry: &Value) -> std::result::Result<SqlNeed
         }
         refusal
     })?;
+    // Fail fast on statements admission accepts but execution never can:
+    // `catalog_operations` rows resolve only in online executor ad-hoc
+    // query_sql from the serving snapshot, which a need execution never
+    // carries. Dependency observation is alias-aware, so a same-named CTE
+    // or literal never trips this.
+    match crate::query::sql::validated_relation_dependencies(sql) {
+        Ok(dependencies) if dependencies.contains("catalog_operations") => {
+            return Err(format!(
+                "{TOOL}: sql need '{key}' cannot read 'catalog_operations': serving catalogue rows resolve only in online executor ad-hoc query_sql [invalid_sql_need]"
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(format!(
+                "{TOOL}: sql need '{key}' dependencies are unavailable: {error} [invalid_sql_need]"
+            ));
+        }
+    }
     crate::query::sql_contract::check_positional_arguments(
         crate::query::sql_contract::QuerySqlProfile::SqliteLocal,
         sql,
@@ -832,6 +876,10 @@ pub enum DeclaredRead {
     },
     ArtifactRender {
         artifact_id: String,
+    },
+    BodyCurrent {
+        record_id: String,
+        include_body: bool,
     },
 }
 
@@ -982,6 +1030,27 @@ pub fn parse_declared_read(
             }
             Ok(DeclaredRead::ArtifactRender {
                 artifact_id: canonical,
+            })
+        }
+        RECORDS_BODY_CURRENT_NEED => {
+            if !only(&["record_id", "include_body"]) {
+                return Err("invalid_params");
+            }
+            let record_id = params
+                .get("record_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .ok_or("invalid_params")?;
+            if record_id.is_empty() || record_id.chars().count() > RECORD_ID_MAX_CHARS {
+                return Err("invalid_params");
+            }
+            let include_body = match params.get("include_body") {
+                None => true,
+                Some(value) => value.as_bool().ok_or("invalid_params")?,
+            };
+            Ok(DeclaredRead::BodyCurrent {
+                record_id: record_id.to_string(),
+                include_body,
             })
         }
         _ => Err("unknown_need"),
@@ -1226,6 +1295,15 @@ pub fn parse_reads_declaration(value: &Value) -> std::result::Result<ReadsDeclar
     let mut grants = Vec::with_capacity(relations.len());
     for (name, columns) in relations {
         let relation = name.to_ascii_lowercase();
+        // `catalog_operations` rows resolve only in online executor ad-hoc
+        // query_sql from the serving pinned catalogue; alpha-tab needs can
+        // never be granted them. Refuse at declaration so the denial names
+        // the relation instead of failing later as an empty read.
+        if relation == "catalog_operations" {
+            return Err(format!(
+                "{TOOL}: declaration 'reads' relation '{name}' is unavailable to alpha tabs: serving catalogue rows resolve only in online executor ad-hoc query_sql [invalid_reads]"
+            ));
+        }
         let catalog = reads_catalog_columns(&relation).ok_or_else(|| {
             format!("{TOOL}: declaration 'reads' names unknown relation '{name}' [invalid_reads]")
         })?;
@@ -1427,9 +1505,14 @@ pub const APP_READ_PRIVATE_MESSAGE_RELATIONS: &[&str] = &["messages_awaiting_rep
 
 /// Full record-text columns that merit the quiet broad badge even under a
 /// narrowed scope. Both records.body and the reassemblable body_blocks.text
-/// chunks disclose record text; records.summary and links.note are short
-/// annotations and do not qualify.
-pub const APP_READ_BROAD_COLUMNS: &[(&str, &str)] = &[("records", "body"), ("body_blocks", "text")];
+/// chunks disclose record text, and a comment anchor's quote may span a
+/// whole body; records.summary and links.note are short annotations and do
+/// not qualify.
+pub const APP_READ_BROAD_COLUMNS: &[(&str, &str)] = &[
+    ("records", "body"),
+    ("body_blocks", "text"),
+    ("comment_anchors", "selectors"),
+];
 
 /// Relations whose rows belong to the exact record set narrowed inside the
 /// viewer fence. Chunks, task markers and typed times use their owner record's type/kind. Other
@@ -2517,6 +2600,20 @@ pub fn alpha_tab_canonical_declaration(declaration: &Value) -> Result<Value> {
         if let (Some(object), Some(list)) = (canonical.as_object_mut(), sessions) {
             object.insert("sessions".to_string(), Value::Array(list));
         }
+    }
+    // `contract` is bound iff present, so v1 digests stay byte-identical.
+    // Refused here too, so the pin never depends on the install path.
+    crate::alpha_tab_sessions::validate_declaration_contract(declaration).map_err(|reason| {
+        Error::engine(format!("{TOOL}: declaration {reason} [invalid_contract]"))
+    })?;
+    if is_app_v2_declaration(declaration) {
+        canonical
+            .as_object_mut()
+            .expect("canonical declaration object")
+            .insert(
+                "contract".to_string(),
+                json!(crate::alpha_tab_sessions::APP_CONTRACT_V2),
+            );
     }
     if body_read {
         canonical
@@ -3614,6 +3711,13 @@ pub fn verify_alpha_tab_adopt_confirm(
     Ok(())
 }
 
+// Omission opts out, while an explicitly supplied null/non-string is malformed.
+fn deserialize_delivery<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
 /// Arguments accepted by `manage_alpha_tabs`. Personal scope only: the
 /// caller's own `account_id` rows. No workspace scope, no `trusted` mode.
 /// M2 subscribe request on `live_read` (design `ee12faf` §2.2): `stream` is
@@ -3642,13 +3746,24 @@ struct LiveReadOptions {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "action", rename_all = "snake_case")]
 pub enum ManageAlphaTabsArgs {
+    PrepareInstall(prepare_install::Args),
     Inspect {
         package: String,
     },
-    List {},
+    List {
+        #[serde(default)]
+        view: Option<String>,
+        #[serde(default)]
+        include_removed: Option<bool>,
+    },
     Launch {
         package: String,
         expected_install_event_id: String,
+        /// Optional deployment-allowlisted host parent; omission keeps web behavior.
+        #[serde(default)]
+        parent_origin: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_delivery")]
+        delivery: Option<String>,
     },
     LiveRead {
         package: String,
@@ -3863,18 +3978,9 @@ pub(crate) fn require_package(package: &str) -> Result<()> {
             "{TOOL}: package must be 1..128 characters"
         )));
     }
-    let labels: Vec<&str> = package.split('.').collect();
-    if labels.len() < 2
-        || labels.iter().any(|label| {
-            label.is_empty()
-                || label.len() > 32
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-    {
+    // Shape is the shared artifact-html predicate; the length branch above
+    // keeps this function's historic messages byte-identical.
+    if !native_artifact_html::bundle_url::is_valid_package_id(package) {
         return Err(Error::engine(format!(
             "{TOOL}: package '{package}' is not a reverse-dns id"
         )));
@@ -4203,6 +4309,7 @@ pub(crate) async fn check_body_binding_in(
         source_sha256,
         scope,
         Some(record_id),
+        BindingMembership::Target,
     )
     .await
 }
@@ -4518,6 +4625,7 @@ async fn check_facet_set_binding_in(
         source_sha256,
         scope,
         record_id,
+        BindingMembership::Resolve,
     )
     .await
 }
@@ -4558,6 +4666,7 @@ pub(crate) async fn check_comment_binding_in(
         source_sha256,
         scope,
         record_id,
+        BindingMembership::Resolve,
     )
     .await
 }
@@ -4594,6 +4703,7 @@ pub(crate) async fn check_react_binding_in(
         source_sha256,
         scope,
         record_id,
+        BindingMembership::Resolve,
     )
     .await
 }
@@ -4630,8 +4740,26 @@ pub(crate) async fn check_title_binding_in(
         source_sha256,
         scope,
         record_id,
+        BindingMembership::Resolve,
     )
     .await
+}
+
+/// How [`check_current_binding_in`] decides whether the target is inside a
+/// bound collection. Both give the same membership answer; they differ in
+/// cost and in one deliberate respect: `Resolve` converts every member and
+/// so refuses when *any* member carries a non-canonical declared facet,
+/// while `Target` converts only the target, so only the target's own
+/// malformed facet refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingMembership {
+    /// Resolve each bound collection in full, then look for the target.
+    Resolve,
+    /// Ask each bound collection about the target alone
+    /// ([`super::artifacts::collection_contains_in`]), so the check does not
+    /// grow with the collection. Body Save uses this: it runs on every
+    /// autosave, inside the write transaction.
+    Target,
 }
 
 /// Neutral current-binding core behind both arms, on the write transaction.
@@ -4643,10 +4771,12 @@ pub(crate) async fn check_title_binding_in(
 /// kind re-read (never the stale preflight kind), viewer View, and the
 /// exact input.read grant through its transaction twin — and the target is
 /// re-resolved inside those collections through the existing
-/// transaction-capable collection resolver. No new executor, no duplicated
-/// TEMP internals. Refusal codes mirror the pre-transaction diagnostics
-/// where the situation matches; `binding_changed` names genuine
-/// in-transaction divergence.
+/// transaction-capable collection resolver, or — under
+/// [`BindingMembership::Target`] — asked about the target alone through the
+/// same query engine. No new executor, no duplicated TEMP internals.
+/// Refusal codes mirror the pre-transaction diagnostics where the situation
+/// matches; `binding_changed` names genuine in-transaction divergence.
+#[allow(clippy::too_many_arguments)] // Keep the transaction and pinned binding inputs explicit.
 async fn check_current_binding_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
@@ -4655,6 +4785,7 @@ async fn check_current_binding_in(
     source_sha256: &str,
     scope: &[(String, String, String)],
     record_id: Option<&str>,
+    membership: BindingMembership,
 ) -> Result<Option<(String, String)>> {
     use crate::authorization::Capability;
     let changed = || {
@@ -4770,8 +4901,28 @@ async fn check_current_binding_in(
                 ),
             )));
         }
-        match super::artifacts::resolve_collection_in(tx, caller, collection_id, &live_kind).await {
-            Ok(records) => in_binding.extend(records.into_iter().map(|record| record.id)),
+        let resolved = match (membership, record_id) {
+            (BindingMembership::Target, Some(target)) => super::artifacts::collection_contains_in(
+                tx,
+                caller,
+                collection_id,
+                &live_kind,
+                target,
+            )
+            .await
+            .map(|inside| {
+                if inside {
+                    vec![target.to_owned()]
+                } else {
+                    Vec::new()
+                }
+            }),
+            _ => super::artifacts::resolve_collection_in(tx, caller, collection_id, &live_kind)
+                .await
+                .map(|records| records.into_iter().map(|record| record.id).collect()),
+        };
+        match resolved {
+            Ok(ids) => in_binding.extend(ids),
             Err(error) => {
                 return Ok(Some(("input_resolution_failed".into(), error.to_string())));
             }
@@ -4897,6 +5048,14 @@ struct ParsedDeclaration {
     effects: Vec<String>,
 }
 
+/// Whether a declaration carries the app-contract v2 marker. Callers that
+/// need the verdict on stored bytes rely on admission having refused every
+/// other `contract` value, so this is an exact match.
+pub(crate) fn is_app_v2_declaration(declaration: &Value) -> bool {
+    declaration.get("contract").and_then(Value::as_str)
+        == Some(crate::alpha_tab_sessions::APP_CONTRACT_V2)
+}
+
 fn require_declaration(declaration: &Value) -> Result<ParsedDeclaration> {
     require_declaration_for_adoption(declaration, false)
 }
@@ -4926,6 +5085,12 @@ fn require_declaration_for_adoption(
             "{TOOL}: declaration must hold 'needs' and 'effects' (and optional 'sessions')"
         )));
     }
+    // `contract` is optional; only `native.app.v2` is accepted, and a v2
+    // install declares nothing (the validator owns that rule). Absent keeps
+    // v1 untouched.
+    crate::alpha_tab_sessions::validate_declaration_contract(declaration).map_err(|reason| {
+        Error::engine(format!("{TOOL}: declaration {reason} [invalid_contract]"))
+    })?;
     let effect_entries = object["effects"]
         .as_array()
         .ok_or_else(|| Error::engine(format!("{TOOL}: declaration 'effects' must be an array")))?;
@@ -5147,6 +5312,7 @@ type InstallRowTuple = (
 );
 
 /// One projection row as the tool sees it.
+#[derive(Debug)]
 struct InstallRow {
     package: String,
     version: String,
@@ -5255,6 +5421,7 @@ fn target_state_name(state: TargetState) -> &'static str {
 /// exact bytes. The identity is portable because content event ids are
 /// stable across event import while local content sequence numbers may
 /// remap.
+#[derive(Debug)]
 struct AlphaTabSource {
     #[allow(dead_code)]
     event_id: String,
@@ -5272,15 +5439,11 @@ async fn resolve_alpha_tab_source_in(
     artifact_id: &str,
     source_revision: &str,
 ) -> Result<Option<AlphaTabSource>> {
-    let row = sqlx::query(
-        "SELECT id, json_extract(payload,'$.body') AS body FROM content_events
-          WHERE record_id=? AND id=?
-            AND type IN ('record.created','record.updated','receipt.committed.v1')
-            AND json_type(payload,'$.body') IS NOT NULL",
+    let row = crate::record_body::pinned::exact_source_on(
+        &mut **tx,
+        source_revision,
+        crate::record_body::pinned::ExactSourcePolicy::PresentBodyForRecord(artifact_id),
     )
-    .bind(artifact_id)
-    .bind(source_revision)
-    .fetch_optional(&mut **tx)
     .await?;
     row.map(|row| {
         Ok(AlphaTabSource {
@@ -5813,7 +5976,8 @@ async fn do_update(
     let source = resolve_alpha_tab_source_in(&mut tx, &artifact_id, &source_revision)
         .await?
         .ok_or_else(|| Error::engine(format!("{TOOL}: update refused [source_unresolved]")))?;
-    let manifest = crate::artifact_html::validate_cached(&source.body)
+    let body_limit = super::artifacts::html_body_limit_in(&mut tx, &artifact_id).await?;
+    let manifest = crate::artifact_html::validate_cached_with_limit(&source.body, body_limit)
         .map_err(|failure| Error::engine(format!("{TOOL}: update refused [{}]", failure.code)))?;
     let bundle_digest = alpha_tab_bundle_digest(&source.body);
     if manifest.body_digest != bundle_digest
@@ -6304,7 +6468,19 @@ async fn do_reorder(
     )
 }
 
-async fn do_list(db: &Db, caller: &Caller) -> Result<Value> {
+async fn do_list(
+    db: &Db,
+    caller: &Caller,
+    view: Option<String>,
+    include_removed: Option<bool>,
+) -> Result<Value> {
+    let view = view.as_deref().unwrap_or("full");
+    if view != "full" && view != "summary" {
+        return Err(Error::engine(format!(
+            "{TOOL}: unknown list view '{view}' [invalid_params]"
+        )));
+    }
+    let include_removed = include_removed.unwrap_or(view == "full");
     let account_id = require_account(caller)?;
     let mut tx = db.pool().begin().await?;
     let rows: Vec<InstallRowTuple> = sqlx::query_as(
@@ -6316,6 +6492,7 @@ async fn do_list(db: &Db, caller: &Caller) -> Result<Value> {
     .fetch_all(&mut *tx)
     .await?;
     let mut installs = Vec::new();
+    let mut removed_hidden: i64 = 0;
     for (
         package,
         version,
@@ -6347,11 +6524,47 @@ async fn do_list(db: &Db, caller: &Caller) -> Result<Value> {
             event_id,
             event_seq,
         };
-        installs.push(entry_in(&mut tx, caller, &row).await?);
+        if !include_removed && row.status == "removed" {
+            removed_hidden += 1;
+            continue;
+        }
+        let entry = entry_in(&mut tx, caller, &row).await?;
+        if view == "summary" {
+            let name = if entry["target_resolves"].as_bool() == Some(true) {
+                let name: Option<String> =
+                    sqlx::query_scalar("SELECT name FROM records WHERE id=?")
+                        .bind(&row.artifact_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                name.map(Value::String).unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            installs.push(json!({
+                "package": entry["package"],
+                "name": name,
+                "version": entry["version"],
+                "status": entry["status"],
+                "artifact_id": entry["artifact_id"],
+                "event_id": entry["event_id"],
+                "adoption_basis": entry["adoption_basis"],
+                "request": entry["request"],
+                "target_resolves": entry["target_resolves"],
+                "target_skip_reason": entry["target_skip_reason"],
+            }));
+        } else {
+            installs.push(entry);
+        }
     }
     let tab_order = effective_tab_order_in(&mut tx, &account_id).await?;
     tx.rollback().await?;
-    Ok(json!({"account_id": account_id, "installs": installs, "tab_order": tab_order}))
+    if view == "summary" {
+        Ok(
+            json!({"account_id": account_id, "view": "summary", "installs": installs, "tab_order": tab_order, "removed_hidden": removed_hidden}),
+        )
+    } else {
+        Ok(json!({"account_id": account_id, "installs": installs, "tab_order": tab_order}))
+    }
 }
 
 async fn do_inspect(db: &Db, caller: &Caller, package: String) -> Result<Value> {
@@ -6370,39 +6583,79 @@ async fn do_inspect(db: &Db, caller: &Caller, package: String) -> Result<Value> 
     Ok(result)
 }
 
-/// Issue a one-use HTML ticket from the exact consented source event. The
-/// write transaction serializes source, install, and authority checks with
-/// concurrent control transitions; no URL is returned before the post-issue
-/// provenance check. Delivery is sample-only until the named-input host lands.
-async fn do_launch(
-    db: &Db,
+/// What `admit_installed_app_source_in` returns on success: everything
+/// `do_launch` needs after the gate chain to issue the ticket. The pin
+/// itself (`digest`, `version`, `source_revision`, …) stays on `row`; the
+/// recomputed declaration digest is carried alongside. The bundle hash is
+/// deliberately not carried: `do_launch` recomputes it after manifest
+/// validation, exactly as before, so a pin-valid body that validation
+/// rejects never pays a second full-body hash inside the write transaction.
+#[derive(Debug)]
+struct AdmittedAppSource {
+    row: InstallRow,
+    source: AlphaTabSource,
+    /// Recomputed declaration digest (equals the pin; carried for B4).
+    #[allow(dead_code)]
+    declaration_digest: String,
+    runtime: String,
+    body_limit: usize,
+}
+
+/// Shared launch-time admission for one installed app (slice B2 refactor,
+/// no behaviour change): the exact `do_launch` gate chain, so the later
+/// serve route (B4) can run the same checks on every load.
+///
+/// Given an app-database transaction, the caller, the caller's portable
+/// account id and a package, establishes in order, with today's refusal
+/// reasons:
+/// - the install row for (account, package) exists (`missing_install`);
+/// - when `expected_event_id` is supplied, `event_id` equals it
+///   (`cas_mismatch`);
+/// - when `expected_digest` is supplied, the install pin `digest` equals it
+///   (the full `"sha256:…"` string; also `cas_mismatch` — the caller's pin
+///   names a stale install generation, exactly like a stale event id);
+/// - `evaluate_alpha_tab_install_gates` passes: removed, disabled,
+///   adoption_unverified, missing, archived, wrong_record_type, and
+///   unauthorized via effective View (`can_record_in`);
+/// - the declaration digest recomputes to the pin (`declaration_mismatch`;
+///   a stored declaration the canonical form refuses propagates its
+///   contract error instead, exactly as `do_launch` does today);
+/// - `evaluate_alpha_tab_source_gates` passes over the current runtime
+///   facet (`native.html.v1`), the exact source event
+///   (`resolve_alpha_tab_source_in`) and the recomputed
+///   `alpha_tab_digest(sha256(body), declaration, runtime)` pin equality;
+/// - the current body limit (`html_body_limit_in`).
+///
+/// Manifest validation, ticket issuance and the post-issue provenance
+/// re-check stay with `do_launch`.
+async fn admit_installed_app_source_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
-    package: String,
-    expected_install_event_id: String,
-) -> Result<Value> {
-    require_package(&package)?;
-    if expected_install_event_id.trim().is_empty() {
-        return Err(Error::engine(format!(
-            "{TOOL}: expected_install_event_id must not be blank"
-        )));
-    }
-    let account_id = require_account(caller)?;
-    let mut tx = crate::db::begin_write(db.write_pool()).await?;
-    let row = install_row_in(&mut tx, &account_id, &package)
+    account_id: &str,
+    package: &str,
+    expected_event_id: Option<&str>,
+    expected_digest: Option<&str>,
+) -> Result<AdmittedAppSource> {
+    let row = install_row_in(tx, account_id, package)
         .await?
         .ok_or_else(|| {
             Error::engine(format!(
                 "{TOOL}: package {package} is not installed [missing_install]"
             ))
         })?;
-    if row.event_id != expected_install_event_id {
+    if expected_event_id.is_some_and(|expected| row.event_id != expected) {
         return Err(Error::engine(format!(
             "{TOOL}: installation changed [cas_mismatch]"
         )));
     }
-    let target = target_state_in(&mut tx, &row.artifact_id).await?;
+    if expected_digest.is_some_and(|expected| row.digest != expected) {
+        return Err(Error::engine(format!(
+            "{TOOL}: installation changed [cas_mismatch]"
+        )));
+    }
+    let target = target_state_in(tx, &row.artifact_id).await?;
     let can_view = target == TargetState::Resolvable
-        && super::can_record_in(&mut tx, caller, &row.artifact_id, Capability::View).await?;
+        && super::can_record_in(tx, caller, &row.artifact_id, Capability::View).await?;
     if let Err(reason) =
         evaluate_alpha_tab_install_gates(&row.status, &row.adoption, target, can_view)
     {
@@ -6411,12 +6664,11 @@ async fn do_launch(
     let runtime: Option<String> =
         sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id=? AND key='runtime'")
             .bind(&row.artifact_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .flatten();
     let source =
-        resolve_alpha_tab_source_in(&mut tx, &row.artifact_id, &row.consented_source_revision)
-            .await?;
+        resolve_alpha_tab_source_in(tx, &row.artifact_id, &row.consented_source_revision).await?;
     let declaration_digest = alpha_tab_declaration_digest(&row.consented_declaration)?;
     if declaration_digest != row.declaration_digest {
         return Err(Error::engine(format!(
@@ -6441,7 +6693,96 @@ async fn do_launch(
         return Err(Error::engine(format!("{TOOL}: launch refused [{reason}]")));
     }
     let source = source.expect("source gate passed");
-    let manifest = crate::artifact_html::validate_cached(&source.body)
+    let body_limit = super::artifacts::html_body_limit_in(tx, &row.artifact_id).await?;
+    let runtime = runtime.expect("source gate passed");
+    Ok(AdmittedAppSource {
+        row,
+        source,
+        declaration_digest,
+        runtime,
+        body_limit,
+    })
+}
+
+/// Minimal held-transport boundary; install rows and source provenance stay private.
+pub(crate) async fn admitted_bundle_source_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    account_id: &str,
+    package: &str,
+    install_event: &str,
+    digest: &str,
+) -> Result<(String, usize)> {
+    let admitted = admit_installed_app_source_in(
+        tx,
+        caller,
+        account_id,
+        package,
+        Some(install_event),
+        Some(digest),
+    )
+    .await?;
+    Ok((admitted.source.body, admitted.body_limit))
+}
+
+/// Issue a one-use HTML ticket from the exact consented source event. The
+/// write transaction serializes source, install, and authority checks with
+/// concurrent control transitions; no URL is returned before the post-issue
+/// provenance check. Delivery is sample-only until the named-input host lands.
+async fn do_launch(
+    db: &Db,
+    caller: &Caller,
+    package: String,
+    expected_install_event_id: String,
+    parent_origin: Option<String>,
+    delivery: Option<String>,
+    bundle_delivery: Option<&AppBundleDelivery>,
+) -> Result<Value> {
+    if let Some(value) = delivery.as_deref() {
+        let valid = value.split_once(".v").is_some_and(|(name, version)| {
+            value.len() <= 64
+                && name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+                && version
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| (b'1'..=b'9').contains(b))
+                && version.bytes().all(|b| b.is_ascii_digit())
+        });
+        if !valid {
+            return Err(Error::engine(format!(
+                "{TOOL}: malformed delivery protocol [invalid_params]"
+            )));
+        }
+    }
+    require_package(&package)?;
+    if expected_install_event_id.trim().is_empty() {
+        return Err(Error::engine(format!(
+            "{TOOL}: expected_install_event_id must not be blank"
+        )));
+    }
+    let account_id = require_account(caller)?;
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let admitted = admit_installed_app_source_in(
+        &mut tx,
+        caller,
+        &account_id,
+        &package,
+        Some(&expected_install_event_id),
+        None,
+    )
+    .await?;
+    let AdmittedAppSource {
+        row,
+        source,
+        body_limit,
+        runtime: admitted_runtime,
+        ..
+    } = admitted;
+    let runtime: Option<String> = Some(admitted_runtime);
+    let manifest = crate::artifact_html::validate_cached_with_limit(&source.body, body_limit)
         .map_err(|failure| Error::engine(format!("{TOOL}: launch refused [{}]", failure.code)))?;
     let bundle_sha256 = alpha_tab_bundle_digest(&source.body);
     if manifest.body_digest != bundle_sha256 {
@@ -6449,16 +6790,49 @@ async fn do_launch(
             "{TOOL}: launch refused [body_digest_mismatch]"
         )));
     }
+    let reusable = if delivery.as_deref() == Some("reusable.v1") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        bundle_delivery.and_then(|config| {
+            config.launch(
+                caller,
+                &package,
+                &row.event_id,
+                &row.digest,
+                parent_origin.as_deref(),
+                now,
+            )
+        })
+    } else {
+        None
+    };
     let principal = caller.hosting_principal().unwrap_or(account_id.as_str());
-    let launch = crate::artifact_html::issue_launch(
-        &source.body,
-        &manifest,
-        principal,
-        caller.hosting_database(),
-        &row.artifact_id,
-    )
-    .map_err(|failure| Error::engine(format!("{TOOL}: launch refused [{}]", failure.code)))?;
-    // Post-issue bind: a returned ticket must describe the same event and
+    let launch = if let Some(launch) = reusable {
+        // Tickets check kit availability while composing bytes at issuance.
+        // Preserve that refusal even though reusable delivery composes on GET.
+        manifest.require_available_kit().map_err(|failure| {
+            Error::engine(format!("{TOOL}: launch refused [{}]", failure.code))
+        })?;
+        launch
+    } else {
+        let ticket = crate::artifact_html::issue_launch_for_parent(
+            &source.body,
+            &manifest,
+            principal,
+            caller.hosting_database(),
+            &row.artifact_id,
+            parent_origin.as_deref(),
+        )
+        .map_err(|failure| Error::engine(format!("{TOOL}: launch refused [{}]", failure.code)))?;
+        json!({
+            "url": ticket.url,
+            "expires_in_ms": ticket.expires_in_ms,
+            "bridge_version": crate::artifact_html::BRIDGE_VERSION,
+        })
+    };
+    // Post-issue bind: a returned launch must describe the same event and
     // install state observed before issuance. Under SQLite's write lock these
     // cannot change concurrently, but keep the check explicit as provenance.
     let current = install_row_in(&mut tx, &account_id, &package).await?;
@@ -6503,11 +6877,7 @@ async fn do_launch(
             "body_digest": manifest.body_digest,
             "runtime": runtime,
         },
-        "launch": {
-            "url": launch.url,
-            "expires_in_ms": launch.expires_in_ms,
-            "bridge_version": crate::artifact_html::BRIDGE_VERSION,
-        },
+        "launch": launch,
         "sandbox": {
             "sandbox": "allow-scripts",
             "referrerPolicy": "no-referrer",
@@ -6519,6 +6889,430 @@ async fn do_launch(
         "live_reads": false,
         "effects_wired": false,
     }))
+}
+
+#[cfg(test)]
+mod admitted_app_source_tests {
+    use super::*;
+
+    const ADMIT_BODY: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Admit</title></head><body><main><h1>Admit</h1></main></body></html>";
+    const ADMIT_ARTIFACT: &str = "a1d00000-0000-4000-8000-0000000000a1";
+    const ADMIT_ACCOUNT: &str = "alice";
+    const ADMIT_PACKAGE: &str = "agent.admit-fixture";
+    const WRONG_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn admit_declaration() -> Value {
+        json!({"needs": ["attention.query.v1"], "effects": ["task.triage-set.v1"]})
+    }
+
+    async fn fixture() -> (Db, ToolRegistry) {
+        crate::artifact_html::configure(
+            crate::artifact_html::RuntimeConfig::new(
+                "http://localhost:8080",
+                "http://artifact.localhost:8080",
+            )
+            .expect("admit test HTML runtime configuration"),
+        );
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+        (db, registry)
+    }
+
+    /// Install the exact pin, then preview and adopt it: returns the adopted
+    /// install event id and the pin digest (mirrors the guard-test flow).
+    async fn adopted_install(db: &Db, registry: &ToolRegistry) -> (String, String) {
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": ADMIT_ARTIFACT, "type": "Document", "kind": "artifact",
+                    "name": ADMIT_ARTIFACT, "body": ADMIT_BODY,
+                    "facets": { "runtime": "native.html.v1" },
+                    "reason": "Admit fixture artifact.",
+                }),
+            )
+            .await
+            .unwrap();
+        crate::authorization::replace_explicit_policy(
+            db,
+            "test:policy",
+            ADMIT_ARTIFACT,
+            vec![crate::authorization::AllowEntry::account(
+                ADMIT_ACCOUNT,
+                Capability::View,
+            )],
+        )
+        .await
+        .unwrap();
+        let source_revision: String = sqlx::query_scalar(
+            "SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(ADMIT_ARTIFACT)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let declaration = admit_declaration();
+        let digest = alpha_tab_digest(
+            &alpha_tab_bundle_digest(ADMIT_BODY),
+            &alpha_tab_declaration_digest(&declaration).unwrap(),
+            "native.html.v1",
+        );
+        let installed = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ADMIT_ACCOUNT),
+                "manage_alpha_tabs",
+                json!({
+                    "action": "install", "package": ADMIT_PACKAGE, "version": "0.1.0",
+                    "digest": digest, "artifact_id": ADMIT_ARTIFACT,
+                    "source_revision": source_revision, "declaration": declaration,
+                    "reason": "Admit fixture install.",
+                }),
+            )
+            .await
+            .unwrap();
+        let install_event = installed["install"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let authority = || {
+            alpha_tab_preview_authority_for(
+                ADMIT_ACCOUNT,
+                ADMIT_PACKAGE,
+                "0.1.0",
+                &digest,
+                ADMIT_ARTIFACT,
+                &source_revision,
+                &declaration,
+            )
+            .expect("fixture declaration is well-formed")
+        };
+        let preview = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ADMIT_ACCOUNT).with_verified_alpha_tab_preview(authority()),
+                "manage_alpha_tabs",
+                json!({
+                    "action": "preview", "package": ADMIT_PACKAGE, "version": "0.1.0",
+                    "digest": digest, "artifact_id": ADMIT_ARTIFACT,
+                    "source_revision": source_revision, "declaration": declaration,
+                    "reason": "Admit fixture preview.",
+                }),
+            )
+            .await
+            .unwrap();
+        let adopted = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ADMIT_ACCOUNT).with_verified_alpha_tab_adopt(authority()),
+                "manage_alpha_tabs",
+                json!({
+                    "action": "adopt", "package": ADMIT_PACKAGE, "version": "0.1.0",
+                    "digest": digest, "artifact_id": ADMIT_ARTIFACT,
+                    "source_revision": source_revision, "declaration": declaration,
+                    "receipt_id": preview["receipt"]["receipt_id"],
+                    "nonce": preview["receipt"]["nonce"],
+                    "preview_session": preview["receipt"]["preview_session"],
+                    "expected_install_event_id": install_event,
+                    "reason": "Admit fixture adopt.",
+                }),
+            )
+            .await
+            .unwrap();
+        let adopted_event = adopted["install"]["event_id"].as_str().unwrap().to_string();
+        (adopted_event, digest)
+    }
+
+    async fn admit(
+        db: &Db,
+        event: Option<&str>,
+        digest: Option<&str>,
+    ) -> Result<AdmittedAppSource> {
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let caller = Caller::authenticated(ADMIT_ACCOUNT);
+        admit_installed_app_source_in(
+            &mut tx,
+            &caller,
+            ADMIT_ACCOUNT,
+            ADMIT_PACKAGE,
+            event,
+            digest,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn launch_delivery_refuses_an_unavailable_kit() {
+        let (db, registry) = fixture().await;
+        let (event, _) = adopted_install(&db, &registry).await;
+        // Model an already-adopted pin whose requested kit is unavailable on
+        // this host. Keep source and digest consistent so kit admission is
+        // the refusal, rather than an earlier provenance or digest gate.
+        let body = ADMIT_BODY.replace(
+            "</head>",
+            r#"<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":2}</script></head>"#,
+        );
+        let digest = alpha_tab_digest(
+            &alpha_tab_bundle_digest(&body),
+            &alpha_tab_declaration_digest(&admit_declaration()).unwrap(),
+            "native.html.v1",
+        );
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id": ADMIT_ARTIFACT, "body_set": body,
+                    "if_body_digest": super::super::lifecycle::body_digest(Some(ADMIT_BODY)),
+                    "reason": "Unavailable-kit fixture source.",
+                }),
+            )
+            .await
+            .unwrap();
+        let source_revision: String = sqlx::query_scalar(
+            "SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        ).bind(ADMIT_ARTIFACT).fetch_one(db.pool()).await.unwrap();
+        sqlx::query("UPDATE alpha_tab_installs SET digest=?,consented_source_revision=? WHERE account_id=? AND package=?")
+            .bind(&digest).bind(&source_revision).bind(ADMIT_ACCOUNT).bind(ADMIT_PACKAGE)
+            .execute(db.write_pool()).await.unwrap();
+        let caller = unsafe {
+            Caller::authenticated(ADMIT_ACCOUNT)
+                .with_hosting_context("principal", "database")
+                .with_verified_hosting_session("11111111-1111-4111-8111-111111111111")
+        };
+        let config = AppBundleDelivery {
+            enabled: true,
+            runtime: crate::artifact_html::configuration().unwrap(),
+            keyring: Some(std::sync::Arc::new(native_artifact_runtime::deployment_keyring::DeploymentKeyring::from_json_bundle(
+                r#"{"active_key_id":"test","keys":[{"id":"test","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#,
+            ).unwrap())),
+        };
+        // Confirm signing eligibility: the reusable kit check must run.
+        assert!(config
+            .launch(&caller, ADMIT_PACKAGE, &event, &digest, None, 1000)
+            .is_some());
+        for delivery in [None, Some("reusable.v1".into())] {
+            let error = do_launch(
+                &db,
+                &caller,
+                ADMIT_PACKAGE.into(),
+                event.clone(),
+                None,
+                delivery,
+                Some(&config),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("kit_major_unavailable"),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_delivery_opt_in_keeps_ticket_bytes_and_all_install_gates() {
+        let (db, registry) = fixture().await;
+        let (event, digest) = adopted_install(&db, &registry).await;
+        let caller = unsafe {
+            Caller::authenticated(ADMIT_ACCOUNT)
+                .with_hosting_context("principal", "database")
+                .with_verified_hosting_session("11111111-1111-4111-8111-111111111111")
+        };
+        let config = AppBundleDelivery {
+            enabled: true,
+            runtime: crate::artifact_html::configuration().unwrap(),
+            keyring: Some(std::sync::Arc::new(native_artifact_runtime::deployment_keyring::DeploymentKeyring::from_json_bundle(
+                r#"{"active_key_id":"test","keys":[{"id":"test","key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}]}"#,
+            ).unwrap())),
+        };
+        let call = |caller: Caller, delivery: Option<String>, config: Option<AppBundleDelivery>| {
+            let db = db.clone();
+            let event = event.clone();
+            async move {
+                do_launch(
+                    &db,
+                    &caller,
+                    ADMIT_PACKAGE.into(),
+                    event,
+                    None,
+                    delivery,
+                    config.as_ref(),
+                )
+                .await
+            }
+        };
+        let mut baseline = call(caller.clone(), None, None).await.unwrap();
+        assert!(baseline["launch"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/launch/"));
+        assert!(baseline["launch"].get("kind").is_none());
+        let url_placeholder = json!("<one-use-random-ticket>");
+        baseline["launch"]["url"] = url_placeholder.clone();
+        // The baseline is this branch's ticket arm; equivalence with main rests
+        // on that arm being a pure move of the previous issuance code.
+        // Tickets carry a random credential. All other serialized bytes remain
+        // equal across absent argument, configured signer, and every fallback.
+        let mut off = config.clone();
+        off.enabled = false;
+        let mut no_key = config.clone();
+        no_key.keyring = None;
+        let mut too_long = config.clone();
+        too_long.runtime = crate::artifact_html::RuntimeConfig::new(
+            "http://localhost:8080",
+            format!("https://{}.test", "a.".repeat(700)),
+        )
+        .unwrap();
+        for (caller, delivery, config) in [
+            (caller.clone(), None, Some(config.clone())),
+            (caller.clone(), Some("reusable.v1".into()), None),
+            (caller.clone(), Some("reusable.v1".into()), Some(off)),
+            (caller.clone(), Some("reusable.v1".into()), Some(no_key)),
+            (caller.clone(), Some("reusable.v1".into()), Some(too_long)),
+            (
+                Caller::authenticated(ADMIT_ACCOUNT).with_hosting_context("principal", "database"),
+                Some("reusable.v1".into()),
+                Some(config.clone()),
+            ),
+            (
+                Caller::authenticated(ADMIT_ACCOUNT),
+                Some("reusable.v1".into()),
+                Some(config.clone()),
+            ),
+            (
+                Caller::local_owner(ADMIT_ACCOUNT),
+                Some("reusable.v1".into()),
+                Some(config.clone()),
+            ),
+            (
+                caller.clone(),
+                Some("reusable.v2".into()),
+                Some(config.clone()),
+            ),
+        ] {
+            let mut result = call(caller, delivery, config).await.unwrap();
+            assert!(result["launch"]["url"]
+                .as_str()
+                .unwrap()
+                .contains("/launch/"));
+            result["launch"]["url"] = url_placeholder.clone();
+            assert_eq!(
+                serde_json::to_vec(&result).unwrap(),
+                serde_json::to_vec(&baseline).unwrap()
+            );
+        }
+        let mut reusable = call(
+            caller.clone(),
+            Some("reusable.v1".into()),
+            Some(config.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reusable["pin"]["digest"], digest);
+        assert_eq!(reusable["launch"]["kind"], "reusable.v1");
+        assert!(reusable["launch"].get("expires_in_ms").is_none());
+        reusable["launch"] = baseline["launch"].clone();
+        assert_eq!(reusable, baseline);
+        for malformed in ["", "reusable", "reusable.v0", "reusable.v1 "] {
+            assert!(
+                call(caller.clone(), Some(malformed.into()), Some(config.clone()))
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid_params")
+            );
+        }
+        for malformed in [json!(42), json!(null), json!(true), json!([]), json!({})] {
+            let error = registry.call(db.clone(), caller.clone(), "manage_alpha_tabs", json!({"action":"launch","package":ADMIT_PACKAGE,"expected_install_event_id":event,"delivery":malformed})).await.unwrap_err();
+            assert!(error.to_string().contains("invalid"), "{error}");
+        }
+        let error = do_launch(
+            &db,
+            &caller,
+            ADMIT_PACKAGE.into(),
+            "stale-event".into(),
+            None,
+            Some("reusable.v1".into()),
+            Some(&config),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cas_mismatch"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn mismatched_event_id_is_refused() {
+        let (db, registry) = fixture().await;
+        let (_, digest) = adopted_install(&db, &registry).await;
+        let error = admit(&db, Some("stale-install-event"), Some(&digest))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cas_mismatch"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn mismatched_digest_is_refused() {
+        let (db, registry) = fixture().await;
+        let (event, _) = adopted_install(&db, &registry).await;
+        let error = admit(&db, Some(&event), Some(WRONG_DIGEST))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cas_mismatch"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn matching_expectations_admit_the_source() {
+        let (db, registry) = fixture().await;
+        let (event, digest) = adopted_install(&db, &registry).await;
+        let admitted = admit(&db, Some(&event), Some(&digest)).await.unwrap();
+        assert_eq!(admitted.row.event_id, event);
+        assert_eq!(admitted.row.digest, digest);
+        assert_eq!(admitted.runtime, "native.html.v1");
+        assert_eq!(admitted.source.body, ADMIT_BODY);
+        assert!(admitted.body_limit > 0);
+        // No expectations is also accepted: the checks after the pin still run.
+        admit(&db, None, None).await.unwrap();
+    }
+
+    /// The full admission chain runs on reads only, so the later serve route
+    /// can call it inside a read transaction: with `query_only` on, any
+    /// future accidental write fails this test instead of reaching review.
+    #[tokio::test]
+    async fn matching_expectations_admit_inside_a_read_only_transaction() {
+        let (db, registry) = fixture().await;
+        let (event, digest) = adopted_install(&db, &registry).await;
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(query_only, 1);
+        let caller = Caller::authenticated(ADMIT_ACCOUNT);
+        let admitted = admit_installed_app_source_in(
+            &mut tx,
+            &caller,
+            ADMIT_ACCOUNT,
+            ADMIT_PACKAGE,
+            Some(&event),
+            Some(&digest),
+        )
+        .await
+        .unwrap();
+        assert_eq!(admitted.row.event_id, event);
+        assert_eq!(admitted.row.digest, digest);
+        assert_eq!(admitted.runtime, "native.html.v1");
+        assert_eq!(admitted.source.body, ADMIT_BODY);
+    }
 }
 
 /// Host-executed governed live read for one adopted tab (task `26ba75a`,
@@ -6751,15 +7545,16 @@ fn project_snapshot_need(need: &SqlNeed, raw: &Value) -> Result<SnapshotSqlNeed>
     })
 }
 
-/// One declared SQL need inside the caller's data transaction: same snapshot
-/// as the gates, same rows as the viewer's own `query_sql`. The engine runs
+/// One declared SQL need in the caller's governed session, on the data
+/// transaction its gate ran on: same snapshot as the gates, same rows as the
+/// viewer's own `query_sql`. The engine runs
 /// under the ordinary owned ad-hoc contract (Portable, MAX_ROWS); the
 /// snapshot cap stays in the shared projection. No `as_of_seq` enters the
 /// envelope: it is stripped by construction here, not just unread later.
 /// Only execution failures carry `sql_need_failed`; gate and parameter
 /// refusals are raised before this runs and keep their own codes.
 async fn execute_sql_need_in(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session: &mut crate::query::sql::GovernedSqlSession<'_, '_>,
     principal: crate::query::QueryPrincipal,
     need: &SqlNeed,
     parameters: Vec<crate::query::sql_contract::QuerySqlParameter>,
@@ -6770,26 +7565,26 @@ async fn execute_sql_need_in(
         sql: need.sql.clone(),
         parameters,
     };
-    let (result, _) = crate::query::sql::query_sql_request_in_with_row_limit_observed(
-        tx,
-        principal,
-        request,
-        crate::query::sql_contract::MAX_ROWS as i64,
-        crate::query::sql_contract::FunctionAllowance::Portable,
-        replay_clock,
-        vm_callbacks,
-        // Declared needs always carry ORDER BY (admission refuses
-        // otherwise); the ad-hoc default never applies here. The field
-        // list below stays the pinned package shape.
-        false,
-    )
-    .await
-    .map_err(|error| {
-        Error::engine(format!(
-            "{TOOL}: sql need '{}' failed: {error} [sql_need_failed]",
-            need.key
-        ))
-    })?;
+    let (result, _) = session
+        .execute(
+            principal,
+            request,
+            crate::query::sql_contract::MAX_ROWS as i64,
+            crate::query::sql_contract::FunctionAllowance::Portable,
+            replay_clock,
+            vm_callbacks,
+            // Declared needs always carry ORDER BY (admission refuses
+            // otherwise); the ad-hoc default never applies here. The field
+            // list below stays the pinned package shape.
+            false,
+        )
+        .await
+        .map_err(|error| {
+            Error::engine(format!(
+                "{TOOL}: sql need '{}' failed: {error} [sql_need_failed]",
+                need.key
+            ))
+        })?;
     project_snapshot_need(
         need,
         &json!({
@@ -7276,6 +8071,24 @@ pub(crate) async fn rerun_snapshot_for_scheduler(
     sql_attempted: &mut bool,
     vm_work: Option<&VmWorkObserver>,
 ) -> Result<(Value, String, crate::need_subscriptions::GateSnapshot, bool)> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2(db).await? {
+        let hub = crate::realtime::RealtimeHub::for_database(db)
+            .ok_or_else(|| Error::engine("v2 app data refused [realtime_unavailable]"))?;
+        let request = crate::realtime::v2::AppDataRequest {
+            package: package.to_owned(),
+            expected_install_event_id: expected_install_event_id.to_owned(),
+            need: None,
+            params: serde_json::json!({}),
+        };
+        let mut evaluated = hub.evaluate_app_data(caller, &request).await?;
+        evaluated.result["time_dependent"] = json!(evaluated.time_dependent);
+        let digest = evaluated.result["revision"]["revision_digest"]
+            .as_str()
+            .ok_or_else(|| Error::engine("v2 app data refused [revision_missing]"))?
+            .to_owned();
+        return Ok((evaluated.result, digest, evaluated.gate.surface, false));
+    }
     let (response, gate, clock_replay_safe) = evaluate_snapshot_live_read(
         db,
         caller,
@@ -7377,6 +8190,21 @@ pub(crate) async fn snapshot_surface_gates(
     package: &str,
     expected_install_event_id: &str,
 ) -> Result<crate::need_subscriptions::GateSnapshot> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2(db).await? {
+        let hub = crate::realtime::RealtimeHub::for_database(db)
+            .ok_or_else(|| Error::engine("v2 app data refused [realtime_unavailable]"))?;
+        let request = crate::realtime::v2::AppDataRequest {
+            package: package.to_owned(),
+            expected_install_event_id: expected_install_event_id.to_owned(),
+            need: None,
+            params: serde_json::json!({}),
+        };
+        return hub
+            .revalidate_app_data(caller, &request)
+            .await
+            .map(|gate| gate.surface);
+    }
     let account_id = live_read_precheck(caller, package, expected_install_event_id)?;
     // The read-only pool: the gate chain only reads, and every push re-run
     // passes through here, so it must not queue behind (or hold up) writers.
@@ -7590,38 +8418,60 @@ async fn evaluate_snapshot_live_read_with_clocks(
     // evaluated snapshot need is.
     let mut snapshot_time_dependent = false;
     let mut snapshot_as_of_ms: Option<i64> = None;
-    for need in &sql_needs {
-        if !need.params.is_empty() {
-            continue;
+    // Every domain read on this transaction (gate, attention window, its
+    // `can_record_in` checks) is done. From here only the declared
+    // statements run on it, under one contract install, and only when at
+    // least one of them runs: an attention-only snapshot installs nothing.
+    if sql_needs.iter().any(|need| need.params.is_empty()) {
+        let mut session = crate::query::sql::GovernedSqlSession::begin(db, tx).await?;
+        let evaluated: Result<()> = async {
+            let session = &mut session;
+            for need in &sql_needs {
+                if !need.params.is_empty() {
+                    continue;
+                }
+                if let Some(attempted) = sql_attempted.as_mut() {
+                    **attempted = true;
+                }
+                let replay_clock = replay_clocks
+                    .and_then(|clocks| clocks.get(&need.key))
+                    .copied();
+                let principal: crate::query::QueryPrincipal = caller.into();
+                let result = execute_sql_need_in(
+                    session,
+                    principal,
+                    need,
+                    Vec::new(),
+                    vm_work.map(VmWorkObserver::declared_sql_counter),
+                    replay_clock,
+                )
+                .await?;
+                if replay_clocks.is_some() && result.time_dependent != replay_clock.is_some() {
+                    return Err(Error::engine("live need clock replay metadata mismatch"));
+                }
+                if result.time_dependent {
+                    snapshot_time_dependent = true;
+                    snapshot_as_of_ms = match (snapshot_as_of_ms, result.now_ms_ms) {
+                        (Some(seen), Some(stamp)) => Some(seen.max(stamp)),
+                        (seen, stamp) => seen.or(stamp),
+                    };
+                }
+                sql_digest.insert(need.key.clone(), result.digest);
+                sql_input.insert(need.key.clone(), result.input);
+            }
+            Ok(())
         }
-        if let Some(attempted) = sql_attempted.as_mut() {
-            **attempted = true;
+        .await;
+        if let Err(error) = evaluated {
+            session.abandon().await;
+            return Err(error);
         }
-        let replay_clock = replay_clocks
-            .and_then(|clocks| clocks.get(&need.key))
-            .copied();
-        let principal: crate::query::QueryPrincipal = caller.into();
-        let result = execute_sql_need_in(
-            &mut tx,
-            principal,
-            need,
-            Vec::new(),
-            vm_work.map(VmWorkObserver::declared_sql_counter),
-            replay_clock,
-        )
-        .await?;
-        if replay_clocks.is_some() && result.time_dependent != replay_clock.is_some() {
-            return Err(Error::engine("live need clock replay metadata mismatch"));
-        }
-        if result.time_dependent {
-            snapshot_time_dependent = true;
-            snapshot_as_of_ms = match (snapshot_as_of_ms, result.now_ms_ms) {
-                (Some(seen), Some(stamp)) => Some(seen.max(stamp)),
-                (seen, stamp) => seen.or(stamp),
-            };
-        }
-        sql_digest.insert(need.key.clone(), result.digest);
-        sql_input.insert(need.key.clone(), result.input);
+        // Read-only data transaction ends here, after every SQL read
+        // finished; everything below is pure digest computation over
+        // viewer-visible data.
+        session.finish().await?.rollback().await?;
+    } else {
+        tx.rollback().await?;
     }
     if let Some(clocks) = replay_clocks {
         let observed = sql_input
@@ -7637,9 +8487,6 @@ async fn evaluate_snapshot_live_read_with_clocks(
             return Err(Error::engine("live need clock replay key mismatch"));
         }
     }
-    // Read-only data transaction ends here, after every SQL read finished;
-    // everything below is pure digest computation over viewer-visible data.
-    tx.rollback().await?;
     let clock_replay_safe = clock_probe_safe_sql_needs(&sql_needs);
     // Viewer-scoped staleness token: canonical digest over the returned
     // rows plus the install pin/generation. Derived ONLY from data this
@@ -7815,14 +8662,30 @@ async fn do_declared_read(
                 "{TOOL}: live read refused [undeclared_need]"
             )));
         }
-        let mut data_tx = tx;
         let echo = params.clone().unwrap_or(json!({}));
         let bound = bind_sql_params(&sql_need, params.as_ref())
             .map_err(|code| Error::engine(format!("{TOOL}: live read refused [{code}]")))?;
         let principal: crate::query::QueryPrincipal = caller.into();
-        let executed =
-            execute_sql_need_in(&mut data_tx, principal, &sql_need, bound, None, None).await?;
-        data_tx.rollback().await?;
+        // The gate's domain reads are done; only the declared statement runs
+        // while the contract is installed.
+        let mut session = crate::query::sql::GovernedSqlSession::begin(db, tx).await?;
+        let executed = match execute_sql_need_in(
+            &mut session,
+            principal,
+            &sql_need,
+            bound,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(executed) => executed,
+            Err(error) => {
+                session.abandon().await;
+                return Err(error);
+            }
+        };
+        session.finish().await?.rollback().await?;
         let keyed_revision = sql_keyed_revision(&row, &sql_need, &executed.digest);
         let mut response = declared_read_body(
             &package,
@@ -7970,6 +8833,22 @@ async fn do_declared_read(
             .await?;
             (echo, result)
         }
+        DeclaredRead::BodyCurrent {
+            record_id,
+            include_body,
+        } => {
+            let echo = json!({"record_id": record_id, "include_body": include_body});
+            let result = body_current_read(
+                db,
+                caller,
+                &package,
+                &expected_install_event_id,
+                &record_id,
+                include_body,
+            )
+            .await?;
+            (echo, result)
+        }
     };
     Ok(declared_read_body(
         &package,
@@ -8056,6 +8935,24 @@ pub(crate) async fn rerun_keyed_for_scheduler(
     key: &str,
     params: Value,
 ) -> Result<String> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2(db).await? {
+        let hub = crate::realtime::RealtimeHub::for_database(db)
+            .ok_or_else(|| Error::engine("v2 app data refused [realtime_unavailable]"))?;
+        let mut request = crate::realtime::v2::AppDataRequest {
+            package: package.to_owned(),
+            expected_install_event_id: install_event_id.to_owned(),
+            need: None,
+            params: serde_json::json!({}),
+        };
+        request.need = Some(key.to_owned());
+        request.params = params;
+        let evaluated = hub.evaluate_app_data(caller, &request).await?;
+        return evaluated.result["revision"]["revision_digest"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| Error::engine("v2 app data refused [revision_missing]"));
+    }
     let result = do_declared_read(
         db,
         caller,
@@ -8206,6 +9103,87 @@ async fn resolve_reference_in(
         json!({"status": "not_found"})
     };
     Ok(display)
+}
+
+/// `records.body.current.v1`: re-check the tab's consent and the viewer's
+/// access on the read's own transaction, then read the body and its digest
+/// from that same snapshot.
+///
+/// Public only so an integration test can call it without the outer gate
+/// in front of it, and show that it refuses a stale or withdrawn install on
+/// its own. Hosts reach it through `manage_alpha_tabs.live_read`.
+#[doc(hidden)]
+pub async fn body_current_read(
+    db: &Db,
+    caller: &Caller,
+    package: &str,
+    expected_install_event_id: &str,
+    record_id: &str,
+    include_body: bool,
+) -> Result<Value> {
+    let account_id = live_read_precheck(caller, package, expected_install_event_id)?;
+    // A read-only-pool transaction: the gates, the visibility check, the
+    // body and its digest all come from one snapshot.
+    let mut tx = db.pool().begin().await?;
+    let _gate = declared_need_gates_in(
+        db,
+        &mut tx,
+        caller,
+        &account_id,
+        package,
+        expected_install_event_id,
+        RECORDS_BODY_CURRENT_NEED,
+    )
+    .await?;
+    let answer = body_current_in(&mut tx, caller, record_id, include_body).await;
+    tx.rollback().await?;
+    answer
+}
+
+/// The body of `records.body.current.v1` on a transaction whose gate has
+/// already passed. A record the viewer may not view, a deleted one and a
+/// missing one all answer `not_found`, with nothing else, as
+/// `records.resolve_reference.v1` does.
+async fn body_current_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+    include_body: bool,
+) -> Result<Value> {
+    let not_found = || json!({"status": "not_found", "record_id": record_id});
+    if !super::can_record_in(tx, caller, record_id, Capability::View).await? {
+        return Ok(not_found());
+    }
+    let row: Option<Option<String>> =
+        sqlx::query_scalar("SELECT body FROM records WHERE id = ? AND deleted_at IS NULL")
+            .bind(record_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(body) = row else {
+        return Ok(not_found());
+    };
+    let body_bytes = body.as_deref().map_or(0, str::len);
+    let mut answer = json!({
+        "status": "found",
+        "record_id": record_id,
+        "body_digest": super::lifecycle::body_digest(body.as_deref()),
+        "body_bytes": body_bytes,
+        "body": Value::Null,
+    });
+    if !include_body {
+        answer["body_omitted"] = json!("not_requested");
+        return Ok(answer);
+    }
+    if body_bytes > BODY_CURRENT_MAX_BODY_BYTES {
+        answer["body_omitted"] = json!("too_large");
+        return Ok(answer);
+    }
+    answer["body"] = json!(body.unwrap_or_default());
+    if super::canvas::es_json_len(&answer) > BODY_CURRENT_RESULT_MAX_CHARS {
+        answer["body"] = Value::Null;
+        answer["body_omitted"] = json!("too_large");
+    }
+    Ok(answer)
 }
 
 /// Display fields for one record id from the caller's snapshot, or `None`
@@ -9289,7 +10267,9 @@ async fn do_preview(
             "{TOOL}: preview pin does not match the resolved source [digest_mismatch]"
         )));
     }
-    let manifest = match crate::artifact_html::validate_cached(&source.body) {
+    let body_limit = super::artifacts::html_body_limit_in(&mut tx, &artifact_id).await?;
+    let manifest = match crate::artifact_html::validate_cached_with_limit(&source.body, body_limit)
+    {
         Ok(manifest) => manifest,
         Err(failure) => {
             let _ = tx.rollback().await;
@@ -9921,19 +10901,42 @@ fn alpha_action_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std:
     Box::pin(make())
 }
 
-async fn manage_alpha_tabs(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+async fn manage_alpha_tabs(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+    bundle_delivery: Option<AppBundleDelivery>,
+) -> Result<Value> {
     let args: ManageAlphaTabsArgs = parse_args(TOOL, arguments)?;
     match args {
+        ManageAlphaTabsArgs::PrepareInstall(args) => {
+            alpha_action_future(|| prepare_install::prepare(&db, &caller, args)).await
+        }
         ManageAlphaTabsArgs::Inspect { package } => {
             alpha_action_future(|| do_inspect(&db, &caller, package)).await
         }
-        ManageAlphaTabsArgs::List {} => alpha_action_future(|| do_list(&db, &caller)).await,
+        ManageAlphaTabsArgs::List {
+            view,
+            include_removed,
+        } => alpha_action_future(|| do_list(&db, &caller, view, include_removed)).await,
         ManageAlphaTabsArgs::Launch {
             package,
             expected_install_event_id,
+            parent_origin,
+            delivery,
         } => {
-            alpha_action_future(|| do_launch(&db, &caller, package, expected_install_event_id))
-                .await
+            alpha_action_future(|| {
+                do_launch(
+                    &db,
+                    &caller,
+                    package,
+                    expected_install_event_id,
+                    parent_origin,
+                    delivery,
+                    bundle_delivery.as_ref(),
+                )
+            })
+            .await
         }
         ManageAlphaTabsArgs::LiveRead {
             package,
@@ -10227,30 +11230,40 @@ async fn manage_alpha_tabs(db: Db, caller: Caller, arguments: Value) -> Result<V
 
 /// Register `manage_alpha_tabs`.
 pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
+    let bundle_delivery = registry.app_bundle_delivery();
     registry.register(
         ToolKind::ManageAlphaTabs,
-        "Personal alpha tabs pin package/version/digest, viewable live Document kind:artifact, \
-         source revision and consented needs/effects. Install: caller_asserted. Update: \
-         exact bytes/digest, event CAS, unchanged status/request; proven adoption carries for \
-         unchanged canonical declarations, else Preview -> Adopt. Keyed retry: original \
-         receipt + current_install no reapply. disable/restore/remove use event CAS; \
-         disabled/removed tabs stop reads/actions. resolves fails closed; see target_resolves. \
-         tab_order uses reorder, else agents/folders/tasks/graph/installs. Reorder: full strip; omitted \
-         installs append; unknown/removed/duplicate refuse; last writer wins, list first. \
-         Preview: exact source/digest, pinned sample HTML, expiring \
-         account/pin/session receipt; no writes. Preview/adopt/adopt_authored require hosted \
-         cookie+trusted-Origin, never Bearer. Adopt checks receipt/pin/event/attestation. Launch: \
-         adoption/event/View/source; one-use sample-only URL, no live rows. live_read: \
-         caller-only authorized consented input, staleness/pins: attention.query.v1 \
-         at input.records; 8 sql.snapshot.v1 SELECT/WITH needs max, 200 rows each \
-         at input.sql[key]; params[0] binds ?1, optional omitted=NULL. subscribe {stream}: \
-         connection-bound, if_revision resync; {id,time_dependent}, now_ms() uses as_of_ms. \
-         subscribe_refused includes read. live_unsubscribe: idempotent, connection-scoped. \
-         admit_reveal_target: consented surface.reveal.v1, one visible canonical id/pins; \
-         push-only, never live_read.",
+        "Personal alpha tabs pin artifact/source/digest and consent. Before install/update call \
+         read-only prepare_install with a source guard; follow next_call. ready means prepared; \
+         adoption is carried or requires_person_preview_adopt: tell the person to Preview/Adopt. \
+         Argument-shape/authority errors throw; source/declaration refusals return ready:false. \
+         Guide: read_guide topic app-kit-core-1.1.0. Install is caller_asserted; update carries \
+         proven adoption only for unchanged canonical declarations. Transitions use event CAS. \
+         Preview/adopt require hosted cookie+trusted-Origin, never Bearer. Launch checks adoption \
+         and View. Disabled/removed tabs stop reads/actions. live_read/subscribe expose only \
+         consented inputs; unsubscribe is connection-scoped. Reveal is consented, push-only. \
+         List before reorder; it replaces strip order. List view summary finds a package \
+         (removed hidden by default); inspect gives one package's full detail.",
         json!({
             "type": "object",
             "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": { "const": "prepare_install" },
+                        "request": { "type": ["string", "null"], "maxLength": ALPHA_TAB_REQUEST_MAX_CHARS },
+                        "artifact_id": { "type": "string" },
+                        "package": { "type": "string" },
+                        "version": { "type": "string" },
+                        "declaration": { "type": "object" },
+                        "reason": { "type": "string" },
+                        "expected_body_digest": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+                        "expected_source_revision": { "type": "string", "minLength": 1, "maxLength": 256 }
+                    },
+                    "required": ["action", "artifact_id", "package", "version", "declaration", "reason"],
+                    "anyOf": [{ "required": ["expected_body_digest"] }, { "required": ["expected_source_revision"] }],
+                    "additionalProperties": false
+                },
                 {
                     "type": "object",
                     "properties": {
@@ -10262,7 +11275,11 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                 },
                 {
                     "type": "object",
-                    "properties": { "action": { "const": "list" } },
+                    "properties": {
+                        "action": { "const": "list" },
+                        "view": { "type": "string", "enum": ["full", "summary"] },
+                        "include_removed": { "type": "boolean" }
+                    },
                     "required": ["action"],
                     "additionalProperties": false
                 },
@@ -10271,7 +11288,9 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "properties": {
                         "action": { "const": "launch" },
                         "package": { "type": "string" },
-                        "expected_install_event_id": { "type": "string" }
+                        "expected_install_event_id": { "type": "string" },
+                        "parent_origin": { "type": "string", "description": "Exact deployment-allowlisted HTML parent origin. Omitted retains the hosted workbench parent." },
+                        "delivery": { "type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9_-]*\\.v[1-9][0-9]*$", "description": "reusable.v1: reusable URL if eligible, else a one-use ticket." }
                     },
                     "required": ["action", "package", "expected_install_event_id"],
                     "additionalProperties": false
@@ -10284,7 +11303,7 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                         "expected_install_event_id": { "type": "string" },
                         "need": {
                             "type": "string",
-                            "description": "Consented need to execute. Omitted: snapshot (attention.query.v1 and param-less SQL needs). On request: records.search.v1 (params {query, limit<=30}), records.resolve_reference.v1 (params {reference}), or an SQL need by key (params per its declared schema)."
+                            "description": "Omit for snapshots; else consented search/resolve need or SQL key. See guide for params."
                         },
                         "params": { "type": "object" },
                         "subscribe": {
@@ -10292,16 +11311,16 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                             "properties": {
                                 "stream": {
                                     "type": "string",
-                                    "description": "Connection token from the stream frame; snapshot reads only."
+                                    "description": "Stream-frame token; snapshots only."
                                 }
                             },
                             "required": ["stream"],
                             "additionalProperties": false,
-                            "description": "Open a connection-bound need subscription; refusal still returns the read."
+                            "description": "Subscribe on this connection; refusal includes read."
                         },
                         "if_revision": {
                             "type": "string",
-                            "description": "When equal to revision_digest, returns unchanged:true with pin and revision, without rows; snapshot reads only."
+                            "description": "Equal revision_digest returns unchanged:true without rows; snapshots only."
                         }
                     },
                     "required": ["action", "package", "expected_install_event_id"],
@@ -10315,7 +11334,7 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                         "expected_install_event_id": { "type": "string" },
                         "record_id": {
                             "type": "string",
-                            "description": "Exact persisted record id to reveal (full id or reserved id such as native:root); prefixes are refused."
+                            "description": "Full or reserved record id; no prefixes."
                         }
                     },
                     "required": ["action", "package", "expected_install_event_id", "record_id"],
@@ -10474,7 +11493,7 @@ pub fn register_alpha_tab_tools(registry: &mut ToolRegistry) -> Result<()> {
                 }
             ]
         }),
-        manage_alpha_tabs,
+        move |db, caller, arguments| manage_alpha_tabs(db, caller, arguments, bundle_delivery.clone()),
     )?;
     Ok(())
 }
@@ -10548,6 +11567,370 @@ mod order_tests {
             "pending:agent.attention-cockpit",
         ]);
         assert_eq!(resolve_effective_tab_order(Some(&stored), &slotted), stored);
+    }
+}
+
+#[cfg(test)]
+mod list_summary_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const ACCOUNT: &str = "alice";
+    const BODY: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Fixture</title></head><body><main><h1>Fixture</h1></main></body></html>";
+
+    fn declaration() -> Value {
+        json!({
+            "needs": [
+                {"need": "sql.snapshot.v1", "key": "rows.a", "label": "Rows A", "sql": "SELECT id, name, type FROM records WHERE deleted_at IS NULL ORDER BY updated_at_ms DESC, id ASC LIMIT 100"},
+                {"need": "sql.snapshot.v1", "key": "rows.b", "label": "Rows B", "sql": "SELECT id FROM records ORDER BY id LIMIT 50"},
+                "attention.query.v1",
+            ],
+            "effects": [],
+        })
+    }
+
+    async fn fixture() -> (Db, ToolRegistry) {
+        crate::artifact_html::configure(
+            crate::artifact_html::RuntimeConfig::new(
+                "http://localhost:8080",
+                "http://artifact.localhost:8080",
+            )
+            .expect("list summary test HTML runtime configuration"),
+        );
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+        (db, registry)
+    }
+
+    async fn install_package(
+        db: &Db,
+        registry: &ToolRegistry,
+        package: &str,
+        artifact_id: &str,
+        name: &str,
+        request: Option<&str>,
+    ) -> String {
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": artifact_id, "type": "Document", "kind": "artifact",
+                    "name": name, "body": BODY,
+                    "facets": { "runtime": "native.html.v1" },
+                    "reason": "List summary fixture artifact.",
+                }),
+            )
+            .await
+            .unwrap();
+        crate::authorization::replace_explicit_policy(
+            db,
+            "test:policy",
+            artifact_id,
+            vec![crate::authorization::AllowEntry::account(
+                ACCOUNT,
+                Capability::View,
+            )],
+        )
+        .await
+        .unwrap();
+        let source_revision: String = sqlx::query_scalar(
+            "SELECT id FROM content_events WHERE record_id=? AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(artifact_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let declaration = declaration();
+        let digest = alpha_tab_digest(
+            &alpha_tab_bundle_digest(BODY),
+            &alpha_tab_declaration_digest(&declaration).unwrap(),
+            "native.html.v1",
+        );
+        let mut args = json!({
+            "action": "install", "package": package, "version": "0.1.0",
+            "digest": digest, "artifact_id": artifact_id,
+            "source_revision": source_revision, "declaration": declaration,
+            "reason": "List summary fixture install.",
+        });
+        if let Some(request) = request {
+            args["request"] = Value::String(request.to_string());
+        }
+        let installed = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ACCOUNT),
+                "manage_alpha_tabs",
+                args,
+            )
+            .await
+            .unwrap();
+        installed["install"]["event_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn summary_by_package<'a>(summary: &'a Value, package: &str) -> &'a Value {
+        summary["installs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["package"] == package)
+            .unwrap_or_else(|| panic!("summary misses package {package}: {summary}"))
+    }
+
+    fn full_by_package<'a>(full: &'a Value, package: &str) -> &'a Value {
+        full["installs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["package"] == package)
+            .unwrap_or_else(|| panic!("full list misses package {package}"))
+    }
+
+    #[tokio::test]
+    async fn summary_matches_full_and_hides_removed_by_default() {
+        let (db, registry) = fixture().await;
+        let caller = Caller::authenticated(ACCOUNT);
+        install_package(
+            &db,
+            &registry,
+            "agent.alpha-a",
+            "b1d00000-0000-4000-8000-0000000000b1",
+            "Alpha A",
+            Some("fixture request a"),
+        )
+        .await;
+        install_package(
+            &db,
+            &registry,
+            "agent.alpha-b",
+            "b1d00000-0000-4000-8000-0000000000b2",
+            "Alpha B",
+            None,
+        )
+        .await;
+        let event_c = install_package(
+            &db,
+            &registry,
+            "agent.alpha-c",
+            "b1d00000-0000-4000-8000-0000000000b3",
+            "Alpha C",
+            None,
+        )
+        .await;
+        registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "remove", "package": "agent.alpha-c", "expected_install_event_id": event_c, "reason": "Fixture removes C."}),
+            )
+            .await
+            .unwrap();
+
+        let full = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list"}),
+            )
+            .await
+            .unwrap();
+        for key in ["account_id", "installs", "tab_order"] {
+            assert!(full.get(key).is_some(), "list keeps old key {key}: {full}");
+        }
+        assert!(
+            full.get("view").is_none(),
+            "full list carries no view: {full}"
+        );
+        assert!(
+            full.get("removed_hidden").is_none(),
+            "full list carries no removed_hidden"
+        );
+        assert_eq!(full["installs"].as_array().unwrap().len(), 3);
+        assert!(full["installs"][0].get("consented_declaration").is_some());
+
+        let summary = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list", "view": "summary"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary["view"], "summary");
+        assert_eq!(summary["removed_hidden"], 1);
+        assert_eq!(summary["installs"].as_array().unwrap().len(), 2);
+
+        for package in ["agent.alpha-a", "agent.alpha-b"] {
+            let full_entry = full_by_package(&full, package);
+            let summary_entry = summary_by_package(&summary, package);
+            assert_eq!(
+                summary_entry
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                [
+                    "package",
+                    "name",
+                    "version",
+                    "status",
+                    "artifact_id",
+                    "event_id",
+                    "adoption_basis",
+                    "request",
+                    "target_resolves",
+                    "target_skip_reason"
+                ]
+                .into_iter()
+                .collect(),
+                "summary entry has exactly the ten fields for {package}"
+            );
+            for field in [
+                "package",
+                "version",
+                "status",
+                "artifact_id",
+                "event_id",
+                "adoption_basis",
+                "request",
+                "target_resolves",
+                "target_skip_reason",
+            ] {
+                assert_eq!(
+                    summary_entry[field], full_entry[field],
+                    "summary {field} matches full for {package}"
+                );
+            }
+        }
+        assert_eq!(
+            summary_by_package(&summary, "agent.alpha-a")["name"],
+            "Alpha A"
+        );
+        assert_eq!(
+            summary_by_package(&summary, "agent.alpha-a")["request"],
+            "fixture request a"
+        );
+        assert_eq!(
+            summary_by_package(&summary, "agent.alpha-b")["request"],
+            Value::Null
+        );
+
+        let shown = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list", "view": "summary", "include_removed": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown["removed_hidden"], 0);
+        assert_eq!(shown["installs"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            summary_by_package(&shown, "agent.alpha-c")["status"],
+            "removed"
+        );
+
+        let full_filtered = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list", "include_removed": false}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(full_filtered["installs"].as_array().unwrap().len(), 2);
+        assert!(full_filtered.get("removed_hidden").is_none());
+        assert!(full_filtered.get("view").is_none());
+
+        let full_bytes = serde_json::to_string(&full).unwrap().len();
+        let summary_bytes = serde_json::to_string(&summary).unwrap().len();
+        eprintln!("list size full={full_bytes} summary={summary_bytes}");
+        assert!(
+            summary_bytes < full_bytes,
+            "summary is smaller: full={full_bytes} summary={summary_bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_hides_name_without_view_but_keeps_gates() {
+        let (db, registry) = fixture().await;
+        let caller = Caller::authenticated(ACCOUNT);
+        install_package(
+            &db,
+            &registry,
+            "agent.hidden-name",
+            "b1d00000-0000-4000-8000-0000000000b4",
+            "Hidden Name",
+            None,
+        )
+        .await;
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "test:revoke-view",
+            "b1d00000-0000-4000-8000-0000000000b4",
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let full = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list"}),
+            )
+            .await
+            .unwrap();
+        let full_entry = full_by_package(&full, "agent.hidden-name");
+        assert_eq!(full_entry["target_resolves"], false);
+        assert_eq!(full_entry["target_skip_reason"], "unauthorized");
+
+        let summary = registry
+            .call(
+                db.clone(),
+                caller.clone(),
+                "manage_alpha_tabs",
+                json!({"action": "list", "view": "summary", "include_removed": true}),
+            )
+            .await
+            .unwrap();
+        let summary_entry = summary_by_package(&summary, "agent.hidden-name");
+        assert_eq!(summary_entry["name"], Value::Null);
+        assert_eq!(
+            summary_entry["target_resolves"],
+            full_entry["target_resolves"]
+        );
+        assert_eq!(
+            summary_entry["target_skip_reason"],
+            full_entry["target_skip_reason"]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_list_view_is_rejected() {
+        let (db, registry) = fixture().await;
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::authenticated(ACCOUNT),
+                "manage_alpha_tabs",
+                json!({"action": "list", "view": "compact"}),
+            )
+            .await
+            .expect_err("unknown view must be rejected");
+        assert!(error.to_string().contains("unknown list view"), "{error}");
     }
 }
 
@@ -10742,6 +12125,86 @@ mod launch_tests {
             .unwrap();
         }
         db
+    }
+
+    #[tokio::test]
+    async fn alpha_tab_pinned_source_keeps_sqlite_errors_and_duplicate_keys() {
+        let db = source_fixture_db().await;
+        for (id, payload) in [
+            ("duplicate", r#"{"body":"é","body":"replacement"}"#),
+            ("empty", r#"{"body":""}"#),
+            ("null", r#"{"body":null}"#),
+            ("number", r#"{"body":42}"#),
+            ("object", r#"{"body":{"x":1}}"#),
+        ] {
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'complete')")
+                .bind(id).bind(SOURCE_ARTIFACT).bind(payload).execute(db.write_pool()).await.unwrap();
+        }
+        // This disposable :memory: database models one malformed legacy row.
+        // Isolate only its insert from current metadata admission, restore the
+        // trigger before further work, and retain all append-only guards.
+        let mut legacy_fixture = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let trigger: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'")
+            .fetch_one(&mut *legacy_fixture).await.unwrap();
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES ('malformed',?,'record.updated','{',1,'legacy_unknown')")
+            .bind(SOURCE_ARTIFACT).execute(&mut *legacy_fixture).await.unwrap();
+        sqlx::query(&trigger)
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        legacy_fixture.commit().await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        assert_eq!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "duplicate")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            "é"
+        );
+        assert_eq!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "empty")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            ""
+        );
+        assert_eq!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "object")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            r#"{"x":1}"#
+        );
+        // JSON null is selected and SQLx decodes it as an empty String;
+        // a numeric cell cannot be decoded as String. Neither is normalized.
+        assert_eq!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "null")
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            ""
+        );
+        assert!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "number")
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_alpha_tab_source_in(&mut tx, SOURCE_ARTIFACT, "malformed")
+                .await
+                .is_err()
+        );
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -11162,6 +12625,51 @@ mod declared_read_tests {
         RECORD_CHANGES_NEED,
     };
     use serde_json::json;
+
+    #[test]
+    fn body_current_params_are_bounded() {
+        use super::{RECORDS_BODY_CURRENT_NEED, RECORD_ID_MAX_CHARS};
+        assert_eq!(
+            parse_declared_read(
+                RECORDS_BODY_CURRENT_NEED,
+                Some(&json!({"record_id": " r1 "}))
+            ),
+            Ok(DeclaredRead::BodyCurrent {
+                record_id: "r1".into(),
+                include_body: true
+            })
+        );
+        assert_eq!(
+            parse_declared_read(
+                RECORDS_BODY_CURRENT_NEED,
+                Some(&json!({"record_id": "r1", "include_body": false}))
+            ),
+            Ok(DeclaredRead::BodyCurrent {
+                record_id: "r1".into(),
+                include_body: false
+            })
+        );
+        for params in [
+            json!({}),
+            json!({"record_id": ""}),
+            json!({"record_id": 7}),
+            json!({"record_id": "r".repeat(RECORD_ID_MAX_CHARS + 1)}),
+            json!({"record_id": "r1", "include_body": null}),
+            json!({"record_id": "r1", "include_body": 1}),
+            json!({"record_id": "r1", "limit": 1}),
+            json!(["r1"]),
+        ] {
+            assert_eq!(
+                parse_declared_read(RECORDS_BODY_CURRENT_NEED, Some(&params)),
+                Err("invalid_params"),
+                "{params}"
+            );
+        }
+        assert_eq!(
+            parse_declared_read(RECORDS_BODY_CURRENT_NEED, None),
+            Err("invalid_params")
+        );
+    }
 
     /// `do_declared_read` gates these names on the read-only pool because no
     /// declaration can hold a SQL need keyed by one of them.
@@ -11925,6 +13433,16 @@ mod reads_declaration_tests {
             "reads": {"relations": {"records": ["no_such_column"]}}});
         let error = alpha_tab_canonical_declaration(&invalid).expect_err("refused");
         assert!(error.to_string().contains("[invalid_reads]"));
+    }
+
+    #[test]
+    fn reads_refuses_catalog_operations_with_its_reason() {
+        let error = parse_reads_declaration(
+            &json!({"relations": {"catalog_operations": ["executor", "operation"]}}),
+        )
+        .expect_err("serving catalogue rows are never granted to alpha tabs");
+        assert!(error.contains("catalog_operations"), "{error}");
+        assert!(error.contains("[invalid_reads]"), "{error}");
     }
 
     #[test]
@@ -13449,10 +14967,13 @@ mod sql_inner_executor_tests {
         .await
         .unwrap();
         let mut connection = db.governed_pool().acquire().await.unwrap();
-        let mut tx = connection.begin().await.unwrap();
+        let tx = connection.begin().await.unwrap();
+        let mut session = crate::query::sql::GovernedSqlSession::begin(&db, tx)
+            .await
+            .unwrap();
         let callbacks = Arc::new(AtomicU64::new(0));
         let executed = execute_sql_need_in(
-            &mut tx,
+            &mut session,
             principal,
             &lane_need(CLOCK_SQL),
             Vec::new(),
@@ -13474,7 +14995,7 @@ mod sql_inner_executor_tests {
         assert!(callbacks.load(Ordering::Relaxed) > 0);
         // No global sequence in the frame input.
         assert!(executed.input.get("as_of_seq").is_none());
-        tx.rollback().await.unwrap();
+        session.finish().await.unwrap().rollback().await.unwrap();
         drop(connection);
         db.close().await;
     }
@@ -13484,9 +15005,12 @@ mod sql_inner_executor_tests {
         let db = crate::create_database(":memory:").await.unwrap();
         let principal = crate::query::QueryPrincipal::authenticated("alice", false);
         let mut connection = db.governed_pool().acquire().await.unwrap();
-        let mut tx = connection.begin().await.unwrap();
+        let tx = connection.begin().await.unwrap();
+        let mut session = crate::query::sql::GovernedSqlSession::begin(&db, tx)
+            .await
+            .unwrap();
         let executed = execute_sql_need_in(
-            &mut tx,
+            &mut session,
             principal,
             &lane_need(HEAVY_SQL),
             Vec::new(),
@@ -13498,7 +15022,7 @@ mod sql_inner_executor_tests {
         assert_eq!(executed.now_ms_ms, None);
         assert!(!executed.time_dependent);
         assert_eq!(executed.input["truncated"], serde_json::json!(false));
-        tx.rollback().await.unwrap();
+        session.finish().await.unwrap().rollback().await.unwrap();
         drop(connection);
         db.close().await;
     }
@@ -14983,6 +16507,7 @@ mod comment_guard_tests {
                     input: "text".into(),
                     max_bytes: 100,
                 },
+                anchor: None,
             }),
             react: None,
             title: None,
@@ -16269,5 +17794,67 @@ mod inert_body_read_descriptor_tests {
             react_admission(&legacy, "entry", "👍").unwrap().1.key,
             BODY_READ_NEED
         );
+    }
+}
+
+/// Compatibility pin for the shared package-id syntax: acceptance through
+/// `is_valid_package_id` and the exact `require_package` error strings.
+/// Any change to the rule must update both crates together.
+#[cfg(test)]
+mod package_syntax_compat_tests {
+    use super::require_package;
+    use native_artifact_html::bundle_url::is_valid_package_id;
+
+    fn exactly_128() -> String {
+        format!(
+            "{}.{}.{}.{}",
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+            "d".repeat(29)
+        )
+    }
+
+    #[test]
+    fn package_syntax_acceptance_matches_shared_predicate() {
+        assert_eq!(exactly_128().len(), 128);
+        let mut cases: Vec<(String, bool)> = vec![
+            ("agent.cockpit".to_owned(), true),
+            ("agent.attention-cockpit".to_owned(), true),
+            ("a.b".to_owned(), true),
+            ("a1.b2.c3".to_owned(), true),
+            (exactly_128(), true),
+            ("".to_owned(), false),
+            ("single".to_owned(), false),
+            ("a..b".to_owned(), false),
+            (".a".to_owned(), false),
+            ("a.".to_owned(), false),
+            ("-a.b".to_owned(), false),
+            ("a-.b".to_owned(), false),
+            ("a.b-".to_owned(), false),
+            ("Agent.b".to_owned(), false),
+            ("agé.b".to_owned(), false),
+        ];
+        cases.push((format!("{}.b", "a".repeat(33)), false));
+        for (input, accepted) in &cases {
+            assert_eq!(is_valid_package_id(input), *accepted, "{input:?}");
+            assert_eq!(require_package(input).is_ok(), *accepted, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn package_rejection_messages_are_exact() {
+        let over_128 = format!("{}.b", "a".repeat(127));
+        assert_eq!(over_128.len(), 129);
+        assert_eq!(
+            require_package(&over_128).unwrap_err().to_string(),
+            "manage_alpha_tabs: package must be 1..128 characters"
+        );
+        for input in ["", "single", "a..b", "-a.b", "Agent.b"] {
+            assert_eq!(
+                require_package(input).unwrap_err().to_string(),
+                format!("manage_alpha_tabs: package '{input}' is not a reverse-dns id")
+            );
+        }
     }
 }

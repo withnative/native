@@ -685,12 +685,12 @@ mod tests {
         // pair of strings for both sections — as this test used to — passes on
         // whichever section happens to match and checks neither deliberately.
         assert!(rendered.contains("- **focused**: 27 tools,"));
-        assert!(rendered.contains("- **complete**: 86 tools,"));
+        assert!(rendered.contains("- **complete**: 88 tools,"));
         assert!(rendered.contains("| `manage_memberships` | identity | atomicity | — |"));
         assert!(rendered.contains("| `workspace_read` | identity | bounded-context-or-calls | — |"));
         assert!(rendered.contains("## Federated lens projection"));
         assert!(rendered.contains("- **focused**: 28 tools,"));
-        assert!(rendered.contains("- **complete**: 87 tools,"));
+        assert!(rendered.contains("- **complete**: 89 tools,"));
         assert!(rendered.contains("| `materialize_record` | identity | atomicity | yes |"));
     }
 }

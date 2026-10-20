@@ -44,11 +44,20 @@ pub const DEFINITION_DIGEST_ALGORITHM: &str = "sha256";
 pub const BEHAVIOUR_KIND: &str = "host.readonly.v1";
 /// The only surface kind S1 accepts: declarative host-rendered view.
 pub const SURFACE_KIND: &str = "host.surface.v1";
+/// The only operation provider S1 accepts: the trusted host arithmetic
+/// provider. Operations never carry code; the provider names a fixed,
+/// host-owned implementation.
+pub const OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC: &str = "host.table-arithmetic/1";
+/// The only read an operation may declare in this slice: it reads the one
+/// source record the caller names.
+pub const OPERATION_READ_RECORD_VIEW: &str = "record:view";
 
 const MAX_PART_LEN: usize = 128;
 const MAX_DEFINITIONS: usize = 16;
 const MAX_READS: usize = 64;
 const MAX_READ_LEN: usize = 128;
+const MAX_OPERATIONS: usize = 8;
+const MAX_OPERATION_DESCRIPTION_LEN: usize = 1024;
 
 fn validate_part(kind: &str, part: &str) -> Result<()> {
     if part.is_empty() || part.len() > MAX_PART_LEN {
@@ -141,6 +150,25 @@ pub struct SurfaceDescriptor {
     pub fallback: String,
 }
 
+/// One callable host-owned operation a package advertises.
+///
+/// The descriptor is closed and declarative: it names a trusted host provider
+/// (no code travels in the manifest), the record family and kind it serves,
+/// the text source field it reads (or an optional any-record target), and the read scopes it needs. Effects must
+/// stay empty. The provider's concrete request/result schema is owned by the
+/// host, not described here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationDescriptor {
+    pub name: String,
+    pub description: String,
+    pub provider: String,
+    pub family: String,
+    pub kind: String,
+    pub source_field: String,
+    pub reads: Vec<String>,
+    pub effects: Vec<String>,
+}
+
 /// The S1 canonical manifest: a namespaced triple plus a definition set, and
 /// optionally one behaviour descriptor plus one surface descriptor and the
 /// declared-read set covering every behaviour read.
@@ -159,6 +187,10 @@ pub struct PackageManifest {
     pub behaviour: Option<BehaviourDescriptor>,
     pub surface: Option<SurfaceDescriptor>,
     pub declared_reads: Vec<String>,
+    /// Callable host-owned operations this package advertises. Empty for
+    /// definitions-only and behaviour/surface-only packages, whose canonical
+    /// value (and therefore digest) is unchanged by this field's absence.
+    pub operations: Vec<OperationDescriptor>,
 }
 
 impl DefinitionEntry {
@@ -256,6 +288,107 @@ impl SurfaceDescriptor {
     }
 }
 
+impl OperationDescriptor {
+    /// Additive wire target: any LIVE kernel record. Empty legacy selectors
+    /// represent this variant internally, preserving retained struct literals
+    /// and semantic source bytes. Only exact compiled claims packages admit it.
+    pub fn any_record(name: &str, description: &str, provider: &str) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            provider: provider.into(),
+            family: String::new(),
+            kind: String::new(),
+            source_field: String::new(),
+            reads: vec![OPERATION_READ_RECORD_VIEW.into()],
+            effects: vec![],
+        }
+    }
+    pub fn targets_any_record(&self) -> bool {
+        self.family.is_empty() && self.kind.is_empty() && self.source_field.is_empty()
+    }
+
+    /// Shape-only validation. Family/kind membership against the embedded
+    /// definitions and declared-read coverage are checked by
+    /// [`PackageManifest::validate`], which can see the whole manifest.
+    pub fn validate_shape(&self) -> Result<()> {
+        validate_part("operation name", &self.name)?;
+        if self.description.trim().is_empty()
+            || self.description.len() > MAX_OPERATION_DESCRIPTION_LEN
+        {
+            return Err(Error::engine(format!(
+                "package manifest operation description must be 1..{MAX_OPERATION_DESCRIPTION_LEN} bytes"
+            )));
+        }
+        if self.provider != OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC
+            && self.provider != crate::v2_standard::relates_to::PROVIDER
+            && self.provider != crate::v2_standard::claims_v1::PROVIDER
+        {
+            return Err(Error::engine(format!(
+                "package manifest operation provider must be a supported compiled provider ('{OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC}' or 'host.relates-to/1')"
+            )));
+        }
+        if self.targets_any_record() {
+            if self.provider != crate::v2_standard::claims_v1::PROVIDER {
+                return Err(Error::engine(
+                    "any-record target requires compiled claims provider",
+                ));
+            }
+        } else {
+            validate_part("operation family", &self.family)?;
+            validate_part("operation kind", &self.kind)?;
+            validate_part("operation source field", &self.source_field)?;
+        }
+        if !self.effects.is_empty() {
+            return Err(Error::engine(
+                "package manifest operation effects must stay empty",
+            ));
+        }
+        // Exactly one read, exactly the source record: this slice's provider
+        // reads only the record the caller names. A duplicate or extra read
+        // would widen the declared capability, so it is refused outright.
+        if self.reads.len() != 1 || self.reads[0] != OPERATION_READ_RECORD_VIEW {
+            return Err(Error::engine(format!(
+                "package manifest operation reads must be exactly [\"{OPERATION_READ_RECORD_VIEW}\"]"
+            )));
+        }
+        validate_read_scope(&self.reads[0])?;
+        Ok(())
+    }
+}
+
+/// Whether the embedded definition's `kind` declares `field` with type
+/// `text`. Only `native.defn/3`-style object kinds carry field descriptors;
+/// legacy string kinds declare no typed fields and never satisfy this.
+fn definition_declares_text_field(definition: &DefinitionEntry, kind: &str, field: &str) -> bool {
+    let Ok(parsed) =
+        crate::meta::definition_artifact::parse_artifact_envelope(&definition.artifact_bytes)
+    else {
+        return false;
+    };
+    let Some(kinds) = parsed.kinds.as_array() else {
+        return false;
+    };
+    kinds.iter().any(|entry| {
+        let Some(entry) = entry.as_object() else {
+            return false;
+        };
+        if entry.get("token").and_then(serde_json::Value::as_str) != Some(kind) {
+            return false;
+        }
+        entry
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|fields| {
+                fields.iter().any(|field_entry| {
+                    field_entry.get("name").and_then(serde_json::Value::as_str) == Some(field)
+                        && field_entry.get("type").and_then(serde_json::Value::as_str)
+                            == Some("text")
+                })
+            })
+    })
+}
+
 impl PackageManifest {
     pub fn validate(&self) -> Result<()> {
         validate_part("namespace", &self.namespace)?;
@@ -283,52 +416,128 @@ impl PackageManifest {
                 }
             }
         }
-        // Behaviour and surface are optional together. A definitions-only
-        // package (K5) omits both and declares no reads; supplying one part
-        // without the other, or reads without a behaviour, refuses.
-        match (&self.behaviour, &self.surface) {
-            (None, None) => {
-                if !self.declared_reads.is_empty() {
+        // Operations are validated before the read-coverage rule so a bad
+        // descriptor is refused for its own reason. Every operation must name
+        // a family whose embedded definition declares its kind.
+        if self.operations.len() > MAX_OPERATIONS {
+            return Err(Error::engine(format!(
+                "package manifest operations must be 0..={MAX_OPERATIONS}"
+            )));
+        }
+        for (i, operation) in self.operations.iter().enumerate() {
+            operation.validate_shape()?;
+            // This first command port selects one exact compiled service. A
+            // foreign descriptor cannot advertise that service under another
+            // package identity; later ports must declare their own catalogue.
+            if operation.provider == crate::v2_standard::relates_to::PROVIDER
+                && !crate::v2_standard::relates_to::known_package(self)
+            {
+                return Err(Error::engine(
+                    "relationship provider requires its exact compiled first-party package",
+                ));
+            }
+            for earlier in &self.operations[..i] {
+                if earlier.name == operation.name {
+                    return Err(Error::engine(format!(
+                        "package manifest duplicate operation name '{}'",
+                        operation.name
+                    )));
+                }
+            }
+            if operation.provider == crate::v2_standard::claims_v1::PROVIDER {
+                if !crate::v2_standard::claims_v1::known_package(self)
+                    || !operation.targets_any_record()
+                {
                     return Err(Error::engine(
-                        "package manifest declared reads require a behaviour",
+                        "claims provider requires exact compiled any-record package",
                     ));
                 }
-                return Ok(());
+                continue;
             }
+            let definition = self
+                .definitions
+                .iter()
+                .find(|d| d.family == operation.family)
+                .ok_or_else(|| {
+                    Error::engine(format!(
+                        "package manifest operation '{}' names family '{}' with no embedded definition",
+                        operation.name, operation.family
+                    ))
+                })?;
+            if !definition.declares_kind(&operation.kind) {
+                return Err(Error::engine(format!(
+                    "package manifest operation '{}' kind '{}' is not declared by embedded definition '{}'",
+                    operation.name, operation.kind, operation.family
+                )));
+            }
+            if !definition_declares_text_field(definition, &operation.kind, &operation.source_field)
+            {
+                return Err(Error::engine(format!(
+                    "package manifest operation '{}' source field '{}' must be a text field of declared kind '{}'",
+                    operation.name, operation.source_field, operation.kind
+                )));
+            }
+        }
+        // Behaviour and surface remain both-or-neither. Operations are
+        // independent of them: a definitions-only package may advertise
+        // operations without a behaviour/surface pair.
+        match (&self.behaviour, &self.surface) {
             (Some(_), None) | (None, Some(_)) => {
                 return Err(Error::engine(
                     "package manifest behaviour and surface must be supplied together or omitted together",
                 ));
             }
+            (None, None) => {}
             (Some(behaviour), Some(surface)) => {
-                if self.declared_reads.is_empty() || self.declared_reads.len() > MAX_READS {
-                    return Err(Error::engine(format!(
-                        "package manifest declared reads must be 1..{MAX_READS}"
-                    )));
-                }
-                for scope in &self.declared_reads {
-                    validate_read_scope(scope)?;
-                }
-                for (label, reads) in [
-                    ("declared reads", &self.declared_reads),
-                    ("behaviour reads", &behaviour.reads),
-                ] {
-                    for (i, a) in reads.iter().enumerate() {
-                        if reads[..i].iter().any(|b| b == a) {
-                            return Err(Error::engine(format!(
-                                "package manifest duplicate entry '{a}' in {label}"
-                            )));
-                        }
-                    }
-                }
                 behaviour.validate()?;
                 surface.validate()?;
-                for scope in &behaviour.reads {
-                    if !self.declared_reads.iter().any(|d| d == scope) {
+            }
+        }
+        // Every read declared by a behaviour or an operation must be covered
+        // by `declared_reads`; an empty requirement set means no reads at all.
+        let mut required: Vec<&String> = Vec::new();
+        if let Some(behaviour) = &self.behaviour {
+            required.extend(behaviour.reads.iter());
+        }
+        for operation in &self.operations {
+            required.extend(operation.reads.iter());
+        }
+        if required.is_empty() {
+            if !self.declared_reads.is_empty() {
+                return Err(Error::engine(
+                    "package manifest declared reads require a behaviour or an operation",
+                ));
+            }
+        } else {
+            if self.declared_reads.is_empty() || self.declared_reads.len() > MAX_READS {
+                return Err(Error::engine(format!(
+                    "package manifest declared reads must be 1..{MAX_READS}"
+                )));
+            }
+            for scope in &self.declared_reads {
+                validate_read_scope(scope)?;
+            }
+            for (i, a) in self.declared_reads.iter().enumerate() {
+                if self.declared_reads[..i].iter().any(|b| b == a) {
+                    return Err(Error::engine(format!(
+                        "package manifest duplicate entry '{a}' in declared reads"
+                    )));
+                }
+            }
+            if let Some(behaviour) = &self.behaviour {
+                for (i, a) in behaviour.reads.iter().enumerate() {
+                    if behaviour.reads[..i].iter().any(|b| b == a) {
                         return Err(Error::engine(format!(
-                            "package manifest behaviour read '{scope}' must be in declared reads"
+                            "package manifest duplicate entry '{a}' in behaviour reads"
                         )));
                     }
+                }
+            }
+            for scope in &required {
+                if !self.declared_reads.iter().any(|d| d == *scope) {
+                    return Err(Error::engine(format!(
+                        "package manifest read '{scope}' must be in declared reads"
+                    )));
                 }
             }
         }
@@ -401,6 +610,43 @@ impl PackageManifest {
                     "kind": surface.kind,
                     "view": surface.view,
                 }),
+            );
+        }
+        // Operations are omitted entirely when empty, so an existing
+        // behaviour/surface or definitions-only manifest keeps the exact
+        // canonical bytes (and digest) it had before this field existed.
+        if !self.operations.is_empty() {
+            let mut operations: Vec<&OperationDescriptor> = self.operations.iter().collect();
+            operations.sort_by(|a, b| a.name.cmp(&b.name));
+            let operations: Vec<serde_json::Value> = operations
+                .iter()
+                .map(|operation| {
+                    let mut reads = operation.reads.clone();
+                    reads.sort();
+                    let effects: Vec<serde_json::Value> = operation
+                        .effects
+                        .iter()
+                        .map(|effect| serde_json::Value::String(effect.clone()))
+                        .collect();
+                    if operation.targets_any_record() {
+                        return serde_json::json!({"name":operation.name,"description":operation.description,
+                            "provider":operation.provider,"target":"any-record","reads":reads,"effects":effects});
+                    }
+                    serde_json::json!({
+                        "description": operation.description,
+                        "effects": effects,
+                        "family": operation.family,
+                        "kind": operation.kind,
+                        "name": operation.name,
+                        "provider": operation.provider,
+                        "reads": reads,
+                        "source_field": operation.source_field,
+                    })
+                })
+                .collect();
+            obj.insert(
+                "operations".to_string(),
+                serde_json::Value::Array(operations),
             );
         }
         Ok(value)
@@ -552,6 +798,44 @@ impl PackageManifest {
             }),
             None => None,
         };
+        let operations = match obj.get("operations") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    let o = item.as_object().ok_or_else(|| {
+                        Error::engine("package manifest operation must be an object")
+                    })?;
+                    Ok(OperationDescriptor {
+                        name: sub_str(o, "name")?,
+                        description: sub_str(o, "description")?,
+                        provider: sub_str(o, "provider")?,
+                        family: if o.get("target").is_some_and(|v| v == "any-record") {
+                            String::new()
+                        } else {
+                            sub_str(o, "family")?
+                        },
+                        kind: if o.get("target").is_some_and(|v| v == "any-record") {
+                            String::new()
+                        } else {
+                            sub_str(o, "kind")?
+                        },
+                        source_field: if o.get("target").is_some_and(|v| v == "any-record") {
+                            String::new()
+                        } else {
+                            sub_str(o, "source_field")?
+                        },
+                        reads: str_list(o, "reads")?,
+                        effects: str_list(o, "effects")?,
+                    })
+                })
+                .collect::<Result<Vec<OperationDescriptor>>>()?,
+            Some(_) => {
+                return Err(Error::engine(
+                    "package manifest canonical value 'operations' must be an array",
+                ))
+            }
+        };
         let manifest = PackageManifest {
             namespace: str_field("namespace")?.to_owned(),
             name: str_field("name")?.to_owned(),
@@ -560,6 +844,7 @@ impl PackageManifest {
             behaviour,
             surface,
             declared_reads: read_list("declared_reads")?,
+            operations,
         };
         manifest.validate()?;
         // Round-trip backstop: no digest-covered semantics may be dropped or
@@ -611,6 +896,7 @@ mod tests {
                 fallback: "notes.unavailable".to_string(),
             }),
             declared_reads: vec!["linked_record:view".to_string()],
+            operations: vec![],
         }
     }
 
@@ -623,6 +909,7 @@ mod tests {
             behaviour: None,
             surface: None,
             declared_reads: vec![],
+            operations: vec![],
         }
     }
 

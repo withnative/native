@@ -100,6 +100,15 @@ path = "src/bin/board_render_cost.rs"
 required-features = ["dev-tools"]
 test = false
 
+# End-to-end cost of one private `as_of` fold on a real corpus copy (task
+# 6ffcde3). Appended after board-render-cost, never inserted above: the
+# source-boundary manifest freezes transition debt by `bin[N]` index.
+[[bin]]
+name = "asof-fold-time"
+path = "src/bin/asof_fold_time.rs"
+required-features = ["dev-tools"]
+test = false
+
 # Fresh-agent harness for the v2 kernel slice (trial binary, not a product
 # surface). Cargo auto-discovers `examples/`; `required-features` keeps it
 # out of default builds exactly like the dev-tools binaries above.
@@ -117,12 +126,12 @@ test = true
 
 [features]
 default = ["experimental-agent-intents", "mcp-executor-prototype"]
-# Test-only v2 kernel probe surface (slice 2, piece 6): enables the
+# Named v2 engine surface (also built into the hosted image): enables the
 # `kernel` module, its content-log intent/projector arms, the `kernel.`
 # store-skip exemption, and the `/2` definition-language validators — all
-# spelled `cfg(any(test, feature = "v2-kernel-probe"))`, so the default
-# build is byte-identical (production `EVENT_TYPES`, frozen DDL, and the
-# `cfg!(test)` store skip are untouched).
+# spelled `cfg(any(test, feature = "v2-kernel-probe"))`. The default feature
+# set still excludes v2; production `EVENT_TYPES`, frozen v1 DDL, and the
+# `cfg!(test)` store skip remain unchanged.
 v2-kernel-probe = []
 # Read-only observation of existing body jobs for inter-crate fixture lifecycle
 # proofs. Enabled by Held's dev-dependency only, never a production default.
@@ -235,6 +244,9 @@ sqlx-postgres = { version = "0.8", default-features = false, features = ["chrono
 syn = { version = "2", features = ["full", "parsing"] }
 tempfile = "3"
 thiserror = "2"
+# Session saver daemon client (S1): minimal WebSocket transport for the
+# read-only Paseo daemon connection. Small pure-WS crate; no TLS features.
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 tokio = { version = "1", features = [
@@ -254,7 +266,7 @@ tokio = { version = "1", features = [
     # Bounded test-owned subprocess proof of process-lifetime custody.
     "process",
 ] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 # Pinned alongside sqlx's SQLite build; the bundled amalgamation compiles with
 # SQLITE_ENABLE_FTS5, which the frozen DDL's records_fts virtual table needs
 # (verified by test/engine FTS coverage and the conformance self-check).
@@ -263,6 +275,8 @@ base64 = "0.23.0"
 # Bounded gzip decode for `body_encoding: "gzip+base64"` write bodies.
 flate2 = "1"
 fs2 = "0.4"
+unicode-normalization = "0.1"
+unicase = "2.9"
 libc = "0.2"
 serde_jcs = "0.1"
 zeroize = { version = "1", features = ["derive"] }
@@ -322,3 +336,18 @@ opt-level = 1
 # versioned-private-module change.  The vendored source is byte-for-byte the
 # released crate except for that compatibility path (`__private228`).
 swc_common = { path = "vendor/swc_common-12.0.1" }
+
+[[example]]
+name = "v2-import"
+path = "examples/v2_import.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v2-digest-bench"
+path = "examples/v2_digest_bench.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v2-history-bench"
+path = "examples/v2_history_bench.rs"
+required-features = ["v2-kernel-probe"]

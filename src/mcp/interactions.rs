@@ -39,6 +39,7 @@ pub enum ToolKind {
     Ping,
     EngineInfo,
     StandbyStatus,
+    OutboxStatus,
     Bootstrap,
     Quickstart,
     ReadGuide,
@@ -67,6 +68,7 @@ pub enum ToolKind {
     WhatsChanged,
     ManageBindings,
     ManageRecordPolicy,
+    ManageAccountConfig,
     ResolveExternal,
     ObserveExternal,
     GetRunActivity,
@@ -74,6 +76,7 @@ pub enum ToolKind {
     ManageLinks,
     ManageRelationships,
     ManageMessages,
+    ManageParticipants,
     ManageInterventions,
     InstantiateArtifact,
     ManageRendererBinding,
@@ -391,10 +394,11 @@ pub enum AuthorizationDisposition {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 87] = [
+    pub const ALL: [ToolKind; 90] = [
         ToolKind::Ping,
         ToolKind::EngineInfo,
         ToolKind::StandbyStatus,
+        ToolKind::OutboxStatus,
         ToolKind::Bootstrap,
         ToolKind::Quickstart,
         ToolKind::ReadGuide,
@@ -422,6 +426,7 @@ impl ToolKind {
         ToolKind::WhatsChanged,
         ToolKind::ManageBindings,
         ToolKind::ManageRecordPolicy,
+        ToolKind::ManageAccountConfig,
         ToolKind::ResolveExternal,
         ToolKind::ObserveExternal,
         ToolKind::GetRunActivity,
@@ -429,6 +434,7 @@ impl ToolKind {
         ToolKind::ManageLinks,
         ToolKind::ManageRelationships,
         ToolKind::ManageMessages,
+        ToolKind::ManageParticipants,
         ToolKind::ManageInterventions,
         ToolKind::InstantiateArtifact,
         ToolKind::ManageRendererBinding,
@@ -486,6 +492,7 @@ impl ToolKind {
             ToolKind::Ping => "ping",
             ToolKind::EngineInfo => "engine_info",
             ToolKind::StandbyStatus => "standby_status",
+            ToolKind::OutboxStatus => "outbox_status",
             ToolKind::Bootstrap => "bootstrap",
             ToolKind::Quickstart => "quickstart",
             ToolKind::ReadGuide => "read_guide",
@@ -514,6 +521,7 @@ impl ToolKind {
             ToolKind::WhatsChanged => "whats_changed",
             ToolKind::ManageBindings => "manage_bindings",
             ToolKind::ManageRecordPolicy => "manage_record_policy",
+            ToolKind::ManageAccountConfig => "manage_account_config",
             ToolKind::ResolveExternal => "resolve_external",
             ToolKind::ObserveExternal => "observe_external",
             ToolKind::GetRunActivity => "get_run_activity",
@@ -521,6 +529,7 @@ impl ToolKind {
             ToolKind::ManageLinks => "manage_links",
             ToolKind::ManageRelationships => "manage_relationships",
             ToolKind::ManageMessages => "manage_messages",
+            ToolKind::ManageParticipants => "manage_participants",
             ToolKind::ManageInterventions => "manage_interventions",
             ToolKind::InstantiateArtifact => "instantiate_artifact",
             ToolKind::ManageRendererBinding => "manage_renderer_binding",
@@ -601,6 +610,7 @@ impl ToolKind {
         match self {
             Self::Ping
             | Self::EngineInfo
+            | Self::OutboxStatus
             | Self::StandbyStatus
             | Self::Bootstrap
             | Self::ReadGuide
@@ -639,8 +649,10 @@ impl ToolKind {
             | Self::WorkspaceRead => Read,
             Self::ManageBindings => Actions(&["list", "observations"]),
             Self::ManageRecordPolicy => Actions(&["inspect", "list"]),
+            Self::ManageAccountConfig => Actions(&["inspect"]),
             Self::ManageLinks => Actions(&["list"]),
             Self::ManageRelationships => Actions(&["read", "why", "find"]),
+            Self::ManageParticipants => Actions(&["list"]),
             Self::ManageMessages => Actions(&[
                 "list_context",
                 "list_message_state",
@@ -657,9 +669,14 @@ impl ToolKind {
             | Self::ManageArtifactInputs
             | Self::ManageArtifactModuleGrants => Actions(&["read"]),
             Self::ManageSurfaceBindings => Actions(&["list", "get"]),
-            Self::ManageAlphaTabs => {
-                Actions(&["list", "inspect", "preview", "launch", "live_read"])
-            }
+            Self::ManageAlphaTabs => Actions(&[
+                "list",
+                "inspect",
+                "prepare_install",
+                "preview",
+                "launch",
+                "live_read",
+            ]),
             Self::ManageMdxModules => Actions(&["inspect", "impact"]),
             Self::ManageFacetObservations => Actions(&["list"]),
             Self::ManageVocabularies => Actions(&["list_values"]),
@@ -705,7 +722,11 @@ impl ToolKind {
 
     /// Compatibility spelling for the immutable-standby consumer.
     pub const fn standby_disposition(self) -> AuthoritativeDisposition {
-        self.authoritative_disposition()
+        if matches!(self, Self::ManageAccountConfig) {
+            AuthoritativeDisposition::Mutation
+        } else {
+            self.authoritative_disposition()
+        }
     }
 
     /// How this surface behaves when what it was asked for is not held
@@ -755,8 +776,10 @@ impl ToolKind {
             | Self::WorkspaceRead
             | Self::ManageBindings
             | Self::ManageRecordPolicy
+            | Self::ManageAccountConfig
             | Self::ManageLinks
             | Self::ManageRelationships
+            | Self::ManageParticipants
             | Self::ManageInterventions
             | Self::ManageRendererBinding
             | Self::ManageArtifactInputs
@@ -818,9 +841,11 @@ impl ToolKind {
             // Report the replica's own footing, including the holding
             // disclosure itself. They describe the boundary rather than
             // running into it.
-            Self::Ping | Self::EngineInfo | Self::StandbyStatus | Self::Bootstrap => {
-                Class::reads(Unaffected)
-            }
+            Self::Ping
+            | Self::EngineInfo
+            | Self::OutboxStatus
+            | Self::StandbyStatus
+            | Self::Bootstrap => Class::reads(Unaffected),
 
             Self::ReadGuide | Self::Quickstart => Class::reads(Unaffected),
 
@@ -873,7 +898,9 @@ impl ToolKind {
         match self {
             ToolKind::Ping => ToolExposure::new(System, false, Discoverability),
             ToolKind::EngineInfo => ToolExposure::new(System, false, Discoverability),
-            ToolKind::StandbyStatus => ToolExposure::new(System, false, Discoverability),
+            ToolKind::OutboxStatus | ToolKind::StandbyStatus => {
+                ToolExposure::new(System, false, Discoverability)
+            }
             ToolKind::Bootstrap => {
                 ToolExposure::new(System, true, Discoverability).always_visible()
             }
@@ -912,6 +939,7 @@ impl ToolKind {
                 ToolExposure::new(Identity, false, CorrectnessUnderIgnorance)
             }
             ToolKind::ManageRecordPolicy => ToolExposure::new(Records, false, Atomicity),
+            ToolKind::ManageAccountConfig => ToolExposure::new(Records, false, Atomicity),
             ToolKind::ResolveExternal => {
                 ToolExposure::new(Identity, false, CorrectnessUnderIgnorance)
             }
@@ -927,6 +955,7 @@ impl ToolKind {
             ToolKind::ManageLinks => ToolExposure::new(Records, true, Atomicity),
             ToolKind::ManageRelationships => ToolExposure::new(Records, false, Atomicity),
             ToolKind::ManageMessages => ToolExposure::new(Messaging, true, Atomicity),
+            ToolKind::ManageParticipants => ToolExposure::new(Messaging, false, Atomicity),
             ToolKind::ManageInterventions => ToolExposure::new(Messaging, false, Atomicity),
             ToolKind::InstantiateArtifact => ToolExposure::new(Artifacts, false, Atomicity),
             ToolKind::ManageRendererBinding => {
@@ -1035,6 +1064,7 @@ impl ToolKind {
         match self {
             ToolKind::Ping
             | ToolKind::EngineInfo
+            | ToolKind::OutboxStatus
             | ToolKind::StandbyStatus
             | ToolKind::Quickstart
             | ToolKind::ReadGuide
@@ -1080,11 +1110,13 @@ impl ToolKind {
             | ToolKind::GetRunActivity
             | ToolKind::ManageBindings
             | ToolKind::ManageRecordPolicy
+            | ToolKind::ManageAccountConfig
             | ToolKind::ResolveExternal
             | ToolKind::ObserveExternal
             | ToolKind::ManageLinks
             | ToolKind::ManageRelationships
             | ToolKind::ManageMessages
+            | ToolKind::ManageParticipants
             | ToolKind::ManageInterventions
             | ToolKind::InstantiateArtifact
             | ToolKind::ManageRendererBinding
@@ -1394,6 +1426,7 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
     match kind {
         ToolKind::Ping
         | ToolKind::EngineInfo
+        | ToolKind::OutboxStatus
         | ToolKind::StandbyStatus
         | ToolKind::ReadGuide
         | ToolKind::ExportSnapshot
@@ -1616,6 +1649,15 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             }
             extraction.count(1);
         }
+        ToolKind::ManageAccountConfig => {
+            let id = string_at(result, "record_id");
+            if result.get("created").and_then(Value::as_bool) == Some(true) {
+                extraction.mutated(id);
+            } else {
+                extraction.opened(id);
+            }
+            extraction.count(1);
+        }
         ToolKind::ManageRecordPolicy => {
             let outcomes = array_at(result, "outcomes");
             if !outcomes.is_empty() {
@@ -1714,6 +1756,21 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                     );
                 }
                 extraction.count(array_at(result, "results").len());
+            }
+            _ => {}
+        },
+        ToolKind::ManageParticipants => match string_at(arguments, "action") {
+            Some("register_persona" | "retire_persona") => {
+                extraction.mutated(string_at(result, "persona_id"));
+                extraction.count(1);
+            }
+            Some("list") => {
+                surface_id_array(
+                    &mut extraction,
+                    array_at(result, "participants"),
+                    "persona_id",
+                );
+                extraction.count(array_at(result, "participants").len());
             }
             _ => {}
         },
@@ -1884,6 +1941,15 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                         extraction.surfaced(string_at(item, "artifact_id"));
                     }
                     extraction.count(array_at(result, "installs").len());
+                }
+                Some("prepare_install") => {
+                    extraction.surfaced(string_at(arguments, "artifact_id"));
+                    extraction.count(usize::from(
+                        result
+                            .get("ready")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ));
                 }
                 Some("inspect") => {
                     extraction.surfaced(install_artifact);
@@ -2243,8 +2309,9 @@ pub(crate) fn timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn error_kind(error: &Error) -> &'static str {
+pub(crate) fn error_kind(error: &Error) -> &'static str {
     match error {
+        Error::StandbyAdmission { source, .. } => error_kind(source),
         Error::Engine(_) => "engine",
         Error::Conflict(_) => "conflict",
         Error::NotHeld(_) => "not_held",
@@ -2257,6 +2324,7 @@ fn error_kind(error: &Error) -> &'static str {
         Error::Delivery(_) => "delivery",
         Error::DeploymentReadOnly(_) => "deployment_read_only",
         Error::DeploymentDraining(_) => "deployment_draining",
+        Error::ReplayBounded { .. } => "replay_bounded",
         Error::Sqlx(_) => "database",
         Error::Json(_) => "json",
         Error::Io(_) => "io",
@@ -3439,7 +3507,18 @@ mod tests {
                 "{}",
                 kind.name()
             );
-            assert_eq!(disposition, kind.standby_disposition());
+            if kind == ToolKind::ManageAccountConfig {
+                assert_eq!(disposition, AuthoritativeDisposition::Actions(&["inspect"]));
+                assert_eq!(
+                    kind.standby_disposition(),
+                    AuthoritativeDisposition::Mutation
+                );
+                assert!(!kind
+                    .standby_disposition()
+                    .admits(&json!({"action":"inspect"})));
+            } else {
+                assert_eq!(disposition, kind.standby_disposition());
+            }
         }
 
         let links = ToolKind::ManageLinks.standby_disposition();
@@ -3638,6 +3717,10 @@ mod tests {
                 result: json!({ "engine": "native-ce" }),
                 touches: vec![],
                 result_count: Some(0),
+            },
+            Case {
+                name: "outbox status has no record result", kind: ToolKind::OutboxStatus,
+                arguments: json!({}), result: json!({"entries":[]}), touches: vec![], result_count: Some(0),
             },
             Case {
                 name: "standby_status has no record result",
@@ -4066,6 +4149,33 @@ mod tests {
                 result: json!({ "id": "sent-message" }),
                 touches: vec![mutated("sent-message")],
                 result_count: Some(1),
+            },
+            Case {
+                name: "manage_participants register mutates the persona it creates or adopts",
+                kind: ToolKind::ManageParticipants,
+                arguments: json!({ "action": "register_persona" }),
+                result: json!({ "id": "persona", "persona_id": "persona", "state": "active" }),
+                touches: vec![mutated("persona")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_participants retire mutates the persona it retires",
+                kind: ToolKind::ManageParticipants,
+                arguments: json!({ "action": "retire_persona" }),
+                result: json!({ "id": "persona", "persona_id": "persona", "state": "retired" }),
+                touches: vec![mutated("persona")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "manage_participants list surfaces each owned persona and no other id",
+                kind: ToolKind::ManageParticipants,
+                arguments: json!({ "action": "list" }),
+                result: json!({ "participants": [
+                    { "persona_id": "persona-a", "participant_address": "persona:persona-a" },
+                    { "persona_id": "persona-b", "participant_address": "persona:persona-b" }
+                ] }),
+                touches: vec![surfaced("persona-a", 1), surfaced("persona-b", 2)],
+                result_count: Some(2),
             },
             Case {
                 name: "manage_interventions resume mutates its Message root",
@@ -4807,6 +4917,30 @@ mod tests {
                 arguments: json!({ "action": "grant" }),
                 result: json!({"record_id":"policy-record","changed":true}),
                 touches: vec![mutated("policy-record")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "canonical creation mutates only its new record",
+                kind: ToolKind::ManageAccountConfig,
+                arguments: json!({"action":"ensure"}),
+                result: json!({"record_id":"new-config","created":true}),
+                touches: vec![mutated("new-config")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "canonical healthy hit opens the current winner",
+                kind: ToolKind::ManageAccountConfig,
+                arguments: json!({"action":"ensure"}),
+                result: json!({"record_id":"current-config","created":false}),
+                touches: vec![opened("current-config")],
+                result_count: Some(1),
+            },
+            Case {
+                name: "canonical forbidden refusal never captures a record identity",
+                kind: ToolKind::ManageAccountConfig,
+                arguments: json!({"action":"inspect"}),
+                result: json!({"record_id":null,"created":null,"status":"unusable","reason":"forbidden"}),
+                touches: vec![],
                 result_count: Some(1),
             },
             Case {

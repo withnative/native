@@ -654,7 +654,7 @@ async fn bootstrap_resolves_ordered_caller_context_without_consuming_obligations
         native_ce::ENGINE_VERSION
     );
     assert_eq!(entries[0]["source"]["template_key"], "engine-orientation");
-    assert_eq!(entries[0]["source"]["template_version"], 10);
+    assert_eq!(entries[0]["source"]["template_version"], 11);
     assert!(entries[0]["source"]["record_id"].is_null());
     let orientation = entries[0]["content"].as_str().unwrap();
     for guarantee in [
@@ -1207,11 +1207,16 @@ async fn bootstrap_fails_closed_when_tiny_sources_exceed_the_metadata_count_boun
 async fn bootstrap_fails_closed_when_one_source_exceeds_the_serialized_metadata_bound() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
+    const TITLE_MARKER: &str = "metadata-heavy-title-must-not-leak:";
+    let oversized_title = format!(
+        "{TITLE_MARKER}{}",
+        "m".repeat(native_ce::MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES)
+    );
     sqlx::query(
         "INSERT INTO records(id,type,kind,name,body,home_id,policy_anchor_id) \
          VALUES('metadata-heavy-source','Document','note',?,'x','native:unfiled','native:root')",
     )
-    .bind("m".repeat(native_ce::MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES))
+    .bind(&oversized_title)
     .execute(&crate::common::fixture_write_pool(&db).await)
     .await
     .unwrap();
@@ -1233,8 +1238,25 @@ async fn bootstrap_fails_closed_when_one_source_exceeds_the_serialized_metadata_
         .as_array()
         .unwrap()
         .is_empty());
-    // 8b1e3da: approved SQL pointer grows orientation by ~0.16 KiB.
-    assert!(serde_json::to_vec(&payload).unwrap().len() < 17 * 1024);
+    // Rejected instructions contain no authored bodies. Bound their metadata,
+    // independently of build-owned orientation and variable-length run keys.
+    let rejected_metadata = json!({
+        "instructions": payload["instructions"],
+        "pending_obligations": payload["pending_obligations"],
+    });
+    let metadata_bytes = serde_json::to_vec(&rejected_metadata).unwrap().len();
+    let payload_text = serde_json::to_string(&payload).unwrap();
+    assert!(
+        metadata_bytes <= native_ce::MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES,
+        "rejected instruction metadata is {metadata_bytes} bytes; budget is {} bytes (full bootstrap: {} bytes)",
+        native_ce::MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES,
+        payload_text.len(),
+    );
+    assert!(
+        !payload_text.contains(TITLE_MARKER),
+        "oversized source title leaked into bootstrap (metadata: {metadata_bytes} bytes; full bootstrap: {} bytes)",
+        payload_text.len(),
+    );
 }
 
 #[tokio::test]

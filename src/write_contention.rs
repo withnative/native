@@ -107,7 +107,7 @@ const BUCKET_BOUNDS_MICROS: [u64; 15] = [
 /// control-plane catalogue, and mixing the two would corrupt the distribution
 /// the MVCC question turns on. The pool that releases the connection knows
 /// which it is, so samples are routed at close rather than at open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum WriteDomain {
     Workspace,
     HostCatalog,
@@ -428,30 +428,80 @@ pub(crate) fn close_critical_section(domain: WriteDomain, connection_key: usize)
         // the tail has been cut rather than folded in with the losses that
         // carry no such implication.
         HELD_OVER_CAP.fetch_add(1, Ordering::Relaxed);
+        emit_over_cap(
+            domain,
+            section
+                .operation
+                .unwrap_or(crate::db::HOST_CATALOG_OP_OTHER),
+            1,
+        );
         return;
     }
     registry().totals(domain).held.record(held);
-    if held >= SLOW_HOLD_LOG_AFTER {
-        if let Some(operation) = section.operation {
-            if BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed) {
-                let domain = match domain {
-                    WriteDomain::Workspace => "workspace",
-                    WriteDomain::HostCatalog => "host_catalog",
-                };
-                tracing::info!(target: "native_ce::standby::verification",
-                    domain, held_ms = held.as_millis(),
-                    "standby writer contention slow");
-            } else {
-                eprintln!(
-                    "write-contention-slow domain={domain:?} operation={operation} held_ms={}",
-                    held.as_millis()
-                );
-            }
-        }
+    if held >= SLOW_HOLD_LOG_AFTER && matches!(domain, WriteDomain::HostCatalog) {
+        // Ordinary catalog journal writes are milliseconds, so a seconds-long
+        // hold is the contention signal bbbd18b had to reconstruct from
+        // unattributed maxima. Unlabelled catalog writes report as `other`
+        // rather than staying silent; workspace writes stay domain-aggregated.
+        emit_slow_hold(
+            domain,
+            section
+                .operation
+                .unwrap_or(crate::db::HOST_CATALOG_OP_OTHER),
+            held,
+        );
     }
     #[cfg(test)]
-    observed::note_held(domain, connection_key, held);
+    observed::note_held(domain, connection_key, held, section.operation);
     maybe_report();
+}
+
+/// The log name for a domain, matching the minute `write-contention` line.
+fn domain_name(domain: WriteDomain) -> &'static str {
+    match domain {
+        WriteDomain::Workspace => "workspace",
+        WriteDomain::HostCatalog => "host_catalog",
+    }
+}
+
+/// One greppable line per slow catalog hold. `write-contention-slow` is the
+/// anchor; every field is `key=value` like the minute line, whose format this
+/// does not change.
+fn slow_hold_line(domain: WriteDomain, operation: &str, held: Duration) -> String {
+    format!(
+        "write-contention-slow domain={} operation={operation} held_ms={}",
+        domain_name(domain),
+        held.as_millis()
+    )
+}
+
+fn emit_slow_hold(domain: WriteDomain, operation: &'static str, held: Duration) {
+    if BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed) {
+        tracing::info!(target: "native_ce::standby::verification",
+            domain = domain_name(domain), operation, held_ms = held.as_millis(),
+            "standby writer contention slow");
+    } else {
+        eprintln!("{}", slow_hold_line(domain, operation, held));
+    }
+}
+
+/// One greppable line per batch of sections abandoned past the five-minute
+/// cap, attributed by label like the slow-hold line.
+fn over_cap_line(domain: WriteDomain, operation: &str, count: u64) -> String {
+    format!(
+        "write-contention-over-cap domain={} operation={operation} count={count}",
+        domain_name(domain),
+    )
+}
+
+fn emit_over_cap(domain: WriteDomain, operation: &'static str, count: u64) {
+    if BOUNDED_STANDBY_DIAGNOSTICS.load(Ordering::Relaxed) {
+        tracing::info!(target: "native_ce::standby::verification",
+            domain = domain_name(domain), operation, count,
+            "standby writer contention over cap");
+    } else {
+        eprintln!("{}", over_cap_line(domain, operation, count));
+    }
 }
 
 /// A point-in-time view of one domain's totals.
@@ -539,13 +589,16 @@ pub(crate) mod observed {
     /// reliably the task that opened the transaction, so a task-local sink
     /// would report a false zero. Keying by connection is race-free between
     /// concurrent tests without needing to be.
-    fn closed() -> &'static Mutex<HashMap<usize, (WriteDomain, Duration)>> {
-        static CLOSED: OnceLock<Mutex<HashMap<usize, (WriteDomain, Duration)>>> = OnceLock::new();
+    type ClosedSections = HashMap<usize, (WriteDomain, Option<&'static str>, Duration)>;
+    fn closed() -> &'static Mutex<ClosedSections> {
+        static CLOSED: OnceLock<Mutex<ClosedSections>> = OnceLock::new();
         CLOSED.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     /// The critical section recorded for `connection_key`, if one has closed.
-    pub(crate) fn section_for(connection_key: usize) -> Option<(WriteDomain, Duration)> {
+    pub(crate) fn section_for(
+        connection_key: usize,
+    ) -> Option<(WriteDomain, Option<&'static str>, Duration)> {
         closed()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -563,11 +616,16 @@ pub(crate) mod observed {
             .remove(&connection_key);
     }
 
-    pub(super) fn note_held(domain: WriteDomain, connection_key: usize, held: Duration) {
+    pub(super) fn note_held(
+        domain: WriteDomain,
+        connection_key: usize,
+        held: Duration,
+        operation: Option<&'static str>,
+    ) {
         closed()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(connection_key, (domain, held));
+            .insert(connection_key, (domain, operation, held));
     }
 }
 
@@ -696,13 +754,30 @@ fn collect_abandoned_sections(now: Instant) {
     let mut sections = open_sections()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let before = sections.len();
-    sections
-        .retain(|_, section| now.saturating_duration_since(section.opened) < STALE_SECTION_AFTER);
-    let collected = before - sections.len();
+    let mut stale: HashMap<(WriteDomain, &'static str), u64> = HashMap::new();
+    sections.retain(|_, section| {
+        if now.saturating_duration_since(section.opened) < STALE_SECTION_AFTER {
+            return true;
+        }
+        *stale
+            .entry((
+                section.domain,
+                section
+                    .operation
+                    .unwrap_or(crate::db::HOST_CATALOG_OP_OTHER),
+            ))
+            .or_default() += 1;
+        false
+    });
+    let collected: u64 = stale.values().sum();
     drop(sections);
     if collected > 0 {
-        HELD_OVER_CAP.fetch_add(collected as u64, Ordering::Relaxed);
+        HELD_OVER_CAP.fetch_add(collected, Ordering::Relaxed);
+        let mut stale: Vec<((WriteDomain, &'static str), u64)> = stale.into_iter().collect();
+        stale.sort();
+        for ((domain, operation), count) in stale {
+            emit_over_cap(domain, operation, count);
+        }
     }
 }
 
@@ -897,6 +972,77 @@ mod tests {
             observed::section_for(key).map(|section| section.0),
             Some(WriteDomain::Workspace)
         );
+    }
+
+    #[test]
+    fn a_labelled_close_records_its_operation() {
+        // Asserted through the per-connection sink rather than the global
+        // counters, which sibling tests in this binary are writing to
+        // concurrently.
+        let key = 0xc0de_0001;
+        observed::note_open(key);
+        open_critical_section(
+            WriteDomain::HostCatalog,
+            key,
+            Some(crate::db::HOST_CATALOG_OP_SQL_COMMIT_GUARD),
+        );
+        close_critical_section(WriteDomain::HostCatalog, key);
+        assert_eq!(
+            observed::section_for(key).map(|section| (section.0, section.1)),
+            Some((
+                WriteDomain::HostCatalog,
+                Some(crate::db::HOST_CATALOG_OP_SQL_COMMIT_GUARD)
+            ))
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_close_records_no_operation_so_the_line_says_other() {
+        let key = 0xc0de_0002;
+        observed::note_open(key);
+        open_critical_section(WriteDomain::HostCatalog, key, None);
+        close_critical_section(WriteDomain::HostCatalog, key);
+        assert_eq!(
+            observed::section_for(key).map(|section| (section.0, section.1)),
+            Some((WriteDomain::HostCatalog, None))
+        );
+        // The close records the opener's label verbatim; the `other`
+        // fallback lives in the line builders below, not in the sample.
+        assert_eq!(
+            slow_hold_line(
+                WriteDomain::HostCatalog,
+                crate::db::HOST_CATALOG_OP_OTHER,
+                Duration::from_millis(1500)
+            ),
+            "write-contention-slow domain=host_catalog operation=other held_ms=1500"
+        );
+    }
+
+    #[test]
+    fn slow_and_over_cap_lines_name_domain_operation_and_duration() {
+        let slow = slow_hold_line(
+            WriteDomain::HostCatalog,
+            crate::db::HOST_CATALOG_OP_SQL_COMMIT_GUARD,
+            Duration::from_millis(2345),
+        );
+        assert_eq!(
+            slow,
+            "write-contention-slow domain=host_catalog operation=sql_commit_guard held_ms=2345"
+        );
+        let over_cap = over_cap_line(
+            WriteDomain::HostCatalog,
+            crate::db::HOST_CATALOG_OP_SIGN_IN,
+            3,
+        );
+        assert_eq!(
+            over_cap,
+            "write-contention-over-cap domain=host_catalog operation=sign_in count=3"
+        );
+        for line in [slow, over_cap] {
+            for field in line.split(' ').skip(1) {
+                assert!(field.contains('='), "field {field} is not key=value");
+            }
+        }
     }
 
     #[test]

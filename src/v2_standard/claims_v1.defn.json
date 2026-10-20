@@ -1,0 +1,14 @@
+{
+  "family": "native.coordination.claims",
+  "version": 1,
+  "interpreter": "native.defn/4",
+  "primary_type": "ClaimOccupancy",
+  "kinds": [{
+    "token": "occupancy",
+    "description": "Private per-record occupancy; commands target any LIVE kernel record. No expiry, ownership, lifecycle, readiness or work derivation effects.",
+    "maturity": "current",
+    "identity": {"mode": "record"},
+    "fields": [],
+    "links": []
+  }]
+}

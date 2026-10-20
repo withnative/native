@@ -85,6 +85,7 @@ enum BatchItem {
         if_home_id: Option<String>,
         if_body_digest: Option<String>,
         if_unmodified_since: Option<String>,
+        if_policy_revision: Option<String>,
     },
     AddLink {
         source_id: String,
@@ -99,6 +100,18 @@ enum BatchItem {
 }
 
 impl BatchItem {
+    fn is_guard_only_update(&self) -> bool {
+        matches!(self, BatchItem::Update {
+            name, summary, maturity, home_id, facets,
+            if_facets, if_maturity, if_home_id, if_body_digest,
+            if_unmodified_since, if_policy_revision, ..
+        } if name.is_none() && summary.is_none() && maturity.is_none()
+            && home_id.is_none() && facets.as_ref().is_none_or(Map::is_empty)
+            && (if_facets.is_some() || if_maturity.is_some() || if_home_id.is_some()
+                || if_body_digest.is_some() || if_unmodified_since.is_some()
+                || if_policy_revision.is_some()))
+    }
+
     fn op(&self) -> &'static str {
         match self {
             BatchItem::Update { .. } => "update",
@@ -126,7 +139,7 @@ struct BatchIssue {
 pub fn register_batch_write_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::BatchWrite,
-        "Atomic batch of up to 25 existing-record writes under one reason and idempotency key: update_record-style field/facet patches (name, summary, maturity, home_id, facets), manage_links.add link additions, and archive_record transitions. Every item authorizes and validates first; one failing item refuses the whole batch with nothing written, naming the item index. A keyed replay re-checks View on every disclosed record and returns the original receipt without writing, so a caller demoted since the first call can still replay but cannot execute a new batch. Body operations are refused in M0 — use update_record for body edits. SQLite only; Turso-local and Postgres do not offer this tool.",
+        "Atomic batch of up to 25 existing-record writes under one reason and idempotency key: update_record-style field/facet patches (name, summary, maturity, home_id, facets), manage_links.add link additions, and archive_record transitions. Update preconditions may stand alone; if_policy_revision fences audience changes. Every item authorizes and validates first; one failing item refuses the whole batch with nothing written, naming the item index. A keyed replay re-checks View on every disclosed record and returns the original receipt without writing, so a caller demoted since the first call can still replay but cannot execute a new batch. Body operations are refused in M0 — use update_record for body edits. SQLite only; Turso-local and Postgres do not offer this tool.",
         json!({
             "type": "object",
             "properties": {
@@ -153,7 +166,8 @@ pub fn register_batch_write_tool(registry: &mut ToolRegistry) -> Result<()> {
                                     "if_maturity": { "type": ["string", "null"] },
                                     "if_home_id": { "type": "string" },
                                     "if_body_digest": { "type": "string" },
-                                    "if_unmodified_since": { "type": "string" }
+                                    "if_unmodified_since": { "type": "string" },
+                                    "if_policy_revision": { "type": "string", "minLength": 1, "description": "Opaque policy list revision, checked in the write transaction." }
                                 },
                                 "required": ["op", "id"],
                                 "additionalProperties": false
@@ -229,21 +243,31 @@ async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
                 home_id,
                 facets,
                 if_facets,
-                ..
+                if_maturity,
+                if_home_id,
+                if_body_digest,
+                if_unmodified_since,
+                if_policy_revision,
             } => {
                 if !crate::mcp::record_ref::is_canonical_uuid_v4_or_v7(id) {
                     return Err(Error::engine(format!(
                         "{TOOL}: items[{index}].id must be an exact canonical lowercase UUID of version 4 or 7"
                     )));
                 }
-                // An update item that changes nothing is refused up front,
-                // following the singular no-changes guard rather than silently
-                // riding the batch as unchanged.
+                // A guard-only update can admit a later item atomically
+                // (for example an archive). An empty, unguarded item still
+                // refuses rather than silently riding along unchanged.
                 if name.is_none()
                     && summary.is_none()
                     && maturity.is_none()
                     && home_id.is_none()
                     && facets.as_ref().is_none_or(Map::is_empty)
+                    && if_facets.is_none()
+                    && if_maturity.is_none()
+                    && if_home_id.is_none()
+                    && if_body_digest.is_none()
+                    && if_unmodified_since.is_none()
+                    && if_policy_revision.is_none()
                 {
                     return Err(Error::engine(format!(
                         "{TOOL}: items[{index}] names no changes — pass at least one field or facet"
@@ -277,9 +301,10 @@ async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
             }
         }
     }
-    // One record per batch: a record mutated twice would make guards,
-    // previous seqs, and the replay receipt order-dependent. Link targets
-    // are not mutated, so many-to-one fans (W2) stay legal.
+    // One mutation per record. The sole repeated-id form is an adjacent
+    // guard-only Update followed by Archive: the guard appends nothing and
+    // admits the transition inside this transaction. A third item, reversed
+    // order, or a mutating Update still refuses. Link targets aren't mutated.
     {
         let mut seen = std::collections::BTreeMap::new();
         for (index, item) in args.items.iter().enumerate() {
@@ -288,8 +313,14 @@ async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
                 BatchItem::AddLink { source_id, .. } => source_id,
             };
             if let Some(first) = seen.insert(primary, index) {
+                if first + 1 == index
+                    && args.items[first].is_guard_only_update()
+                    && matches!(item, BatchItem::Archive { .. })
+                {
+                    continue;
+                }
                 return Err(Error::engine(format!(
-                    "{TOOL}: items[{index}] duplicates items[{first}] ({primary}); a record may appear in only one item per batch"
+                    "{TOOL}: items[{index}] duplicates items[{first}] ({primary}); a record may have only one mutation per batch (an adjacent guard-only update before archive is allowed)"
                 )));
             }
         }
@@ -669,6 +700,7 @@ async fn apply_item_in(
             if_home_id,
             if_body_digest,
             if_unmodified_since,
+            if_policy_revision,
         } => {
             apply_update_item_in(
                 db,
@@ -691,6 +723,7 @@ async fn apply_item_in(
                 if_home_id,
                 if_body_digest,
                 if_unmodified_since,
+                if_policy_revision,
             )
             .await
         }
@@ -756,9 +789,13 @@ async fn apply_update_item_in(
     if_home_id: &Option<String>,
     if_body_digest: &Option<String>,
     if_unmodified_since: &Option<String>,
+    if_policy_revision: &Option<String>,
 ) -> std::result::Result<(), BatchIssue> {
     let invalid = |message: String| issue(index, item, "invalid", message);
     let conflict = |message: String| issue(index, item, "conflict", message);
+    super::policy::assert_write_policy_revision_in(tx, id, if_policy_revision.as_deref(), TOOL)
+        .await
+        .map_err(|error| conflict(error.to_string()))?;
     if let Some(value) = name {
         if value.is_null() {
             return Err(invalid(format!(
@@ -1432,7 +1469,42 @@ async fn rebuild_hit_receipt_in(
             .find(|(i, _)| *i == index)
             .map(|(_, id)| id);
         let Some(attestation_id) = attestation else {
-            let previous_seq = previous_record_seq_in(tx, primary).await?;
+            // The adjacent guard precedes this record's archive event. Pin
+            // its original content head, not the now-advanced archive head.
+            let archive_attestation = if item.is_guard_only_update()
+                && matches!(args.items.get(index + 1), Some(BatchItem::Archive { id, .. }) if id == primary)
+            {
+                hit.found
+                    .iter()
+                    .find(|(i, _)| *i == index + 1)
+                    .map(|(_, id)| id)
+            } else {
+                None
+            };
+            let mut archive_first: Option<i64> = None;
+            if let Some(archive_attestation) = archive_attestation {
+                for (domain, event_id) in attestation_outputs_in(tx, archive_attestation).await? {
+                    if domain == "content" {
+                        let seq: i64 =
+                            sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+                                .bind(event_id)
+                                .fetch_one(&mut **tx)
+                                .await?;
+                        archive_first = Some(archive_first.map_or(seq, |first| first.min(seq)));
+                    }
+                }
+            }
+            let previous_seq = if let Some(first) = archive_first {
+                sqlx::query_scalar(
+                    "SELECT MAX(seq) FROM content_events WHERE record_id=? AND seq<?",
+                )
+                .bind(primary)
+                .bind(first)
+                .fetch_one(&mut **tx)
+                .await?
+            } else {
+                previous_record_seq_in(tx, primary).await?
+            };
             let mut outcome = json!({
                 "index": index, "op": item.op(), "id": primary,
                 "status": "unchanged", "previous_seq": previous_seq,

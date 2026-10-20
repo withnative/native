@@ -24,6 +24,21 @@ pub trait BackupSink: Send + Sync + std::fmt::Debug {
     /// Download `key` to `dest`, creating or truncating it.
     fn get(&self, key: String, dest: PathBuf) -> BoxFuture<'_, Result<()>>;
 
+    /// Download while enforcing a byte ceiling before writing each chunk.
+    /// Unsupported sinks fail closed; never fall back to unbounded `get`.
+    fn get_bounded(
+        &self,
+        _key: String,
+        _dest: PathBuf,
+        _max_bytes: u64,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async {
+            Err(Error::engine(
+                "backup sink does not support bounded downloads",
+            ))
+        })
+    }
+
     /// Every key beginning with `prefix`, in arbitrary order.
     fn list(&self, prefix: String) -> BoxFuture<'_, Result<Vec<String>>>;
 
@@ -182,6 +197,48 @@ impl BackupSink for FsSink {
     fn get(&self, key: String, dest: PathBuf) -> BoxFuture<'_, Result<()>> {
         let sink = self.clone();
         Box::pin(run_blocking(move || sink.get_blocking(&key, &dest)))
+    }
+
+    fn get_bounded(&self, key: String, dest: PathBuf, max_bytes: u64) -> BoxFuture<'_, Result<()>> {
+        let sink = self.clone();
+        Box::pin(run_blocking(move || {
+            use std::io::{Read, Write};
+            crate::managed_custody::refuse_maintenance(&dest)?;
+            let mut source_options = std::fs::OpenOptions::new();
+            source_options.read(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                source_options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            let mut source = source_options.open(sink.path_for(&key)?)?;
+            if !source.metadata()?.is_file() {
+                return Err(Error::engine(
+                    "bounded backup source must be a regular file",
+                ));
+            }
+            let mut output = std::fs::File::create(dest)?;
+            let mut total = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = match source.read(&mut buffer) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if read == 0 {
+                    break;
+                }
+                total = total
+                    .checked_add(read as u64)
+                    .ok_or_else(|| Error::engine("backup download size overflow"))?;
+                if total > max_bytes {
+                    return Err(Error::engine("backup download exceeds byte limit"));
+                }
+                output.write_all(&buffer[..read])?;
+            }
+            output.sync_all()?;
+            Ok(())
+        }))
     }
 
     fn list(&self, prefix: String) -> BoxFuture<'_, Result<Vec<String>>> {

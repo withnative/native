@@ -1,4 +1,4 @@
-//! Canonical storage interchange v1, revision 5.
+//! Canonical storage interchange v1, revision 8.
 //!
 //! The wire representation is intentionally logical rather than a SQLite file
 //! copy: every durable table is an ordered section, every SQLite value carries
@@ -22,12 +22,17 @@ use crate::db::{
 use crate::{Error, Result};
 
 pub const FORMAT: &str = "native.canonical-interchange.v1";
-pub const REVISION: u64 = 5;
+pub const REVISION: u64 = 8;
+const REVISION_7: u64 = 7;
+const REVISION_6: u64 = 6;
+const REVISION_5: u64 = 5;
 
 // SQLite's application id is database-local provenance, not portable content.
 // The high bytes identify Native's canonical-history marker and the low byte
 // records the interchange revision from which this database was materialised.
-// Zero/foreign values are deliberately "unknown" and may not author deltas.
+// Zero/foreign values are deliberately "unknown". A standby still takes
+// forward deltas after its own full-snapshot checkpoint, but reports the
+// history before that checkpoint as unknown rather than relabelling it.
 pub(crate) const SOURCE_HISTORY_APPLICATION_ID_BASE: i64 = 0x4e41_5400;
 
 pub(crate) const fn source_history_application_id(revision: u64) -> i64 {
@@ -84,6 +89,7 @@ pub(crate) const SECTION_NAMES: &[&str] = &[
     "provenance_action_events",
     "provenance_attestation_validity_events",
     "provenance_action_outputs",
+    "provenance_action_app_attributions",
     "webhook_endpoints",
     "webhook_credentials",
     "webhook_deliveries",
@@ -100,6 +106,223 @@ pub(crate) const SECTION_NAMES: &[&str] = &[
     "message_audiences",
     "message_origin_state",
     "message_origin_principals",
+    "personas",
+    "message_speakers",
+    "message_conversations",
+    "awareness_command_intents",
+    "human_message_awareness",
+    "agent_message_dispositions",
+    "awareness_event_evidence",
+    "message_inbox_routing",
+    "message_preferences",
+    "member_destinations",
+    "message_mentions",
+    "record_mentions",
+    "notification_candidates",
+    "module_releases",
+    "module_release_imports",
+    "artifact_source_attestations",
+    "artifact_inputs",
+    "artifact_module_grants",
+    "annotation_targets",
+    "attribution_targets",
+    "attribution_assertions",
+    "attribution_evidence",
+    "attribution_retractions",
+    "facet_values",
+    "facet_observations",
+    "semantic_units",
+    "unit_revisions",
+    "unit_heads",
+    "occurrences",
+    "freshness_command_results",
+    "freshness_runtime_command_results",
+    "receipts",
+    "receipt_provenance",
+    "dependencies",
+    "dependency_assessments",
+    "receipt_comparisons",
+    "receipt_uncertainty_lineage",
+    "reconciliations",
+    "unit_supersessions",
+    "dependency_audits",
+    "canvas_objects",
+    "canvas_batches",
+    "bindings",
+    "binding_audit",
+    "external_observations",
+    "database_identity",
+    "database_identity_audit",
+    "blobs",
+    "vocabularies",
+    "vocabulary_values",
+    "schema_config",
+    "member_contexts",
+    "instruction_bindings",
+    "onboarding_programmes",
+    "onboarding_programme_sources",
+    "member_obligations",
+    "member_obligation_progress",
+    "seeded_instruction_sources",
+    "control_event_applications",
+    "storage_portability_policy",
+    "account_configs",
+    "sql_write_receipts",
+];
+
+// Frozen engine89 inventory before SQL batch receipts.
+const REVISION_7_SECTION_NAMES: &[&str] = &[
+    "content_events",
+    "content_event_causal_frontier",
+    "content_event_causal_cutover",
+    "act_state",
+    "act_cutover",
+    "policy_events",
+    "meta_events",
+    "control_events",
+    "derivation_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "relationship_events",
+    "relationship_foreign_action_attestations",
+    "relationship_foreign_action_outputs",
+    "relationship_federation_events",
+    "relationship_federation_quarantine",
+    "content_event_sources",
+    "replicated_message_provenance",
+    "destination_message_ingest",
+    "replicated_message_references",
+    "provenance_interaction_receipts",
+    "provenance_action_attestations",
+    "provenance_action_events",
+    "provenance_attestation_validity_events",
+    "provenance_action_outputs",
+    "provenance_action_app_attributions",
+    "webhook_endpoints",
+    "webhook_credentials",
+    "webhook_deliveries",
+    "records",
+    "record_policies",
+    "policy_entries",
+    "links",
+    "relationships",
+    "relationship_endpoints",
+    "relationship_legacy_links",
+    "relationship_assertion_heads",
+    "relationship_endpoint_activity",
+    "message_audience_state",
+    "message_audiences",
+    "message_origin_state",
+    "message_origin_principals",
+    "personas",
+    "message_speakers",
+    "message_conversations",
+    "awareness_command_intents",
+    "human_message_awareness",
+    "agent_message_dispositions",
+    "awareness_event_evidence",
+    "message_inbox_routing",
+    "message_preferences",
+    "member_destinations",
+    "message_mentions",
+    "record_mentions",
+    "notification_candidates",
+    "module_releases",
+    "module_release_imports",
+    "artifact_source_attestations",
+    "artifact_inputs",
+    "artifact_module_grants",
+    "annotation_targets",
+    "attribution_targets",
+    "attribution_assertions",
+    "attribution_evidence",
+    "attribution_retractions",
+    "facet_values",
+    "facet_observations",
+    "semantic_units",
+    "unit_revisions",
+    "unit_heads",
+    "occurrences",
+    "freshness_command_results",
+    "freshness_runtime_command_results",
+    "receipts",
+    "receipt_provenance",
+    "dependencies",
+    "dependency_assessments",
+    "receipt_comparisons",
+    "receipt_uncertainty_lineage",
+    "reconciliations",
+    "unit_supersessions",
+    "dependency_audits",
+    "canvas_objects",
+    "canvas_batches",
+    "bindings",
+    "binding_audit",
+    "external_observations",
+    "database_identity",
+    "database_identity_audit",
+    "blobs",
+    "vocabularies",
+    "vocabulary_values",
+    "schema_config",
+    "member_contexts",
+    "instruction_bindings",
+    "onboarding_programmes",
+    "onboarding_programme_sources",
+    "member_obligations",
+    "member_obligation_progress",
+    "seeded_instruction_sources",
+    "control_event_applications",
+    "storage_portability_policy",
+    "account_configs",
+];
+
+// Frozen pre-account-config inventory; never derive from current names.
+const REVISION_6_SECTION_NAMES: &[&str] = &[
+    "content_events",
+    "content_event_causal_frontier",
+    "content_event_causal_cutover",
+    "act_state",
+    "act_cutover",
+    "policy_events",
+    "meta_events",
+    "control_events",
+    "derivation_events",
+    "awareness_events",
+    "notification_candidate_events",
+    "relationship_events",
+    "relationship_foreign_action_attestations",
+    "relationship_foreign_action_outputs",
+    "relationship_federation_events",
+    "relationship_federation_quarantine",
+    "content_event_sources",
+    "replicated_message_provenance",
+    "destination_message_ingest",
+    "replicated_message_references",
+    "provenance_interaction_receipts",
+    "provenance_action_attestations",
+    "provenance_action_events",
+    "provenance_attestation_validity_events",
+    "provenance_action_outputs",
+    "provenance_action_app_attributions",
+    "webhook_endpoints",
+    "webhook_credentials",
+    "webhook_deliveries",
+    "records",
+    "record_policies",
+    "policy_entries",
+    "links",
+    "relationships",
+    "relationship_endpoints",
+    "relationship_legacy_links",
+    "relationship_assertion_heads",
+    "relationship_endpoint_activity",
+    "message_audience_state",
+    "message_audiences",
+    "message_origin_state",
+    "message_origin_principals",
+    "personas",
+    "message_speakers",
     "message_conversations",
     "awareness_command_intents",
     "human_message_awareness",
@@ -569,7 +792,7 @@ impl ValidatedInterchange {
     pub(crate) fn require_native_current_revision(&self) -> Result<()> {
         ensure(
             self.source_revision == REVISION,
-            "canonical interchange must be authored at revision 5 for exhaustive canonical history",
+            "canonical interchange must be authored at the current revision for exhaustive canonical history",
         )
     }
 
@@ -604,11 +827,40 @@ pub(crate) fn validate_canonical_interchange(bytes: &[u8]) -> Result<ValidatedIn
     let mut bundle: Bundle = serde_json::from_slice(bytes)
         .map_err(|error| Error::engine(format!("invalid canonical interchange JSON: {error}")))?;
     let wire_revision = bundle.manifest.revision;
-    let source_revision = if wire_revision == REVISION {
+    let source_revision = if matches!(
+        wire_revision,
+        REVISION_5 | REVISION_6 | REVISION_7 | REVISION
+    ) {
         bundle.manifest.source_history_revision.unwrap_or_default()
     } else {
         wire_revision
     };
+    if bundle.manifest.revision == REVISION_7 {
+        validate_bundle_revision(
+            &bundle,
+            REVISION_7_SECTION_NAMES,
+            REVISION_7,
+            bundle.manifest.source_engine_schema,
+        )?;
+        ensure(
+            bundle.manifest.source_engine_schema <= 89,
+            "revision-7 source cannot contain SQL receipts",
+        )?;
+        refresh_bundle_revision(&mut bundle)?;
+    }
+    if bundle.manifest.revision == REVISION_6 {
+        validate_bundle_revision(
+            &bundle,
+            REVISION_6_SECTION_NAMES,
+            REVISION_6,
+            bundle.manifest.source_engine_schema,
+        )?;
+        ensure(
+            bundle.manifest.source_engine_schema <= 88,
+            "revision-6 source cannot contain account configs",
+        )?;
+        refresh_bundle_revision(&mut bundle)?;
+    }
     if bundle.manifest.revision == LEGACY_REVISION {
         validate_bundle_revision(&bundle, REVISION_1_SECTION_NAMES, LEGACY_REVISION, 45)?;
         upgrade_legacy_bundle(&mut bundle)?;
@@ -678,6 +930,91 @@ pub(crate) fn validate_canonical_interchange(bytes: &[u8]) -> Result<ValidatedIn
         )?;
         upgrade_revision_4_bundle(&mut bundle)?;
     }
+    if bundle.manifest.revision == REVISION_5 {
+        let names = REVISION_6_SECTION_NAMES
+            .iter()
+            .copied()
+            .filter(|name| {
+                !matches!(
+                    *name,
+                    "personas"
+                        | "message_speakers"
+                        | "provenance_action_app_attributions"
+                        | "account_configs"
+                        | "sql_write_receipts"
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_bundle_revision(
+            &bundle,
+            &names,
+            REVISION_5,
+            bundle.manifest.source_engine_schema,
+        )?;
+        // Restore the engine-84 section first: participant sections insert
+        // at absolute `SECTION_NAMES` positions that count it.
+        upgrade_pre_84_app_attributions(&mut bundle)?;
+        add_participant_sections(&mut bundle);
+        refresh_bundle_revision(&mut bundle)?;
+    }
+    // Any export from engine 83 or older predates the app-attribution
+    // section (older wire revisions restored it in their upgrades above).
+    if bundle.manifest.source_engine_schema < 84 {
+        upgrade_pre_84_app_attributions(&mut bundle)?;
+    }
+    if bundle.manifest.source_engine_schema < 89
+        && !bundle
+            .sections
+            .iter()
+            .any(|section| section.name == "account_configs")
+    {
+        bundle.sections.push(Section {
+            format: SECTION_FORMAT.into(),
+            revision: REVISION,
+            name: "account_configs".into(),
+            columns: ["account_id", "kind", "record_id", "created_at"]
+                .into_iter()
+                .map(|name| Column {
+                    name: name.into(),
+                    declared_type: "TEXT".into(),
+                })
+                .collect(),
+            primary_key: vec!["account_id".into(), "kind".into()],
+            rows: vec![],
+        });
+        refresh_bundle_revision(&mut bundle)?;
+    }
+    if bundle.manifest.source_engine_schema < 90
+        && !bundle
+            .sections
+            .iter()
+            .any(|s| s.name == "sql_write_receipts")
+    {
+        bundle.sections.push(Section {
+            format: SECTION_FORMAT.into(),
+            revision: REVISION,
+            name: "sql_write_receipts".into(),
+            columns: [
+                ("principal", "TEXT"),
+                ("plan_id", "TEXT"),
+                ("profile", "TEXT"),
+                ("prepared_digest", "TEXT"),
+                ("anchor_id", "TEXT"),
+                ("act", "INTEGER"),
+                ("envelope", "TEXT"),
+                ("envelope_digest", "TEXT"),
+            ]
+            .into_iter()
+            .map(|(name, ty)| Column {
+                name: name.into(),
+                declared_type: ty.into(),
+            })
+            .collect(),
+            primary_key: vec!["principal".into(), "plan_id".into()],
+            rows: vec![],
+        });
+        refresh_bundle_revision(&mut bundle)?;
+    }
     validate_bundle(&bundle)?;
     // v73 appends caller-independent currency columns to records. Validate
     // the original canonical bytes before deriving those columns from the
@@ -685,6 +1022,29 @@ pub(crate) fn validate_canonical_interchange(bytes: &[u8]) -> Result<ValidatedIn
     if bundle.manifest.source_engine_schema < 73 {
         upgrade_pre_73_currency(&mut bundle)?;
         validate_bundle(&bundle)?;
+    }
+    if bundle.manifest.source_engine_schema < 88 {
+        // Verify the retained wire bytes before adapting the pre-88 nullable
+        // preference column. Old events and rows retain legacy-derived unread.
+        let preferences = bundle
+            .sections
+            .iter_mut()
+            .find(|section| section.name == "message_preferences")
+            .ok_or_else(|| Error::engine("missing message_preferences section"))?;
+        if !preferences
+            .columns
+            .iter()
+            .any(|column| column.name == "unread_override")
+        {
+            preferences.columns.push(Column {
+                name: "unread_override".into(),
+                declared_type: "INTEGER".into(),
+            });
+            for row in &mut preferences.rows {
+                row.push(Cell::Null);
+            }
+            refresh_bundle_revision(&mut bundle)?;
+        }
     }
     Ok(ValidatedInterchange {
         bundle,
@@ -1182,14 +1542,68 @@ fn upgrade_revision_3_bundle(bundle: &mut Bundle) -> Result<()> {
     Ok(())
 }
 
-/// Upgrade a revision-4 document to revision 5. Revision 4 predates act
-/// stamping for external observations and awareness command intents: both
-/// sections gain a trailing `act` column with every historical row stamped
-/// NULL. Their transaction grouping is permanently unknown, so the upgrade
-/// never fabricates grouping — it only preserves import support. Callers
-/// that claim exhaustive source fidelity must reject this upgraded
-/// representation at any exhaustive-history authority boundary,
-/// which now requires revision 5.
+/// Engine 84 adds `provenance_action_app_attributions` (task `50f5aca`). No
+/// call before that edge carried an app, so an older export gains the section
+/// empty, at its current inventory position, before inventory validation.
+fn upgrade_pre_84_app_attributions(bundle: &mut Bundle) -> Result<()> {
+    const NAME: &str = "provenance_action_app_attributions";
+    if bundle.sections.iter().any(|section| section.name == NAME) {
+        return Ok(());
+    }
+    // Insert before the first section the current inventory orders after it.
+    let rank = |name: &str| {
+        SECTION_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+    };
+    let own = rank(NAME).expect("current inventory contains the app-attribution section");
+    let position = bundle
+        .sections
+        .iter()
+        .position(|section| rank(&section.name).is_some_and(|other| other > own))
+        .unwrap_or(bundle.sections.len());
+    let columns = [
+        ("action_attestation_id", "TEXT"),
+        ("package", "TEXT"),
+        ("version", "TEXT"),
+        ("install_event_id", "TEXT"),
+        ("assertion", "TEXT"),
+    ]
+    .into_iter()
+    .map(|(name, declared_type)| Column {
+        name: name.into(),
+        declared_type: declared_type.into(),
+    })
+    .collect();
+    bundle.sections.insert(
+        position,
+        Section {
+            format: SECTION_FORMAT.into(),
+            revision: bundle.manifest.revision,
+            name: NAME.into(),
+            columns,
+            primary_key: vec!["action_attestation_id".into()],
+            rows: Vec::new(),
+        },
+    );
+    let revision = bundle.manifest.revision;
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
+}
+
+/// An empty `derivation_events` section in current column order.
 fn empty_derivation_section() -> Section {
     let columns = [
         ("seq", "INTEGER"),
@@ -1222,18 +1636,30 @@ fn empty_derivation_section() -> Section {
     }
 }
 
+/// Upgrade a revision-4 document to revision 5. Revision 4 predates act
+/// stamping for external observations and awareness command intents: both
+/// sections gain a trailing `act` column with every historical row stamped
+/// NULL. Their transaction grouping is permanently unknown, so the upgrade
+/// never fabricates grouping — it only preserves import support. Callers
+/// that claim exhaustive source fidelity must reject this upgraded
+/// representation at any exhaustive-history authority boundary,
+/// which now requires revision 6.
 fn upgrade_revision_4_bundle(bundle: &mut Bundle) -> Result<()> {
     bundle
         .sections
         .retain(|section| !matches!(section.name.as_str(), "read_log_calls" | "read_log_touches"));
+    // Restore the engine-84 section first: `add_participant_sections` below
+    // inserts at absolute `SECTION_NAMES` positions that count it.
+    upgrade_pre_84_app_attributions(bundle)?;
     if !bundle
         .sections
         .iter()
         .any(|section| section.name == "derivation_events")
     {
-        let position = SECTION_NAMES
+        let position = bundle
+            .sections
             .iter()
-            .position(|name| *name == "derivation_events")
+            .position(|section| section.name == "awareness_events")
             .expect("current inventory contains derivation_events");
         bundle.sections.insert(position, empty_derivation_section());
     }
@@ -1243,10 +1669,12 @@ fn upgrade_revision_4_bundle(bundle: &mut Bundle) -> Result<()> {
         .any(|section| section.name == "record_mentions")
     {
         let rows = derive_record_mentions_rows(bundle)?;
-        let position = SECTION_NAMES
+        let position = bundle
+            .sections
             .iter()
-            .position(|name| *name == "record_mentions")
-            .expect("current inventory contains record_mentions");
+            .position(|section| section.name == "message_mentions")
+            .expect("historical inventory contains message_mentions")
+            + 1;
         bundle
             .sections
             .insert(position, record_mentions_section(rows));
@@ -1271,6 +1699,83 @@ fn upgrade_revision_4_bundle(bundle: &mut Bundle) -> Result<()> {
             }
         }
     }
+    add_participant_sections(bundle);
+    for section in &mut bundle.sections {
+        section.revision = REVISION;
+    }
+    bundle.manifest.revision = REVISION;
+    bundle.manifest.sections = bundle
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    bundle.manifest.content_sha256 = sha256_json(&bundle.sections)?;
+    Ok(())
+}
+
+fn add_participant_sections(bundle: &mut Bundle) {
+    for (name, primary_key, columns) in [
+        (
+            "personas",
+            "persona_id",
+            vec![
+                ("persona_id", "TEXT"),
+                ("owner_person_id", "TEXT"),
+                ("owner_principal", "TEXT"),
+                ("state", "TEXT"),
+                ("registered_event_seq", "INTEGER"),
+                ("retired_event_seq", "INTEGER"),
+                ("updated_at", "TEXT"),
+            ],
+        ),
+        (
+            "message_speakers",
+            "message_id",
+            vec![
+                ("message_id", "TEXT"),
+                ("speaker_kind", "TEXT"),
+                ("persona_id", "TEXT"),
+                ("agent_key", "TEXT"),
+                ("session_hint", "TEXT"),
+                ("owner_principal", "TEXT"),
+                ("assurance", "TEXT"),
+                ("stamp", "TEXT"),
+                ("event_seq", "INTEGER"),
+            ],
+        ),
+    ] {
+        let position = SECTION_NAMES
+            .iter()
+            .position(|n| *n == name)
+            .expect("participant section inventory");
+        bundle.sections.insert(
+            position,
+            Section {
+                format: SECTION_FORMAT.into(),
+                revision: REVISION,
+                name: name.into(),
+                columns: columns
+                    .into_iter()
+                    .map(|(name, declared_type)| Column {
+                        name: name.into(),
+                        declared_type: declared_type.into(),
+                    })
+                    .collect(),
+                primary_key: vec![primary_key.into()],
+                rows: vec![],
+            },
+        );
+    }
+}
+
+fn refresh_bundle_revision(bundle: &mut Bundle) -> Result<()> {
     for section in &mut bundle.sections {
         section.revision = REVISION;
     }
@@ -1615,9 +2120,14 @@ pub async fn import_canonical_interchange(
         // Schema-config nodes are another derived carrier: rebuild from the
         // imported source bytes in this transaction before conformance.
         crate::schema_config_json_nodes::backfill(&mut tx).await?;
-        // Facet-value nodes are derived from the imported current facet values,
-        // never carried as a section; rebuild them before conformance too.
+        // Facet-value and facet-observation nodes are derived from the imported
+        // facet text, never carried as a section; rebuild them before
+        // conformance too.
         crate::facet_value_json_nodes::backfill(&mut tx).await?;
+        crate::facet_value_json_nodes::backfill_observations(&mut tx).await?;
+        // Record-body nodes are derived from the imported body text the same
+        // way, including tombstoned rows; never carried as a section.
+        crate::facet_value_json_nodes::backfill_record_bodies(&mut tx).await?;
         tx.commit().await?;
 
         let report = crate::conformance::run_conformance_with_progress(&staging, |_, _| {}).await;
@@ -1976,6 +2486,8 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
     // records currency columns, derived during the validated import upgrade.
     // Engine 76→77 adds only trigger-derived reaction metadata, which is
     // regenerated from imported events and never serialized as canonical state.
+    // Engine 83→84 adds only the app-attribution section, which no engine-83
+    // call could populate; the import upgrade inserts it empty.
     ensure(
         matches!(
             bundle.manifest.source_engine_schema,
@@ -1997,6 +2509,11 @@ fn validate_bundle(bundle: &Bundle) -> Result<()> {
                 | 75
                 | 76
                 | 77
+                | 81
+                | 82
+                | 83
+                | 87
+                | 88
                 | CURRENT_ENGINE_SCHEMA_VERSION
         ),
         "unsupported source engine schema revision",
@@ -2753,6 +3270,16 @@ mod tests {
     }
 
     fn downgrade_to_revision_1(mut bundle: Bundle) -> Bundle {
+        bundle.sections.retain(|section| {
+            !matches!(
+                section.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
         // `record_mentions` postdates every wire revision below 4 (it first
         // ships as a revision-4 section at engine 59): a faithful revision-1
         // reconstruction carries no such section, so strip it before the
@@ -2973,7 +3500,7 @@ mod tests {
     }
 
     fn assert_protocol_inventory_tracks_section_names() {
-        assert_eq!(SECTION_NAMES.len(), 99);
+        assert_eq!(SECTION_NAMES.len(), 104);
         for table in crate::act::CANONICAL_EVENT_TABLES {
             assert!(
                 SECTION_NAMES.contains(&table),
@@ -3163,6 +3690,16 @@ mod tests {
     }
 
     fn downgrade_to_revision_2(mut bundle: Bundle) -> Bundle {
+        bundle.sections.retain(|section| {
+            !matches!(
+                section.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
         for name in [
             "act_state",
             "act_cutover",
@@ -3208,6 +3745,16 @@ mod tests {
     }
 
     fn downgrade_to_revision_3(mut bundle: Bundle) -> Bundle {
+        bundle.sections.retain(|section| {
+            !matches!(
+                section.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
         let derivation = bundle
             .sections
             .iter()
@@ -3261,6 +3808,16 @@ mod tests {
     }
 
     fn downgrade_to_revision_4(mut bundle: Bundle) -> Bundle {
+        bundle.sections.retain(|section| {
+            !matches!(
+                section.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
         let derivation = bundle
             .sections
             .iter()
@@ -3307,6 +3864,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revision_6_schema88_upgrade_preserves_sections_and_adds_empty_account_configs() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&db).await.unwrap()).unwrap();
+        let mut old = current.clone();
+        old.sections
+            .retain(|s| s.name != "account_configs" && s.name != "sql_write_receipts");
+        assert_eq!(
+            old.sections
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            REVISION_6_SECTION_NAMES
+        );
+        for section in &mut old.sections {
+            section.revision = REVISION_6;
+        }
+        old.manifest.revision = REVISION_6;
+        old.manifest.source_engine_schema = 88;
+        old.manifest.source_history_revision = Some(REVISION_6);
+        old.manifest.sections = old
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_6,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        old.manifest.content_sha256 = sha256_json(&old.sections).unwrap();
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let upgraded = validate_canonical_interchange(&bytes).unwrap();
+        assert_eq!(upgraded.source_revision(), REVISION_6);
+        assert_eq!(upgraded.bundle().manifest.revision, REVISION);
+        assert_eq!(
+            serde_json::to_value(&upgraded.bundle().sections).unwrap(),
+            serde_json::to_value(&current.sections).unwrap()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            &bytes,
+            &dir.path().join("schema88.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM account_configs")
+                .fetch_one(imported.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(imported.pool())
+                .await
+                .unwrap(),
+            CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        imported.close().await;
+    }
+
+    #[tokio::test]
+    async fn revision_5_upgrade_preserves_existing_sections_and_adds_empty_personas() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let current: Bundle =
+            serde_json::from_slice(&export_canonical_interchange(&db).await.unwrap()).unwrap();
+        let mut old = current.clone();
+        // Neither the revision-6 participant sections nor the engine-84
+        // app-attribution section existed in a revision-5 export.
+        old.sections.retain(|s| {
+            !matches!(
+                s.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
+        for section in &mut old.sections {
+            section.revision = REVISION_5;
+        }
+        old.manifest.revision = REVISION_5;
+        old.manifest.source_history_revision = Some(REVISION_5);
+        old.manifest.source_engine_schema = 81;
+        old.manifest.sections = old
+            .sections
+            .iter()
+            .map(|section| SectionDescriptor {
+                name: section.name.clone(),
+                revision: REVISION_5,
+                row_count: section.rows.len() as u64,
+                sha256: sha256_json(section).unwrap(),
+            })
+            .collect();
+        old.manifest.content_sha256 = sha256_json(&old.sections).unwrap();
+        // A previous compatibility import's fidelity must survive the 5→6
+        // upgrade; omission remains unknown, never promoted to exhaustive.
+        for history in [None, Some(ACT_REVISION)] {
+            let mut compatibility = old.clone();
+            compatibility.manifest.source_history_revision = history;
+            let validated =
+                validate_canonical_interchange(&serde_json::to_vec(&compatibility).unwrap())
+                    .unwrap();
+            assert_eq!(validated.source_revision(), history.unwrap_or_default());
+            assert_eq!(validated.bundle().manifest.source_history_revision, history);
+        }
+        let upgraded = validate_canonical_interchange(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(upgraded.source_revision(), REVISION_5);
+        assert_eq!(upgraded.bundle().manifest.revision, REVISION);
+        assert_eq!(
+            serde_json::to_value(&upgraded.bundle().sections).unwrap(),
+            serde_json::to_value(&current.sections).unwrap()
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&old).unwrap(),
+            &temp.path().join("revision5.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        assert!(
+            crate::conformance::rebuild::rebuild_and_diff(&imported)
+                .await
+                .unwrap()
+                .equal
+        );
+    }
+
+    #[tokio::test]
+    async fn private_read_preferences_export_import_and_pre_88_null_upgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::awareness::set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            crate::awareness::PreferenceAction::Mute,
+            None,
+            0,
+            "mute",
+            "test",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut historical: Bundle = serde_json::from_slice(&bytes).unwrap();
+        historical.manifest.source_engine_schema = 87;
+        let preference = historical
+            .sections
+            .iter_mut()
+            .find(|section| section.name == "message_preferences")
+            .unwrap();
+        let index = preference
+            .columns
+            .iter()
+            .position(|column| column.name == "unread_override")
+            .unwrap();
+        preference.columns.remove(index);
+        for row in &mut preference.rows {
+            assert_eq!(row.remove(index), Cell::Null);
+        }
+        refresh_bundle_revision(&mut historical).unwrap();
+        let imported = import_canonical_interchange(
+            &serde_json::to_vec(&historical).unwrap(),
+            &temp.path().join("historical.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        let state: (bool, Option<bool>, i64) =
+            sqlx::query_as("SELECT muted,unread_override,version FROM message_preferences")
+                .fetch_one(imported.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, (true, None, 1));
+        imported.close().await;
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::awareness::set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            crate::awareness::PreferenceAction::MarkUnread,
+            None,
+            1,
+            "unread",
+            "test",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let current = import_canonical_interchange(
+            &bytes,
+            &temp.path().join("current.db"),
+            ImportContinuity::ForeignBoundary,
+        )
+        .await
+        .unwrap();
+        crate::awareness::rebuild_projections(&current)
+            .await
+            .unwrap();
+        let state: (bool, bool, i64) =
+            sqlx::query_as("SELECT muted,unread_override,version FROM message_preferences")
+                .fetch_one(current.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, (true, true, 2));
+        current.close().await;
+        source.close().await;
+    }
+
+    #[tokio::test]
     async fn revision_5_admits_data_only_62_and_63_sources_but_not_future_engine() {
         let temp = tempfile::tempdir().unwrap();
         let source = crate::create_database(temp.path().join("source.db").to_str().unwrap())
@@ -3315,12 +4097,124 @@ mod tests {
         let bytes = export_canonical_interchange(&source).await.unwrap();
         let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(bundle.manifest.revision, REVISION);
-        for version in [62, 63, 68, 69, 70, CURRENT_ENGINE_SCHEMA_VERSION] {
+        for version in [62, 63, 68, 69, 70, 81, 82, CURRENT_ENGINE_SCHEMA_VERSION] {
             bundle.manifest.source_engine_schema = version;
             validate_bundle(&bundle).unwrap();
         }
-        bundle.manifest.source_engine_schema = CURRENT_ENGINE_SCHEMA_VERSION + 1;
-        assert!(validate_bundle(&bundle).is_err());
+        for version in [78, 79, 80, CURRENT_ENGINE_SCHEMA_VERSION + 1] {
+            bundle.manifest.source_engine_schema = version;
+            assert!(
+                validate_bundle(&bundle).is_err(),
+                "unqualified engine {version}"
+            );
+        }
+        source.close().await;
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_keep_winning_uuids_through_rebuild_and_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let source =
+            crate::create_database(temp.path().join("public-reactions.db").to_str().unwrap())
+                .await
+                .unwrap();
+        let message = crate::store::create_record(
+            &source,
+            serde_json::json!({
+                "type":"Message","kind":"message","name":"public reactions","body":"body"
+            }),
+        )
+        .await
+        .unwrap();
+        for (sequence, emoji, command) in [
+            (false, "👍", "add_reaction"),
+            (false, "👍", "remove_reaction"),
+            (false, "👍", "add_reaction"),
+            (true, "😂", "add_reaction"),
+            (true, "👍", "add_reaction"),
+        ] {
+            let reason = "r".repeat(512 * 1024);
+            let key = "k".repeat(512 * 1024);
+            let payload = if sequence {
+                serde_json::json!([
+                    "native.message-reaction.v1",
+                    emoji,
+                    key,
+                    command,
+                    true,
+                    "alice",
+                    "authenticated_principal",
+                    null,
+                    reason,
+                    null
+                ])
+            } else {
+                serde_json::json!({"format":"native.message-reaction.v1","emoji":emoji,
+                    "idempotency_key":key,"command":command,"changed":true,
+                    "actor_account_id":"alice","executor_kind":"authenticated_principal",
+                    "executor_ref":null,"reason":reason})
+            };
+            crate::store::append(
+                &source,
+                crate::store::AppendSpec {
+                    record_id: message.clone(),
+                    actor: Some("alice".into()),
+                    payload,
+                    event_type: if command == "remove_reaction" {
+                        "message.reaction.removed.v1"
+                    } else {
+                        "message.reaction.added.v1"
+                    }
+                    .into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let sql = "SELECT * FROM message_reactions ORDER BY reaction_id";
+        let expected = crate::query::sql::query_sql(&source, &crate::mcp::Caller::local(), sql)
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(expected.len(), 2);
+        assert!(expected
+            .iter()
+            .all(|r| r["emoji"] == "👍" && r["message_id"] == message));
+        assert_ne!(expected[0]["reaction_id"], expected[1]["reaction_id"]);
+        assert!(
+            crate::conformance::rebuild_and_diff(&source)
+                .await
+                .unwrap()
+                .equal
+        );
+        assert_eq!(
+            crate::query::sql::query_sql(&source, &crate::mcp::Caller::local(), sql)
+                .await
+                .unwrap()
+                .rows,
+            expected
+        );
+        let bytes = export_canonical_interchange(&source).await.unwrap();
+        let mut bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
+        for version in [CURRENT_ENGINE_SCHEMA_VERSION, 76, 75] {
+            bundle.manifest.source_engine_schema = version;
+            let imported = import_canonical_interchange(
+                &serde_json::to_vec(&bundle).unwrap(),
+                &temp.path().join(format!("public-import-{version}.db")),
+                ImportContinuity::ForeignBoundary,
+            )
+            .await
+            .unwrap();
+            let actual = crate::query::sql::query_sql(&imported, &crate::mcp::Caller::local(), sql)
+                .await
+                .unwrap()
+                .rows;
+            assert_eq!(
+                actual, expected,
+                "public winning event UUIDs/disclosure changed for engine{version}"
+            );
+            imported.close().await;
+        }
         source.close().await;
     }
 
@@ -3564,12 +4458,185 @@ mod tests {
     /// Every section of `after` equals the same section of `before` after
     /// deriving the v73 currency columns for historical exports.
     fn assert_sections_unchanged(before: &Bundle, after: &Bundle) {
-        let mut expected = before.clone();
+        let mut expected = validate_canonical_interchange(&serde_json::to_vec(before).unwrap())
+            .unwrap()
+            .bundle;
         if expected.manifest.source_engine_schema < 73 {
             upgrade_pre_73_currency(&mut expected).unwrap();
         }
-        assert_eq!(expected.sections.len(), after.sections.len());
-        for (left, right) in expected.sections.iter().zip(&after.sections) {
+        if expected.manifest.source_engine_schema < 84 {
+            upgrade_pre_84_app_attributions(&mut expected).unwrap();
+        }
+        // Ordinary open reconciles newly compiled seeds after importing a
+        // genuine older file. Permit exactly two seed additions, each only when
+        // the older file lacks it: the persona kind and the empty
+        // `kind:Configuration` vocabulary (task 6ec81db). Every existing
+        // canonical row is still compared byte for byte.
+        let mut actual = after.clone();
+        let persona = crate::meta::kind::core_kind_manifest()
+            .unwrap()
+            .kinds
+            .into_iter()
+            .find(|kind| kind.record_type == "Entity" && kind.token == "persona")
+            .unwrap();
+        let mut seeded_acts: Vec<i64> = Vec::new();
+        let values = expected
+            .sections
+            .iter()
+            .find(|s| s.name == "vocabulary_values")
+            .unwrap();
+        let id_col = values.columns.iter().position(|c| c.name == "id").unwrap();
+        if !values
+            .rows
+            .iter()
+            .any(|row| cell_text(&row[id_col]) == Some(persona.value_id.as_str()))
+        {
+            let values = actual
+                .sections
+                .iter_mut()
+                .find(|s| s.name == "vocabulary_values")
+                .unwrap();
+            let id_col = values.columns.iter().position(|c| c.name == "id").unwrap();
+            let position = values
+                .rows
+                .iter()
+                .position(|row| cell_text(&row[id_col]) == Some(persona.value_id.as_str()))
+                .unwrap();
+            let added = values.rows.remove(position);
+            let column = |name: &str| values.columns.iter().position(|c| c.name == name).unwrap();
+            assert_eq!(cell_text(&added[column("value")]), Some("persona"));
+            assert_eq!(cell_text(&added[column("status")]), Some("active"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    cell_text(&added[column("metadata")]).unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&persona.metadata).unwrap()
+            );
+            let events = actual
+                .sections
+                .iter_mut()
+                .find(|s| s.name == "meta_events")
+                .unwrap();
+            let subject = events
+                .columns
+                .iter()
+                .position(|c| c.name == "subject_id")
+                .unwrap();
+            let additions = events
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| cell_text(&row[subject]) == Some(persona.value_id.as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(additions.len(), 1);
+            let event = events.rows.remove(additions[0]);
+            let event_column =
+                |name: &str| events.columns.iter().position(|c| c.name == name).unwrap();
+            assert_eq!(
+                cell_text(&event[event_column("type")]),
+                Some("vocab_value.proposed")
+            );
+            let payload: serde_json::Value =
+                serde_json::from_str(cell_text(&event[event_column("payload")]).unwrap()).unwrap();
+            assert_eq!(payload["value"], "persona");
+            assert_eq!(
+                payload["metadata"],
+                serde_json::to_value(&persona.metadata).unwrap()
+            );
+            seeded_acts.push(cell_integer(&event[event_column("act")]).unwrap());
+        }
+        let configuration_id = crate::meta::kind::kind_vocabulary_id("Configuration");
+        let vocabularies = expected
+            .sections
+            .iter()
+            .find(|s| s.name == "vocabularies")
+            .unwrap();
+        let id_col = vocabularies
+            .columns
+            .iter()
+            .position(|c| c.name == "id")
+            .unwrap();
+        if !vocabularies
+            .rows
+            .iter()
+            .any(|row| cell_text(&row[id_col]) == Some(configuration_id.as_str()))
+        {
+            let vocabularies = actual
+                .sections
+                .iter_mut()
+                .find(|s| s.name == "vocabularies")
+                .unwrap();
+            let id_col = vocabularies
+                .columns
+                .iter()
+                .position(|c| c.name == "id")
+                .unwrap();
+            let position = vocabularies
+                .rows
+                .iter()
+                .position(|row| cell_text(&row[id_col]) == Some(configuration_id.as_str()))
+                .unwrap();
+            let added = vocabularies.rows.remove(position);
+            let name_col = vocabularies
+                .columns
+                .iter()
+                .position(|c| c.name == "name")
+                .unwrap();
+            assert_eq!(cell_text(&added[name_col]), Some("kind:Configuration"));
+            let events = actual
+                .sections
+                .iter_mut()
+                .find(|s| s.name == "meta_events")
+                .unwrap();
+            let subject = events
+                .columns
+                .iter()
+                .position(|c| c.name == "subject_id")
+                .unwrap();
+            let additions = events
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| cell_text(&row[subject]) == Some(configuration_id.as_str()))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            assert_eq!(additions.len(), 1);
+            let event = events.rows.remove(additions[0]);
+            let event_column =
+                |name: &str| events.columns.iter().position(|c| c.name == name).unwrap();
+            assert_eq!(
+                cell_text(&event[event_column("type")]),
+                Some("vocabulary.created")
+            );
+            seeded_acts.push(cell_integer(&event[event_column("act")]).unwrap());
+        }
+        // Both seeds land in one reconciliation transaction and so share one
+        // act; each distinct removed act gives back one count.
+        seeded_acts.sort_unstable();
+        seeded_acts.dedup();
+        if !seeded_acts.is_empty() {
+            let act = actual
+                .sections
+                .iter_mut()
+                .find(|s| s.name == "act_state")
+                .unwrap();
+            let next = act
+                .columns
+                .iter()
+                .position(|c| c.name == "next_act")
+                .unwrap();
+            let Cell::Integer(counter) = &mut act.rows[0][next] else {
+                panic!("integer act counter");
+            };
+            for declared_act in seeded_acts.into_iter().rev() {
+                assert_eq!(declared_act, *counter);
+                *counter -= 1;
+            }
+        }
+        assert_eq!(expected.sections.len(), actual.sections.len());
+        for (left, right) in expected.sections.iter().zip(&actual.sections) {
             assert_eq!(left.name, right.name);
             assert_eq!(
                 sha256_json(left).unwrap(),
@@ -3665,7 +4732,7 @@ mod tests {
             include_bytes!("../tests/fixtures/interchange/engine-68-export.json");
         let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
         assert_eq!(source.manifest.source_engine_schema, 68);
-        assert_eq!(source.manifest.revision, REVISION);
+        assert_eq!(source.manifest.revision, REVISION_5);
         let temp = tempfile::tempdir().unwrap();
         let imported = import_canonical_interchange(
             FIXTURE,
@@ -3706,7 +4773,7 @@ mod tests {
             include_bytes!("../tests/fixtures/interchange/engine-69-export.json");
         let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
         assert_eq!(source.manifest.source_engine_schema, 69);
-        assert_eq!(source.manifest.revision, REVISION);
+        assert_eq!(source.manifest.revision, REVISION_5);
         let temp = tempfile::tempdir().unwrap();
         let imported = import_canonical_interchange(
             FIXTURE,
@@ -3755,7 +4822,7 @@ mod tests {
             include_bytes!("../tests/fixtures/interchange/engine-70-export.json");
         let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
         assert_eq!(source.manifest.source_engine_schema, 70);
-        assert_eq!(source.manifest.revision, REVISION);
+        assert_eq!(source.manifest.revision, REVISION_5);
         let temp = tempfile::tempdir().unwrap();
         let imported = import_canonical_interchange(
             FIXTURE,
@@ -3808,7 +4875,7 @@ mod tests {
             include_bytes!("../tests/fixtures/interchange/engine-71-export.json");
         let source: Bundle = serde_json::from_slice(FIXTURE).unwrap();
         assert_eq!(source.manifest.source_engine_schema, 71);
-        assert_eq!(source.manifest.revision, REVISION);
+        assert_eq!(source.manifest.revision, REVISION_5);
         let temp = tempfile::tempdir().unwrap();
         let imported = import_canonical_interchange(
             FIXTURE,
@@ -3914,7 +4981,7 @@ mod tests {
         );
         let bytes = export_canonical_interchange(&source).await.unwrap();
         let bundle: Bundle = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(bundle.manifest.revision, 5);
+        assert_eq!(bundle.manifest.revision, REVISION);
         assert!(bundle
             .sections
             .iter()
@@ -4606,9 +5673,11 @@ mod tests {
         .unwrap();
         assert!(!validity_acts.is_empty());
         assert!(validity_acts.iter().all(Option::is_none));
+        // Unknown history no longer refuses the act head: a standby treats
+        // its first full snapshot as the checkpoint for later deltas.
         assert!(crate::standby::read_authority_act_head(&imported)
             .await
-            .is_err());
+            .is_ok());
         let reexported = export_canonical_interchange(&imported).await.unwrap();
         let reimported = import_canonical_interchange(
             &reexported,
@@ -4619,7 +5688,7 @@ mod tests {
         .unwrap();
         assert!(crate::standby::read_authority_act_head(&reimported)
             .await
-            .is_err());
+            .is_ok());
         assert_eq!(
             schema_config_node_rows(&reimported, "legacy-json-import").await,
             expected_nodes
@@ -4634,6 +5703,16 @@ mod tests {
     /// fabricates grouping, and imports — but is not exhaustive, so the
     /// native-delta gate rejects it.
     fn downgrade_to_branch_revision_4(mut bundle: Bundle) -> Bundle {
+        bundle.sections.retain(|section| {
+            !matches!(
+                section.name.as_str(),
+                "personas"
+                    | "message_speakers"
+                    | "provenance_action_app_attributions"
+                    | "account_configs"
+                    | "sql_write_receipts"
+            )
+        });
         let mentions = bundle
             .sections
             .iter()
@@ -4864,7 +5943,7 @@ mod tests {
         );
         assert!(crate::standby::read_authority_act_head(&imported)
             .await
-            .is_err());
+            .is_ok());
         imported.close().await;
         source.close().await;
     }

@@ -1,0 +1,784 @@
+{
+  "identity": {
+    "columns": [
+      "id",
+      "name",
+      "account"
+    ],
+    "rows": [
+      {
+        "id": "39775fd8-de33-4493-b526-6f4c0022cc8e",
+        "name": "Alice",
+        "account": "acct:alice"
+      }
+    ],
+    "row_count": 1,
+    "truncated": false,
+    "truncation_hint": null,
+    "as_of_seq": 74,
+    "now_ms_ms": null,
+    "time_dependent": false,
+    "assumed_order": {
+      "columns": [
+        "id",
+        "name",
+        "account"
+      ],
+      "order_by": "ORDER BY 1, 2, 3",
+      "reason": "limit_without_order_by"
+    },
+    "run_context": {
+      "run_key": null,
+      "intent": null,
+      "notes": [
+        "This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap."
+      ]
+    }
+  },
+  "event": {
+    "local_database_id": "ndb_1a7daf6045810c42d71c369aeb2e17a8",
+    "events": [
+      {
+        "local_seq": 22,
+        "id": "f215af2d-1ae2-4fcd-8a35-81777186037a",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "record.created",
+        "payload": {
+          "type": "Document",
+          "reason": "Prepare session sharing event",
+          "kind": "agent-session-share-event",
+          "name": "Session sharing transition",
+          "body": "{\"version\":1,\"kind\":\"shared\",\"transitionId\":\"50a00000-0000-4000-8000-000000000007\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000006\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"39775fd8-de33-4493-b526-6f4c0022cc8e\",\"from\":0,\"to\":1,\"previousCardTransition\":null,\"ownerLabel\":\"Fixture owner\",\"title\":\"Fixture session\",\"hostLabel\":\"Fixture host\",\"provider\":\"claude\",\"note\":\"Please review\"}",
+          "home_id": "50a00000-0000-4000-8000-000000000002",
+          "owner_id": null
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.715Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "6b5c6a4a-3101-4689-bd51-9584c89c86a1"
+          ]
+        }
+      },
+      {
+        "local_seq": 23,
+        "id": "bc92e39a-b2c2-4152-bb8c-79cbec5e785a",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.state",
+          "value": "pending"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.716Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "f215af2d-1ae2-4fcd-8a35-81777186037a"
+          ]
+        }
+      },
+      {
+        "local_seq": 24,
+        "id": "8934a0b0-5d95-4945-9112-4a8e59fbc01a",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.type",
+          "value": "shared"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.717Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "bc92e39a-b2c2-4152-bb8c-79cbec5e785a"
+          ]
+        }
+      },
+      {
+        "local_seq": 25,
+        "id": "e3d9a910-c5eb-4747-a465-fe52c79e35c8",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.transition_id",
+          "value": "50a00000-0000-4000-8000-000000000007"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.718Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "8934a0b0-5d95-4945-9112-4a8e59fbc01a"
+          ]
+        }
+      },
+      {
+        "local_seq": 26,
+        "id": "a392b7b8-aad4-4c30-8be1-de1c9ea383ab",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.at",
+          "value": "2026-10-18T22:00:00Z"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.719Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "e3d9a910-c5eb-4747-a465-fe52c79e35c8"
+          ]
+        }
+      },
+      {
+        "local_seq": 27,
+        "id": "cd0169fa-52f6-474c-9639-d672b5b89c25",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.session_folder_id",
+          "value": "50a00000-0000-4000-8000-000000000003"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.720Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "a392b7b8-aad4-4c30-8be1-de1c9ea383ab"
+          ]
+        }
+      },
+      {
+        "local_seq": 28,
+        "id": "3d14e058-8f4d-4ebb-afef-dc9b33a1132b",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.card_id",
+          "value": "50a00000-0000-4000-8000-000000000006"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.720Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "cd0169fa-52f6-474c-9639-d672b5b89c25"
+          ]
+        }
+      },
+      {
+        "local_seq": 29,
+        "id": "53ca5188-8bbc-4872-a817-6083c906128d",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.channel_id",
+          "value": "50a00000-0000-4000-8000-000000000005"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.721Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "3d14e058-8f4d-4ebb-afef-dc9b33a1132b"
+          ]
+        }
+      },
+      {
+        "local_seq": 30,
+        "id": "3c9d9bdd-ea3d-4ae9-8e1b-ae373f6923b3",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.from_v",
+          "value": "0"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.722Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "53ca5188-8bbc-4872-a817-6083c906128d"
+          ]
+        }
+      },
+      {
+        "local_seq": 31,
+        "id": "a8f0b0c7-d1b5-44e6-89ed-05cd3b94cfcc",
+        "record_id": "50a00000-0000-4000-8000-000000000008",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.event.to_v",
+          "value": "1"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.722Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "3c9d9bdd-ea3d-4ae9-8e1b-ae373f6923b3"
+          ]
+        }
+      }
+    ],
+    "next_after_local_seq": null,
+    "order": "oldest_first",
+    "representation": {
+      "detail": "full",
+      "payloads": "included"
+    },
+    "run_context": {
+      "run_key": null,
+      "intent": null,
+      "notes": [
+        "This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap."
+      ]
+    }
+  },
+  "card": {
+    "local_database_id": "ndb_1a7daf6045810c42d71c369aeb2e17a8",
+    "events": [
+      {
+        "local_seq": 9,
+        "id": "0b7eab8a-62fe-4ec4-a816-26a1a26240ea",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "record.created",
+        "payload": {
+          "type": "Document",
+          "reason": "Prepare session share",
+          "kind": "agent-session-share",
+          "name": "Fixture session",
+          "body": "Please review",
+          "home_id": "50a00000-0000-4000-8000-000000000002",
+          "owner_id": null
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.695Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "97adcf61-77bc-4bed-9243-b604196a174c"
+          ]
+        }
+      },
+      {
+        "local_seq": 10,
+        "id": "7a2094fc-9976-4eb4-9cdf-7b835b9e124e",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.state",
+          "value": "pending"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.697Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "0b7eab8a-62fe-4ec4-a816-26a1a26240ea"
+          ]
+        }
+      },
+      {
+        "local_seq": 11,
+        "id": "62aad952-e576-4b56-897f-88d02d3a7108",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.transition_id",
+          "value": "50a00000-0000-4000-8000-000000000007"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.698Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "7a2094fc-9976-4eb4-9cdf-7b835b9e124e"
+          ]
+        }
+      },
+      {
+        "local_seq": 12,
+        "id": "0f87359d-a1b8-4633-ac55-4e1c02e5d8c9",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.post_transition_id",
+          "value": "50a00000-0000-4000-8000-000000000007"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.699Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "62aad952-e576-4b56-897f-88d02d3a7108"
+          ]
+        }
+      },
+      {
+        "local_seq": 13,
+        "id": "d2e7cf01-b9d2-450b-a7a4-c3a7209335f2",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.owner_label",
+          "value": "Fixture owner"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.700Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "0f87359d-a1b8-4633-ac55-4e1c02e5d8c9"
+          ]
+        }
+      },
+      {
+        "local_seq": 14,
+        "id": "4998a13a-ccbf-4064-8436-c2005242f29b",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.session_folder_id",
+          "value": "50a00000-0000-4000-8000-000000000003"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.701Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "d2e7cf01-b9d2-450b-a7a4-c3a7209335f2"
+          ]
+        }
+      },
+      {
+        "local_seq": 15,
+        "id": "1299df31-7480-4ce0-8634-575625aed38a",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.session_record_id",
+          "value": "50a00000-0000-4000-8000-000000000004"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.702Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "4998a13a-ccbf-4064-8436-c2005242f29b"
+          ]
+        }
+      },
+      {
+        "local_seq": 16,
+        "id": "e7283242-5b67-44ea-b293-92623db3fffb",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.channel_id",
+          "value": "50a00000-0000-4000-8000-000000000005"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.702Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "1299df31-7480-4ce0-8634-575625aed38a"
+          ]
+        }
+      },
+      {
+        "local_seq": 17,
+        "id": "0f7b5f7b-9847-4f0c-b5e0-67b8a1b0b62f",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.shared_at",
+          "value": "2026-10-18T22:00:00Z"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.703Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "e7283242-5b67-44ea-b293-92623db3fffb"
+          ]
+        }
+      },
+      {
+        "local_seq": 18,
+        "id": "fea897a4-e319-42d0-92d2-1c6110a3cca9",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.title",
+          "value": "Fixture session"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.704Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "0f7b5f7b-9847-4f0c-b5e0-67b8a1b0b62f"
+          ]
+        }
+      },
+      {
+        "local_seq": 19,
+        "id": "f36aa628-0022-4ab8-aacd-966c733a2b80",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.host_label",
+          "value": "Fixture host"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.705Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "fea897a4-e319-42d0-92d2-1c6110a3cca9"
+          ]
+        }
+      },
+      {
+        "local_seq": 20,
+        "id": "7536ea55-edf4-4942-9346-1a90172607d6",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.provider",
+          "value": "claude"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.706Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "f36aa628-0022-4ab8-aacd-966c733a2b80"
+          ]
+        }
+      },
+      {
+        "local_seq": 21,
+        "id": "6b5c6a4a-3101-4689-bd51-9584c89c86a1",
+        "record_id": "50a00000-0000-4000-8000-000000000006",
+        "type": "facet.set",
+        "payload": {
+          "key": "native.share.expected_access_version",
+          "value": "0"
+        },
+        "actor": "acct:alice",
+        "actor_name": "Alice",
+        "run_key": null,
+        "parent_key": null,
+        "intent": null,
+        "created_at": "2026-10-19T00:26:42.707Z",
+        "causal_envelope": {
+          "version": "v1",
+          "status": "complete",
+          "frontier": [
+            "7536ea55-edf4-4942-9346-1a90172607d6"
+          ]
+        }
+      }
+    ],
+    "next_after_local_seq": null,
+    "order": "oldest_first",
+    "representation": {
+      "detail": "full",
+      "payloads": "included"
+    },
+    "run_context": {
+      "run_key": null,
+      "intent": null,
+      "notes": [
+        "This call is not attached to a run. Pass run_key on every call to correlate them \u2014 use the required key issued by bootstrap."
+      ]
+    }
+  },
+  "records": {
+    "records": [
+      {
+        "status": "found",
+        "id": "50a00000-0000-4000-8000-000000000003",
+        "type": "Collection",
+        "kind": "folder",
+        "name": "Fixture session",
+        "body": null,
+        "home_id": "50a00000-0000-4000-8000-000000000002",
+        "owner_id": "39775fd8-de33-4493-b526-6f4c0022cc8e",
+        "archived": false,
+        "deleted_at": null,
+        "facets": []
+      },
+      {
+        "status": "found",
+        "id": "50a00000-0000-4000-8000-000000000006",
+        "type": "Document",
+        "kind": "agent-session-share",
+        "name": "Fixture session",
+        "body": "Please review",
+        "home_id": "50a00000-0000-4000-8000-000000000002",
+        "owner_id": "39775fd8-de33-4493-b526-6f4c0022cc8e",
+        "archived": false,
+        "deleted_at": null,
+        "facets": [
+          {
+            "key": "native.share.channel_id",
+            "value": "50a00000-0000-4000-8000-000000000005",
+            "vocab_ref": null,
+            "version": "obs:16"
+          },
+          {
+            "key": "native.share.expected_access_version",
+            "value": "0",
+            "vocab_ref": null,
+            "version": "obs:21"
+          },
+          {
+            "key": "native.share.host_label",
+            "value": "Fixture host",
+            "vocab_ref": null,
+            "version": "obs:19"
+          },
+          {
+            "key": "native.share.owner_label",
+            "value": "Fixture owner",
+            "vocab_ref": null,
+            "version": "obs:13"
+          },
+          {
+            "key": "native.share.post_transition_id",
+            "value": "50a00000-0000-4000-8000-000000000007",
+            "vocab_ref": null,
+            "version": "obs:12"
+          },
+          {
+            "key": "native.share.provider",
+            "value": "claude",
+            "vocab_ref": null,
+            "version": "obs:20"
+          },
+          {
+            "key": "native.share.session_folder_id",
+            "value": "50a00000-0000-4000-8000-000000000003",
+            "vocab_ref": null,
+            "version": "obs:14"
+          },
+          {
+            "key": "native.share.session_record_id",
+            "value": "50a00000-0000-4000-8000-000000000004",
+            "vocab_ref": null,
+            "version": "obs:15"
+          },
+          {
+            "key": "native.share.shared_at",
+            "value": "2026-10-18T22:00:00Z",
+            "vocab_ref": null,
+            "version": "obs:17"
+          },
+          {
+            "key": "native.share.state",
+            "value": "pending",
+            "vocab_ref": null,
+            "version": "obs:10"
+          },
+          {
+            "key": "native.share.title",
+            "value": "Fixture session",
+            "vocab_ref": null,
+            "version": "obs:18"
+          },
+          {
+            "key": "native.share.transition_id",
+            "value": "50a00000-0000-4000-8000-000000000007",
+            "vocab_ref": null,
+            "version": "obs:11"
+          }
+        ]
+      },
+      {
+        "status": "found",
+        "id": "50a00000-0000-4000-8000-000000000008",
+        "type": "Document",
+        "kind": "agent-session-share-event",
+        "name": "Session sharing transition",
+        "body": "{\"version\":1,\"kind\":\"shared\",\"transitionId\":\"50a00000-0000-4000-8000-000000000007\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000006\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"39775fd8-de33-4493-b526-6f4c0022cc8e\",\"from\":0,\"to\":1,\"previousCardTransition\":null,\"ownerLabel\":\"Fixture owner\",\"title\":\"Fixture session\",\"hostLabel\":\"Fixture host\",\"provider\":\"claude\",\"note\":\"Please review\"}",
+        "home_id": "50a00000-0000-4000-8000-000000000002",
+        "owner_id": "39775fd8-de33-4493-b526-6f4c0022cc8e",
+        "archived": false,
+        "deleted_at": null,
+        "facets": [
+          {
+            "key": "native.share.event.at",
+            "value": "2026-10-18T22:00:00Z",
+            "vocab_ref": null,
+            "version": "obs:26"
+          },
+          {
+            "key": "native.share.event.card_id",
+            "value": "50a00000-0000-4000-8000-000000000006",
+            "vocab_ref": null,
+            "version": "obs:28"
+          },
+          {
+            "key": "native.share.event.channel_id",
+            "value": "50a00000-0000-4000-8000-000000000005",
+            "vocab_ref": null,
+            "version": "obs:29"
+          },
+          {
+            "key": "native.share.event.from_v",
+            "value": "0",
+            "vocab_ref": null,
+            "version": "obs:30"
+          },
+          {
+            "key": "native.share.event.session_folder_id",
+            "value": "50a00000-0000-4000-8000-000000000003",
+            "vocab_ref": null,
+            "version": "obs:27"
+          },
+          {
+            "key": "native.share.event.state",
+            "value": "pending",
+            "vocab_ref": null,
+            "version": "obs:23"
+          },
+          {
+            "key": "native.share.event.to_v",
+            "value": "1",
+            "vocab_ref": null,
+            "version": "obs:31"
+          },
+          {
+            "key": "native.share.event.transition_id",
+            "value": "50a00000-0000-4000-8000-000000000007",
+            "vocab_ref": null,
+            "version": "obs:25"
+          },
+          {
+            "key": "native.share.event.type",
+            "value": "shared",
+            "vocab_ref": null,
+            "version": "obs:24"
+          }
+        ]
+      }
+    ]
+  }
+}

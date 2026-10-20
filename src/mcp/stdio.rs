@@ -116,11 +116,19 @@ impl StdioServer {
 
     /// Dispatch one message. `None` means no response goes out (notification,
     /// or a stray response message we ignore per JSON-RPC).
+    ///
+    /// The caller retains its startup-resolved account identity, but the
+    /// channel is the server-observed transport: stdio IS MCP, so it reads
+    /// `Mcp` rather than the `Local` default the bare caller carries. Without
+    /// this, local MCP clients would never satisfy first-call harness capture
+    /// gating while sharing the seam with genuinely local callers.
     async fn handle_message(&self, message: Value) -> Option<Value> {
         dispatch_engine_message(
             self.registry.clone(),
             self.engine.clone(),
-            self.caller.clone(),
+            self.caller
+                .clone()
+                .with_channel(crate::provenance::Channel::Mcp),
             message,
         )
         .await

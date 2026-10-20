@@ -1052,7 +1052,7 @@ fn render_attribution_snapshot(
     })
 }
 
-async fn read_attributions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(super) async fn read_attributions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let request = validated_read_attributions(arguments)?;
     let snapshot = read_attribution_snapshot(db, &caller, &request).await?;
     Ok(render_attribution_snapshot(request, snapshot))
@@ -1064,15 +1064,38 @@ enum ManageAttributionsArgs {
     Retract {
         annotation_id: String,
         reason: String,
+        idempotency_key: Option<String>,
     },
     AddEvidence {
         annotation_id: String,
         evidence: EvidenceInput,
+        idempotency_key: Option<String>,
     },
+}
+
+/// Replay renderer for a keyed `retract`/`add_evidence` (keyed-replay
+/// contract, `keyed_replay`): the receipt names only the annotation, the
+/// action and the act, all pinned by the one event the command appended.
+fn replay_attribution_write(
+    replay: &super::keyed_replay::KeyedReplay,
+    annotation_id: &str,
+    action: &str,
+) -> Result<Value> {
+    if replay.content().len() != 1 {
+        return Err(Error::engine(
+            "manage_attributions: idempotent receipt is incomplete",
+        ));
+    }
+    echo_act(
+        json!({ "annotation_id": annotation_id, "action": action }),
+        replay.act(),
+    )
 }
 
 async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "manage_attributions";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ManageAttributionsArgs = parse_args(TOOL, arguments)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
@@ -1080,16 +1103,36 @@ async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result
         ManageAttributionsArgs::Retract {
             annotation_id,
             reason,
+            idempotency_key,
         } => {
             if reason.trim().is_empty() {
                 return Err(Error::engine(format!("{TOOL}: reason must not be blank")));
             }
+            let keyed =
+                super::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?.is_some();
             let bearer = attribution_bearer_in(&mut tx, &annotation_id)
                 .await?
                 .ok_or_else(|| not_found(TOOL, &annotation_id))?;
             require_record_in(&mut tx, &caller, TOOL, &bearer, Capability::Edit)
                 .await
                 .map_err(|_| not_found(TOOL, &annotation_id))?;
+            // Keyed replay: after the bearer-edit check, before "already
+            // retracted", which the first call's own effect would now trip.
+            if keyed {
+                if let Some(replay) = super::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt = replay_attribution_write(&replay, &annotation_id, "retracted")?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             let already: i64 = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM attribution_retractions WHERE annotation_id=?)",
             )
@@ -1114,13 +1157,34 @@ async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result
         ManageAttributionsArgs::AddEvidence {
             annotation_id,
             evidence,
+            idempotency_key,
         } => {
+            let keyed =
+                super::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?.is_some();
             let bearer = attribution_bearer_in(&mut tx, &annotation_id)
                 .await?
                 .ok_or_else(|| not_found(TOOL, &annotation_id))?;
             require_record_in(&mut tx, &caller, TOOL, &bearer, Capability::Edit)
                 .await
                 .map_err(|_| not_found(TOOL, &annotation_id))?;
+            // Keyed replay: after the bearer-edit check, before the evidence
+            // visibility check, which judges the world as it is now.
+            if keyed {
+                if let Some(replay) = super::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt =
+                        replay_attribution_write(&replay, &annotation_id, "evidence_added")?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             if evidence.role == EvidenceRole::ExactTargetConfirmation {
                 return Err(Error::engine(format!(
                     "{TOOL}: exact_target_confirmation is internal to the accepted direct-declaration action"
@@ -1161,6 +1225,7 @@ async fn manage_attributions(db: Db, caller: Caller, arguments: Value) -> Result
         &mut act_alloc,
     )
     .await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     echo_act(
         json!({ "annotation_id": annotation_id, "action": action }),
@@ -1234,11 +1299,16 @@ pub fn register_attribution_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "evidence":{"type":"object","properties":{
                     "role":{"type":"string","enum":["basis","counterevidence"]},
                     "action_attestation_id":{"type":"string"}
-                },"required":["role","action_attestation_id"],"additionalProperties":false}
+                },"required":["role","action_attestation_id"],"additionalProperties":false},
+                "idempotency_key":super::keyed_replay::idempotency_key_schema()
             },
             "required":["action","annotation_id"],"additionalProperties":false
         }),
-        manage_attributions,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_attributions(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     Ok(())
 }

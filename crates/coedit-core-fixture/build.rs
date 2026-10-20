@@ -13,6 +13,16 @@ fn main() {
             "COEDIT_REFUSAL_SHA256",
             include_bytes!("../../src/coedit/refusal.rs").as_slice(),
         ),
+        (
+            "../../src/coedit/span_map.rs",
+            "COEDIT_SPAN_MAP_SHA256",
+            include_bytes!("../../src/coedit/span_map.rs").as_slice(),
+        ),
+        (
+            "../../src/coedit/text_diff.rs",
+            "COEDIT_TEXT_DIFF_SHA256",
+            include_bytes!("../../src/coedit/text_diff.rs").as_slice(),
+        ),
     ] {
         println!("cargo:rerun-if-changed={path}");
         println!("cargo:rustc-env={name}={:x}", Sha256::digest(bytes));

@@ -5,6 +5,16 @@
       "name": "host fixture (alpha_tab_digest_vectors, alpha_tabs.rs:5397)",
       "body": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Fixture</title></head><body><main><h1>Fixture</h1></main></body></html>",
       "bundle_sha256": "44a905b57d7957f3d8411ac4ce8fcedd5dcd202454cfbed87ec84cfda75efda0"
+    },
+    {
+      "name": "source kit major 1",
+      "body": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+      "bundle_sha256": "342e086db0f64f94d5a271aef91991714960f342269945e9facecae5bace0ae0"
+    },
+    {
+      "name": "source kit major 2",
+      "body": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":2}</script></main></body></html>",
+      "bundle_sha256": "6ddf7f14e5b839aa51135509ae1cdf3cc69fa5fe5ceac5ba5078bddfbb4ff374"
     }
   ],
   "declaration": [
@@ -312,6 +322,23 @@
         ]
       },
       "declaration_digest": "5735f407f65cfd97242297d29f4ea60e4c6c317450b9be479abe62de874594ee"
+    },
+    {
+      "name": "app contract v2 marker (alpha_tab_sessions::APP_CONTRACT_V2)",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [],
+        "effects": []
+      },
+      "declaration_digest": "c88880b7ec70e0f66547d982b4ed627cd145e9646c61b6708a0cfe07e7a1bcaf"
+    },
+    {
+      "name": "empty v1 declaration carries no contract",
+      "declaration": {
+        "needs": [],
+        "effects": []
+      },
+      "declaration_digest": "4681a6706ccbee8a85a2ad7c390945b65564e47211b087e2b3bd86df086546e9"
     }
   ],
   "digest": [
@@ -328,6 +355,20 @@
       "declaration_digest": "3e78e51d165ed4714624234fb9f1f111561e0a8e1b95f056de171e596ba74922",
       "runtime": "native.html.v1",
       "digest": "sha256:e6856cb7f71098710fe43e470306d8e25ac4cbd52d59de9ac3477b80e333067f"
+    },
+    {
+      "name": "source kit major 1",
+      "bundle_sha256": "342e086db0f64f94d5a271aef91991714960f342269945e9facecae5bace0ae0",
+      "declaration_digest": "9c6045ec2a73034d6e1a55463fec891dc38db088202f556a0e89bee7ae7bcb15",
+      "runtime": "native.html.v1",
+      "digest": "sha256:063f5a32673edd9b7b7e278b9b4c8952351ac5361d04b2314e017b115bfda412"
+    },
+    {
+      "name": "source kit major 2",
+      "bundle_sha256": "6ddf7f14e5b839aa51135509ae1cdf3cc69fa5fe5ceac5ba5078bddfbb4ff374",
+      "declaration_digest": "9c6045ec2a73034d6e1a55463fec891dc38db088202f556a0e89bee7ae7bcb15",
+      "runtime": "native.html.v1",
+      "digest": "sha256:59595df4d4ecfdfbd2e443fe80a4c9cdcabb801c91a4ed19022cab9aa089505c"
     }
   ]
 }

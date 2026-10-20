@@ -565,6 +565,71 @@ async fn admitted_rename_commits_name_receipt() {
     assert_eq!(title_updates(&setup.db).await, 1);
 }
 
+/// `rev:<event id>` names the same record-wide state as `rec:<seq>` (design
+/// 08b4c21 S3a): it is accepted as the title precondition, a stale one
+/// conflicts, and an id that resolves to nothing is an invalid precondition.
+#[tokio::test]
+async fn rename_accepts_an_event_id_version_token() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = title_setup().await;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM content_events WHERE record_id=? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(&setup.record_id)
+    .fetch_one(setup.db.pool())
+    .await
+    .unwrap();
+    let renamed = invoke(
+        &setup,
+        Caller::authenticated(ALICE),
+        &setup.record_id.clone(),
+        "By event id",
+        &format!("rev:{latest}"),
+        "title:rev:one",
+    )
+    .await;
+    assert_eq!(renamed["status"], "committed", "{renamed:#}");
+    assert_eq!(
+        record_name(&setup.db, &setup.record_id).await,
+        "By event id"
+    );
+
+    // The rename moved the record: the same event id is now stale.
+    let stale = invoke(
+        &setup,
+        Caller::authenticated(ALICE),
+        &setup.record_id.clone(),
+        "Too late",
+        &format!("rev:{latest}"),
+        "title:rev:two",
+    )
+    .await;
+    assert_eq!(stale["status"], "conflict", "{stale:#}");
+    assert_eq!(
+        record_name(&setup.db, &setup.record_id).await,
+        "By event id"
+    );
+
+    let unknown = invoke(
+        &setup,
+        Caller::authenticated(ALICE),
+        &setup.record_id.clone(),
+        "Never",
+        "rev:5b6f0d52-9d1c-4a8e-8f0b-3c2d1e0f9a8b",
+        "title:rev:three",
+    )
+    .await;
+    assert_eq!(unknown["status"], "rejected", "{unknown:#}");
+    assert_eq!(
+        unknown["error"]["code"], "invalid_precondition",
+        "{unknown:#}"
+    );
+    assert_eq!(
+        record_name(&setup.db, &setup.record_id).await,
+        "By event id"
+    );
+}
+
 #[tokio::test]
 async fn blank_and_whitespace_titles_refuse() {
     let _runtime_config = crate::runtime_config_fixture::reader().await;
@@ -1053,6 +1118,215 @@ async fn same_key_undo_replay_settles_without_appending() {
         "undo replay appends nothing"
     );
     assert_eq!(record_name(&setup.db, &setup.record_id).await, "Original");
+}
+
+/// Each viewer's rename and undo is attributed to that viewer's own account,
+/// and an undo names exactly the forward write it reverses. Extracted from the
+/// hosted title-editor browser proof (an alpha-tab journey): the same
+/// attribution and exact-once linkage assertions, without a browser.
+#[tokio::test]
+async fn renames_and_undo_are_attributed_to_the_acting_account_with_exact_linkage() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    use native_ce::mcp::tools::artifact_reversal::{revert_in, ReversalRequest};
+    let setup = title_setup().await;
+    // Bob is a second editor with his own consented install of the same tab.
+    for id in [ARTIFACT, GRID, INSIDE] {
+        replace_explicit_policy(
+            &setup.db,
+            "test:policy",
+            id,
+            [ALICE, BOB]
+                .into_iter()
+                .flat_map(|account| {
+                    [
+                        AllowEntry::account(account, Capability::View),
+                        AllowEntry::account(account, Capability::Edit),
+                    ]
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+    }
+    let html = html_interaction_source(&title_mdx_source());
+    let (bob_verified, bob_revision, bob_digest, bob_declaration_digest) =
+        verified_install(&setup.db, &setup.registry, BOB, &html, title_declaration()).await;
+    let bob_guard = guard_json(
+        &bob_verified,
+        &bob_revision,
+        &bob_digest,
+        &bob_declaration_digest,
+    );
+
+    let alice_token = observed_token(&setup.db, &setup.record_id).await;
+    let forward = invoke(
+        &setup,
+        Caller::authenticated(ALICE),
+        &setup.record_id.clone(),
+        "Alice title",
+        &alice_token,
+        "title:attr:alice",
+    )
+    .await;
+    assert_eq!(forward["status"], "committed", "{forward:#}");
+    let undone = revert_in(
+        &setup.db,
+        &Caller::authenticated(ALICE),
+        ReversalRequest {
+            artifact_id: ARTIFACT.to_string(),
+            record_id: setup.record_id.clone(),
+            entry_id: "rename".to_string(),
+            original_key: "title:attr:alice".to_string(),
+            idempotency_key: "title:attr:alice:undo".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let undone = serde_json::to_value(&undone).unwrap();
+    assert_eq!(undone["status"], "committed", "{undone:#}");
+    assert_eq!(record_name(&setup.db, &setup.record_id).await, "Original");
+
+    let bob_token = observed_token(&setup.db, &setup.record_id).await;
+    let mut bob_args = invoke_args(
+        &setup,
+        &setup.record_id,
+        "Bob title",
+        &bob_token,
+        "title:attr:bob",
+    );
+    bob_args["alpha_install_guard"] = bob_guard;
+    let bob_renamed = setup
+        .registry
+        .call(
+            setup.db.clone(),
+            Caller::authenticated(BOB),
+            "invoke_artifact_interaction",
+            bob_args,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bob_renamed["status"], "committed", "{bob_renamed:#}");
+    assert_eq!(record_name(&setup.db, &setup.record_id).await, "Bob title");
+    // Bob undoes his own rename: the viewer who made a write is the one whose
+    // undo names it, and the name returns to what it was before his rename.
+    let bob_undone = revert_in(
+        &setup.db,
+        &Caller::authenticated(BOB),
+        ReversalRequest {
+            artifact_id: ARTIFACT.to_string(),
+            record_id: setup.record_id.clone(),
+            entry_id: "rename".to_string(),
+            original_key: "title:attr:bob".to_string(),
+            idempotency_key: "title:attr:bob:undo".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let bob_undone = serde_json::to_value(&bob_undone).unwrap();
+    assert_eq!(bob_undone["status"], "committed", "{bob_undone:#}");
+    assert_eq!(record_name(&setup.db, &setup.record_id).await, "Original");
+
+    // Exactly four name writes, each under the account that made it: Alice's
+    // rename and undo, then Bob's rename and undo.
+    let events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, actor, payload FROM content_events
+          WHERE record_id=? AND type='record.updated' AND json_extract(payload,'$.name') IS NOT NULL
+          ORDER BY seq",
+    )
+    .bind(&setup.record_id)
+    .fetch_all(setup.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(events.len(), 4, "{events:#?}");
+    // No other update hides behind the name filter: the record carries exactly
+    // four `record.updated` events in total, and each actor owns exactly two,
+    // one forward `title.set` origin and one reversal (never two forward
+    // origins, never an undo labelled as a forward `title.set`).
+    let count = |sql: &'static str, actor: Option<&'static str>| {
+        let record_id = setup.record_id.clone();
+        let pool = setup.db.pool().clone();
+        async move {
+            let query = sqlx::query_scalar::<_, i64>(sql).bind(record_id);
+            let query = match actor {
+                Some(actor) => query.bind(actor),
+                None => query,
+            };
+            query.fetch_one(&pool).await.unwrap()
+        }
+    };
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.updated'",
+            None
+        )
+        .await,
+        4,
+        "exactly four record.updated events in total"
+    );
+    for actor in [ALICE, BOB] {
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.updated' AND actor=?",
+                Some(actor)
+            )
+            .await,
+            2,
+            "two writes by {actor}"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.updated' AND json_extract(payload,'$.origin.effect')='title.set' AND actor=?",
+                Some(actor)
+            )
+            .await,
+            1,
+            "exactly one forward title.set by {actor}"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM content_events WHERE record_id=? AND type='record.updated' AND json_extract(payload,'$.origin.reverses') IS NOT NULL AND actor=?",
+                Some(actor)
+            )
+            .await,
+            1,
+            "exactly one reversal by {actor}"
+        );
+    }
+    let actors: Vec<&str> = events.iter().map(|(_, actor, _)| actor.as_str()).collect();
+    assert_eq!(actors, [ALICE, ALICE, BOB, BOB], "per-account attribution");
+    let payloads: Vec<Value> = events
+        .iter()
+        .map(|(_, _, payload)| serde_json::from_str(payload).unwrap())
+        .collect();
+    let keys: Vec<&str> = payloads
+        .iter()
+        .map(|p| p["origin"]["idempotency_key"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "title:attr:alice",
+            "title:attr:alice:undo",
+            "title:attr:bob",
+            "title:attr:bob:undo"
+        ],
+        "one distinct key per write"
+    );
+    let names: Vec<&str> = payloads
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Alice title", "Original", "Bob title", "Original"]);
+    // Each undo names exactly the forward event it reverses, that event's key
+    // and the entry; the forward writes name nothing they reverse.
+    for (undo, forward, key) in [(1, 0, "title:attr:alice"), (3, 2, "title:attr:bob")] {
+        let reverses = &payloads[undo]["origin"]["reverses"];
+        assert_eq!(reverses["event_id"], events[forward].0, "{reverses:#}");
+        assert_eq!(reverses["idempotency_key"], key, "{reverses:#}");
+        assert_eq!(reverses["entry_id"], "rename", "{reverses:#}");
+    }
+    assert!(payloads[0]["origin"].get("reverses").is_none());
+    assert!(payloads[2]["origin"].get("reverses").is_none());
 }
 
 #[tokio::test]

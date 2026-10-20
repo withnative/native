@@ -1,9 +1,12 @@
 // Whole-body, digest-guarded install by default. Explicit chunked mode keeps
 // the legacy note/append/query/re-kind route for constrained transports.
-// Saved plans execute their original steps through runInstall.
+// Saved install plans execute their original steps through runInstall;
+// old update plans without presentation checks must be regenerated.
 import { createHash } from "node:crypto";
 import { gzipSync } from "node:zlib";
+import { isDeepStrictEqual } from "node:util";
 import { computeDigests } from "./digest.mjs";
+import { isAppV2Declaration } from "./declaration.mjs";
 import { validatePackage } from "./validate.mjs";
 import { parseIconFacet } from "./icons.mjs";
 import { LIMITS } from "./limits.mjs";
@@ -61,11 +64,11 @@ export function chunkUtf8(text, maxBytes) {
 
 /**
  * @param {object} p
- * @param {object} p.descriptor   package descriptor (package, version, runtime, declaration)
+ * @param {object} p.descriptor   package descriptor (package, version, runtime, declaration, optional title)
  * @param {string} p.html         exact bundle text
  * @param {string} p.homeId       folder for the source record
  * @param {string} p.reason       why (every write needs one; ≤1024 bytes for install)
- * @param {string} [p.name]       source record name
+ * @param {string} [p.name]       source record name; overrides descriptor.title
  * @param {string} [p.summary]
  * @param {Array}  [p.sources]    [{record_id, reason}] the writes rest on
  * @param {boolean} [p.chunked] opt in to the legacy chunked route
@@ -74,6 +77,7 @@ export function chunkUtf8(text, maxBytes) {
  * @param {object} [p.completenessBudget] overrides the advisory completeness lint bounds (tests)
  * @param {string} [p.replaceInstallEventId]  remove the current install of this package first
  * @param {string} [p.updateInstallEventId]  update the current install generation in place
+ * @param {boolean} [p.resetPresentation] use package presentation on update instead of carrying the current artifact's
  * @param {string} [p.afterRemovalEventId]  install against an existing removal event
  * @param {Array}  [p.bindings]   [{port, collection_id}] bind each input port of the new source to a
  *                                Collection and grant it input.read; whole-body route only
@@ -82,6 +86,10 @@ export function planInstall(p) {
   const hasReplace = p.replaceInstallEventId !== undefined;
   const hasAfterRemoval = p.afterRemovalEventId !== undefined;
   const hasUpdate = p.updateInstallEventId !== undefined;
+  if (p.resetPresentation && !hasUpdate) throw new Error("--reset-presentation requires --update");
+  if (hasUpdate && p.name !== undefined && !p.resetPresentation) {
+    throw new Error("--name with --update requires --reset-presentation");
+  }
   if (hasUpdate && (hasReplace || hasAfterRemoval)) {
     throw new Error("--update, --replace and --after-removal are mutually exclusive");
   }
@@ -105,11 +113,25 @@ export function planInstall(p) {
   }
   if (!p.homeId || !p.reason) throw new Error("planInstall needs homeId and reason");
   if (Buffer.byteLength(p.reason) > LIMITS.install.reason_max_bytes) throw new Error(`reason exceeds ${LIMITS.install.reason_max_bytes} bytes`);
+  const name = p.name ?? (typeof descriptor.title === "string" && descriptor.title.trim()
+    ? descriptor.title.trim() : `${descriptor.package} ${descriptor.version} (alpha tab source)`);
   const digests = computeDigests(html, descriptor.declaration, descriptor.runtime);
   const iconFacets = Object.hasOwn(descriptor, "icon") && parseIconFacet(descriptor.icon)
     ? { app_icon: descriptor.icon } : {};
+  // The package marker: a bundle over the ordinary HTML body limit (512 KiB)
+  // is created with this facet so the engine admits it up to the package
+  // limit (1 MiB). A bundle within the ordinary limit does not need it, so its
+  // plan is unchanged. The chunked route sets it on the re-kind, which is
+  // where the complete document is first validated.
+  const packageFacet = Buffer.byteLength(html, "utf8") > LIMITS.html.body_max_bytes
+    ? { [LIMITS.install.package_facet_key]: LIMITS.install.package_facet_value } : {};
   const bindings = p.bindings ?? [];
-  const requestedPorts = requestedInputPorts(html);
+  // A native.app.v2 install has no input ports: it reads and writes through
+  // the host's call surface and the one Adopt is the whole consent. So the
+  // plan never binds or grants, and a binding is refused, not dropped.
+  const appV2 = isAppV2Declaration(descriptor.declaration);
+  if (appV2 && bindings.length) throw new Error("--bind does not apply to a native.app.v2 package: it declares no input ports");
+  const requestedPorts = appV2 ? [] : requestedInputPorts(html);
   for (const binding of bindings) {
     if (!binding || typeof binding.port !== "string" || !binding.port || typeof binding.collection_id !== "string" || !binding.collection_id) {
       throw new Error("each binding needs a port and a collection_id");
@@ -124,13 +146,25 @@ export function planInstall(p) {
   const chunks = p.chunked ? chunkUtf8(html, p.chunkBytes ?? 8000) : [html];
   const sources = p.sources ?? [];
   const steps = [];
+  if (hasUpdate) {
+    steps.push({
+      step: "read-current-install", executor: "artifacts_read", operation: "manage_alpha_tabs.inspect",
+      arguments: { package: descriptor.package },
+      presentation: { action: "read-install", expected_event_id: p.updateInstallEventId },
+    });
+    if (!p.resetPresentation) steps.push({
+      step: "read-current-presentation", executor: "records_read", operation: "get_record",
+      arguments: { ids: ["{{previous_artifact_id}}"], resolve: false, children_limit: 0, links_limit: 0 },
+      presentation: { action: "read" },
+    });
+  }
   if (p.chunked) {
     let prefix = "";
     chunks.forEach((chunk, index) => {
       const before = prefix;
       prefix += chunk;
       const args = index === 0
-        ? { type: "Document", kind: "note", name: p.name ?? `${descriptor.package} ${descriptor.version} (alpha tab source)`, home_id: p.homeId, summary: p.summary ?? `Source bytes of alpha tab ${descriptor.package} ${descriptor.version}; staged as a note, then switched to native.html.v1.`, body: chunk, reason: p.reason, sources }
+        ? { type: "Document", kind: "note", name, home_id: p.homeId, summary: p.summary ?? `Source bytes of alpha tab ${descriptor.package} ${descriptor.version}; staged as a note, then switched to native.html.v1.`, body: chunk, reason: p.reason, sources }
         : { id: "{{record_id}}", body_append: chunk, if_body_digest: sha256(before), reason: `${p.reason} (chunk ${index + 1} of ${chunks.length})`, sources };
       steps.push({
         step: index === 0 ? "create-note" : `append-${index + 1}`,
@@ -161,17 +195,17 @@ export function planInstall(p) {
       step: "rekind-artifact",
       executor: "records_write",
       operation: "update_record",
-      arguments: { id: "{{record_id}}", kind: "artifact", facets: { runtime: LIMITS.install.runtime, ...iconFacets }, if_body_digest: digests.bundle_sha256, reason: `${p.reason} (switch to native.html.v1; validates the complete document)`, sources },
+      arguments: { id: "{{record_id}}", kind: "artifact", facets: { runtime: LIMITS.install.runtime, ...packageFacet, ...iconFacets }, if_body_digest: digests.bundle_sha256, reason: `${p.reason} (switch to native.html.v1; validates the complete document)`, sources },
       expect: { body_digest: digests.bundle_sha256 },
     });
   } else {
     const args = {
       type: "Document", kind: "artifact",
-      name: p.name ?? `${descriptor.package} ${descriptor.version} (alpha tab source)`,
+      name,
       home_id: p.homeId,
       summary: p.summary ?? `Source bytes of alpha tab ${descriptor.package} ${descriptor.version}.`,
       ...encodeBody(html, bodyEncoding),
-      facets: { runtime: LIMITS.install.runtime, ...iconFacets },
+      facets: { runtime: LIMITS.install.runtime, ...packageFacet, ...iconFacets },
       reason: p.reason, sources,
       response_mode: "summary",
     };
@@ -215,6 +249,28 @@ export function planInstall(p) {
       executor: "artifacts_write",
       operation: "manage_alpha_tabs.remove",
       arguments: { package: descriptor.package, expected_install_event_id: p.replaceInstallEventId, reason: `${p.reason} (install refuses a package that is already installed)` },
+    });
+  }
+  if (hasUpdate) {
+    // Mark only the newly created record's presentation writes. Copied values
+    // are applied after template expansion, so literal {{...}} text survives.
+    if (!p.resetPresentation) {
+      for (const step of steps) {
+        if (["create-note", "create-artifact", "rekind-artifact"].includes(step.step)) {
+          step.presentation = { action: "seed" };
+          step.note = "On updates, runInstall seeds the captured old name/icon/skin at run time; these arguments alone are not a resolved MCP call.";
+        }
+      }
+    }
+    steps.push({
+      step: "recheck-current-install", executor: "artifacts_read", operation: "manage_alpha_tabs.inspect",
+      arguments: { package: descriptor.package },
+      presentation: { action: "recheck-install", expected_event_id: p.updateInstallEventId },
+    });
+    if (!p.resetPresentation) steps.push({
+      step: "recheck-current-presentation", executor: "records_read", operation: "get_record",
+      arguments: { ids: ["{{previous_artifact_id}}"], resolve: false, children_limit: 0, links_limit: 0 },
+      presentation: { action: "recheck" },
     });
   }
   steps.push({
@@ -277,6 +333,21 @@ export function refusesBodyEncoding(error) {
   return /body_encoding/.test(message) && !/\[body_encoding_[a-z_]+\]/.test(message);
 }
 
+function readPresentation(result, artifactId) {
+  const record = result?.records?.find(record => record.id === artifactId);
+  if (record?.status !== "found" || record.archived || record.deleted_at
+    || typeof record.name !== "string" || !Array.isArray(record.facets)) {
+    const state = record?.archived ? "archived" : record?.deleted_at ? "deleted"
+      : record?.status !== "found" ? "not found or not viewable" : "presentation is unreadable";
+    throw new Error(`update: old artifact ${artifactId} is ${state}; regenerate the plan with --reset-presentation to update using package presentation`);
+  }
+  const facets = {};
+  for (const facet of record.facets) {
+    if (["app_icon", "app_skin"].includes(facet.key)) facets[facet.key] = facet.value;
+  }
+  return { name: record.name, facets };
+}
+
 /**
  * Execute a plan. `client.call(executor, operation, args)` must return the
  * parsed JSON result (throw on transport or tool errors). Stops at the first
@@ -287,12 +358,39 @@ export async function runInstall(plan, client, options = {}) {
   if (kind && Object.hasOwn(kind, "value") && kind.value === "alpha-tab.body-feature-plan.v1") {
     throw new Error("body feature plans require a separately qualified Cookie host executor; runInstall refuses before source writes");
   }
-  const { onStep } = options;
+  if (plan.steps.some(step => step.operation === "manage_alpha_tabs.update")
+    && !plan.steps.some(step => step.step === "read-current-install")) {
+    throw new Error("update: this saved update plan predates presentation checks; regenerate this plan before running it");
+  }
   const vars = {};
+  const progress = { installed: false };
+  try {
+    return await runInstallSteps(plan, client, options, vars, progress);
+  } catch (error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    const source = progress.installed
+      ? `Installed source record ${vars.record_id} (live; do not archive)`
+      : `Staged source record ${vars.record_id}`;
+    if (vars.record_id && !failure.message.includes(source)) {
+      failure.message += `. ${source}`;
+    }
+    throw failure;
+  }
+}
+
+async function runInstallSteps(plan, client, options, vars, progress) {
+  const { onStep } = options;
+  let presentation;
   const log = [];
   for (const step of plan.steps) {
     let rawBodyFallback = false;
-    const args = fill(step.arguments, vars);
+    const seed = (args) => {
+      if (step.presentation?.action !== "seed") return args;
+      if (!presentation) throw new Error("update: no presentation snapshot; rebuild the plan");
+      return { ...args, ...(Object.hasOwn(args, "name") ? { name: presentation.name } : {}),
+        ...(args.facets ? { facets: { ...args.facets, ...presentation.facets } } : {}) };
+    };
+    const args = seed(fill(step.arguments, vars));
     let result;
     try {
       try {
@@ -310,7 +408,7 @@ export async function runInstall(plan, client, options = {}) {
         if (!step.fallback || !refusesBodyEncoding(error)) throw error;
         (options.onNotice ?? ((message) => console.error(message)))(
           "Server does not support body_encoding yet; retrying the source write with the raw body.");
-        result = await client.call(step.executor, step.operation, fill(step.fallback.arguments, vars));
+        result = await client.call(step.executor, step.operation, seed(fill(step.fallback.arguments, vars)));
         rawBodyFallback = true;
       }
     } catch (error) {
@@ -319,7 +417,24 @@ export async function runInstall(plan, client, options = {}) {
       }
       throw error;
     }
+    // The mutation has succeeded even if validating its receipt or a later
+    // inspect fails. Its source is now live, so do not label it as staged.
+    if (["manage_alpha_tabs.install", "manage_alpha_tabs.update"].includes(step.operation)) progress.installed = true;
     if (step.operation === "manage_alpha_tabs.update") result = result?.write_receipt ?? result;
+    const action = step.presentation?.action;
+    if (action === "read-install" || action === "recheck-install") {
+      const install = result?.install;
+      if (install?.event_id !== step.presentation.expected_event_id || install.status === "removed"
+        || typeof install.artifact_id !== "string" || !install.artifact_id
+        || (action === "recheck-install" && install.artifact_id !== vars.previous_artifact_id)) {
+        throw new Error("update: current install changed or is unavailable; rebuild the plan");
+      }
+      vars.previous_artifact_id = install.artifact_id;
+    }
+    if (action === "read") presentation = readPresentation(result, vars.previous_artifact_id);
+    if (action === "recheck" && !isDeepStrictEqual(presentation, readPresentation(result, vars.previous_artifact_id))) {
+      throw new Error(`update: current presentation changed; rebuild the plan. Staged source record ${vars.record_id} can be archived`);
+    }
     const entry = { step: step.step, ok: true, ...(rawBodyFallback ? { fallback: "raw-body" } : {}) };
     if (step.operation === "manage_alpha_tabs.update") {
       if (typeof result?.update_event_id !== "string" || !result.update_event_id.trim()

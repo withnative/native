@@ -7,6 +7,45 @@ use std::process::Command;
 
 const WIDGET_BYTES: &str = r#"{"family":"demo.widget","version":1,"primary_type":"Widget","interpreter":"native.defn/2","kinds":[{"token":"Widget","fields":[{"name":"accession","type":"text","required":true},{"name":"mass_kg","type":"number","required":true},{"name":"color","type":"text","required":false}],"identity":{"field":"accession"},"links":[],"maturity":"current","description":"A demo widget."},{"token":"Cog","fields":[{"name":"accession","type":"text","required":true},{"name":"teeth","type":"integer","required":true}],"identity":{"field":"accession"},"links":[{"predicate":"fitted_to","target":{"primary_type":"Widget","kind":"Widget"},"direction":"out","cardinality":"many"}],"maturity":"current","description":"A cog fitted to a widget."}]}"#;
 
+/// A deliberately renamed generic fixture: a different namespace, family,
+/// primary type, kind, and source-field name, bound to the same trusted
+/// provider. It exists to prove the seam and provider carry no budget-specific
+/// branches.
+const CUSTOM_MODEL_BYTES: &str = r#"{"family":"demo.custom.model","version":1,"interpreter":"native.defn/3","primary_type":"Model","kinds":[{"token":"model","description":"A generic model held in one text field.","maturity":"current","identity":{"mode":"record"},"fields":[{"name":"title","type":"text","required":true,"description":"Short human title."},{"name":"model_json","type":"text","required":true,"description":"JSON object of address -> expression."}],"links":[]}]}"#;
+
+fn custom_model_package() -> native_ce::package_manifest::PackageManifest {
+    use native_ce::package_manifest::{
+        DefinitionEntry, OperationDescriptor, PackageManifest,
+        OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC,
+    };
+    PackageManifest {
+        operations: vec![OperationDescriptor {
+            name: "recalculate".to_string(),
+            description: "Evaluate the model_json field with the generic provider.".to_string(),
+            provider: OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC.to_string(),
+            family: "demo.custom.model".to_string(),
+            kind: "model".to_string(),
+            source_field: "model_json".to_string(),
+            reads: vec!["record:view".to_string()],
+            effects: vec![],
+        }],
+        namespace: "demo.custom".to_string(),
+        name: "model".to_string(),
+        version: 1,
+        definitions: vec![DefinitionEntry {
+            family: "demo.custom.model".to_string(),
+            version: 1,
+            artifact_bytes: CUSTOM_MODEL_BYTES.to_string(),
+            digest: native_ce::meta::definition_artifact::digest_artifact_bytes(
+                CUSTOM_MODEL_BYTES.as_bytes(),
+            ),
+        }],
+        behaviour: None,
+        surface: None,
+        declared_reads: vec!["record:view".to_string()],
+    }
+}
+
 struct World {
     dir: tempfile::TempDir,
     db: String,
@@ -148,6 +187,68 @@ fn v2_contract_smoke_demo_widget() {
             &home_id,
         ],
     );
+
+    let catalog = w.run_ok("agent:op", &["tools"]);
+    assert_eq!(catalog.as_object().unwrap().len(), 2);
+    assert_eq!(
+        catalog["rules"],
+        serde_json::json!(native_ce::definition_shape::TYPED_TOOL_RULES)
+    );
+    let rules = catalog["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for required in [
+        "Kernel refusals are returned unchanged",
+        "compare-and-swap",
+        "record's own pin",
+        "Queries span versions",
+        "Query predicates are suggestions",
+        "Link cardinalities are declaration metadata",
+        "generic link subcommand",
+    ] {
+        assert!(rules.contains(required), "missing shared rule: {required}");
+    }
+    let tools = catalog["tools"].as_array().unwrap();
+    for tool in tools {
+        for rule in native_ce::definition_shape::TYPED_TOOL_RULES {
+            assert!(!tool["description"].as_str().unwrap().contains(rule));
+        }
+    }
+    let create_tool = tools
+        .iter()
+        .find(|t| t["name"] == "create_demo_widget_Widget")
+        .unwrap();
+    assert_eq!(
+        create_tool["inputSchema"]["properties"]["home"]["enum"],
+        serde_json::json!([home_id])
+    );
+    let typed_input =
+        serde_json::json!({"home":home_id,"fields":{"accession":"TYPED-1","mass_kg":3}})
+            .to_string();
+    let typed = w.run_ok(
+        "agent:op",
+        &["call", "create_demo_widget_Widget", &typed_input],
+    );
+    assert!(typed["id"].is_string());
+    let query_input = serde_json::json!({"field_equals":{"accession":"TYPED-1"}}).to_string();
+    let page = w.run_ok(
+        "agent:op",
+        &["call", "query_demo_widget_Widget", &query_input],
+    );
+    assert_eq!(page["hits"][0]["pin"]["digest"], digest);
+    let (ok, refused) = w.run(
+        "agent:op",
+        &["call", "create_demo_widget_Widget", &typed_input],
+    );
+    assert!(!ok);
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("identity value unavailable"));
 
     let fields = w.write(
         "w1.json",
@@ -916,18 +1017,80 @@ fn write_package(
     )
 }
 
-/// A definitions-only `native.standard/document@2` whose definition adds an
-/// optional `summary` field. Used by the replace step.
-fn document_v2_package() -> native_ce::package_manifest::PackageManifest {
-    const BYTES: &str = r#"{"family":"native.standard.document","version":2,"interpreter":"native.defn/3","primary_type":"Document","kinds":[{"token":"note","description":"An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.","maturity":"current","identity":{"mode":"record"},"fields":[{"name":"title","type":"text","required":true,"description":"Short human title."},{"name":"body","type":"text","required":false,"description":"The prose, as Markdown."},{"name":"summary","type":"text","required":false,"description":"An optional one-line summary."}],"links":[{"predicate":"relates_to","target":{"primary_type":"Document","kind":"note"},"direction":"either","cardinality":"many"}]}]}"#;
+/// Upgrade fixtures own their namespace; only compiled revisions may publish native.*.
+fn fixture_standard_package(
+    mut manifest: native_ce::package_manifest::PackageManifest,
+) -> native_ce::package_manifest::PackageManifest {
+    manifest.namespace = "fixture.standard".to_string();
+    for entry in &mut manifest.definitions {
+        entry.family = entry.family.replace("native.standard", "fixture.standard");
+        entry.artifact_bytes = entry
+            .artifact_bytes
+            .replace("native.standard", "fixture.standard");
+        entry.digest = native_ce::meta::definition_artifact::digest_artifact_bytes(
+            entry.artifact_bytes.as_bytes(),
+        );
+    }
+    manifest
+}
+
+#[tokio::test]
+async fn v2_contract_smoke_native_standard_packages() {
+    let w = World::fresh();
+    init_admin_world(&w);
+    let blank = w.run_ok("acct:admin", &["describe"]);
+    assert_eq!(
+        blank["namespace_policy"]["publication"],
+        "exact_compiled_first_party_package"
+    );
+    for manifest in native_ce::v2_standard::standard_packages() {
+        let pkg = write_package(&w, &manifest, &manifest.name);
+        w.run_ok("acct:admin", &["package-install", "--json", &pkg]);
+        w.run_ok(
+            "acct:admin",
+            &[
+                "package-adopt",
+                "--json",
+                &pkg,
+                "--scope",
+                "kernel:root",
+                "--ack-reads",
+                "[]",
+            ],
+        );
+        let described = w.run_ok("acct:admin", &["describe"]);
+        assert!(described["definitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["family"] == manifest.definitions[0].family));
+    }
+    let own_package = write_package(&w, &document_v3_package(), "own-namespace");
+    // The upgrade fixture owns fixture.standard. Re-label it as native.* to
+    // confirm the generic CLI returns the admission reason.
+    let mut reserved = document_v3_package();
+    reserved.namespace = "native.standard".to_string();
+    let reserved = write_package(&w, &reserved, "reserved");
+    let (ok, err) = w.run("acct:admin", &["package-install", "--json", &reserved]);
+    assert!(!ok, "{err}");
+    assert!(err.to_string().contains("reserved namespace"), "{err}");
+    w.run_ok("acct:admin", &["package-install", "--json", &own_package]);
+}
+
+/// A definitions-only `fixture.standard/document@3` whose definition adds an
+/// optional `summary` field. Used by the replace step. (Version 3 because the
+/// real loosened note ships as definition/package version 2.)
+fn document_v3_package() -> native_ce::package_manifest::PackageManifest {
+    const BYTES: &str = r#"{"family":"fixture.standard.document","version":3,"interpreter":"native.defn/3","primary_type":"Document","kinds":[{"token":"note","description":"An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.","maturity":"current","identity":{"mode":"record"},"fields":[{"name":"title","type":"text","required":false,"description":"Short human title. May be absent: v1 notes are often untitled and no title is invented."},{"name":"body","type":"text","required":false,"description":"The prose, as Markdown."},{"name":"summary","type":"text","required":false,"description":"An optional one-line summary."}],"links":[{"predicate":"relates_to","target":{"primary_type":"Document","kind":"note"},"direction":"either","cardinality":"many"}]}]}"#;
     let digest = native_ce::meta::definition_artifact::digest_artifact_bytes(BYTES.as_bytes());
     native_ce::package_manifest::PackageManifest {
-        namespace: "native.standard".to_string(),
+        operations: vec![],
+        namespace: "fixture.standard".to_string(),
         name: "document".to_string(),
-        version: 2,
+        version: 3,
         definitions: vec![native_ce::package_manifest::DefinitionEntry {
-            family: "native.standard.document".to_string(),
-            version: 2,
+            family: "fixture.standard.document".to_string(),
+            version: 3,
             artifact_bytes: BYTES.to_string(),
             digest,
         }],
@@ -948,11 +1111,11 @@ fn describe_entry(value: &serde_json::Value, family: &str, kind: &str) -> serde_
 }
 
 #[tokio::test]
-async fn v2_contract_smoke_native_standard_packages() {
+async fn v2_contract_smoke_fixture_standard_upgrades() {
     let w = World::fresh();
     let (admin, home) = init_admin_world(&w);
-    let document_family = "native.standard.document";
-    let outcome_family = "native.standard.outcome";
+    let document_family = "fixture.standard.document";
+    let outcome_family = "fixture.standard.outcome";
 
     // ---- Step 1: blank. describe lists nothing; create refuses. ----
     let blank = w.run_ok("acct:admin", &["describe"]);
@@ -976,8 +1139,16 @@ async fn v2_contract_smoke_native_standard_packages() {
     assert!(err.get("error").is_some(), "{err}");
 
     // ---- Step 2: install, then adopt (install is not adoption). ----
-    let doc_pkg = write_package(&w, &native_ce::v2_standard::document_package(), "document");
-    let out_pkg = write_package(&w, &native_ce::v2_standard::outcome_package(), "outcome");
+    let doc_pkg = write_package(
+        &w,
+        &fixture_standard_package(native_ce::v2_standard::document_package()),
+        "document",
+    );
+    let out_pkg = write_package(
+        &w,
+        &fixture_standard_package(native_ce::v2_standard::outcome_package()),
+        "outcome",
+    );
     for pkg in [&doc_pkg, &out_pkg] {
         w.run_ok("acct:admin", &["package-install", "--json", pkg]);
     }
@@ -1004,7 +1175,7 @@ async fn v2_contract_smoke_native_standard_packages() {
     let adopted = w.run_ok("acct:admin", &["describe"]);
     let doc_entry = describe_entry(&adopted, document_family, "note");
     assert_eq!(
-        doc_entry["package"]["namespace"], "native.standard",
+        doc_entry["package"]["namespace"], "fixture.standard",
         "{adopted}"
     );
     assert_eq!(doc_entry["package"]["name"], "document", "{adopted}");
@@ -1251,20 +1422,21 @@ async fn v2_contract_smoke_native_standard_packages() {
         "a disabled entry takes no package provenance: {after_disable}"
     );
 
-    // ---- Step 5: replace Document with @2 (adds optional summary). ----
-    // The merged K6a retained-data guard
+    // ---- Step 5: replace Document with @3 (adds optional summary). ----
+    // The K6a retained-data guard
     // (`dependency_transition_tests::visible_outside_rows_block_replacement_with_retained_data`)
     // refuses a *direct* package replacement while records still pin the old
     // revision, because mapping data across revisions is out of scope. The
-    // approved brief did not anticipate that guard; the demo records it and
-    // then replaces via disable-then-adopt, which leaves old records on v1.
-    let doc_v2 = document_v2_package();
-    let doc_v2_file = write_package(&w, &doc_v2, "document-v2");
-    w.run_ok("acct:admin", &["package-install", "--json", &doc_v2_file]);
+    // supported replacement path is disable-then-adopt, which leaves old
+    // records on their original pin (v2 here).
+    let doc_v3 = document_v3_package();
+    let doc_v3_file = write_package(&w, &doc_v3, "document-v3");
+    w.run_ok("acct:admin", &["package-install", "--json", &doc_v3_file]);
 
-    // (b) A saved-query consumer pinned to v1 refuses the v2 adoption with no
+    // A saved-query consumer pinned to v2 refuses the v3 adoption with no
     // state change.
-    let v1_digest = native_ce::v2_standard::document_package().definitions[0]
+    let v2_digest = fixture_standard_package(native_ce::v2_standard::document_package())
+        .definitions[0]
         .digest
         .clone();
     let registered = w.run_ok(
@@ -1276,15 +1448,15 @@ async fn v2_contract_smoke_native_standard_packages() {
             "--consumer-kind",
             "saved-query",
             "--namespace",
-            "native.standard",
+            "fixture.standard",
             "--name",
             "document-watcher",
             "--family",
             document_family,
             "--version",
-            "1",
+            "2",
             "--digest",
-            &v1_digest,
+            &v2_digest,
         ],
     );
     let consumer_seq = registered["event_seq"].as_i64().unwrap().to_string();
@@ -1293,7 +1465,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         &[
             "package-preview-adopt",
             "--json",
-            &doc_v2_file,
+            &doc_v3_file,
             "--scope",
             "kernel:root",
         ],
@@ -1316,7 +1488,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         &[
             "package-adopt",
             "--json",
-            &doc_v2_file,
+            &doc_v3_file,
             "--scope",
             "kernel:root",
             "--ack-reads",
@@ -1325,7 +1497,7 @@ async fn v2_contract_smoke_native_standard_packages() {
     );
     assert!(
         !ok,
-        "v2 adoption must refuse while the v1 consumer lives: {err}"
+        "v3 adoption must refuse while the v2 consumer lives: {err}"
     );
     let db = native_ce::db::open_database(&w.db).await.unwrap();
     let after = native_ce::kernel::dump_all_kernel_tables(&db)
@@ -1335,7 +1507,7 @@ async fn v2_contract_smoke_native_standard_packages() {
     assert_eq!(before, after, "a refused adoption appends nothing");
 
     // Retire the consumer. A direct replacement is still refused, now by the
-    // retained-data guard: the old notes pin Document v1.
+    // retained-data guard: the old notes pin Document v2.
     w.run_ok(
         "acct:admin",
         &[
@@ -1345,7 +1517,7 @@ async fn v2_contract_smoke_native_standard_packages() {
             "--consumer-kind",
             "saved-query",
             "--namespace",
-            "native.standard",
+            "fixture.standard",
             "--name",
             "document-watcher",
             "--family",
@@ -1359,7 +1531,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         &[
             "package-preview-adopt",
             "--json",
-            &doc_v2_file,
+            &doc_v3_file,
             "--scope",
             "kernel:root",
         ],
@@ -1370,7 +1542,7 @@ async fn v2_contract_smoke_native_standard_packages() {
             .unwrap()
             .iter()
             .any(|b| b["consumer_kind"] == "retained-data"),
-        "the retained-data guard names the stranded v1 pin: {still}"
+        "the retained-data guard names the stranded v2 pin: {still}"
     );
     let db = native_ce::db::open_database(&w.db).await.unwrap();
     let before = native_ce::kernel::dump_all_kernel_tables(&db)
@@ -1382,7 +1554,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         &[
             "package-adopt",
             "--json",
-            &doc_v2_file,
+            &doc_v3_file,
             "--scope",
             "kernel:root",
             "--ack-reads",
@@ -1401,8 +1573,8 @@ async fn v2_contract_smoke_native_standard_packages() {
     assert_eq!(before, after, "a refused replacement appends nothing");
 
     // Disable-then-adopt is the replacement path that leaves old records on
-    // their original pin. Old notes keep their v1 pin and read under v1; a
-    // new note pins v2.
+    // their original pin. Old notes keep their v2 pin and read under v2; a
+    // new note pins v3.
     w.run_ok(
         "acct:admin",
         &[
@@ -1418,7 +1590,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         &[
             "package-adopt",
             "--json",
-            &doc_v2_file,
+            &doc_v3_file,
             "--scope",
             "kernel:root",
             "--ack-reads",
@@ -1426,7 +1598,7 @@ async fn v2_contract_smoke_native_standard_packages() {
         ],
     );
     let old_note = w.run_ok("acct:admin", &["read", "--id", &n1_id]);
-    assert_eq!(old_note["pin"]["version"], 1, "{old_note}");
+    assert_eq!(old_note["pin"]["version"], 2, "{old_note}");
     let new_note = w.run_ok(
         "acct:admin",
         &[
@@ -1443,10 +1615,10 @@ async fn v2_contract_smoke_native_standard_packages() {
     );
     let new_note_id = new_note["id"].as_str().unwrap().to_string();
     let new_read = w.run_ok("acct:admin", &["read", "--id", &new_note_id]);
-    assert_eq!(new_read["pin"]["version"], 2, "{new_read}");
+    assert_eq!(new_read["pin"]["version"], 3, "{new_read}");
     let after_replace = w.run_ok("acct:admin", &["describe"]);
-    let doc_v2_entry = describe_entry(&after_replace, document_family, "note");
-    assert_eq!(doc_v2_entry["version"], 2, "{after_replace}");
+    let doc_v3_entry = describe_entry(&after_replace, document_family, "note");
+    assert_eq!(doc_v3_entry["version"], 3, "{after_replace}");
 
     // ---- Step 6: replay reproduces every projection; history carries the pin. ----
     let db = native_ce::db::open_database(&w.db).await.unwrap();
@@ -1478,4 +1650,1089 @@ async fn v2_contract_smoke_native_standard_packages() {
         final_history.as_array().unwrap().len() >= 2,
         "history keeps the create and revise events: {final_history}"
     );
+}
+
+/// D7 (task 9d70658): the loosened `native.standard/document@2` accepts an
+/// untitled note, while a record pinned to the strict v1 revision keeps its
+/// pin and replays exactly after the disable-then-adopt replacement.
+#[tokio::test]
+async fn v2_contract_smoke_loosened_note_accepts_untitled_and_keeps_v1_pin() {
+    /// The shipped v1 definition bytes (title required), verbatim: the
+    /// digest assertion below pins the exact bytes.
+    const V1_BYTES: &str = "{\n  \"family\": \"native.standard.document\",\n  \"version\": 1,\n  \"interpreter\": \"native.defn/3\",\n  \"primary_type\": \"Document\",\n  \"kinds\": [\n    {\n      \"token\": \"note\",\n      \"description\": \"An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.\",\n      \"maturity\": \"current\",\n      \"identity\": { \"mode\": \"record\" },\n      \"fields\": [\n        { \"name\": \"title\", \"type\": \"text\", \"required\": true, \"description\": \"Short human title.\" },\n        { \"name\": \"body\", \"type\": \"text\", \"required\": false, \"description\": \"The prose, as Markdown.\" }\n      ],\n      \"links\": [\n        { \"predicate\": \"relates_to\", \"target\": { \"primary_type\": \"Document\", \"kind\": \"note\" }, \"direction\": \"either\", \"cardinality\": \"many\" }\n      ]\n    }\n  ]\n}\n";
+    assert_eq!(
+        native_ce::meta::definition_artifact::digest_artifact_bytes(V1_BYTES.as_bytes()),
+        "6f0dab56958edc57378098a3f5bcde76d32f2d34f0e58d590cb534fecb91da61",
+        "v1 fixture must be the shipped bytes",
+    );
+    fn v1_package() -> native_ce::package_manifest::PackageManifest {
+        native_ce::package_manifest::PackageManifest {
+            operations: vec![],
+            namespace: "native.standard".to_string(),
+            name: "document".to_string(),
+            version: 1,
+            definitions: vec![native_ce::package_manifest::DefinitionEntry {
+                family: "native.standard.document".to_string(),
+                version: 1,
+                artifact_bytes: V1_BYTES.to_string(),
+                digest: native_ce::meta::definition_artifact::digest_artifact_bytes(
+                    V1_BYTES.as_bytes(),
+                ),
+            }],
+            behaviour: None,
+            surface: None,
+            declared_reads: Vec::new(),
+        }
+    }
+
+    let w = World::fresh();
+    let (admin, home) = init_admin_world(&w);
+    let document_family = "native.standard.document";
+
+    // Seed the shipped @1 bytes and a historical package event. The shared
+    // registry/fold validates history without re-running current admission;
+    // this setup adds no bypass to the kernel/package installation wrappers.
+    let legacy = v1_package();
+    let db = native_ce::db::open_database(&w.db).await.unwrap();
+    native_ce::definition_registry::install_definition_artifact(
+        &db,
+        document_family,
+        1,
+        V1_BYTES.as_bytes(),
+    )
+    .await
+    .unwrap();
+    let payload = native_ce::meta::events::PackageArtifactInstalledV1Payload {
+        namespace: legacy.namespace.clone(),
+        name: legacy.name.clone(),
+        version: legacy.version,
+        digest: legacy.package_digest().unwrap(),
+        manifest_bytes: String::from_utf8(
+            serde_jcs::to_vec(&legacy.canonical_value().unwrap()).unwrap(),
+        )
+        .unwrap(),
+    };
+    let subject = format!(
+        "package:{}/{}@{}#{}",
+        payload.namespace, payload.name, payload.version, payload.digest
+    );
+    let mut event = native_ce::meta::events::MetaEventRow {
+        seq: -1,
+        id: uuid::Uuid::new_v4().to_string(),
+        subject_id: subject,
+        event_type: "package_artifact.installed.v1".to_string(),
+        payload: Some(serde_json::to_string(&payload).unwrap()),
+        actor: Some(admin.clone()),
+        created_at: "2026-10-01T00:00:00.000Z".to_string(),
+    };
+    db.close().await;
+    use sqlx::{Connection, SqliteConnection};
+    let mut connection = SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&w.db)
+            .foreign_keys(true),
+    )
+    .await
+    .unwrap();
+    let mut tx = connection.begin().await.unwrap();
+    // Legacy rows may have no act grouping; their event identity is retained.
+    event.seq = sqlx::query_scalar(
+        "INSERT INTO meta_events (id, subject_id, type, payload, actor, created_at)
+         VALUES (?, ?, ?, ?, ?, ?) RETURNING seq",
+    )
+    .bind(&event.id)
+    .bind(&event.subject_id)
+    .bind(&event.event_type)
+    .bind(&event.payload)
+    .bind(&event.actor)
+    .bind(&event.created_at)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    native_ce::projector::meta::project_meta(&mut tx, &event)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    connection.close().await.unwrap();
+
+    // Adopt the seeded strict @1 package plus the installed current outcome.
+    let v1_pkg = write_package(&w, &legacy, "document-v1");
+    let out_pkg = write_package(&w, &native_ce::v2_standard::outcome_package(), "outcome");
+    w.run_ok("acct:admin", &["package-install", "--json", &out_pkg]);
+    let (ok, err) = w.run("acct:admin", &["package-install", "--json", &v1_pkg]);
+    assert!(
+        !ok,
+        "an older compiled revision cannot be reinstalled: {err}"
+    );
+    assert!(err.to_string().contains("reserved namespace"), "{err}");
+    for pkg in [&v1_pkg, &out_pkg] {
+        w.run_ok(
+            "acct:admin",
+            &[
+                "package-adopt",
+                "--json",
+                pkg,
+                "--scope",
+                "kernel:root",
+                "--ack-reads",
+                "[]",
+            ],
+        );
+    }
+
+    // An untitled note refuses on v1.
+    let untitled = w.write("untitled.json", br#"{"body": "A note with no title."}"#);
+    let create_args = |file: &str| {
+        vec![
+            "create".to_string(),
+            "--family".to_string(),
+            document_family.to_string(),
+            "--kind".to_string(),
+            "note".to_string(),
+            "--home".to_string(),
+            home.clone(),
+            "--json".to_string(),
+            file.to_string(),
+        ]
+    };
+    let owned: Vec<String> = create_args(&untitled);
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let (ok, err) = w.run("acct:admin", &borrowed);
+    assert!(!ok, "v1 must refuse a missing title: {err}");
+    assert!(
+        err["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("missing required field 'title'"),
+        "{err}"
+    );
+
+    // A titled note pins v1.
+    let titled = w.write(
+        "titled.json",
+        br#"{"title": "Old note", "body": "Pinned to v1."}"#,
+    );
+    let owned = create_args(&titled);
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let created = w.run_ok("acct:admin", &borrowed);
+    let old_id = created["id"].as_str().unwrap().to_string();
+
+    // Replace via disable-then-adopt with the loosened @2.
+    let doc_pkg = write_package(&w, &native_ce::v2_standard::document_package(), "document");
+    w.run_ok("acct:admin", &["package-install", "--json", &doc_pkg]);
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-disable",
+            "--json",
+            &v1_pkg,
+            "--scope",
+            "kernel:root",
+        ],
+    );
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-adopt",
+            "--json",
+            &doc_pkg,
+            "--scope",
+            "kernel:root",
+            "--ack-reads",
+            "[]",
+        ],
+    );
+
+    // The old note keeps its v1 pin and fields.
+    let old = w.run_ok("acct:admin", &["read", "--id", &old_id]);
+    assert_eq!(old["pin"]["family"], document_family, "{old}");
+    assert_eq!(old["pin"]["version"], 1, "{old}");
+    assert_eq!(
+        old["fields"]["title"],
+        serde_json::json!("Old note"),
+        "{old}"
+    );
+
+    // Revising the @1-pinned note still validates under @1 even after @2 is
+    // adopted: clearing or removing the title refuses, while a body-only
+    // revise succeeds and keeps the v1 pin.
+    for (patch, needle) in [
+        (
+            br#"{"title": null}"#.to_vec(),
+            "missing required field 'title'",
+        ),
+        (
+            br#"{"title": "   "}"#.to_vec(),
+            "required field 'title' must not be blank",
+        ),
+    ] {
+        let file = w.write("clear-title.json", &patch);
+        let (ok, err) = w.run("acct:admin", &["revise", "--id", &old_id, "--json", &file]);
+        assert!(!ok, "clearing the @1 title must refuse: {err}");
+        assert!(
+            err["error"].as_str().unwrap_or_default().contains(needle),
+            "{err}"
+        );
+    }
+    let body_patch = w.write(
+        "body-patch.json",
+        br#"{"body": "Revised under @2, still pinned @1."}"#,
+    );
+    w.run_ok(
+        "acct:admin",
+        &["revise", "--id", &old_id, "--json", &body_patch],
+    );
+    let revised = w.run_ok("acct:admin", &["read", "--id", &old_id]);
+    assert_eq!(revised["pin"]["version"], 1, "{revised}");
+    assert_eq!(
+        revised["fields"]["title"],
+        serde_json::json!("Old note"),
+        "{revised}"
+    );
+    assert_eq!(
+        revised["fields"]["body"],
+        serde_json::json!("Revised under @2, still pinned @1."),
+        "{revised}"
+    );
+
+    // The untitled note is now accepted and pins v2 with no title.
+    let owned = create_args(&untitled);
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let new = w.run_ok("acct:admin", &borrowed);
+    let new_id = new["id"].as_str().unwrap().to_string();
+    let read_new = w.run_ok("acct:admin", &["read", "--id", &new_id]);
+    assert_eq!(read_new["pin"]["version"], 2, "{read_new}");
+    assert!(
+        read_new["fields"].get("title").is_none_or(|v| v.is_null()),
+        "no title is invented: {read_new}"
+    );
+
+    // Pinned edge-case behaviour on @2: an explicit null stores as absent,
+    // while an empty string stores as given (non-blank is only enforced for
+    // required fields, and title is optional now). Importers must therefore
+    // omit empty v1 names rather than writing "".
+    let null_title = w.write(
+        "null-title.json",
+        br#"{"title": null, "body": "Null title."}"#,
+    );
+    let owned = create_args(&null_title);
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let null_created = w.run_ok("acct:admin", &borrowed);
+    let null_read = w.run_ok(
+        "acct:admin",
+        &["read", "--id", null_created["id"].as_str().unwrap()],
+    );
+    assert!(
+        null_read["fields"].get("title").is_none_or(|v| v.is_null()),
+        "{null_read}"
+    );
+    let empty_title = w.write(
+        "empty-title.json",
+        br#"{"title": "", "body": "Empty title."}"#,
+    );
+    let owned = create_args(&empty_title);
+    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let empty_created = w.run_ok("acct:admin", &borrowed);
+    let empty_read = w.run_ok(
+        "acct:admin",
+        &["read", "--id", empty_created["id"].as_str().unwrap()],
+    );
+    assert_eq!(
+        empty_read["fields"]["title"],
+        serde_json::json!(""),
+        "{empty_read}"
+    );
+
+    // note→note links still work after the loosening.
+    w.run_ok(
+        "acct:admin",
+        &[
+            "link",
+            "--source",
+            &new_id,
+            "--predicate",
+            "relates_to",
+            "--target",
+            &old_id,
+        ],
+    );
+
+    // Replay reproduces every projection with both pins intact.
+    let db = native_ce::db::open_database(&w.db).await.unwrap();
+    let before = native_ce::kernel::dump_all_kernel_tables(&db)
+        .await
+        .unwrap();
+    native_ce::kernel::replay_all_projections(&db)
+        .await
+        .unwrap();
+    let after = native_ce::kernel::dump_all_kernel_tables(&db)
+        .await
+        .unwrap();
+    let replayed = native_ce::kernel::read_record_as(&db, &admin, &old_id)
+        .await
+        .unwrap()
+        .expect("old note visible");
+    db.close().await;
+    assert_eq!(before, after, "replay must reproduce every projection");
+    assert_eq!(replayed.pin.as_ref().unwrap().version, 1);
+}
+
+/// End-to-end proof of the generic package-operation seam over the
+/// `demo.budget/sheet@1` fixture: install/adopt, create, call to totals,
+/// compare-and-swap edit, whole-operation domain failure, view-only compute,
+/// disable, and the read/history/replay invariants around a call.
+#[tokio::test]
+async fn v2_contract_smoke_budget_operations() {
+    let w = World::fresh();
+    let (admin, home) = init_admin_world(&w);
+    let family = "demo.budget.sheet";
+
+    // ---- blank: describe-with-no-operations refuses. ----
+    let (blank_ok, blank_err) = w.run(
+        "acct:admin",
+        &[
+            "package-describe",
+            "--scope",
+            &home,
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+        ],
+    );
+    assert!(!blank_ok, "nothing adopted yet: {blank_err}");
+
+    // ---- install + adopt at the root (children inherit). ----
+    let pkg = write_package(&w, &native_ce::v2_budget::budget_package(), "budget");
+    w.run_ok("acct:admin", &["package-install", "--json", &pkg]);
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-adopt",
+            "--json",
+            &pkg,
+            "--scope",
+            "kernel:root",
+            "--ack-reads",
+            r#"["record:view"]"#,
+        ],
+    );
+
+    // ---- package-describe advertises the operation and its schema. ----
+    let described = w.run_ok(
+        "acct:admin",
+        &[
+            "package-describe",
+            "--scope",
+            &home,
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+        ],
+    );
+    assert_eq!(described["operations"][0]["name"], "recalculate");
+    assert_eq!(
+        described["operations"][0]["provider"],
+        "host.table-arithmetic/1"
+    );
+    assert!(described["provider_schemas"]["host.table-arithmetic/1"].is_object());
+
+    // ---- discovery: describe advertises the visible operation with no hints.
+    let world = w.run_ok("acct:admin", &["describe"]);
+    let discovered = world["package_operations"]
+        .as_array()
+        .expect("visible operation is discoverable");
+    assert!(
+        discovered.iter().any(|entry| {
+            entry["namespace"] == "demo.budget"
+                && entry["name"] == "sheet"
+                && entry["operation"]["name"] == "recalculate"
+                && entry["operation"]["provider"] == "host.table-arithmetic/1"
+        }),
+        "{world}"
+    );
+
+    // ---- create a budget sheet. ----
+    let cells = w.write(
+        "budget-cells.json",
+        br#"{"title":"Q3","cells_json":"{\"A1\":\"100\",\"A2\":\"250\",\"B1\":\"=A1+A2\"}"}"#,
+    );
+    let created = w.run_ok(
+        "acct:admin",
+        &[
+            "create", "--family", family, "--kind", "sheet", "--home", &home, "--json", &cells,
+        ],
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let read1 = w.run_ok("acct:admin", &["read", "--id", &id]);
+    let rev1 = read1["revision"].as_i64().expect("revision token");
+    assert!(read1["fields"]["cells_json"]
+        .as_str()
+        .unwrap()
+        .contains("A1"));
+
+    // ---- call: totals; a call appends nothing. ----
+    let req1 = w.write(
+        "call1.json",
+        format!(r#"{{"record_id":"{id}"}}"#).as_bytes(),
+    );
+    let call1 = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req1,
+        ],
+    );
+    assert_eq!(
+        call1["result"]["cells"]["B1"]["value"],
+        serde_json::json!(350.0),
+        "{call1}"
+    );
+    assert_eq!(call1["result"]["error"], serde_json::Value::Null);
+    assert_eq!(call1["receipt"]["record_revision"], rev1);
+    assert_eq!(call1["receipt"]["provider"], "host.table-arithmetic/1");
+    let read_after_call = w.run_ok("acct:admin", &["read", "--id", &id]);
+    assert_eq!(
+        read_after_call["revision"], rev1,
+        "a call must not append an event"
+    );
+
+    // ---- edit through compare-and-swap: totals change. ----
+    let patched = w.write(
+        "budget-patch.json",
+        br#"{"cells_json":"{\"A1\":\"200\",\"A2\":\"250\",\"B1\":\"=A1+A2\"}"}"#,
+    );
+    w.run_ok(
+        "acct:admin",
+        &[
+            "revise",
+            "--id",
+            &id,
+            "--expected-seq",
+            &rev1.to_string(),
+            "--json",
+            &patched,
+        ],
+    );
+    let read2 = w.run_ok("acct:admin", &["read", "--id", &id]);
+    let rev2 = read2["revision"].as_i64().unwrap();
+    assert!(rev2 > rev1, "edit moves the revision");
+    let req2 = w.write(
+        "call2.json",
+        format!(r#"{{"record_id":"{id}"}}"#).as_bytes(),
+    );
+    let call2 = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req2,
+        ],
+    );
+    assert_eq!(
+        call2["result"]["cells"]["B1"]["value"],
+        serde_json::json!(450.0)
+    );
+
+    // ---- a stale editor refuses and appends nothing. ----
+    let (stale_ok, stale_err) = w.run(
+        "acct:admin",
+        &[
+            "revise",
+            "--id",
+            &id,
+            "--expected-seq",
+            &rev1.to_string(),
+            "--json",
+            &patched,
+        ],
+    );
+    assert!(!stale_ok, "stale edit must refuse: {stale_err}");
+    let read_after_stale = w.run_ok("acct:admin", &["read", "--id", &id]);
+    assert_eq!(read_after_stale["revision"], rev2);
+
+    // ---- whole-operation domain failure: a malformed source is a named
+    // result error, not a transport failure, and it still appends nothing. ----
+    let bad_patched = w.write("budget-bad.json", br#"{"cells_json":"{\"A1\":\"=B9\"}"}"#);
+    w.run_ok(
+        "acct:admin",
+        &[
+            "revise",
+            "--id",
+            &id,
+            "--expected-seq",
+            &rev2.to_string(),
+            "--json",
+            &bad_patched,
+        ],
+    );
+    let rev3 = w.run_ok("acct:admin", &["read", "--id", &id])["revision"]
+        .as_i64()
+        .unwrap();
+    let req3 = w.write(
+        "call3.json",
+        format!(r#"{{"record_id":"{id}"}}"#).as_bytes(),
+    );
+    let call3 = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req3,
+        ],
+    );
+    assert_eq!(call3["result"]["error"]["kind"], "MissingReference");
+    assert_eq!(call3["result"]["error"]["address"], "A1");
+    assert_eq!(call3["receipt"]["record_revision"], rev3);
+    // Repair the source and compute again.
+    w.run_ok(
+        "acct:admin",
+        &[
+            "revise",
+            "--id",
+            &id,
+            "--expected-seq",
+            &rev3.to_string(),
+            "--json",
+            &patched,
+        ],
+    );
+    let call4 = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req1,
+        ],
+    );
+    assert_eq!(
+        call4["result"]["cells"]["B1"]["value"],
+        serde_json::json!(450.0)
+    );
+
+    // ---- view-only can compute but not edit. ----
+    let viewer = w.run_ok(
+        "acct:admin",
+        &[
+            "principal",
+            "--kind",
+            "agent",
+            "--label",
+            "Viewer",
+            "--binding",
+            "agent:viewer",
+        ],
+    );
+    let viewer_id = viewer["principal_id"].as_str().unwrap().to_string();
+    let viewer_grant = w.write(
+        "viewer-grant.json",
+        format!(r#"{{"{viewer_id}": "view"}}"#).as_bytes(),
+    );
+    w.run_ok(
+        "acct:admin",
+        &["grant", "--home", &home, "--json", &viewer_grant],
+    );
+    let viewer_call = w.run_ok(
+        "agent:viewer",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req1,
+        ],
+    );
+    assert_eq!(
+        viewer_call["result"]["cells"]["B1"]["value"],
+        serde_json::json!(450.0)
+    );
+    let (viewer_edit_ok, viewer_edit_err) =
+        w.run("agent:viewer", &["revise", "--id", &id, "--json", &patched]);
+    assert!(
+        !viewer_edit_ok,
+        "view-only must not edit: {viewer_edit_err}"
+    );
+
+    // ---- hidden and nonexistent targets refuse identically. ----
+    let admin_manage = w.write(
+        "admin-manage.json",
+        format!(r#"{{"{admin}": "manage"}}"#).as_bytes(),
+    );
+    let other_home = w.run_ok(
+        "acct:admin",
+        &["home", "--parent", "kernel:root", "--json", &admin_manage],
+    );
+    let other_home_id = other_home["home_id"].as_str().unwrap().to_string();
+    let hidden_cells = w.write(
+        "hidden-cells.json",
+        br#"{"title":"Secret","cells_json":"{\"A1\":\"1\"}"}"#,
+    );
+    let hidden = w.run_ok(
+        "acct:admin",
+        &[
+            "create",
+            "--family",
+            family,
+            "--kind",
+            "sheet",
+            "--home",
+            &other_home_id,
+            "--json",
+            &hidden_cells,
+        ],
+    );
+    let hidden_id = hidden["id"].as_str().unwrap().to_string();
+    let hidden_req = w.write(
+        "hidden-call.json",
+        format!(r#"{{"record_id":"{hidden_id}"}}"#).as_bytes(),
+    );
+    let missing_req = w.write(
+        "missing-call.json",
+        br#"{"record_id":"kernel:no-such-record"}"#,
+    );
+    let (hidden_ok, hidden_err) = w.run(
+        "agent:viewer",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &hidden_req,
+        ],
+    );
+    let (missing_ok, missing_err) = w.run(
+        "agent:viewer",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &missing_req,
+        ],
+    );
+    assert!(!hidden_ok && !missing_ok);
+    assert_eq!(
+        hidden_err["error"], missing_err["error"],
+        "hidden and missing must be indistinguishable"
+    );
+
+    // ---- disable: calls refuse; data, history and replay are unchanged. ----
+    w.run_ok(
+        "acct:admin",
+        &["package-disable", "--json", &pkg, "--scope", "kernel:root"],
+    );
+    let (disabled_ok, disabled_err) = w.run(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.budget",
+            "--name",
+            "sheet",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req1,
+        ],
+    );
+    assert!(!disabled_ok, "disabled package must refuse: {disabled_err}");
+    let disabled_read = w.run_ok("acct:admin", &["read", "--id", &id]);
+    assert!(
+        disabled_read["fields"]["cells_json"].is_string(),
+        "disable preserves readable data: {disabled_read}"
+    );
+    let history = w.run_ok("acct:admin", &["history", "--id", &id]);
+    assert!(history.as_array().unwrap().len() >= 2);
+    let after_disable = w.run_ok("acct:admin", &["describe"]);
+    assert!(
+        after_disable.get("package_operations").is_none(),
+        "a disabled package is not discoverable: {after_disable}"
+    );
+
+    // ---- replay reproduces every projection with no evaluator involved. ----
+    let db = native_ce::db::open_database(&w.db).await.unwrap();
+    let before = native_ce::kernel::dump_all_kernel_tables(&db)
+        .await
+        .unwrap();
+    native_ce::kernel::replay_all_projections(&db)
+        .await
+        .unwrap();
+    let after = native_ce::kernel::dump_all_kernel_tables(&db)
+        .await
+        .unwrap();
+    let replayed = native_ce::kernel::read_record_as(&db, &admin, &id)
+        .await
+        .unwrap()
+        .expect("budget record visible after replay");
+    db.close().await;
+    assert_eq!(before, after, "replay must reproduce every projection");
+    assert_eq!(replayed.pin.as_ref().unwrap().family, family);
+    assert!(replayed.fields["cells_json"]
+        .as_str()
+        .unwrap()
+        .contains("A1"));
+}
+
+/// The same generic provider, driven end-to-end through a renamed custom
+/// fixture (`demo.custom/model`, source field `model_json`) — proving there
+/// are no budget-specific branches in the seam or provider, rather than
+/// asserting it statically.
+#[test]
+fn v2_contract_smoke_generic_provider_renamed_fixture() {
+    let w = World::fresh();
+    let (admin, home) = init_admin_world(&w);
+    let family = "demo.custom.model";
+    let expected_definition_digest =
+        native_ce::meta::definition_artifact::digest_artifact_bytes(CUSTOM_MODEL_BYTES.as_bytes());
+
+    // ---- install + adopt a wholly different package. ----
+    let pkg = write_package(&w, &custom_model_package(), "custom-model");
+    w.run_ok("acct:admin", &["package-install", "--json", &pkg]);
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-adopt",
+            "--json",
+            &pkg,
+            "--scope",
+            "kernel:root",
+            "--ack-reads",
+            r#"["record:view"]"#,
+        ],
+    );
+
+    // ---- create + query + read a record of the custom kind. ----
+    let source = r#"{"A1":"3","A2":"4","B1":"=SUM(A1:A2)","C1":"=B1*2"}"#;
+    let payload = serde_json::json!({"title": "Model", "model_json": source});
+    let create_file = w.write(
+        "custom-model-create.json",
+        &serde_json::to_vec(&payload).unwrap(),
+    );
+    let created = w.run_ok(
+        "acct:admin",
+        &[
+            "create",
+            "--family",
+            family,
+            "--kind",
+            "model",
+            "--home",
+            &home,
+            "--json",
+            &create_file,
+        ],
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let queried = w.run_ok(
+        "acct:admin",
+        &["query", "--family", family, "--kind", "model"],
+    );
+    let hits = queried["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{queried}");
+    assert_eq!(hits[0]["id"], id);
+
+    let read = w.run_ok("acct:admin", &["read", "--id", &id]);
+    assert_eq!(read["pin"]["family"], family);
+    assert_eq!(read["pin"]["version"], 1);
+    assert_eq!(
+        read["pin"]["digest"].as_str().unwrap(),
+        expected_definition_digest
+    );
+    assert_eq!(read["fields"]["model_json"], source);
+    let revision = read["revision"].as_i64().unwrap();
+
+    // ---- call: the provider computes the known chained SUM. ----
+    let req = w.write(
+        "custom-model-call.json",
+        format!(r#"{{"record_id":"{id}"}}"#).as_bytes(),
+    );
+    let call = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.custom",
+            "--name",
+            "model",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req,
+        ],
+    );
+    assert_eq!(
+        call["result"]["cells"]["B1"]["value"],
+        serde_json::json!(7.0),
+        "{call}"
+    );
+    assert_eq!(
+        call["result"]["cells"]["C1"]["value"],
+        serde_json::json!(14.0)
+    );
+    assert_eq!(call["result"]["error"], serde_json::Value::Null);
+    assert_eq!(call["receipt"]["family"], family);
+    assert_eq!(call["receipt"]["kind"], "model");
+    assert_eq!(call["receipt"]["definition_version"], 1);
+    assert_eq!(
+        call["receipt"]["definition_digest"].as_str().unwrap(),
+        expected_definition_digest
+    );
+    assert_eq!(call["receipt"]["provider"], "host.table-arithmetic/1");
+    assert_eq!(call["receipt"]["operation"], "recalculate");
+    assert_eq!(call["receipt"]["record_id"], id);
+    assert_eq!(call["receipt"]["record_revision"], revision);
+    assert_eq!(
+        call["receipt"]["input_digest"].as_str().unwrap(),
+        native_ce::meta::definition_artifact::digest_artifact_bytes(source.as_bytes())
+    );
+
+    // ---- a sibling scope stays callable after a child scope is disabled. ----
+    let sibling_grant = w.write(
+        "sibling-grant.json",
+        format!(r#"{{"{admin}":"manage"}}"#).as_bytes(),
+    );
+    let sibling_home = w.run_ok(
+        "acct:admin",
+        &["home", "--parent", "kernel:root", "--json", &sibling_grant],
+    )["home_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sibling_payload =
+        serde_json::json!({"title": "Sibling", "model_json": r#"{"A1":"5","B1":"=A1+1"}"#});
+    let sibling_file = w.write(
+        "sibling-create.json",
+        &serde_json::to_vec(&sibling_payload).unwrap(),
+    );
+    let sibling_id = w.run_ok(
+        "acct:admin",
+        &[
+            "create",
+            "--family",
+            family,
+            "--kind",
+            "model",
+            "--home",
+            &sibling_home,
+            "--json",
+            &sibling_file,
+        ],
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    w.run_ok(
+        "acct:admin",
+        &["package-disable", "--json", &pkg, "--scope", &home],
+    );
+    let (disabled_ok, disabled_err) = w.run(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.custom",
+            "--name",
+            "model",
+            "--operation",
+            "recalculate",
+            "--json",
+            &req,
+        ],
+    );
+    assert!(
+        !disabled_ok,
+        "disabled child scope must refuse: {disabled_err}"
+    );
+    let sibling_req = w.write(
+        "sibling-call.json",
+        format!(r#"{{"record_id":"{sibling_id}"}}"#).as_bytes(),
+    );
+    let sibling_call = w.run_ok(
+        "acct:admin",
+        &[
+            "package-call",
+            "--namespace",
+            "demo.custom",
+            "--name",
+            "model",
+            "--operation",
+            "recalculate",
+            "--json",
+            &sibling_req,
+        ],
+    );
+    assert_eq!(
+        sibling_call["result"]["cells"]["B1"]["value"],
+        serde_json::json!(6.0),
+        "{sibling_call}"
+    );
+}
+
+#[tokio::test]
+async fn v2_contract_smoke_document4_adoption_retains_document3_and_enables_note_metadata() {
+    let w = World::fresh();
+    let (_, home) = init_admin_world(&w);
+    let old_package = write_package(
+        &w,
+        &native_ce::v2_standard::document3_package(),
+        "document3",
+    );
+    let new_package = write_package(
+        &w,
+        &native_ce::v2_standard::document4_package(),
+        "document4",
+    );
+    for package in [&old_package, &new_package] {
+        w.run_ok("acct:admin", &["package-install", "--json", package]);
+    }
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-adopt",
+            "--json",
+            &old_package,
+            "--scope",
+            "kernel:root",
+            "--ack-reads",
+            "[]",
+        ],
+    );
+    let old_fields = w.write("old-note.json", br#"{"title":"Old synthetic note"}"#);
+    let old = w.run_ok(
+        "acct:admin",
+        &[
+            "create",
+            "--family",
+            "native.standard.document",
+            "--kind",
+            "note",
+            "--home",
+            &home,
+            "--json",
+            &old_fields,
+        ],
+    );
+    let id = old["id"].as_str().unwrap();
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-disable",
+            "--json",
+            &old_package,
+            "--scope",
+            "kernel:root",
+        ],
+    );
+    w.run_ok(
+        "acct:admin",
+        &[
+            "package-adopt",
+            "--json",
+            &new_package,
+            "--scope",
+            "kernel:root",
+            "--ack-reads",
+            "[]",
+        ],
+    );
+    let retained = w.run_ok("acct:admin", &["read", "--id", id]);
+    assert_eq!(retained["pin"]["version"], 3);
+    let fields = w.write(
+        "new-note.json",
+        br#"{"summary":"Synthetic summary","lifecycle":"published"}"#,
+    );
+    let new = w.run_ok(
+        "acct:admin",
+        &[
+            "create",
+            "--family",
+            "native.standard.document",
+            "--kind",
+            "note",
+            "--home",
+            &home,
+            "--json",
+            &fields,
+        ],
+    );
+    let new_id = new["id"].as_str().unwrap();
+    assert_ne!(new_id, id);
+    let read = w.run_ok("acct:admin", &["read", "--id", new_id]);
+    assert_eq!(read["pin"]["version"], 4);
+    assert_eq!(read["fields"]["summary"], "Synthetic summary");
+    assert_eq!(read["fields"]["lifecycle"], "published");
+    assert!(read["fields"].get("title").is_none());
+}
+
+#[tokio::test]
+async fn v2_contract_smoke_kernel_mcp_banner_describes_persisted_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("banner.db");
+    let (db, _) = native_ce::kernel::create_v2_database(
+        path.to_str().unwrap(),
+        "account",
+        "Admin",
+        "banner-account",
+    )
+    .await
+    .unwrap();
+    db.close().await;
+    let output = Command::new(env!("CARGO_BIN_EXE_mcp-stdio"))
+        .args([
+            "--kernel-v2",
+            "--account",
+            "banner-account",
+            path.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("ordinary MCP reads, writes, search and coordination"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("runs and receipts persisted"), "{stderr}");
+    assert!(!stderr.contains("run keys echoed"), "{stderr}");
 }

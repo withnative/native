@@ -1200,6 +1200,69 @@ async fn mixed_snapshot_raw_receipt_is_actual_current_v2_and_v1_has_none() {
 }
 
 #[tokio::test]
+async fn package_marker_sets_the_proof_body_limit_for_a_600_kb_installed_bundle() {
+    Box::pin(async {
+        // A 600 KB bundle: over the ordinary limit, inside the package limit.
+        let big = format!(
+            "<!doctype html><html><body><!--{}--></body></html>",
+            "a".repeat(600_000)
+        );
+        let f = Box::pin(fixture_with_source_body(&big)).await;
+        for (marker, expected) in [
+            (None, crate::artifact_html::BODY_LIMIT),
+            (Some("false"), crate::artifact_html::BODY_LIMIT),
+            (Some("true"), crate::artifact_html::PACKAGE_BODY_LIMIT),
+        ] {
+            if let Some(value) = marker {
+                crate::store::set_facet(
+                    &f.db,
+                    &f.artifact,
+                    crate::events::FacetSetPayload {
+                        key: crate::artifact_html::PACKAGE_FACET_KEY.into(),
+                        value: Some(value.into()),
+                        vocab_ref: None,
+                        as_of: None,
+                        observation_only: false,
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let mut holder = fixture_resources(&f.db, &f.slots).await;
+            {
+                let Resources {
+                    connection,
+                    budget,
+                    cpu,
+                    ..
+                } = &mut holder;
+                let transaction = connection.as_mut().unwrap().begin().await.unwrap();
+                let mut snapshot = ReadSnapshot {
+                    transaction,
+                    budget: budget.as_mut().unwrap(),
+                    viewer: "acct_alice".into(),
+                    member: true,
+                };
+                let handle = f.db.handle_id().to_string();
+                let proof = resolve_current(&mut snapshot, PACKAGE, &handle, cpu)
+                    .await
+                    .unwrap();
+                assert_eq!(proof.body, big);
+                assert_eq!(proof.body_limit, expected, "marker {marker:?}");
+                assert_eq!(
+                    proof.body.len() > proof.body_limit,
+                    expected == crate::artifact_html::BODY_LIMIT
+                );
+                snapshot.transaction.rollback().await.unwrap();
+            }
+            holder.finish().await.unwrap();
+        }
+        f.db.close().await;
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn mixed_issuance_caller_cancel_before_ack_cleans_reserved_pair_after_real_finalization() {
     Box::pin(async {
         use crate::body_read::hosted::{self, OwnedRequest, Work};

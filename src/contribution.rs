@@ -404,8 +404,7 @@ pub struct ViewerDisclosure {
 /// actually carries a `body` key. Attribution already relies on this rule, and
 /// duplicating a *different* rule here would let a comment's byline and its
 /// attribution disagree about which event a reader is looking at.
-pub const BODY_PRODUCING_EVENT_SQL: &str = "(type = 'record.created' \
-     OR (type = 'record.updated' AND json_type(payload, '$.body') IS NOT NULL))";
+pub use crate::record_body::BODY_PRODUCING_EVENT_SQL;
 
 /// Fold raw engine facts plus a viewer's disclosure into the wire projection.
 ///
@@ -593,14 +592,7 @@ pub async fn raw_contribution_in(
     tx: &mut Transaction<'_, Sqlite>,
     record_id: &str,
 ) -> Result<Option<RawContribution>> {
-    let current = sqlx::query(&format!(
-        "SELECT id, type, run_key, actor FROM content_events
-          WHERE record_id = ? AND {BODY_PRODUCING_EVENT_SQL}
-          ORDER BY seq DESC LIMIT 1"
-    ))
-    .bind(record_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+    let current = crate::record_body::latest_revision_facts_on(&mut **tx, record_id).await?;
     let Some(current) = current else {
         return Ok(None);
     };

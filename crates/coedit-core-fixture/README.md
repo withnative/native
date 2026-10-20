@@ -1,7 +1,7 @@
 # Actual core ↔ SDK interoperability fixture
 
 This opt-in test executable compiles the real `src/coedit/registry.rs` and
-`refusal.rs` through source-path modules. It does not link `native_ce` or copy
+`refusal.rs`, `span_map.rs` and `text_diff.rs` through source-path modules. It does not link `native_ce` or copy
 its CRDT/admission algorithm. The SDK suite constructs actual `CoeditClient`
 instances, sends their Yjs v1 bytes to Rust and consumes Rust's sync/broadcast
 bytes. `FakeHome` is not involved.
@@ -25,8 +25,8 @@ COEDIT_CORE_FIXTURE_BIN="$PWD/../../target/debug/coedit-core-fixture" npm run te
 The executable path must be absolute. A missing binary, incompatible handshake,
 stale source hash, child failure, malformed output or timeout fails the suite;
 nothing is skipped. A non-default Cargo target directory requires its actual
-absolute executable path instead. `build.rs` embeds SHA-256 hashes of both
-included source files at compile time and requests a rebuild when either changes.
+absolute executable path instead. `build.rs` embeds SHA-256 hashes of all four
+included source files at compile time and requests a rebuild when any changes.
 Before attaching any SDK client, the harness compares those hashes with the
 current checkout's bytes. The executable is excluded from Rust test-harness
 compilation (`cfg(not(test))`); the included core unit tests remain owned and

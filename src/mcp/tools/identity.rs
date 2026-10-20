@@ -40,7 +40,12 @@ struct ResolveExternalArgs {
     reason: String,
 }
 
-async fn resolve_external(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+async fn resolve_external(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
+    super::keyed_replay::refuse_key_on_naturally_idempotent_write(
+        "resolve_external",
+        super::keyed_replay::RESOLVE_EXTERNAL_IS_IDEMPOTENT,
+        &mut arguments,
+    )?;
     let args: ResolveExternalArgs = parse_args("resolve_external", arguments)?;
     require_nonblank_reason("resolve_external", &args.reason)?;
     let result = identity::resolve_external(

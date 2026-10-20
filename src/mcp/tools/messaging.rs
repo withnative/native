@@ -24,6 +24,13 @@ use super::{
     REASON_DESCRIPTION,
 };
 
+// Missing means no claim; explicit null is an invalid supplied claim.
+fn deserialize_speaker_claim<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, tag = "action", rename_all = "snake_case")]
 // This is the transport contract's closed action union. Boxing the Send
@@ -35,6 +42,8 @@ enum ManageMessagesArgs {
         #[serde(default)]
         id: Option<String>,
         body: String,
+        #[serde(default, deserialize_with = "deserialize_speaker_claim")]
+        speaker: Option<Value>,
         #[serde(default)]
         preview: Option<String>,
         #[serde(default)]
@@ -63,15 +72,21 @@ enum ManageMessagesArgs {
     Classify {
         message_id: String,
         conversation_id: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Unclassify {
         message_id: String,
         conversation_id: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Move {
         message_id: String,
         from_conversation_id: String,
         to_conversation_id: String,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     ShareHistory {
         recipient_id: String,
@@ -82,6 +97,9 @@ enum ManageMessagesArgs {
         #[serde(default)]
         snapshot_seq: Option<i64>,
         reason: String,
+        /// Parsed only so a key is refused by name, not as an unknown field.
+        #[serde(default)]
+        idempotency_key: Option<Value>,
     },
     AddReaction {
         message_id: String,
@@ -96,6 +114,18 @@ enum ManageMessagesArgs {
         reason: String,
     },
     SatisfyAcknowledgementExpectationWithReaction {
+        message_id: String,
+        idempotency_key: String,
+        reason: String,
+    },
+    MarkNoLongerRelevant {
+        message_id: String,
+        #[serde(default)]
+        note: Option<String>,
+        idempotency_key: String,
+        reason: String,
+    },
+    UnmarkNoLongerRelevant {
         message_id: String,
         idempotency_key: String,
         reason: String,
@@ -177,6 +207,12 @@ enum ManageMessagesArgs {
     GetAttention,
 }
 
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn validate_kernel_arguments(arguments: &Value) -> Result<()> {
+    let _: ManageMessagesArgs = parse_args("manage_messages", arguments.clone())?;
+    Ok(())
+}
+
 fn default_inbox_view() -> String {
     "needs_me".into()
 }
@@ -220,6 +256,91 @@ fn decode_snapshot(db: &Db, raw: &str) -> Result<InboxSnapshot> {
         ));
     }
     Ok(snapshot)
+}
+
+/// Validate a classification action's optional key. Blank means no key.
+fn classification_key(action: &str, key: Option<&str>) -> Result<bool> {
+    Ok(super::keyed_replay::idempotency_key(&format!("manage_messages.{action}"), key)?.is_some())
+}
+
+/// `share_history` is not wired for keys, so a key is refused by name, and
+/// before any work, rather than as an unknown field. A null or blank key is no
+/// key, as everywhere else.
+///
+/// It cannot be keyed as written: it reserves one keyed attestation per shared
+/// message inside a single transaction, and the authority index allows one per
+/// command. More fundamentally its receipt carries `snapshot_seq`, the live
+/// log head when the call ran, and `unchanged` messages leave no event, so a
+/// replay could not reproduce the first call's receipt. It does not need a key
+/// to be safe to retry: the grant id derives from the recipient and the exact
+/// message set, so a repeat grants nothing twice and answers `unchanged`.
+fn refuse_share_history_key(key: Option<&Value>) -> Result<()> {
+    let blank = match key {
+        None | Some(Value::Null) => true,
+        Some(Value::String(key)) => key.trim().is_empty(),
+        Some(_) => false,
+    };
+    if blank {
+        Ok(())
+    } else {
+        Err(Error::engine(
+            "manage_messages.share_history does not accept idempotency_key; retry without a key (it is already safe to repeat: a repeated share grants nothing twice)",
+        ))
+    }
+}
+
+/// What a classification action's replay must rebuild.
+enum ClassificationReplay<'a> {
+    Classify(&'a str),
+    Unclassify(&'a str),
+    Move { from: &'a str, to: &'a str },
+}
+
+/// Keyed replay for classify / unclassify / move (contract steps 2 and 3).
+/// Returns the original receipt, with the attestation to settle once the
+/// caller has rolled back, when this key already committed; `None` on a miss.
+async fn replay_classification(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    provenance_arguments: Option<&Value>,
+    message_id: &str,
+    kind: ClassificationReplay<'_>,
+) -> Result<Option<(Value, super::keyed_replay::KeyedReplay)>> {
+    let arguments = provenance_arguments.ok_or_else(|| {
+        Error::engine("manage_messages: keyed classification lost its dispatched arguments")
+    })?;
+    let Some(replay) =
+        super::keyed_replay::keyed_replay_in(tx, caller, "manage_messages", arguments).await?
+    else {
+        return Ok(None);
+    };
+    // An anchor is a keyed no-op: nothing was classified or removed.
+    let receipt = match kind {
+        ClassificationReplay::Classify(conversation_id) => {
+            if replay.is_noop() {
+                json!({"status":"unchanged","message_id":message_id,"conversation_id":conversation_id,"changed":false})
+            } else {
+                json!({"status":"classified","message_id":message_id,"conversation_id":conversation_id,"changed":true})
+            }
+        }
+        ClassificationReplay::Unclassify(conversation_id) => {
+            if replay.is_noop() {
+                json!({"status":"unchanged","message_id":message_id,"conversation_id":conversation_id,"changed":false})
+            } else {
+                json!({"status":"unclassified","message_id":message_id,"conversation_id":conversation_id,"changed":true})
+            }
+        }
+        ClassificationReplay::Move { from, to } => {
+            if replay.is_noop() {
+                return Err(Error::engine(
+                    "manage_messages: idempotent receipt is incomplete",
+                ));
+            }
+            json!({"status":"moved","message_id":message_id,"from_conversation_id":from,"to_conversation_id":to,"changed":true})
+        }
+    };
+    let receipt = echo_act(receipt, replay.act())?;
+    Ok(Some((receipt, replay)))
 }
 
 async fn relation_exists(
@@ -752,6 +873,15 @@ async fn reaction_groups(db: &Db, viewer_account: &str, message_id: &str) -> Res
         .collect())
 }
 
+#[cfg(test)]
+pub(crate) async fn reaction_groups_for_projection_test(
+    db: &Db,
+    viewer: &str,
+    message: &str,
+) -> Result<Vec<Value>> {
+    reaction_groups(db, viewer, message).await
+}
+
 async fn reaction_groups_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     viewer_account: &str,
@@ -868,6 +998,17 @@ async fn message_state(db: &Db, caller: &Caller, message_id: &str) -> Result<Val
     Ok(state)
 }
 
+/// Mirrors `my_message_state.unread`: preferences never regress awareness,
+/// and archive/own-human-message hiding takes precedence over an override.
+fn private_message_unread(
+    stage: &str,
+    is_own: bool,
+    archived: bool,
+    unread_override: Option<bool>,
+) -> bool {
+    !is_own && !archived && unread_override.unwrap_or(!matches!(stage, "opened" | "acknowledged"))
+}
+
 async fn message_state_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
@@ -876,8 +1017,34 @@ async fn message_state_in(
     require_visible_message_in(tx, caller, message_id).await?;
     let (expectation, can_satisfy_acknowledgement) =
         acknowledgement_eligibility_in(tx, caller, message_id).await?;
+    let attention = sqlx::query(
+        "SELECT COALESCE(h.stage,'unsurfaced') stage, COALESCE(h.version,0) human_version,
+                EXISTS(SELECT 1 FROM message_mentions mm JOIN bindings b ON b.record_id=mm.target_record_id AND b.system='account' AND b.is_canonical=1
+                  WHERE mm.message_id=r.id AND mm.target_kind='principal' AND mm.effective=1 AND b.identifier=?) mentioned,
+                p.unread_override, COALESCE(p.version,0) version,
+                COALESCE(p.archived,0) archived,
+                CASE WHEN r.owner_id=(SELECT account.record_id FROM bindings account JOIN records person ON person.id=account.record_id WHERE account.system='account' AND account.identifier=? AND account.is_canonical=1 AND person.type='Entity' AND person.kind='person' AND person.deleted_at IS NULL ORDER BY account.record_id LIMIT 1)
+                     AND NOT EXISTS(SELECT 1 FROM message_speakers s WHERE s.message_id=r.id) THEN 1 ELSE 0 END is_own
+           FROM records r
+           LEFT JOIN human_message_awareness h ON h.message_id=r.id AND h.subject_account_id=?
+           LEFT JOIN message_preferences p ON p.message_id=r.id AND p.subject_account_id=?
+          WHERE r.id=?",
+    )
+    .bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential())
+    .bind(message_id).fetch_one(&mut **tx).await?;
+    let stage: String = attention.try_get("stage")?;
+    let unread_override: Option<bool> = attention.try_get("unread_override")?;
+    let unread = private_message_unread(
+        &stage,
+        attention.try_get("is_own")?,
+        attention.try_get("archived")?,
+        unread_override,
+    );
     Ok(json!({
         "message_id":message_id,
+        "human":{"stage":stage,"version":attention.try_get::<i64,_>("human_version")?},
+        "mention":{"principal":attention.try_get::<bool,_>("mentioned")?},
+        "attention":{"unread":unread,"unread_override":unread_override,"version":attention.try_get::<i64,_>("version")?,"archived":attention.try_get::<bool,_>("archived")?},
         "reactions":reaction_groups_in(tx, caller.credential(), message_id).await?,
         "message_expectation_state":expectation,
         "can_satisfy_acknowledgement":can_satisfy_acknowledgement,
@@ -1382,6 +1549,311 @@ async fn satisfy_acknowledgement_expectation_with_reaction(
     )
 }
 
+/// The caller's live no-longer-relevant marks on a Message: Annotation
+/// records they own with a live `resolves`/`no_longer_relevant` link to the
+/// Message, oldest link first. Normally at most one, but archiving plus
+/// re-marking plus a restore can leave several; unmark removes all of them.
+async fn own_no_longer_relevant_marks_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    owner_id: &str,
+    message_id: &str,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT r.id FROM main.links l JOIN main.records r ON r.id = l.source_id
+          WHERE l.target_id = ? AND l.relationship = ? AND l.note = ?
+            AND r.owner_id = ? AND r.type = 'Annotation' AND r.kind = 'no_longer_relevant'
+            AND r.deleted_at IS NULL AND r.archived = 0
+          ORDER BY l.created_at, l.id",
+    )
+    .bind(message_id)
+    .bind(crate::message_expectation::NO_LONGER_RELEVANT_RELATIONSHIP)
+    .bind(crate::message_expectation::NO_LONGER_RELEVANT_NOTE)
+    .bind(owner_id)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+async fn mark_message_no_longer_relevant(
+    db: &Db,
+    caller: &Caller,
+    message_id: String,
+    note: Option<String>,
+    idempotency_key: String,
+    reason: String,
+    provenance_arguments: Option<&Value>,
+) -> Result<Value> {
+    require_nonblank_reason("manage_messages.mark_no_longer_relevant", &reason)?;
+    super::keyed_replay::idempotency_key(
+        "manage_messages.mark_no_longer_relevant",
+        Some(&idempotency_key),
+    )?
+    .ok_or_else(|| Error::engine("no_longer_relevant idempotency_key must not be blank"))?;
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    require_local_message_in(&mut tx, caller, &message_id).await?;
+    let actor_record_id = caller_record_id_in(&mut tx, caller).await?.ok_or_else(|| {
+        Error::engine("marking no longer relevant requires a portable account binding")
+    })?;
+    // Keyed replay: after authorization, before the existing-mark check the
+    // first call's own effect would now trip. The receipt is rebuilt from the
+    // attestation's own outputs alone, never from live state: the effect
+    // path leaves a `record.created` output, while the already-marked path
+    // below re-appends the live mark's `resolves` link (a projection upsert,
+    // so the projection is unchanged) precisely so the retry finds that
+    // output and replays the original receipt.
+    if let Some(replay) = super::keyed_replay::keyed_replay_in(
+        &mut tx,
+        caller,
+        "manage_messages",
+        provenance_arguments.ok_or_else(|| {
+            Error::engine("manage_messages: keyed mark lost its dispatched arguments")
+        })?,
+    )
+    .await?
+    {
+        let created = replay
+            .content()
+            .iter()
+            .find(|output| output.event_type == "record.created")
+            .map(|output| output.record_id.clone());
+        let relinked = replay.content().iter().find_map(|output| {
+            (output.event_type == "link.added"
+                && output.payload.get("relationship").and_then(Value::as_str)
+                    == Some(crate::message_expectation::NO_LONGER_RELEVANT_RELATIONSHIP))
+            .then(|| {
+                output
+                    .payload
+                    .get("source_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten()
+        });
+        let (evidence_record_id, changed) = match (created, relinked) {
+            (Some(id), _) => (id, true),
+            (None, Some(id)) => (id, false),
+            (None, None) => {
+                return Err(Error::engine(
+                    "no_longer_relevant retry has no valid durable evidence",
+                ));
+            }
+        };
+        tx.rollback().await?;
+        replay.settle();
+        // A keyed replay returns the original write's act.
+        return echo_act(
+            json!({
+            "status":"marked","message_id":message_id,
+            "evidence_record_id":evidence_record_id,"changed":changed,
+            }),
+            replay.act(),
+        );
+    }
+    if let Some(existing) = own_no_longer_relevant_marks_in(&mut tx, &actor_record_id, &message_id)
+        .await?
+        .into_iter()
+        .next()
+    {
+        // Already marked: re-append the live mark's link so this call leaves
+        // the attested output a retry replays. This is a real `link.added`
+        // event, not a silent no-op: it touches the mark's `updated_at` and
+        // `last_activity_at`, appears in history, and can wake need
+        // subscriptions, even though the receipt says `changed:false`. That
+        // is accepted: it happens only when a caller marks an already-marked
+        // message with a new idempotency key, and the projection itself is
+        // unchanged (the links fold upserts on source, target and
+        // relationship). The receipt reports the live mark unchanged.
+        append_in(
+            db,
+            &mut tx,
+            AppendSpec {
+                record_id: existing.clone(),
+                event_type: "link.added".into(),
+                payload: serde_json::to_value(LinkAddedPayload {
+                    id: None,
+                    source_id: existing.clone(),
+                    target_id: message_id.clone(),
+                    relationship: crate::message_expectation::NO_LONGER_RELEVANT_RELATIONSHIP
+                        .into(),
+                    note: Some(crate::message_expectation::NO_LONGER_RELEVANT_NOTE.into()),
+                })?,
+                actor: Some(caller.actor().into()),
+            },
+            &mut act_alloc,
+        )
+        .await?;
+        db.commit_content(tx).await?;
+        return echo_act(
+            json!({
+            "status":"marked","message_id":message_id,
+            "evidence_record_id":existing,"changed":false,
+            }),
+            act_alloc.get(),
+        );
+    }
+    // Each mark creates a fresh record with a random id carrying its own
+    // note, so a squatted id can never block a mark, a deleted or archived
+    // record never wedges a re-mark, and a re-mark keeps its new note.
+    let evidence_id = uuid::Uuid::new_v4().to_string();
+    let home_id: Option<String> = sqlx::query_scalar("SELECT home_id FROM records WHERE id=?")
+        .bind(&message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    // The mark is an inert Annotation container with the open kind
+    // `no_longer_relevant`: it must stay visible to the caller-relative
+    // `messages_awaiting_reply` derivation, whose shared visibility relation
+    // excludes the governed `acknowledgement` (and `attribution`) kinds, and
+    // it must not read as a real acknowledgement, so the governed
+    // acknowledgement kind is wrong on both counts. The semantics live on
+    // the `resolves`/`no_longer_relevant` link, never on the kind. The
+    // optional note becomes the body; an empty body is fine.
+    let mut fields = serde_json::Map::new();
+    fields.insert("type".into(), json!("Annotation"));
+    fields.insert("kind".into(), json!("no_longer_relevant"));
+    fields.insert("name".into(), json!("No longer relevant"));
+    fields.insert("body".into(), json!(note.unwrap_or_default()));
+    fields.insert("owner_id".into(), json!(actor_record_id));
+    fields.insert("reason".into(), json!(reason.clone()));
+    if let Some(home_id) = home_id {
+        fields.insert("home_id".into(), json!(home_id));
+    }
+    append_in(
+        db,
+        &mut tx,
+        AppendSpec {
+            record_id: evidence_id.clone(),
+            event_type: "record.created".into(),
+            payload: Value::Object(fields),
+            actor: Some(caller.actor().into()),
+        },
+        &mut act_alloc,
+    )
+    .await?;
+    clone_message_visibility_to_evidence_in(
+        &mut tx,
+        caller,
+        &message_id,
+        &evidence_id,
+        &mut act_alloc,
+    )
+    .await?;
+    append_link_if_missing_in(
+        db,
+        &mut tx,
+        caller,
+        &evidence_id,
+        &message_id,
+        "part_of",
+        &mut act_alloc,
+    )
+    .await?;
+    append_in(
+        db,
+        &mut tx,
+        AppendSpec {
+            record_id: evidence_id.clone(),
+            event_type: "link.added".into(),
+            payload: serde_json::to_value(LinkAddedPayload {
+                id: None,
+                source_id: evidence_id.clone(),
+                target_id: message_id.clone(),
+                relationship: crate::message_expectation::NO_LONGER_RELEVANT_RELATIONSHIP.into(),
+                note: Some(crate::message_expectation::NO_LONGER_RELEVANT_NOTE.into()),
+            })?,
+            actor: Some(caller.actor().into()),
+        },
+        &mut act_alloc,
+    )
+    .await?;
+    db.commit_content(tx).await?;
+    echo_act(
+        json!({
+        "status":"marked","message_id":message_id,
+        "evidence_record_id":evidence_id,"changed":true,
+        }),
+        act_alloc.get(),
+    )
+}
+
+async fn unmark_message_no_longer_relevant(
+    db: &Db,
+    caller: &Caller,
+    message_id: String,
+    idempotency_key: String,
+    reason: String,
+    provenance_arguments: Option<&Value>,
+) -> Result<Value> {
+    require_nonblank_reason("manage_messages.unmark_no_longer_relevant", &reason)?;
+    super::keyed_replay::idempotency_key(
+        "manage_messages.unmark_no_longer_relevant",
+        Some(&idempotency_key),
+    )?
+    .ok_or_else(|| Error::engine("no_longer_relevant idempotency_key must not be blank"))?;
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    require_local_message_in(&mut tx, caller, &message_id).await?;
+    let actor_record_id = caller_record_id_in(&mut tx, caller).await?.ok_or_else(|| {
+        Error::engine("unmarking no longer relevant requires a portable account binding")
+    })?;
+    // Keyed replay: after authorization, before the existing-mark check the
+    // first call's own effect would now trip.
+    if let Some(replay) = super::keyed_replay::keyed_replay_in(
+        &mut tx,
+        caller,
+        "manage_messages",
+        provenance_arguments.ok_or_else(|| {
+            Error::engine("manage_messages: keyed unmark lost its dispatched arguments")
+        })?,
+    )
+    .await?
+    {
+        let changed = !replay.is_noop();
+        tx.rollback().await?;
+        replay.settle();
+        return echo_act(
+            json!({
+            "status":"unmarked","message_id":message_id,"changed":changed,
+            }),
+            replay.act(),
+        );
+    }
+    // Undoing removes all of the caller's own live mark links, which
+    // reopens the expectation at the next derivation. There is normally one,
+    // but an archived mark plus a re-mark plus a restore can leave several.
+    // The evidence records themselves are kept as history.
+    let existing = own_no_longer_relevant_marks_in(&mut tx, &actor_record_id, &message_id).await?;
+    let changed = !existing.is_empty();
+    for evidence_id in existing {
+        append_in(
+            db,
+            &mut tx,
+            AppendSpec {
+                record_id: evidence_id.clone(),
+                event_type: "link.removed".into(),
+                payload: serde_json::to_value(LinkRemovedPayload {
+                    source_id: evidence_id,
+                    target_id: message_id.clone(),
+                    relationship: crate::message_expectation::NO_LONGER_RELEVANT_RELATIONSHIP
+                        .into(),
+                })?,
+                actor: Some(caller.actor().into()),
+            },
+            &mut act_alloc,
+        )
+        .await?;
+    }
+    if !changed {
+        super::keyed_replay::anchor_noop_in(&mut tx).await?;
+    }
+    db.commit_content(tx).await?;
+    echo_act(
+        json!({
+        "status":"unmarked","message_id":message_id,"changed":changed,
+        }),
+        act_alloc.get(),
+    )
+}
+
 async fn visible_message_rows(
     db: &Db,
     caller: &Caller,
@@ -1665,6 +2137,9 @@ async fn list_context(
         if let Some(supersedes_id) = supersedes_targets.remove(id) {
             value["supersedes_id"] = Value::String(supersedes_id);
         }
+        if let Some(speaker) = crate::persona::message_speaker(&mut snapshot, id).await? {
+            value["speaker"] = speaker;
+        }
         messages.push(value);
     }
     snapshot.rollback().await?;
@@ -1929,11 +2404,18 @@ async fn hydrate_inbox_items_in(
     let ids_json = serde_json::to_string(message_ids)?;
     let rows = sqlx::query(
         "SELECT r.id,r.name,r.body,r.created_at,r.home_id,
+                CASE WHEN r.owner_id=(SELECT account.record_id FROM bindings account JOIN records person ON person.id=account.record_id WHERE account.system='account' AND account.identifier=? AND account.is_canonical=1 AND person.type='Entity' AND person.kind='person' AND person.deleted_at IS NULL ORDER BY account.record_id LIMIT 1) AND NOT EXISTS(SELECT 1 FROM message_speakers speaker WHERE speaker.message_id=r.id) THEN 1 ELSE 0 END AS is_own,
+                p.unread_override,
                 COALESCE(h.stage,'unsurfaced') human_stage,COALESCE(h.version,0) human_version,
                 COALESCE(a.state,'unhandled') agent_state,COALESCE(a.version,0) agent_version,
                 COALESCE(p.attention_flag,0) attention_flag,COALESCE(p.muted,0) muted,
                 p.snoozed_until,COALESCE(p.archived,0) archived,COALESCE(p.version,0) preference_version,
-                ir.obligation_state,ir.executor_route,COALESCE(ir.version,0) routing_version
+                ir.obligation_state,ir.executor_route,COALESCE(ir.version,0) routing_version,
+                EXISTS(SELECT 1 FROM message_speakers speaker WHERE speaker.message_id=r.id) AS has_speaker,
+                EXISTS(SELECT 1 FROM message_audiences audience JOIN bindings owner
+                  ON owner.identifier=audience.principal_id AND owner.system='native-principal' AND owner.is_canonical=1
+                  JOIN bindings account ON account.record_id=owner.record_id AND account.system='account' AND account.is_canonical=1
+                  WHERE audience.message_id=r.id AND audience.source='addressed_to' AND account.identifier=?) AS addressed_to_viewer
            FROM records r
            LEFT JOIN human_message_awareness h ON h.message_id=r.id AND h.subject_account_id=?
            LEFT JOIN agent_message_dispositions a ON a.message_id=r.id AND a.subject_account_id=?
@@ -1941,7 +2423,7 @@ async fn hydrate_inbox_items_in(
            LEFT JOIN message_inbox_routing ir ON ir.message_id=r.id AND ir.subject_account_id=?
           WHERE r.id IN (SELECT value FROM json_each(?)) AND r.type='Message' AND r.deleted_at IS NULL",
     )
-    .bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential())
+    .bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential()).bind(caller.credential())
     .bind(&ids_json).fetch_all(&mut **tx).await?;
     let mut rows_by_id = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
@@ -2013,11 +2495,17 @@ async fn hydrate_inbox_items_in(
         let expectation = expectation_by_id
             .remove(message_id)
             .expect("batched expectation derivations cover every hydrated row");
-        let default_obligation = match expectation.state {
-            crate::message_expectation::MessageExpectationState::Open
-            | crate::message_expectation::MessageExpectationState::Unknown => "open",
-            crate::message_expectation::MessageExpectationState::Satisfied => "satisfied",
-            crate::message_expectation::MessageExpectationState::NotRequired => "none",
+        let default_obligation = if row.try_get::<bool, _>("has_speaker")?
+            && !row.try_get::<bool, _>("addressed_to_viewer")?
+        {
+            "none"
+        } else {
+            match expectation.state {
+                crate::message_expectation::MessageExpectationState::Open
+                | crate::message_expectation::MessageExpectationState::Unknown => "open",
+                crate::message_expectation::MessageExpectationState::Satisfied => "satisfied",
+                crate::message_expectation::MessageExpectationState::NotRequired => "none",
+            }
         };
         let obligation_state = row
             .try_get::<Option<String>, _>("obligation_state")?
@@ -2053,7 +2541,7 @@ async fn hydrate_inbox_items_in(
             "obligation":{"state":obligation_state,"expectation_state":expectation.state},
             "route":{"executor":executor_route,"version":row.try_get::<i64,_>("routing_version")?},
             "mention":{"principal":mention_count>0},
-            "attention":{"flagged":row.try_get::<i64,_>("attention_flag")?!=0,"muted":row.try_get::<i64,_>("muted")?!=0,"snoozed_until":snoozed_until,"archived":row.try_get::<i64,_>("archived")?!=0,"version":row.try_get::<i64,_>("preference_version")?},
+            "attention":{"unread":private_message_unread(&human_stage,row.try_get("is_own")?,row.try_get("archived")?,row.try_get("unread_override")?),"unread_override":row.try_get::<Option<bool>,_>("unread_override")?,"flagged":row.try_get::<i64,_>("attention_flag")?!=0,"muted":row.try_get::<i64,_>("muted")?!=0,"snoozed_until":snoozed_until,"archived":row.try_get::<i64,_>("archived")?!=0,"version":row.try_get::<i64,_>("preference_version")?},
             "delivery":{"candidate_count":candidate_count},
             "reactions":reactions,
             "_predicates":{"snoozed":snoozed}
@@ -2216,6 +2704,9 @@ async fn validate_strong_agent_evidence_in(
             | crate::message_expectation::MessageExpectationEvidenceKind::Reply => "reply",
             crate::message_expectation::MessageExpectationEvidenceKind::CompletedWorkItem => "work",
             crate::message_expectation::MessageExpectationEvidenceKind::Decision => "decision",
+            crate::message_expectation::MessageExpectationEvidenceKind::NoLongerRelevant => {
+                "resolution"
+            }
         };
         if evidence
             .iter()
@@ -2253,7 +2744,7 @@ async fn validate_strong_agent_evidence_in(
     ))
 }
 
-fn item_in_view(item: &Value, view: &str) -> bool {
+pub(crate) fn item_in_view(item: &Value, view: &str) -> bool {
     let archived = item["attention"]["archived"].as_bool().unwrap_or(false);
     let snoozed = item["_predicates"]["snoozed"].as_bool().unwrap_or(false);
     let obligation = item["obligation"]["state"].as_str().unwrap_or("none");
@@ -2268,7 +2759,9 @@ fn item_in_view(item: &Value, view: &str) -> bool {
                 && !matches!(agent, "acted" | "resolved")
         }
         "handled_without_me" => human == "unsurfaced" && matches!(agent, "acted" | "resolved"),
-        "all_new" => human != "acknowledged" && !snoozed && !archived,
+        "all_new" => {
+            item["attention"]["unread"].as_bool().unwrap_or(false) && !snoozed && !archived
+        }
         "browse" => true,
         _ => false,
     }
@@ -2298,7 +2791,7 @@ const ATTENTION_CANDIDATE_LIMIT: i64 = 10_001;
 /// no Message bodies, and no inbox snapshot token stored.
 ///
 /// The predicate mirrors the workbench `adapter.newMessages` dot exactly:
-/// unsurfaced human stage, author exclusion against the caller's own live
+/// explicit unread override or legacy unsurfaced human stage, author exclusion against the caller's own live
 /// Person (`owner_id IS NOT` keeps the NULL-owner behaviour identical to the
 /// `!==` comparison), unarchived/unmuted attention in SQL with the
 /// not-future-snoozed check per surviving row in Rust, and a valid
@@ -2332,8 +2825,8 @@ async fn get_attention(db: &Db, caller: &Caller) -> Result<Value> {
              ON p.message_id=r.id AND p.subject_account_id=?
            LEFT JOIN message_origin_state s ON s.message_id=r.id
           WHERE r.type='Message' AND r.deleted_at IS NULL
-            AND COALESCE(h.stage,'unsurfaced')='unsurfaced'
-            AND r.owner_id IS NOT ?
+            AND COALESCE(p.unread_override, CASE WHEN COALESCE(h.stage,'unsurfaced')='unsurfaced' THEN 1 ELSE 0 END)=1
+            AND (r.owner_id IS NOT ? OR EXISTS(SELECT 1 FROM message_speakers speaker WHERE speaker.message_id=r.id))
             AND COALESCE(p.archived,0)=0 AND COALESCE(p.muted,0)=0
           ORDER BY r.created_at DESC, r.id DESC LIMIT ?",
     )
@@ -2420,10 +2913,48 @@ async fn get_attention(db: &Db, caller: &Caller) -> Result<Value> {
 }
 
 async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
-    match parse_args("manage_messages", arguments)? {
+    // The exact dispatched arguments, kept for the keyed classification and
+    // no-longer-relevant actions: a keyed lookup recomputes their digest.
+    let provenance_arguments = matches!(
+        arguments.get("action").and_then(Value::as_str),
+        Some(
+            "classify"
+                | "unclassify"
+                | "move"
+                | "mark_no_longer_relevant"
+                | "unmark_no_longer_relevant"
+        )
+    )
+    .then(|| arguments.clone());
+    let arguments = parse_args("manage_messages", arguments)?;
+    // Sending enters the creation kernel. Keep the unrelated read/awareness
+    // branches out of its poll frame on normal worker and test-thread stacks.
+    match arguments {
+        arguments @ ManageMessagesArgs::Send { .. } => {
+            Box::pin(manage_messages_send(db, caller, arguments)).await
+        }
+        arguments => {
+            Box::pin(manage_messages_non_send(
+                db,
+                caller,
+                arguments,
+                provenance_arguments,
+            ))
+            .await
+        }
+    }
+}
+
+async fn manage_messages_send(
+    db: Db,
+    caller: Caller,
+    arguments: ManageMessagesArgs,
+) -> Result<Value> {
+    match arguments {
         ManageMessagesArgs::Send {
             id,
             body,
+            speaker,
             preview,
             name,
             addressed_to,
@@ -2503,6 +3034,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 caller,
                 create,
                 super::lifecycle::SendMessagePlan {
+                    speaker,
                     idempotency_key,
                     intent_digest,
                     disclosure_preview: preview,
@@ -2510,6 +3042,18 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
             )
             .await
         }
+        _ => unreachable!("send dispatch requires the send variant"),
+    }
+}
+
+async fn manage_messages_non_send(
+    db: Db,
+    caller: Caller,
+    arguments: ManageMessagesArgs,
+    provenance_arguments: Option<Value>,
+) -> Result<Value> {
+    match arguments {
+        ManageMessagesArgs::Send { .. } => unreachable!("send uses its dedicated dispatcher"),
         ManageMessagesArgs::ListContext {
             origin,
             limit,
@@ -2518,11 +3062,30 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
         ManageMessagesArgs::Classify {
             message_id,
             conversation_id,
+            idempotency_key,
         } => {
+            let keyed = classification_key("classify", idempotency_key.as_deref())?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_classification_authority(&mut tx, &caller, &message_id, &conversation_id)
                 .await?;
+            // Keyed replay: after authorization, before the existing-relation
+            // check the first call's own effect would now trip.
+            if keyed {
+                if let Some((receipt, replay)) = replay_classification(
+                    &mut tx,
+                    &caller,
+                    provenance_arguments.as_ref(),
+                    &message_id,
+                    ClassificationReplay::Classify(&conversation_id),
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             let changed = !relation_exists(&mut tx, &message_id, &conversation_id).await?;
             if changed {
                 append_classification(
@@ -2536,6 +3099,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 )
                 .await?;
             }
+            super::keyed_replay::anchor_noop_in(&mut tx).await?;
             db.commit_content(tx).await?;
             Ok(echo_act(
                 json!({"status": if changed {"classified"} else {"unchanged"}, "message_id":message_id,"conversation_id":conversation_id,"changed":changed}),
@@ -2545,11 +3109,28 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
         ManageMessagesArgs::Unclassify {
             message_id,
             conversation_id,
+            idempotency_key,
         } => {
+            let keyed = classification_key("unclassify", idempotency_key.as_deref())?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_classification_authority(&mut tx, &caller, &message_id, &conversation_id)
                 .await?;
+            if keyed {
+                if let Some((receipt, replay)) = replay_classification(
+                    &mut tx,
+                    &caller,
+                    provenance_arguments.as_ref(),
+                    &message_id,
+                    ClassificationReplay::Unclassify(&conversation_id),
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             let changed = relation_exists(&mut tx, &message_id, &conversation_id).await?;
             if changed {
                 append_classification(
@@ -2563,6 +3144,7 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 )
                 .await?;
             }
+            super::keyed_replay::anchor_noop_in(&mut tx).await?;
             db.commit_content(tx).await?;
             Ok(echo_act(
                 json!({"status": if changed {"unclassified"} else {"unchanged"}, "message_id":message_id,"conversation_id":conversation_id,"changed":changed}),
@@ -2573,7 +3155,9 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
             message_id,
             from_conversation_id,
             to_conversation_id,
+            idempotency_key,
         } => {
+            let keyed = classification_key("move", idempotency_key.as_deref())?;
             if from_conversation_id == to_conversation_id {
                 return Err(Error::engine(
                     "manage_messages.move requires different Conversations",
@@ -2591,6 +3175,26 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 Capability::View,
             )
             .await?;
+            // Keyed replay: after both authority checks, before the
+            // source-classification check the first move already consumed.
+            if keyed {
+                if let Some((receipt, replay)) = replay_classification(
+                    &mut tx,
+                    &caller,
+                    provenance_arguments.as_ref(),
+                    &message_id,
+                    ClassificationReplay::Move {
+                        from: &from_conversation_id,
+                        to: &to_conversation_id,
+                    },
+                )
+                .await?
+                {
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             if !relation_exists(&mut tx, &message_id, &from_conversation_id).await? {
                 return Err(Error::engine(
                     "manage_messages.move source classification does not exist",
@@ -2630,7 +3234,9 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
             conversation_id,
             snapshot_seq,
             reason,
+            idempotency_key,
         } => {
+            refuse_share_history_key(idempotency_key.as_ref())?;
             share_history(
                 &db,
                 &caller,
@@ -2687,6 +3293,38 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 message_id,
                 idempotency_key,
                 reason,
+            )
+            .await
+        }
+        ManageMessagesArgs::MarkNoLongerRelevant {
+            message_id,
+            note,
+            idempotency_key,
+            reason,
+        } => {
+            mark_message_no_longer_relevant(
+                &db,
+                &caller,
+                message_id,
+                note,
+                idempotency_key,
+                reason,
+                provenance_arguments.as_ref(),
+            )
+            .await
+        }
+        ManageMessagesArgs::UnmarkNoLongerRelevant {
+            message_id,
+            idempotency_key,
+            reason,
+        } => {
+            unmark_message_no_longer_relevant(
+                &db,
+                &caller,
+                message_id,
+                idempotency_key,
+                reason,
+                provenance_arguments.as_ref(),
             )
             .await
         }
@@ -3204,9 +3842,10 @@ fn manage_messages_schema() -> Value {
     json!({
             "type":"object",
             "properties":{
-                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates","get_attention"]},
+                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","mark_no_longer_relevant","unmark_no_longer_relevant","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates","get_attention"]},
                 "id":{"type":"string"},
                 "body":{"type":"string","minLength":1},
+                "speaker":{"type":"object","properties":{"persona_id":{"type":"string","pattern":"\\S"}},"required":["persona_id"],"additionalProperties":false,"description":"Persona claim."},
                 "preview":{"type":"string","minLength":1,"maxLength":500},
                 "name":{"type":"string"},
                 "addressed_to":{"type":"array","uniqueItems":true,"items":{"type":"string"}},
@@ -3218,6 +3857,7 @@ fn manage_messages_schema() -> Value {
                 "links":{"type":"array","items":{"type":"object","properties":{"target_id":{"type":"string"},"relationship":{"type":"string"},"note":{"type":"string"}},"required":["target_id","relationship"],"additionalProperties":false}},
                 "mentions":{"type":"array","uniqueItems":true,"items":{"type":"object","properties":{"mention_id":{"type":"string"},"target_kind":{"type":"string","enum":["principal","record"]},"target_id":{"type":"string"},"span_start":{"type":"integer","minimum":0},"span_end":{"type":"integer","minimum":1},"authored_label":{"type":"string"}},"required":["mention_id","target_kind","target_id","span_start","span_end","authored_label"],"additionalProperties":false}},
                 "message_id":{"type":"string"},
+                "note":{"type":"string","description":"Optional note stored as the no-longer-relevant mark body."},
                 "emoji":{"type":"string","enum":["👍","❤️","😂","🎉","👀"]},
                 "conversation_id":{"type":"string"},
                 "collection_id":{"type":"string"},
@@ -3234,7 +3874,7 @@ fn manage_messages_schema() -> Value {
                 "idempotency_key":{"type":"string","minLength":1},
                 "state":{"type":"string","enum":["triaged","deferred","escalated","acted","resolved"]},
                 "evidence":{"type":"array","items":{"type":"object","properties":{"record_id":{"type":"string"},"role":{"type":"string","enum":["reply","work","decision","resolution","other"]}},"required":["record_id","role"],"additionalProperties":false}},
-                "preference":{"type":"string","enum":["flag_attention","clear_attention","mute","unmute","snooze","clear_snooze","archive","restore"]},
+                "preference":{"type":"string","enum":["mark_read","mark_unread","flag_attention","clear_attention","mute","unmute","snooze","clear_snooze","archive","restore"],"description":"Private read/unread."},
                 "snoozed_until":{"type":"string","format":"date-time"},
                 "obligation_state":{"type":"string","enum":["none","open","satisfied","withdrawn"]},
                 "executor_route":{"type":"string","enum":["unassigned","human","agent","joint","closed"]},
@@ -3270,6 +3910,7 @@ pub(crate) fn manage_messages_send_operation_schema() -> Value {
     for field in [
         "id",
         "body",
+        "speaker",
         "preview",
         "name",
         "addressed_to",
@@ -3303,6 +3944,11 @@ pub(crate) fn manage_messages_send_operation_schema() -> Value {
         &mut send_properties,
         "origin",
         "Immutable communication origin: the Collection venue or the exact direct participant set. A reply or correction must repeat its target's origin exactly; filing home never substitutes for origin.",
+    );
+    describe_send_property(
+        &mut send_properties,
+        "speaker",
+        "Persona claim {persona_id}; engine selects assurance and the author remains the owner. After ordinary permission checks, invalid, foreign, nonexistent, retired or malformed claims all refuse as speaker not found. A speaker never grants authority. Self-addressing requires a valid speaker fact. Every send receipt, including retries, reports speaker_claim_status recorded|absent for the committed Message. Retries validate supplied claims and cannot add or replace its speaker. Federation export refuses speaker-bearing Messages (participant_message_not_federatable); canonical interchange preserves them.",
     );
     describe_send_property(
         &mut send_properties,
@@ -3436,9 +4082,20 @@ pub(crate) fn manage_messages_send_operation_schema() -> Value {
 pub fn register_messaging_tools(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::ManageMessages,
-        "Send/read direct or Collection contexts; classify/share; manage reactions, 👍 acknowledgement, Inbox, destinations, awareness, routing, preferences. Filing or visibility never establishes context.",
+        "Direct/Collection send/read/classify/share; reactions/👍 ack; Inbox/destinations; awareness/routing/preferences. Filing/visibility ≠ context.",
         manage_messages_schema(),
-        manage_messages,
+        |db, caller, arguments| {
+            // Keyed classify/unclassify/move replay inside their own
+            // BEGIN IMMEDIATE, so the authority-index race is unreachable
+            // today; wrapping it keeps the contract's step 5 backstop.
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_messages(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     registry.register_operation_schema(
         ToolKind::ManageMessages.name(),

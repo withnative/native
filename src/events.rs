@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 /// The canonical event types the projector folds into projections.
-pub const EVENT_TYPES: [&str; 46] = [
+pub const EVENT_TYPES: [&str; 49] = [
     "record.created",
     "record.updated",
     "record.type_corrected.v1",
@@ -25,6 +25,9 @@ pub const EVENT_TYPES: [&str; 46] = [
     "attribution.asserted.v1",
     "attribution.evidence.added.v1",
     "attribution.retracted.v1",
+    "persona.registered.v1",
+    "persona.retired.v1",
+    "message.speaker.declared.v1",
     "message.audience.declared",
     "message.audience.legacy_unknown",
     "message.origin.declared.v1",
@@ -1032,4 +1035,28 @@ mod message_origin_tests {
         );
         assert_eq!(collection.context_key(), "collection:collection-id");
     }
+}
+
+/// Durable identity, independent of mutable persona profile text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaRegisteredPayload {
+    pub owner_person_id: String,
+    pub owner_principal: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaRetiredPayload {
+    pub reason: String,
+}
+
+/// S2 accepts persona claims only. Agent addresses are a later slice.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageSpeakerDeclaredPayload {
+    pub kind: String,
+    pub persona_id: String,
+    pub owner_principal: String,
+    pub assurance: String,
 }

@@ -504,23 +504,13 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
     let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
     // Reconstruct the released engine-58 shape before exercising its real
     // record-mentions backfill edge.
-    sqlx::query("DROP TABLE facet_value_json_nodes")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("DROP TABLE schema_config_json_nodes")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("DROP TABLE workspace_rule_installations")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("DROP TRIGGER content_event_reaction_meta_insert")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("DROP TABLE content_event_reaction_meta")
+    // Everything added since engine 74 comes from the shared step-down table;
+    // the frozen tail below it (engines 59..74) is this fixture's own.
+    for statement in native_ce::schema::step_down::statements(74) {
+        sqlx::query(&statement).execute(&mut conn).await.unwrap();
+    }
+    // The step-down leaves foreign keys off (it rebuilds `records`).
+    sqlx::query("PRAGMA foreign_keys=ON")
         .execute(&mut conn)
         .await
         .unwrap();
@@ -572,14 +562,6 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
     ] {
         sqlx::query(statement).execute(&mut conn).await.unwrap();
     }
-    sqlx::query("DROP TABLE vocabulary_value_json_nodes")
-        .execute(&mut conn)
-        .await
-        .unwrap();
-    sqlx::query("DROP TABLE body_blocks")
-        .execute(&mut conn)
-        .await
-        .unwrap();
     sqlx::query("DROP TABLE body_task_items")
         .execute(&mut conn)
         .await
@@ -628,7 +610,21 @@ async fn unit_revision_body_folds_and_backfills_mentions() {
         let to = from + 1;
         let step = registry.pending(from, to).unwrap().pop().unwrap();
         step.preflight(&mut conn).await.unwrap();
+        // Table rebuilds run with foreign keys fenced off, as the runner does.
+        let fenced = step.requires_foreign_keys_disabled();
+        if fenced {
+            sqlx::query("PRAGMA foreign_keys=OFF")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
         step.apply(&mut conn).await.unwrap();
+        if fenced {
+            sqlx::query("PRAGMA foreign_keys=ON")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
         sqlx::query(&format!("PRAGMA user_version={to}"))
             .execute(&mut conn)
             .await
@@ -774,7 +770,7 @@ async fn outgoing_mentions_resolve_visible_targets_and_count_occurrences() {
 
     let text = render::render("get_record", &payload).unwrap();
     assert!(text.contains("Mentions"), "{text}");
-    assert!(text.contains("resolved to Target note"), "{text}");
+    assert!(text.contains("Target note (bare_hex, ×2)"), "{text}");
     assert!(text.contains("unresolved"), "{text}");
     db.close().await;
 }

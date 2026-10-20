@@ -12,7 +12,7 @@
 //! - Each item is then checked as a single read checks it (snapshot,
 //!   declared SQL key, declaration membership, push-only, parameters), and
 //!   anything wrong with one item is reported against that item only.
-//! - Search, reference and canvas items read through that same gate
+//! - Search, reference, canvas and body-current items read through that same gate
 //!   transaction. SQL items share one governed transaction with its own
 //!   gate. Record-change, artifact-render and snapshot items each run through
 //!   their single read path, which gates on its own (cached) snapshot.
@@ -127,7 +127,7 @@ fn plan(
     }
 }
 
-/// One search, reference or canvas item on the gate's own transaction.
+/// One search, reference, canvas or body-current item on the gate's own transaction.
 async fn host_item_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
@@ -166,6 +166,16 @@ async fn host_item_in(
                 result,
             )
         }
+        DeclaredRead::BodyCurrent {
+            record_id,
+            include_body,
+        } => {
+            let result = body_current_in(tx, caller, &record_id, include_body).await?;
+            (
+                json!({"record_id": record_id, "include_body": include_body}),
+                result,
+            )
+        }
         DeclaredRead::RecordChanges { .. } | DeclaredRead::ArtifactRender { .. } => {
             unreachable!("self-gating reads are planned onto their own path")
         }
@@ -182,32 +192,50 @@ async fn host_item_in(
     ))
 }
 
-/// One SQL item on the governed transaction its gate passed on.
-async fn sql_item_in(
-    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
-    caller: &Caller,
-    package: &str,
+/// A SQL item's need, bound parameters and echo, checked against the
+/// governed gate before anything executes: a parameter refusal never costs a
+/// contract install or a fresh transaction.
+fn prepare_sql_item(
     gate: &LiveReadGate,
     item: &LiveReadItem,
-) -> Result<Value> {
+) -> Result<(
+    SqlNeed,
+    Vec<crate::query::sql_contract::QuerySqlParameter>,
+    Value,
+)> {
     let sql_need = gate
         .verified
         .sql_needs()?
         .into_iter()
         .find(|candidate| candidate.key == item.need)
         .ok_or_else(|| refused("undeclared_need"))?;
-    let echo = item.params.clone().unwrap_or(json!({}));
     let bound = bind_sql_params(&sql_need, item.params.as_ref()).map_err(refused)?;
+    let echo = item.params.clone().unwrap_or(json!({}));
+    Ok((sql_need, bound, echo))
+}
+
+/// One prepared SQL item in the group's governed session.
+#[allow(clippy::too_many_arguments)]
+async fn sql_item_in(
+    session: &mut crate::query::sql::GovernedSqlSession<'_, 'static>,
+    caller: &Caller,
+    package: &str,
+    gate: &LiveReadGate,
+    need: &str,
+    sql_need: &SqlNeed,
+    bound: Vec<crate::query::sql_contract::QuerySqlParameter>,
+    echo: Value,
+) -> Result<Value> {
     let principal: crate::query::QueryPrincipal = caller.into();
-    let executed = execute_sql_need_in(tx, principal, &sql_need, bound, None, None).await?;
-    let revision = sql_keyed_revision(&gate.row, &sql_need, &executed.digest);
+    let executed = execute_sql_need_in(session, principal, sql_need, bound, None, None).await?;
+    let revision = sql_keyed_revision(&gate.row, sql_need, &executed.digest);
     let mut body = declared_read_body(
         package,
         &gate.row,
         &gate.source,
         &gate.runtime,
         &gate.bundle_sha256,
-        &item.need,
+        need,
         echo,
         executed.input,
     );
@@ -217,10 +245,49 @@ async fn sql_item_in(
     Ok(body)
 }
 
-/// The SQL items, in request order, on one governed transaction gated once.
-/// A failed item ends that transaction and the next item opens a fresh one,
-/// so an execution error cannot leave later items on a broken snapshot. A
-/// gate refusal here fails the whole call.
+/// The SQL group's governed transaction: gated first, while it still reads
+/// ordinary tables, then turned into a session (one contract install) for
+/// the first item that executes.
+struct GovernedGroup<'db> {
+    gate: LiveReadGate,
+    gated: Option<sqlx::Transaction<'static, sqlx::Sqlite>>,
+    session: Option<crate::query::sql::GovernedSqlSession<'db, 'static>>,
+}
+
+impl<'db> GovernedGroup<'db> {
+    /// The group's session, opened on first use, beside its gate.
+    async fn session(
+        &mut self,
+        db: &'db Db,
+    ) -> Result<(
+        &mut crate::query::sql::GovernedSqlSession<'db, 'static>,
+        &LiveReadGate,
+    )> {
+        if self.session.is_none() {
+            let tx = self
+                .gated
+                .take()
+                .expect("a group is gated until its session opens");
+            self.session = Some(crate::query::sql::GovernedSqlSession::begin(db, tx).await?);
+        }
+        Ok((self.session.as_mut().expect("opened above"), &self.gate))
+    }
+
+    async fn end(self) -> Result<()> {
+        match (self.session, self.gated) {
+            (Some(session), _) => session.finish().await?.rollback().await?,
+            (None, Some(tx)) => tx.rollback().await?,
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
+/// The SQL items, in request order, on one governed transaction gated once
+/// and under one contract install. A failed execution ends that transaction
+/// and the next item opens a fresh one, so an execution error cannot leave
+/// later items on a broken snapshot. A gate refusal here fails the whole
+/// call.
 async fn sql_group(
     db: &Db,
     caller: &Caller,
@@ -230,34 +297,47 @@ async fn sql_group(
     items: Vec<(usize, &LiveReadItem)>,
 ) -> Result<Vec<(usize, Value)>> {
     let mut out = Vec::with_capacity(items.len());
-    let mut open: Option<(sqlx::Transaction<'static, sqlx::Sqlite>, LiveReadGate)> = None;
+    let mut open: Option<GovernedGroup<'_>> = None;
     for (index, item) in items {
-        let (tx, gate) = match open.as_mut() {
-            Some(open) => open,
-            None => {
-                let mut tx = db.governed_pool().begin().await?;
-                let gate = live_read_gates_in(
-                    db,
-                    &mut tx,
-                    caller,
-                    account_id,
-                    package,
-                    expected_install_event_id,
-                )
-                .await?;
-                open.insert((tx, gate))
+        if open.is_none() {
+            let mut tx = db.governed_pool().begin().await?;
+            let gate = live_read_gates_in(
+                db,
+                &mut tx,
+                caller,
+                account_id,
+                package,
+                expected_install_event_id,
+            )
+            .await?;
+            open = Some(GovernedGroup {
+                gate,
+                gated: Some(tx),
+                session: None,
+            });
+        }
+        let group = open.as_mut().expect("opened above");
+        let (sql_need, bound, echo) = match prepare_sql_item(&group.gate, item) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                out.push((index, item_result(&item.need, Err(error))));
+                continue;
             }
         };
-        let result = sql_item_in(tx, caller, package, gate, item).await;
+        let (session, gate) = group.session(db).await?;
+        let result = sql_item_in(
+            session, caller, package, gate, &item.need, &sql_need, bound, echo,
+        )
+        .await;
         if result.is_err() {
-            if let Some((tx, _)) = open.take() {
-                let _ = tx.rollback().await;
+            if let Some(session) = open.take().and_then(|group| group.session) {
+                session.abandon().await;
             }
         }
         out.push((index, item_result(&item.need, result)));
     }
-    if let Some((tx, _)) = open {
-        tx.rollback().await?;
+    if let Some(group) = open {
+        group.end().await?;
     }
     Ok(out)
 }
@@ -384,7 +464,8 @@ pub(super) async fn do_batch_read(
             ),
             DeclaredRead::Search { .. }
             | DeclaredRead::ResolveReference { .. }
-            | DeclaredRead::CanvasScene { .. } => {
+            | DeclaredRead::CanvasScene { .. }
+            | DeclaredRead::BodyCurrent { .. } => {
                 unreachable!("gate-transaction reads are planned onto the host group")
             }
         };

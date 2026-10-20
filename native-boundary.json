@@ -125,7 +125,167 @@
         },
         {
           "kind": "tree",
-          "source": "src/mcp"
+          "source": "src/markdown_vault"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/action_evidence.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/advisors"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/app_attribution.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/apps.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/authority_act.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/builtin.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/counter_fence.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/deployment_read_only.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/database_freeze.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/evidence.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/executor_prototype"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/executor_prototype.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/federated_source.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/fetch.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/guides"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/hosted_protocol.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/hosted_transport.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/interactions.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/kernel_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/lens_dispatch.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/lens_surface.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/mdx_verification.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/member_scope.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/member_serving.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/member_stdio.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/mod.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/posture-capsule.md"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/product_model.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/protocol.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/record_ref.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/registry.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/render"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/render.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/request_timing.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/snapshot.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/standby_stdio.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/status_only.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/stdio.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/surface.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/tools"
         },
         {
           "kind": "tree",
@@ -361,11 +521,219 @@
         },
         {
           "kind": "file",
+          "source": "src/v1_import.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/v1_import"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel.rs"
         },
         {
           "kind": "file",
+          "source": "src/kernel/hq.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/historical.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/historical/record.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/deletion.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/file_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/workspace_metadata.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/hosted_identity.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/kernel/hosted_identity"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/record_metadata.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/v1_state.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/legacy_history.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/app_state.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/app_installs.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/kernel/app_installs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/blobs.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/generic_links.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/generic_links_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/comments_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/messaging.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/notifications.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/links_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/links_v2_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/commit_port.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/provider_catalogue.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/relates_to_port.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/kernel/fixtures"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/rebind_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/commit_port_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/claims_port.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/claims_port_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/run_ledger.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/search_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_batch.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_batch_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_eval.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_eval_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_gate_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/home_admission_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_home_for_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_host.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_ops.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_ops_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_record_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_recovery.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_recovery_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/slots_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/lib.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/test_process.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/structured_values.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/structured_values/text_formats.rs"
         },
         {
           "kind": "file",
@@ -441,11 +809,27 @@
         },
         {
           "kind": "file",
+          "source": "src/persona.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/package_adopt_tests.rs"
         },
         {
           "kind": "file",
           "source": "src/package_manifest.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/definition_shape.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/definition_shape"
+        },
+        {
+          "kind": "file",
+          "source": "src/package_operations.rs"
         },
         {
           "kind": "tree",
@@ -454,6 +838,10 @@
         {
           "kind": "file",
           "source": "src/portable_sql.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/position.rs"
         },
         {
           "kind": "file",
@@ -474,6 +862,10 @@
         {
           "kind": "file",
           "source": "src/record_body.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/record_body"
         },
         {
           "kind": "file",
@@ -522,6 +914,10 @@
         {
           "kind": "tree",
           "source": "src/standby"
+        },
+        {
+          "kind": "tree",
+          "source": "src/node"
         },
         {
           "kind": "file",
@@ -573,6 +969,10 @@
         },
         {
           "kind": "tree",
+          "source": "src/v2_budget"
+        },
+        {
+          "kind": "tree",
           "source": "src/v2_standard"
         },
         {
@@ -594,6 +994,10 @@
         {
           "kind": "file",
           "source": "src/write_contention.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/asof_fold_time.rs"
         },
         {
           "kind": "file",
@@ -626,6 +1030,18 @@
         {
           "kind": "file",
           "source": "src/bin/tool_types.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_import.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_digest_bench.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_history_bench.rs"
         },
         {
           "kind": "file",
@@ -770,6 +1186,22 @@
         {
           "kind": "file",
           "source": "src/storage_profile/body_admission_tests.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/kernel_v2"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/instruction_bindings.rs"
+        },
+        {
+          "kind": "file",
+          "source": "docs/v2-v1-import.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/saved-session-schema.md"
         }
       ],
       "binaries": [
@@ -988,6 +1420,10 @@
         {
           "kind": "file",
           "source": "docs/local-standby.md"
+        },
+        {
+          "kind": "file",
+          "source": "docs/markdown-vault.md"
         },
         {
           "kind": "file",

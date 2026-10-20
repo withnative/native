@@ -55,7 +55,7 @@ enum CpuOutput {
         )>,
     ),
     AlphaBody(String, String),
-    HtmlPrepared(crate::artifact_html::PreparedLaunch),
+    HtmlPrepared(Box<crate::artifact_html::PreparedLaunch>),
     Canonical(super::hosted::CanonicalBytes),
 }
 
@@ -1075,7 +1075,11 @@ async fn inner_job(
                         context.mixed_reply = Some(bytes);
                         context.mixed_binding = Some(binding);
                     }
-                    (proof.binding, true, Some((proof.body, proof.bundle)))
+                    (
+                        proof.binding,
+                        true,
+                        Some((proof.body, proof.bundle, proof.body_limit)),
+                    )
                 }
             };
             let source = source.checked(&handle)?;
@@ -1103,12 +1107,13 @@ async fn inner_job(
                         #[cfg(test)]
                         _ => return Err(Failure::Engine),
                     };
-                    let (body, bundle) = retained.ok_or(Failure::Engine)?;
-                    if body.len() > crate::artifact_html::BODY_LIMIT {
+                    let (body, bundle, body_limit) = retained.ok_or(Failure::Engine)?;
+                    if body.len() > body_limit {
                         context.refusal = Some(super::hosted::HostRefusal::HtmlUnavailable);
                         return Err(Failure::Engine);
                     }
-                    snapshot.budget.charge(2 * 1024 * 1024, true)?;
+                    // 2 MiB at the ordinary limit; scales with the package limit.
+                    snapshot.budget.charge(4 * body_limit as i64, true)?;
                     let html_context = context
                         .delivery
                         .body_context(&context.origin)
@@ -1127,8 +1132,8 @@ async fn inner_job(
                             wait.recv().unwrap(); // actual registered blocking HTML job
                         }
                         html_context
-                            .prepare(body, expected)
-                            .map(CpuOutput::HtmlPrepared)
+                            .prepare(body, expected, body_limit)
+                            .map(|prepared| CpuOutput::HtmlPrepared(Box::new(prepared)))
                             .map_err(|_| Failure::Engine)
                     })
                     .await;
@@ -1169,7 +1174,7 @@ async fn inner_job(
                     context.reservation = Some(
                         context
                             .delivery
-                            .reserve_body_pair(prepared, meta, ticket_deadline)
+                            .reserve_body_pair(*prepared, meta, ticket_deadline)
                             .map_err(|e| context.fail(e))?,
                     );
                     #[cfg(test)]

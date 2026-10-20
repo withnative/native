@@ -139,6 +139,7 @@ pub(super) async fn project_unit_created(
 pub(super) async fn project_unit_revision_recorded(
     conn: &mut SqliteConnection,
     event: &EventRow,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     require_semantic_actor(event)?;
     assert_record_live(conn, &event.record_id, &event.event_type).await?;
@@ -229,28 +230,17 @@ pub(super) async fn project_unit_revision_recorded(
     // replace the record's body-mention rows exactly as `record.updated`
     // does. The event's own sequence is the provenance: the backfill selects
     // the latest `$.content.content`-bearing `unit.revision.recorded.v1`.
-    crate::body_blocks_projection::replace_sqlite(
+    //
+    // It is likewise a body writer for the block, task-row and record-body
+    // node projections, all folding the Unit string content as `record.updated`
+    // does; a non-object/array string simply leaves no nodes.
+    super::body_deferral::replace_body_derivations(
         conn,
+        defer,
         &event.record_id,
         event.local_seq,
         Some(&payload.content.content),
         crate::body_blocks::BodyFormat::Markdown,
-    )
-    .await?;
-    replace_record_mentions(
-        conn,
-        &event.record_id,
-        event.local_seq,
-        Some(payload.content.content.clone()),
-    )
-    .await?;
-    // E3 M3 increment 2A: a Unit revision is a body writer, so it replaces
-    // the record's body-task rows exactly as `record.updated` does.
-    replace_body_task_items(
-        conn,
-        &event.record_id,
-        event.local_seq,
-        Some(payload.content.content.clone()),
     )
     .await?;
     if let Some(command) = payload.command.as_ref() {
@@ -350,6 +340,7 @@ pub(super) async fn project_occurrence_bound(
 pub(super) async fn project_receipt_committed_aggregate(
     conn: &mut SqliteConnection,
     event: &EventRow,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     require_semantic_actor(event)?;
     assert_record_live(conn, &event.record_id, &event.event_type).await?;
@@ -961,7 +952,9 @@ pub(super) async fn project_receipt_committed_aggregate(
     body_event.payload = Some(serde_json::to_string(&serde_json::json!({
         "body": payload.body
     }))?);
-    project_record_updated(conn, &body_event).await
+    // The synthesized update keeps the receipt's own sequence, so a deferred
+    // entry carries the same `source_event_seq` the immediate write would.
+    project_record_updated(conn, &body_event, defer).await
 }
 
 pub(super) async fn project_reconciliation_recorded(

@@ -1394,6 +1394,7 @@ async fn v2_revise_fields_only_loud_replay() {
     for table in [
         "kernel_links",
         "kernel_record_fields",
+        "kernel_record_metadata",
         "kernel_records",
         "kernel_adoptions",
         "kernel_policy_entries",
@@ -2256,6 +2257,7 @@ fn provenance_package(
     let bytes = provenance_definition(family, definition_version);
     let digest = crate::meta::definition_artifact::digest_artifact_bytes(bytes.as_bytes());
     crate::package_manifest::PackageManifest {
+        operations: vec![],
         namespace: "prov".to_string(),
         name: name.to_string(),
         version: package_version,

@@ -176,12 +176,12 @@ async fn audience_is_sealed_and_rebuildable() {
 }
 
 #[tokio::test]
-async fn addressed_to_excludes_the_sender() {
+async fn ordinary_messages_cannot_address_the_sender() {
     let db = create_database(":memory:").await.unwrap();
     install_people(&db).await;
     let registry = registry();
 
-    let error = call_as(
+    let message = call_as(
         &registry,
         &db,
         Caller::local(),
@@ -194,13 +194,17 @@ async fn addressed_to_excludes_the_sender() {
             "addressed_to":[SENDER],
             "expectation":"none",
             "idempotency_key":"test-self-send",
-            "reason":"Sender is not a recipient"
+            "reason":"Ordinary self-addressing is refused"
         }),
     )
     .await
     .unwrap_err()
     .to_string();
-    assert!(error.contains("must exclude the Message sender"), "{error}");
+    assert!(
+        message.contains("sender cannot be an addressed_to recipient"),
+        "{message}"
+    );
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
 }
 
 #[tokio::test]

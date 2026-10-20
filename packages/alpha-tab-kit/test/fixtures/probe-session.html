@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit session probe</title>
+</head>
+<body>
+<main>
+<h1>Kit session probe</h1>
+<p id="surface">pending</p>
+</main>
+<script>
+// App contract v2: native.session exists only when the host offers app.session.v2.
+// `window.probe` drives sessions from the test and records every frame each
+// channel hears, so ordering and once-only delivery can be asserted.
+const channels = {};
+const heard = {};
+window.probe = {
+  surface: () => {
+    const native = window.native;
+    return {
+      artifactOpen: typeof (window.nativeArtifact.session && window.nativeArtifact.session.open),
+      native: typeof native,
+      nativeOpen: typeof (native && native.session && native.session.open),
+      nativeCall: typeof (native && native.call),
+      same: native && native.session ? native.session.open === window.nativeArtifact.session.open : null,
+      nativeFrozen: native ? Object.isFrozen(native) : null,
+      artifactFrozen: Object.isFrozen(window.nativeArtifact),
+    };
+  },
+  open: (name, recordId, options) => {
+    const channel = window.nativeArtifact.session.open(recordId, options);
+    channels[name] = channel;
+    heard[name] = [];
+    channel.onMessage((frame) => heard[name].push(frame));
+    return { keys: Object.keys(channel).sort(), frozen: Object.isFrozen(channel) };
+  },
+  send: (name, frame) => channels[name].send(frame),
+  sendBlob: (name, chars) => window.probe.attempt(() => channels[name].send({ op: "session.update", blob: "x".repeat(chars) })),
+  close: (name) => channels[name].close(),
+  heard: (name) => heard[name],
+  attempt: (fn) => { try { fn(); return null; } catch (error) { return `${error.name}: ${error.message}`; } },
+  throws: (recordId, options) => window.probe.attempt(() => window.nativeArtifact.session.open(recordId, options)),
+  throwsOnSend: (name, frame) => window.probe.attempt(() => channels[name].send(frame)),
+  // Frames a test cannot send over evaluate(): functions cannot be serialized.
+  badFrames: (name) => [null, [], "text", { noop: true }, { op: 5 }, { op: "x", toJSON: () => 7 }, { op: "x", toJSON: () => [1] }, { op: "session.update", blob: "x".repeat(1048576) }]
+    .map((frame) => window.probe.throwsOnSend(name, frame)),
+  // The frame is going away: the bridge treats pagehide as the host port closing.
+  pagehide: () => window.dispatchEvent(new Event("pagehide")),
+  names: () => Object.keys(channels),
+};
+window.nativeArtifact.ready.then(() => {
+  const surface = window.probe.surface();
+  document.getElementById("surface").textContent = `open:${surface.nativeOpen} artifact:${surface.artifactOpen}`;
+});
+</script>
+</body>
+</html>

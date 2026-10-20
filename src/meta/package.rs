@@ -13,12 +13,10 @@
 //! the kernel-level wrapper, not here: this seam records the actor string for
 //! attribution only, mirroring `install_definition_artifact_as_in`.
 //!
-//! Limited authority model: the namespace is a locally asserted label, not
-//! verified publisher ownership. What the host enforces is scope authority —
-//! only a principal with Manage on the kernel root may install — plus exact
-//! byte identity (digest) and collision refusal. Two workspaces may assert
-//! the same namespace for different bytes; the digest, not the label, is the
-//! identity. Publisher binding is explicitly out of scope for this slice.
+//! Gated admission reserves `native` and `native.*` for exact compiled
+//! first-party packages. Other namespaces remain locally asserted labels,
+//! not verified publisher ownership. Historical validation and replay do
+//! not re-run admission policy.
 
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 
@@ -140,6 +138,7 @@ pub(crate) async fn install_package_in(
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<PackageInstallOutcome> {
     manifest.validate()?;
+    crate::v2_standard::require_publishable_package(manifest)?;
     let digest = manifest.package_digest()?;
     let existing: Option<String> = sqlx::query_scalar(
         "SELECT digest FROM package_artifacts WHERE namespace = ? AND name = ? AND version = ?",
@@ -370,4 +369,105 @@ pub(crate) async fn read_package_in(
         manifest,
         event_seq,
     }))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::{events::KERNEL_ROOT_ID, kernel};
+
+    /// Seed a pre-policy event using the historical append contract. Admission
+    /// must not be applied by verification, projection, replay or adoption.
+    #[tokio::test]
+    async fn legacy_reserved_package_replays_and_adopts_but_cannot_reinstall() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = dir.path().join("legacy.db").to_str().unwrap().to_string();
+        let (db, admin) = kernel::create_v2_database(&url, "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+        let mut manifest = crate::v2_standard::document_package();
+        manifest.name = "legacy-third-party".to_string();
+        // Seed the legacy package at @1 regardless of the compiled bundle version.
+        manifest.version = 1;
+        let identity = manifest.identity().unwrap();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let mut acts = crate::act::ActAllocation::new();
+        for entry in &manifest.definitions {
+            crate::definition_registry::install_definition_artifact_as_in(
+                &mut tx,
+                &entry.family,
+                entry.version,
+                entry.artifact_bytes.as_bytes(),
+                Some(&admin),
+                &mut acts,
+            )
+            .await
+            .unwrap();
+        }
+        let payload = PackageArtifactInstalledV1Payload {
+            namespace: manifest.namespace.clone(),
+            name: manifest.name.clone(),
+            version: manifest.version,
+            digest: identity.digest.clone(),
+            manifest_bytes: String::from_utf8(crate::canonical_json::canonical_json(
+                &manifest.canonical_value().unwrap(),
+            ))
+            .unwrap(),
+        };
+        let subject = package_subject(
+            &payload.namespace,
+            &payload.name,
+            payload.version,
+            &payload.digest,
+        );
+        verify_package_payload(&subject, &payload).unwrap();
+        append_meta_in(
+            &mut tx,
+            MetaAppendSpec::with_payload(
+                &subject,
+                "package_artifact.installed.v1",
+                serde_json::to_value(payload).unwrap(),
+            )
+            .with_actor(Some(&admin)),
+            &mut acts,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        kernel::adopt_package_at(&db, &admin, KERNEL_ROOT_ID, &manifest, Some(&identity), &[])
+            .await
+            .unwrap();
+        let before = kernel::dump_all_kernel_tables(&db).await.unwrap();
+        let described = kernel::describe_world_as(&db, &admin).await.unwrap();
+        assert!(!described["definitions"].as_array().unwrap().is_empty());
+        let err = kernel::install_package_as(&db, &admin, &manifest)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved namespace"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("Packages already installed stay readable and adoptable"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("cannot be reinstalled"), "{err}");
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        // Grandfathering @1 does not permit publishing a new @2 revision.
+        // This is a valid package upgrade retaining the same definition pin,
+        // so refusal must come from namespace admission, not a collision.
+        let mut upgrade = manifest.clone();
+        upgrade.version += 1;
+        upgrade.validate().unwrap();
+        let err = kernel::install_package_as(&db, &admin, &upgrade)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved namespace"), "{err}");
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        kernel::replay_all_projections(&db).await.unwrap();
+        assert_eq!(before, kernel::dump_all_kernel_tables(&db).await.unwrap());
+        assert_eq!(
+            described,
+            kernel::describe_world_as(&db, &admin).await.unwrap()
+        );
+        db.close().await;
+    }
 }

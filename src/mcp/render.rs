@@ -70,7 +70,7 @@ pub(crate) struct RenderOutcome {
 /// resolution, the advertised schema and the dispatch cannot disagree — a
 /// renderer that exists but is never reached is exactly the drift this file is
 /// most likely to grow.
-const RENDERED_TOOLS: [&str; 77] = [
+const RENDERED_TOOLS: [&str; 78] = [
     "bootstrap",
     "quickstart",
     "get_structure",
@@ -140,6 +140,7 @@ const RENDERED_TOOLS: [&str; 77] = [
     "set_intent",
     "close_run",
     "manage_messages",
+    "manage_participants",
     "manage_interventions",
     "manage_change_summaries",
     "query_change_summaries",
@@ -385,6 +386,7 @@ pub(crate) fn render_outcome(tool: &str, value: &Value) -> Option<RenderOutcome>
         "set_intent" => Some(render_set_intent(value)),
         "close_run" => Some(render_close_run(value)),
         "manage_messages" => Some(render_manage_messages(value)),
+        "manage_participants" => Some(render_manage_participants(value)),
         "manage_interventions" => Some(render_manage_interventions(value)),
         "manage_change_summaries" => Some(render_manage_change_summaries(value)),
         "query_change_summaries" => Some(render_query_change_summaries(value)),
@@ -465,6 +467,34 @@ fn render_standby_status(value: &Value) -> String {
         let _ = writeln!(out, "Accepted generation: `{id}`");
     }
     let reasons = array(value, "degraded_reasons");
+    if let Some(progress) = value
+        .pointer("/refresh/transfer_progress")
+        .and_then(|value| {
+            serde_json::from_value::<crate::standby::StandbyTransferProgress>(value.clone()).ok()
+        })
+        .filter(|progress| {
+            progress.valid(progress.activity == crate::standby::StandbyTransferActivity::Active)
+        })
+    {
+        let _ = writeln!(
+            out,
+            "Transfer: {:?} ({:?}), observed {}",
+            progress.stage, progress.activity, progress.updated_at
+        );
+        if let (Some(completed), Some(remaining), Some(total)) = (
+            progress.bytes_completed,
+            progress.bytes_remaining,
+            progress.bytes_total,
+        ) {
+            let _ = writeln!(
+                out,
+                "Durable bytes: {completed} completed, {remaining} remaining, {total} total"
+            );
+        }
+        if progress.retained_for_resume {
+            out.push_str("Local work retained; reuse requires an authorized poll.\n");
+        }
+    }
     if !reasons.is_empty() {
         out.push_str("Degraded reasons:");
         for reason in reasons.iter().filter_map(Value::as_str) {
@@ -1171,6 +1201,33 @@ fn render_manage_messages(value: &Value) -> String {
     // Preserve the complete union member, including fields added by future
     // actions. JSON-encode even strings: Message bodies are untrusted,
     // multiline content and must not be able to impersonate labelled fields.
+    if let Some(object) = value.as_object() {
+        for (key, field) in object {
+            if key != "run_context" {
+                let _ = writeln!(out, "{key}: {}", inline_json(field));
+            }
+        }
+    } else {
+        let _ = writeln!(out, "{}", inline_json(value));
+    }
+    out
+}
+
+fn render_manage_participants(value: &Value) -> String {
+    // Register, retire and list answer with different shapes and none carries a
+    // top-level `status`, so name the outcome from the fields the engine wrote.
+    let mut out = if value.get("participants").is_some() {
+        "Persona list (the caller's own personas only).\n"
+    } else {
+        match value.get("state").and_then(Value::as_str) {
+            Some("active") => "Persona registered.\n",
+            Some("retired") => "Persona retired.\n",
+            _ => "Persona result.\n",
+        }
+    }
+    .to_string();
+    // Profile names are owner-authored free text: JSON-encode every field so
+    // they cannot impersonate labelled lines.
     if let Some(object) = value.as_object() {
         for (key, field) in object {
             if key != "run_context" {
@@ -4124,14 +4181,19 @@ fn inline_json(value: &Value) -> String {
 }
 
 fn temporal_header(value: &Value) -> String {
-    let Some(resolved) = integer(value, "resolved_content_seq") else {
-        return String::new();
-    };
-    let head = integer(value, "content_head_seq").unwrap_or(resolved);
     let selector = value
         .get("as_of")
         .map(inline_json)
         .unwrap_or_else(|| "{}".into());
+    let Some(resolved) = integer(value, "resolved_content_seq") else {
+        // A non-owner reading by event id gets no counters back; the header
+        // still names the position they asked for, and nothing else.
+        if value.pointer("/as_of/event_id").is_some() {
+            return format!("as_of {selector}\n");
+        }
+        return String::new();
+    };
+    let head = integer(value, "content_head_seq").unwrap_or(resolved);
     let observed_at = string(value, "observed_at")
         .map(|observed| format!(", observed at {observed}"))
         .unwrap_or_default();
@@ -4586,7 +4648,139 @@ fn render_bootstrap_next_steps(
     !items.is_empty()
 }
 
+/// The lean executor surface section of the text bootstrap: what is
+/// advertised, how to reach everything else, and the exact enumeration.
+fn render_lean_tool_surface(out: &mut String, exposure: &Value) {
+    out.push_str("## Lean tool surface\n\n");
+    let advertised = array(exposure, "advertised_tools")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>();
+    if !advertised.is_empty() {
+        let _ = writeln!(out, "Advertised tools: {}.", advertised.join(", "));
+    }
+    let call = exposure.get("call_executor").unwrap_or(&Value::Null);
+    if let Some(guidance) = string(call, "guidance") {
+        let _ = writeln!(out, "{guidance}");
+    }
+    let hidden = array(call, "hidden_executors")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if !hidden.is_empty() {
+        let _ = writeln!(
+            out,
+            "Reachable only through `call_executor`: {}.",
+            hidden.join(", ")
+        );
+    }
+    if let Some(narrowed) = call.get("narrowed_executors").and_then(Value::as_object) {
+        for (executor, direct) in narrowed {
+            let direct = direct
+                .as_array()
+                .map(|operations| {
+                    operations
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "`{executor}` is advertised for {direct} only; its other operations go through `call_executor`."
+            );
+        }
+    }
+    if let Some(count) = call.get("hidden_operation_count").and_then(Value::as_u64) {
+        let _ = writeln!(
+            out,
+            "Operations reachable only through `call_executor`: {count}."
+        );
+    }
+    if let Some(query) = string(call, "catalog_query") {
+        let _ = writeln!(out, "List them with `sql_read` `query_sql`: `{query}`");
+    }
+    for example in array(call, "examples") {
+        let _ = writeln!(out, "Example `call_executor`: {}", inline_json(example));
+    }
+}
+
+fn is_outage_bootstrap(value: &Value) -> bool {
+    value.get("outage_bootstrap").and_then(Value::as_bool) == Some(true)
+        || value.get("outage").is_some()
+}
+
+/// Outage-bootstrap text (design 200dc2d §6): bounded local orientation
+/// with standby status and standing instruction bodies, no run key minted,
+/// no keyed next steps, no session guidance and no `set_intent` prompt.
+fn render_outage_bootstrap(value: &Value) -> String {
+    let mut out = String::from("# Outage bootstrap — local standby only\n\n");
+    out.push_str("Hosted Native is unreachable. ");
+    if let Some(guidance) = value.pointer("/outage/guidance").and_then(Value::as_str) {
+        out.push_str(guidance);
+    } else {
+        out.push_str("Run keys, intents and declarations wait until hosted Native is reachable; bootstrap against hosted then.");
+    }
+    out.push('\n');
+    if let Some(key) = value.pointer("/outage/run_key").and_then(Value::as_str) {
+        let _ = writeln!(out, "\nCarried run key (echoed, not minted): `{key}`.");
+        if let Some(note) = value
+            .pointer("/outage/run_history_note")
+            .and_then(Value::as_str)
+        {
+            let _ = writeln!(out, "{note}");
+        }
+    }
+    if let Some(runtime) = value.get("tool_exposure").and_then(|e| e.get("runtime")) {
+        out.push('\n');
+        out.push_str(&render_standby_status(runtime));
+    }
+    if let Some(principal) = value.get("principal") {
+        let name = claimed_string(principal.get("display_name"), "principal name");
+        match string(principal, "email").filter(|email| *email != name) {
+            Some(email) => {
+                let _ = writeln!(out, "\nPrincipal: {name} · {email}");
+            }
+            None => {
+                let _ = writeln!(out, "\nPrincipal: {name}");
+            }
+        }
+    }
+    if let Some(world) = value.get("current_world") {
+        out.push_str("\n## Current world (local copy)\n");
+        let scan_truncated = boolean(world, "scan_truncated").unwrap_or(false);
+        if let Some(recent) = world.get("recent_activity") {
+            render_bootstrap_world_items(
+                &mut out,
+                "Recent relevant activity",
+                recent,
+                scan_truncated,
+            );
+        }
+        if let Some(open) = world.get("open_work") {
+            render_bootstrap_world_items(&mut out, "Open work", open, scan_truncated);
+        }
+    }
+    // Standing bodies are local data: render them as normal bootstrap does.
+    // `render_bootstrap_guidance` already skips the engine entry, so only
+    // portable bodies are stated and no `set_intent` wrapper rides along.
+    if value.get("instructions").is_some() {
+        out.push('\n');
+        render_bootstrap_guidance(&mut out, &value["instructions"]);
+    }
+    out
+}
+
 fn render_bootstrap(value: &Value) -> String {
+    #[cfg(feature = "v2-kernel-probe")]
+    if value.pointer("/engine/name").and_then(Value::as_str) == Some("kernel-v2") {
+        return crate::mcp::kernel_v2::coordination::render_bootstrap_text(value);
+    }
+    if is_outage_bootstrap(value) {
+        return render_outage_bootstrap(value);
+    }
     let mut out = String::new();
     let instructions = value.get("instructions").unwrap_or(&Value::Null);
     let obligations = array(value, "pending_obligations");
@@ -4612,6 +4806,16 @@ fn render_bootstrap(value: &Value) -> String {
     }) {
         out.push('\n');
         out.push_str(&render_standby_status(status));
+    }
+
+    // The lean executor surface changes what an agent can call directly, so
+    // say it on every bootstrap path, before footing or repair.
+    if let Some(exposure) = value
+        .get("tool_exposure")
+        .filter(|exposure| exposure.get("projection").and_then(Value::as_str) == Some("lean"))
+    {
+        out.push('\n');
+        render_lean_tool_surface(&mut out, exposure);
     }
 
     let invalid_instructions = string(instructions, "status").as_deref() != Some("ready");
@@ -4764,6 +4968,7 @@ fn render_quickstart(value: &Value) -> String {
 
 fn render_structure(value: &Value) -> String {
     let mut out = temporal_header(value);
+    render_preview_note(&mut out, value);
     let nodes = array(value, "nodes");
     let max_depth = integer(value, "max_depth").unwrap_or_default();
     let max_children = integer(value, "max_children_per_node").unwrap_or_default();
@@ -6043,15 +6248,89 @@ fn unknown_object_keys(value: &Value, known: impl Fn(&str) -> bool) -> Vec<Strin
         .collect()
 }
 
-// These enrichments remain available in JSON, but their full provenance and
-// governance envelopes overwhelm the authored content on ordinary text reads.
-// Keep the general record-field classification intact for write receipts.
+// Keep get_record's presentation classification separate from write receipts.
 fn is_get_record_text_field(key: &str) -> bool {
-    is_record_render_field(key) && !matches!(key, "kind_governance" | "contribution")
+    is_record_render_field(key)
+        || matches!(
+            key,
+            "is_current" | "maintenance_preview" | "legacy_provenance"
+        )
+}
+
+fn render_legacy_provenance(out: &mut String, value: &Value) {
+    let Some(legacy) = value.get("legacy_provenance").filter(|v| !v.is_null()) else {
+        return;
+    };
+    if legacy.get("kind").and_then(Value::as_str) != Some("v1.snapshot_provenance") {
+        return;
+    }
+    out.push_str("Imported v1 provenance (snapshot):\n");
+    for (label, key) in [
+        ("created at", "created_at"),
+        ("creator", "creator"),
+        ("last edited at", "updated_at"),
+        ("last editor", "last_editor"),
+    ] {
+        if let Some(found) = string(legacy, key) {
+            let _ = writeln!(out, "  {label}: {}", display_inline(&found));
+        }
+    }
+    if legacy.get("actors_withheld").and_then(Value::as_bool) == Some(true) {
+        out.push_str("  Actor attribution withheld.\n");
+    }
+}
+
+/// Bounded provenance/governance cues, never the full envelopes.
+fn render_record_read_summaries(out: &mut String, item: &Value) {
+    if let Some(kind) = item.get("kind_governance").filter(|v| !v.is_null()) {
+        let canonical = claimed_string(kind.get("canonical_kind"), "canonical kind");
+        let classification = claimed_string(kind.get("classification"), "classification");
+        let _ = writeln!(out, "  Kind governance: {canonical} · {classification}");
+    }
+    if let Some(contribution) = item.get("contribution").filter(|v| !v.is_null()) {
+        let field = |path: &str| {
+            claimed_string(
+                contribution.pointer(path),
+                path.rsplit('/').next().unwrap_or(path),
+            )
+        };
+        let _ = write!(
+            out,
+            "  Contribution: {} · channel {} · run {}",
+            field("/principal/display_name"),
+            field("/channel/kind"),
+            field("/run/run_key")
+        );
+        if let Some(client) = contribution.pointer("/run/reported_mcp_client") {
+            let name = claimed_string(client.get("name"), "client name");
+            let _ = write!(out, " · reported MCP client {name}");
+            if let Some(version) = string(client, "version") {
+                let _ = write!(out, " {}", display_inline(&version));
+            }
+        }
+        out.push('\n');
+    }
+}
+
+fn render_pending_label(out: &mut String, item: &Value) {
+    if item
+        .pointer("/maintenance_preview/state")
+        .and_then(Value::as_str)
+        == Some("pending")
+    {
+        out.push_str("Pending until maintenance ends; may be refused.\n");
+    }
+}
+
+fn render_preview_note(out: &mut String, value: &Value) {
+    if let Some(note) = string(value, "maintenance_preview_note") {
+        let _ = writeln!(out, "{}", display_inline(&note));
+    }
 }
 
 fn render_get_record(value: &Value, include_response_disclosures: bool) -> String {
     let mut out = temporal_header(value);
+    render_preview_note(&mut out, value);
     let records = array(value, "records");
     let multiple = records.len() > 1;
     let children_limit = integer(value, "children_limit").unwrap_or_default();
@@ -6078,6 +6357,7 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         if index > 0 {
             out.push('\n');
         }
+        render_pending_label(&mut out, item);
         // Partial success is per item: a batch where one id missed still
         // answers for the rest, and the rendering has to say which missed.
         if string(item, "status").as_deref() == Some("not_found") {
@@ -6095,11 +6375,18 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         }
         let _ = write!(
             out,
-            "{}  {}  {}",
-            display_inline(&string(item, "id").unwrap_or_default()),
-            type_label(item),
+            "{}  ({})  {}",
             linked_record_name(item),
+            display_inline(
+                &string(item, "display_reference")
+                    .or_else(|| string(item, "id"))
+                    .unwrap_or_default()
+            ),
+            type_label(item),
         );
+        if let Some(lifecycle) = lifecycle_display(item).filter(|value| !value.is_empty()) {
+            let _ = write!(out, " · lifecycle {}", display_inline(&lifecycle));
+        }
         if item.get("archived").and_then(Value::as_bool) == Some(true) {
             out.push_str("  [archived]");
         }
@@ -6117,21 +6404,33 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         // Succession heads the record: a reader who never inspects links
         // still learns the successor's title and reference here.
         if let Some(summary) = format_superseded_by(item) {
-            let _ = writeln!(out, "  {summary}");
+            let _ = writeln!(out, "  Currency: {summary}");
+        } else if boolean(item, "is_current") == Some(false)
+            || integer(item, "is_current") == Some(0)
+        {
+            out.push_str("  Currency: not current (successor not reported)\n");
+        } else if boolean(item, "is_current") == Some(true)
+            || integer(item, "is_current") == Some(1)
+            || item
+                .pointer("/superseded_by/total_count")
+                .and_then(Value::as_i64)
+                == Some(0)
+        {
+            out.push_str("  Currency: current\n");
         }
+        // Silence is intentional: an absent projection cannot establish
+        // currency, and ordinary get_record responses do not report is_current.
 
         // Advisory freshness: one factual line for the record plus one
         // compact line per bound occurrence. No advice, no thresholds — the
         // `freshness` JSON block carries the exact coordinates.
         render_freshness(&mut out, item);
+        render_legacy_provenance(&mut out, item);
 
         // State line: the spine facets that are set, plus activity. Absent
         // facets are omitted rather than printed as null — an unset lifecycle
         // is not a value worth a token.
         let mut state = Vec::new();
-        if let Some(found) = lifecycle_display(item) {
-            state.push(format!("lifecycle {}", display_inline(&found)));
-        }
         for (label, key) in [
             ("maturity", "maturity"),
             ("persistence", "persistence"),
@@ -6147,17 +6446,56 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
         if !state.is_empty() {
             let _ = writeln!(out, "  {}", state.join(" · "));
         }
-        // Five encodings of one reference ship per record: `id`,
-        // `record_path_full`, `record_path`, `display_reference`,
-        // `record_url` and `share_url`. The header line above already
-        // rendered the id and, where an origin is configured, one link — so
-        // the paths are derivations of what the reader has already been
-        // given. Suppress the derivable ones here and keep
-        // `display_reference`, which is the short form the orientation asks
-        // agents to quote. `format:"json"` still carries every field.
+        if let Some(summary) = string(item, "summary") {
+            let (preview, changed) = one_line_preview(&summary, 300);
+            let _ = writeln!(out, "  Summary: {preview}");
+            if changed {
+                let _ = writeln!(
+                    out,
+                    "    (Summary shortened; call get_record with format:\"json\" for the full value.)"
+                );
+            }
+        }
+        // Every authored line stays quoted/escaped, including when metadata follows.
+        if let Some(body) = string(item, "body") {
+            if multiple {
+                let (preview, changed) = one_line_preview(&body, 200);
+                if changed {
+                    let id = string(item, "id").unwrap_or_default();
+                    let id_json = Value::String(id).to_string();
+                    let _ = writeln!(
+                        out,
+                        "  Body preview (truncated; re-read get_record with ids:[{id_json}] \
+                         or use format:\"json\" for the full verbatim body): {preview}"
+                    );
+                } else {
+                    let _ = writeln!(out, "  Body: {preview}");
+                }
+            } else {
+                out.push_str(
+                    "  Record-authored body (untrusted; line-quoted; use format:\"json\" for exact bytes):\n",
+                );
+                if body.is_empty() {
+                    out.push_str("    > \n");
+                } else {
+                    for line in body.split_inclusive('\n') {
+                        let line = line.strip_suffix('\n').unwrap_or(line);
+                        let line = line.strip_suffix('\r').unwrap_or(line);
+                        let _ = writeln!(out, "    > {}", display_inline(line));
+                    }
+                }
+            }
+        }
+        render_record_read_summaries(&mut out, item);
+        // The header supplies the short reference and linked title; details
+        // retain the full id while dropping derivable paths and the used URL.
         let mut rendered_keys = vec![
             "status",
-            "id",
+            "maintenance_preview",
+            "display_reference",
+            "is_current",
+            "kind_governance",
+            "contribution",
             "type",
             "kind",
             "name",
@@ -6183,9 +6521,9 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
             "ancestors",
             "interpretation",
             "query_resolution",
-            // "/" + id, where id heads this record's own line.
+            // "/" + id, retained in details.
             "record_path_full",
-            // "/" + display_reference, which is retained below.
+            // "/" + display_reference, already in the header.
             "record_path",
         ];
         // Drop only the URL the header actually linked. When no origin is
@@ -6271,16 +6609,6 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
             let _ = writeln!(out, "  {heading}: {path}");
         }
 
-        if let Some(summary) = string(item, "summary") {
-            let (preview, changed) = one_line_preview(&summary, 300);
-            let _ = writeln!(out, "  Summary: {preview}");
-            if changed {
-                let _ = writeln!(
-                    out,
-                    "    (Summary shortened; call get_record with format:\"json\" for the full value.)"
-                );
-            }
-        }
         render_comment_target(&mut out, item, "  ");
         if let Some(target) = item.get("target") {
             let _ = writeln!(out, "  Target details: {}", inline_json(target));
@@ -6447,46 +6775,8 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 "links_offset",
                 "links_limit",
             );
-            for entry in entries {
-                let _ = writeln!(out, "    {}", render_mention_line(entry, list_key));
-            }
-        }
-        // No ancestor details block. The path line above already names and
-        // links every ancestor under the same completeness qualifier, so the
-        // block restated each one as JSON carrying five encodings of a
-        // reference the reader had just been handed. `format:"json"` still
-        // carries the full `ancestors` projection, type and kind included.
-        // Authored bytes come last so they cannot impersonate metadata that
-        // follows them. A single-record body remains uncapped, but every line
-        // is visibly quoted as untrusted record content; explicit JSON is the
-        // exact-byte recovery path. Batches stay compact.
-        if let Some(body) = string(item, "body") {
-            if multiple {
-                let (preview, changed) = one_line_preview(&body, 200);
-                if changed {
-                    let id = string(item, "id").unwrap_or_default();
-                    let id_json = Value::String(id).to_string();
-                    let _ = writeln!(
-                        out,
-                        "  Body preview (truncated; re-read get_record with ids:[{id_json}] \
-                         or use format:\"json\" for the full verbatim body): {preview}"
-                    );
-                } else {
-                    let _ = writeln!(out, "  Body: {preview}");
-                }
-            } else {
-                out.push_str(
-                    "  Record-authored body (untrusted; line-quoted; use format:\"json\" for exact bytes):\n",
-                );
-                if body.is_empty() {
-                    out.push_str("    > \n");
-                } else {
-                    for line in body.split_inclusive('\n') {
-                        let line = line.strip_suffix('\n').unwrap_or(line);
-                        let line = line.strip_suffix('\r').unwrap_or(line);
-                        let _ = writeln!(out, "    > {}", display_inline(line));
-                    }
-                }
+            for line in render_mention_lines(entries, list_key) {
+                let _ = writeln!(out, "    {line}");
             }
         }
     }
@@ -6534,6 +6824,74 @@ fn render_window_heading(
     out.push_str(")\n");
 }
 
+/// Collapse only resolved outgoing targets in the returned page. Window
+/// headings still count original mention groups, preserving paging coordinates.
+fn render_mention_lines(entries: &[Value], list_key: &str) -> Vec<String> {
+    if list_key != "mentions_out" {
+        return entries
+            .iter()
+            .map(|entry| render_mention_line(entry, list_key))
+            .collect();
+    }
+    let mut groups: Vec<(Option<String>, Vec<&Value>)> = Vec::new();
+    for entry in entries {
+        let target = (entry.pointer("/resolution/state").and_then(Value::as_str)
+            == Some("resolved"))
+        .then(|| entry.pointer("/resolution/id").and_then(Value::as_str))
+        .flatten()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+        if let Some(group) = target
+            .as_ref()
+            .and_then(|id| groups.iter_mut().find(|(key, _)| key.as_ref() == Some(id)))
+        {
+            group.1.push(entry);
+        } else {
+            groups.push((target, vec![entry]));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(target, entries)| {
+            if target.is_none() {
+                return render_mention_line(entries[0], list_key);
+            }
+            let mut combined = entries[0].clone();
+            // A later form may carry a display reference or a shorter lookup
+            // key than the first occurrence. Choose across the resolved group.
+            if let Some(reference) = entries.iter().find_map(|entry| {
+                entry
+                    .pointer("/resolution/display_reference")
+                    .and_then(Value::as_str)
+                    .filter(|reference| !reference.is_empty())
+            }) {
+                combined["resolution"]["display_reference"] = json!(reference);
+            }
+            if let Some(lookup_key) = entries
+                .iter()
+                .filter_map(|entry| string(entry, "lookup_key"))
+                .filter(|key| !key.is_empty())
+                .min_by_key(String::len)
+            {
+                combined["lookup_key"] = json!(lookup_key);
+            }
+            let mut forms = entries
+                .iter()
+                .filter_map(|entry| string(entry, "form"))
+                .collect::<Vec<_>>();
+            forms.sort();
+            forms.dedup();
+            combined["form"] = json!(forms.join("+"));
+            // A missing count or overflow is unknown, never fabricated as zero.
+            let count = entries.iter().try_fold(0i64, |sum, entry| {
+                sum.checked_add(entry.get("occurrence_count")?.as_i64()?)
+            });
+            combined["occurrence_count"] = json!(count);
+            render_mention_line(&combined, list_key)
+        })
+        .collect()
+}
+
 /// One body-mention line. Outgoing entries carry a resolution state and name
 /// only visible records; incoming entries name a visible source.
 ///
@@ -6553,17 +6911,14 @@ fn render_mention_line(entry: &Value, list_key: &str) -> String {
     let state = resolution.and_then(|value| value.get("state"));
     let tail = match state.and_then(Value::as_str) {
         Some("resolved") => {
-            let name = display_inline(
-                &resolution
-                    .and_then(|value| string(value, "name"))
-                    .unwrap_or_default(),
-            );
-            let id = display_inline(
-                &resolution
-                    .and_then(|value| string(value, "id"))
-                    .unwrap_or_default(),
-            );
-            format!("resolved to {name} ({id})")
+            let resolved = resolution.unwrap();
+            let name = display_inline(&string(resolved, "name").unwrap_or_default());
+            let reference = string(resolved, "display_reference")
+                .filter(|reference| !reference.is_empty())
+                .or_else(|| string(entry, "lookup_key").filter(|key| !key.is_empty()))
+                .or_else(|| string(resolved, "id"))
+                .unwrap_or_default();
+            return format!("→ {} {name} ({form}, ×{count})", display_inline(&reference));
         }
         Some("ambiguous") => {
             let candidates = claimed_integer(
@@ -6589,7 +6944,7 @@ fn render_query_messages(out: &mut String, value: &Value) {
 }
 
 fn render_query_unknown_fields(out: &mut String, value: &Value, known: impl Fn(&str) -> bool) {
-    let unknown = unknown_object_keys(value, known);
+    let unknown = unknown_object_keys(value, |key| key == "maintenance_preview_note" || known(key));
     if !unknown.is_empty() {
         let _ = writeln!(
             out,
@@ -6788,12 +7143,16 @@ fn render_federated_query_record(value: &Value) -> String {
 }
 
 fn render_query_record(value: &Value) -> String {
-    let mut out = temporal_header(value);
     if value.get("scope").is_some()
         && (value.get("results").is_some() || string(value, "shape").as_deref() == Some("counts"))
     {
-        return render_federated_query_record(value);
+        let mut out = String::new();
+        render_preview_note(&mut out, value);
+        out.push_str(&render_federated_query_record(value));
+        return out;
     }
+    let mut out = temporal_header(value);
+    render_preview_note(&mut out, value);
     // The payload is a tagged union — counting pipelines and record pipelines
     // are different answers, and `shape` is how the payload says which.
     if string(value, "shape").as_deref() == Some("aggregate") {
@@ -7271,6 +7630,7 @@ fn render_rollup(value: &Value) -> String {
 
 fn render_search(value: &Value) -> String {
     let mut out = String::new();
+    render_preview_note(&mut out, value);
     let hits = array(value, "hits");
     let _ = write!(
         out,
@@ -7295,6 +7655,7 @@ fn render_search(value: &Value) -> String {
     let id_width = column_width(hits, |hit| string(hit, "id").unwrap_or_default());
     let type_width = column_width(hits, type_label);
     for hit in hits {
+        render_pending_label(&mut out, hit);
         let _ = write!(
             out,
             "  {}  {}  {}  [score {}]",
@@ -7345,6 +7706,7 @@ fn render_search(value: &Value) -> String {
         }
         let _ = writeln!(out, "\nNear miss — {label} ({})", candidates.len());
         for candidate in candidates {
+            render_pending_label(&mut out, candidate);
             let _ = writeln!(
                 out,
                 "  {}  {}  {}",
@@ -7415,6 +7777,9 @@ fn render_enriched_write(verb: &str, value: &Value) -> String {
         },
         "Created" => {
             let _ = writeln!(out, "Effect: record created");
+        }
+        "Unchanged" => {
+            let _ = writeln!(out, "Effect: unchanged (no write)");
         }
         _ => {
             let _ = writeln!(out, "Effect: record updated");
@@ -7488,6 +7853,9 @@ fn render_batch_write(value: &Value) -> String {
 }
 
 fn render_update_record(value: &Value) -> String {
+    if value["effect"] == "unchanged" && value["changed"] == false {
+        return render_enriched_write("Unchanged", value);
+    }
     let Some(results) = value.get("results").and_then(Value::as_array) else {
         return render_enriched_write("Updated", value);
     };
@@ -7528,6 +7896,7 @@ fn render_write_receipt(out: &mut String, value: &Value) {
             !matches!(
                 key.as_str(),
                 "previous_seq"
+                    | "previous_event_id"
                     | "act"
                     | "run_context"
                     | "work_overlap"
@@ -7664,6 +8033,7 @@ fn is_get_record_response_field(key: &str) -> bool {
     matches!(
         key,
         "records"
+            | "maintenance_preview_note"
             | "resolve"
             | "children_limit"
             | "children_offset"
@@ -7700,6 +8070,12 @@ fn render_previous_seq(out: &mut String, value: &Value) {
                 seq.as_i64().unwrap_or_default(),
                 seq.as_i64().unwrap_or_default(),
             );
+            if let Some(event_id) = value.get("previous_event_id").and_then(Value::as_str) {
+                let _ = writeln!(
+                    out,
+                    "previous_event_id: {event_id} (pass as as_of.event_id)"
+                );
+            }
         }
         _ => {}
     }
@@ -7887,10 +8263,20 @@ fn render_history(value: &Value) -> String {
         out.push_str(" — stream exhausted");
     }
     out.push('\n');
+    render_legacy_provenance(&mut out, value);
     if detail == "metadata" {
-        out.push_str(
-            "Metadata detail: authoritative events[].payload values were omitted. Request detail \"full\" for complete caller-visible payloads. Payload sizes below are compact UTF-8 JSON bytes after authorization and redaction.\n",
-        );
+        let note = "Metadata detail: authoritative events[].payload values were omitted. Request detail \"full\" for complete caller-visible payloads. Payload sizes below are compact UTF-8 JSON bytes after authorization and redaction.\n";
+        #[cfg(feature = "v2-kernel-probe")]
+        let note = if value
+            .pointer("/representation/payloads")
+            .and_then(Value::as_str)
+            == Some("unavailable")
+        {
+            "Metadata detail: event payloads, payload sizes and full detail are unavailable on this engine.\n"
+        } else {
+            note
+        };
+        out.push_str(note);
     }
     for event in events {
         let _ = write!(
@@ -9112,6 +9498,10 @@ fn string_or_null(value: &Value) -> bool {
 // ---------------------------------------------------------------------------
 
 fn render_manage_links(value: &Value) -> String {
+    #[cfg(feature = "v2-kernel-probe")]
+    if value.get("kernel_v2").is_some() {
+        return super::kernel_v2::render_links(value);
+    }
     let Some(action) = value.get("action").and_then(Value::as_str) else {
         return format!(
             "Link response has no valid server-authored action and was not interpreted; {MANAGE_LINKS_WRITE_RECOVERY}\n"
@@ -9397,6 +9787,7 @@ fn render_manage_links_write(value: &Value, action: &str) -> String {
                     | "target_id"
                     | "relationship"
                     | "previous_seq"
+                    | "previous_event_id"
                     | "act"
                     | "write_receipt"
                     | "relationship_origin_db_id"
@@ -10492,6 +10883,24 @@ fn render_start_work(value: &Value) -> String {
         let _ = write!(out, " · claimed at {claimed_at}");
     }
     out.push('\n');
+
+    #[cfg(feature = "v2-kernel-probe")]
+    if value.pointer("/context/status").and_then(Value::as_str) == Some("unavailable") {
+        let _ = writeln!(
+            out,
+            "Context unavailable: {}",
+            claimed_string(value.pointer("/context/reason"), "context reason")
+        );
+        for key in ["receipt", "generation", "head"] {
+            if let Some(field) = value.get(key).filter(|v| !v.is_null()) {
+                let _ = writeln!(out, "{key}: {}", inline_json(field));
+            }
+        }
+        if let Some(guidance) = string(value, "retry_guidance") {
+            let _ = writeln!(out, "{guidance}");
+        }
+        return out;
+    }
 
     if let Some(overlap) = value.get("work_overlap") {
         render_overlap_window(&mut out, "Work overlap", overlap);

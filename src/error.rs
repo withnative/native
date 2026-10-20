@@ -27,9 +27,109 @@ impl DeploymentReadOnlyOperation {
 /// from the pre-typed engine string so existing callers keep matching.
 pub const STANDBY_READ_ONLY_CODE: &str = "STANDBY_READ_ONLY";
 
+/// Machine code for a reused idempotency key that does not match the
+/// original command (different normalized arguments or resolved intent).
+/// It stays an [`Error::Engine`] refusal — a 4xx that must not be retried —
+/// and is deliberately not [`Error::Conflict`], which hosted callers read as
+/// a stale optimistic write.
+pub const IDEMPOTENCY_CONFLICT_CODE: &str = "idempotency_conflict";
+
+/// Which bound a keyed replay ran into while rebuilding a committed write's
+/// receipt. All three are about resources, never about the caller's input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayBound {
+    /// The historical rebuild's row or byte budget.
+    Budget,
+    /// No rebuild slot became free before the deadline.
+    Admission,
+    /// The replay did not finish inside its execution deadline.
+    Deadline,
+}
+
+impl ReplayBound {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Budget => "historical replay budget exceeded",
+            Self::Admission => "historical replay admission exhausted",
+            Self::Deadline => "historical replay deadline exceeded",
+        }
+    }
+}
+
+/// How much of a keyed call a [`Error::ReplayBounded`] failure confirms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayApplied {
+    /// The call is one write, and the key matched it: it committed.
+    Committed,
+    /// A multi-write call (`create_many`) stopped at an item whose replay hit a
+    /// bound. `completed` of `total` items are confirmed committed: those that
+    /// succeeded before it, plus the item that hit the bound (it committed;
+    /// only its receipt was late). That is a count, not a prefix: an item that
+    /// failed or depended on a failure earlier in the call is not in it, and
+    /// the items after the bound were never reached and may not exist. A retry
+    /// with the same key and arguments resumes, and creates each remaining
+    /// item exactly once.
+    Partial { completed: usize, total: usize },
+}
+
+/// Stable machine code for [`Error::ReplayBounded`] on the wire.
+pub const REPLAY_BOUND_EXCEEDED_CODE: &str = "REPLAY_BOUND_EXCEEDED";
+
+/// Guidance carried with [`REPLAY_BOUND_EXCEEDED_CODE`] for a single write.
+pub const REPLAY_BOUND_EXCEEDED_RECOVERY: &str = "The write behind this idempotency key was committed; only its receipt could not be rebuilt within the replay bound. Retry with the same idempotency_key, or read the record for its current state. Do not issue a fresh write under a new key.";
+
+/// Guidance for a [`ReplayApplied::Partial`] failure.
+pub const REPLAY_BOUND_EXCEEDED_PARTIAL_RECOVERY: &str = "Part of this call is committed (completed_items of total_items items are confirmed committed, not necessarily the first ones) and its replay hit a bound before the rest were reached. Retry with the same idempotency_key and the same arguments: committed items replay and each remaining item is created exactly once. Do not issue the call again under a new key.";
+
+/// Static admission stage selected at the refusal site, never from database prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandbyAdmissionCheck {
+    RouteOrigin,
+    Consumer,
+    ByteIdentity,
+    EngineShape,
+    ManifestState,
+    ActOrderContinuity,
+    /// The local current generation could not be read or trusted as a base
+    /// (pointer, head, shape or manifest), whatever the candidate looks like.
+    CurrentGeneration,
+    ScalarRollbackContinuity,
+    SuccessorPreservation,
+    Integrity,
+    Conformance,
+    Awareness,
+}
+impl StandbyAdmissionCheck {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::RouteOrigin => "install-fence:route-origin",
+            Self::Consumer => "install-fence:consumer",
+            Self::ByteIdentity => "install-fence:byte-identity",
+            Self::EngineShape => "install-fence:engine-shape",
+            Self::ManifestState => "install-fence:manifest-state",
+            Self::ActOrderContinuity => "install-fence:act-order-continuity",
+            Self::CurrentGeneration => "install-fence:current-generation",
+            Self::ScalarRollbackContinuity => "install-fence:scalar-rollback-continuity",
+            Self::SuccessorPreservation => "install-fence:successor",
+            Self::Integrity => "install-fence:integrity",
+            Self::Conformance => "install-fence:conformance",
+            Self::Awareness => "install-fence:awareness",
+        }
+    }
+}
+
 /// Engine error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Preserve the internal source and its historical Display surface, with
+    /// a separate static admission stage for payload-free refresh diagnostics.
+    #[error("{source}")]
+    StandbyAdmission {
+        check: StandbyAdmissionCheck,
+        #[source]
+        source: Box<Error>,
+    },
+
     /// A contract/engine rule was violated (projector guards, meta-tier guards,
     /// hosting lifecycle errors). The message is the contract surface.
     #[error("{0}")]
@@ -115,6 +215,17 @@ pub enum Error {
     /// unapplied or safe to blindly resend.
     #[error("DEPLOYMENT_DRAINING")]
     DeploymentDraining(DeploymentReadOnlyOperation),
+    /// A keyed replay found the original write and could not rebuild its
+    /// receipt inside a resource bound (see [`ReplayBound`]). The write
+    /// committed; only the answer is missing. It is a retryable
+    /// outcome-known-to-be-applied failure, so hosted transports answer it
+    /// 503 (never a 4xx refusal) and a retry with the same key is safe.
+    #[error("{tool}: {bound}", bound = .bound.describe())]
+    ReplayBounded {
+        tool: String,
+        bound: ReplayBound,
+        applied: ReplayApplied,
+    },
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error(transparent)]
@@ -124,6 +235,18 @@ pub enum Error {
 }
 
 impl Error {
+    pub(crate) fn at_standby_check(self, check: StandbyAdmissionCheck) -> Self {
+        // The deepest annotated refusal owns the diagnostic.
+        if matches!(self, Self::StandbyAdmission { .. }) {
+            self
+        } else {
+            Self::StandbyAdmission {
+                check,
+                source: Box::new(self),
+            }
+        }
+    }
+
     pub fn engine(message: impl Into<String>) -> Self {
         Error::Engine(message.into())
     }
@@ -175,6 +298,62 @@ impl Error {
         }
     }
 
+    /// A keyed replay hit `bound` rebuilding `tool`'s committed receipt.
+    pub fn replay_bounded(tool: impl Into<String>, bound: ReplayBound) -> Self {
+        Error::ReplayBounded {
+            tool: tool.into(),
+            bound,
+            applied: ReplayApplied::Committed,
+        }
+    }
+
+    /// Re-state a [`Error::ReplayBounded`] from a multi-write call as partial:
+    /// `completed` of `total` items are confirmed. Any other error is returned
+    /// unchanged.
+    pub fn into_partial_replay(self, completed: usize, total: usize) -> Self {
+        match self {
+            Error::ReplayBounded { tool, bound, .. } => Error::ReplayBounded {
+                tool,
+                bound,
+                applied: ReplayApplied::Partial { completed, total },
+            },
+            other => other,
+        }
+    }
+
+    /// The wire fields of a [`Error::ReplayBounded`], shared by every
+    /// transport: `error_code`, `applied` (`true`, or `"partial"` with
+    /// `completed_items` / `total_items`), `retryable: true` and `recovery`.
+    pub fn replay_bounded_fields(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let Error::ReplayBounded { applied, .. } = self else {
+            return None;
+        };
+        let mut fields = serde_json::Map::new();
+        fields.insert("error_code".into(), REPLAY_BOUND_EXCEEDED_CODE.into());
+        match applied {
+            ReplayApplied::Committed => {
+                fields.insert("applied".into(), true.into());
+                fields.insert("recovery".into(), REPLAY_BOUND_EXCEEDED_RECOVERY.into());
+            }
+            ReplayApplied::Partial { completed, total } => {
+                fields.insert("applied".into(), "partial".into());
+                fields.insert("completed_items".into(), (*completed).into());
+                fields.insert("total_items".into(), (*total).into());
+                fields.insert(
+                    "recovery".into(),
+                    REPLAY_BOUND_EXCEEDED_PARTIAL_RECOVERY.into(),
+                );
+            }
+        }
+        fields.insert("retryable".into(), true.into());
+        Some(fields)
+    }
+
+    /// True for [`Error::ReplayBounded`].
+    pub fn is_replay_bounded(&self) -> bool {
+        matches!(self, Error::ReplayBounded { .. })
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Error::Conflict(message.into())
     }
@@ -185,6 +364,19 @@ impl Error {
 
     pub(crate) fn deployment_read_only(operation: DeploymentReadOnlyOperation) -> Self {
         Error::DeploymentReadOnly(operation)
+    }
+
+    /// True for the shared provenance-key conflict refusals. The message
+    /// texts are the long-standing contract, so the code is derived from them
+    /// rather than carried in a new variant; a tool may prefix its own name.
+    pub fn is_idempotency_conflict(&self) -> bool {
+        match self {
+            Error::Engine(message) => {
+                message.ends_with(crate::provenance::IDEMPOTENCY_CONFLICTING_INPUT)
+                    || message.ends_with(crate::provenance::IDEMPOTENCY_DIFFERENT_INTENT)
+            }
+            _ => false,
+        }
     }
 
     pub fn deployment_read_only_operation(&self) -> Option<&str> {

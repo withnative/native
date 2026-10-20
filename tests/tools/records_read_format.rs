@@ -153,12 +153,8 @@ fn records_read_format_discovery_representation_and_one_step_recovery() {
             assert!(!text(&result).trim_start().starts_with('{'));
             assert!(text(&result).contains("native:root"));
             assert!(!text(&result).contains("Read scope:"));
-            let omitted = text(&result)
-                .lines()
-                .find(|line| line.contains("Additional record fields omitted from text:"))
-                .unwrap();
-            assert!(omitted.contains("kind_governance"));
-            assert!(omitted.contains("contribution"));
+            assert!(text(&result).contains("Kind governance:"));
+            assert!(text(&result).contains("Contribution:"));
             assert!(!text(&result).contains("interpretation_limits"));
             assert!(result.get("structuredContent").is_none());
             if let Some(default) = &rendered {

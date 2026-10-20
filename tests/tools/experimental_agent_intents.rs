@@ -301,6 +301,7 @@ fn descriptor_exposes_closed_nested_contracts_and_run_correlation() {
     let stable_count = registry.specs().count();
     let separately_registered = [
         ToolKind::StandbyStatus,
+        ToolKind::OutboxStatus,
         ToolKind::ExportSnapshot,
         ToolKind::ManageMemberships,
         ToolKind::WorkspaceRead,

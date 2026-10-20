@@ -40,6 +40,7 @@ fn defn2_entry() -> DefinitionEntry {
 
 fn manifest_with_fallback(fallback: &str) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: "acme".to_string(),
         name: "notes".to_string(),
         version: 1,
@@ -66,6 +67,7 @@ fn manifest() -> PackageManifest {
 /// no surface, and an empty declared-read set.
 fn definitions_only_manifest() -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: "acme".to_string(),
         name: "shapes".to_string(),
         version: 1,

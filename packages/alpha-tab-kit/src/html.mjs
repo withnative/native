@@ -21,7 +21,8 @@ const ADVISORY_COMMIT = "ffd9c76cd";
 
 // 28 Sep 2026: strict stays the default because hosted production still runs
 // the validator from before ffd9c76cd. render_artifact reported
-// adapter_revision 1 and validator version 1; main is at 3, which is where
+// adapter_revision 1 and validator version 1; main's validator version is 3
+// (independent of ADAPTER_REVISION), which is where
 // the accessibility rules became advisory. See README "When to flip the
 // strict default": flipping is this one line, once `alpha-tab-kit hosted`
 // reports validator version >= 3.
@@ -115,6 +116,58 @@ export function scanTags(source) {
   return elements;
 }
 
+// Source policy is authoritative; runtime release identity is deliberately absent.
+export const KIT_POLICY_SCHEMA = "native.app-kit.v1";
+export const KIT_MAJOR_MAX = 65535;
+export const KIT_POLICY_JSON_LIMIT = 1024;
+
+export function sourceKitPolicy(source, elements = scanTags(source)) {
+  const markers = elements.filter(element => element.attributes.get("id")?.toLowerCase() === "native-app-kit");
+  const fail = (rule, message) => ({ policy: null, findings: [finding(rule, `${H} parse_kit_policy`, message, { code: "html_invalid_kit_policy" })] });
+  if (!markers.length) return { policy: null, findings: [] };
+  if (markers.length !== 1) return fail("kit-policy-count", "native-app-kit must occur exactly once");
+  const marker = markers[0];
+  if (marker.tag !== "script" || marker.attributes.get("type")?.toLowerCase() !== "application/json") {
+    return fail("kit-policy-marker", "native-app-kit must be an inert script[type=application/json]");
+  }
+  if (Buffer.byteLength(marker.text ?? "", "utf8") > KIT_POLICY_JSON_LIMIT) return fail("kit-policy-size", "native-app-kit JSON exceeds 1024 bytes");
+  let policy;
+  try { policy = JSON.parse(marker.text); } catch { return fail("kit-policy-json", "native-app-kit must contain valid JSON"); }
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) return fail("kit-policy-shape", "native-app-kit must be an object");
+  if (Object.keys(policy).length !== 2 || !Object.hasOwn(policy, "schema") || !Object.hasOwn(policy, "major")) return fail("kit-policy-fields", "native-app-kit requires only schema and major");
+  if (policy.schema !== KIT_POLICY_SCHEMA) return fail("kit-policy-schema", "native-app-kit schema must be native.app-kit.v1");
+  if (!Number.isInteger(policy.major) || policy.major < 1 || policy.major > KIT_MAJOR_MAX) return fail("kit-policy-major", "native-app-kit major must be an integer from 1 to 65535");
+  return { policy: Object.freeze({ schema: KIT_POLICY_SCHEMA, major: policy.major }), findings: [] };
+}
+
+/** Optional descriptor metadata must repeat the author source policy faithfully. */
+export function descriptorKitPolicyFindings(descriptor, source) {
+  const findings = [];
+  if (Object.hasOwn(descriptor, "kit")) {
+    const { policy } = sourceKitPolicy(source);
+    const kit = descriptor.kit;
+    if (!kit || typeof kit !== "object" || Array.isArray(kit)
+      || Object.keys(kit).length !== 1 || !Object.hasOwn(kit, "major")
+      || !Number.isInteger(kit.major) || kit.major < 1 || kit.major > KIT_MAJOR_MAX) {
+      findings.push(finding("descriptor.kit-policy", "HTML native-app-kit source policy", "descriptor kit must contain only an integer major from 1 to 65535"));
+    } else if (!policy || kit.major !== policy.major) {
+      findings.push(finding("descriptor.kit-policy-mismatch", "HTML native-app-kit source policy", "descriptor kit must match the source kit-major policy"));
+    }
+  }
+  return findings;
+}
+
+/** Author policy validation plus host-owned availability check. */
+export function requireAvailableKit(source, delivery) {
+  const { policy, findings } = sourceKitPolicy(source);
+  if (findings.length) throw new Error(`${findings[0].message} [html_invalid_kit_policy]`);
+  if (policy) {
+    if (!delivery) throw new Error(`Native app kit major ${policy.major} is unavailable on this host [kit_major_unavailable]`);
+    return delivery.resolve(policy.major);
+  }
+  return null;
+}
+
 // Mirrors `bootstrap_insertion_offset` (html.rs:1131): BOM, whitespace, the
 // exact doctype, `<html` + space or `>`, then an attribute-free `<head>`.
 // Returns the injection offset, or a finding.
@@ -170,7 +223,7 @@ function decodeDataUrl(raw) {
  * advisories that hosted builds before ffd9c76cd refused — one <main>, an
  * <h1>, and heading order as seen by the 28 Sep 2026 install run — to errors.
  */
-export function validateHtml(source, { strict = STRICT_DEFAULT } = {}) {
+export function validateHtml(source, { strict = STRICT_DEFAULT, package: isPackage = false } = {}) {
   const findings = [];
   const where = (element) => (element ? position(source, element.offset) : undefined);
   const error = (rule, line, message, element, code = "html_policy_violation") => findings.push(finding(rule, `${H}:${line}`, message, { code, where: where(element) }));
@@ -186,8 +239,11 @@ export function validateHtml(source, { strict = STRICT_DEFAULT } = {}) {
   };
 
   const bytes = Buffer.byteLength(source, "utf8");
-  if (bytes > L.body_max_bytes) {
-    error("body-size", 1557, `HTML source is ${bytes} bytes; the UTF-8 body limit is ${L.body_max_bytes}`, null, "html_source_too_large");
+  // An installed app package bundle (the record carries the package facet)
+  // gets the package limit; every other document keeps the ordinary one.
+  const bodyMax = isPackage ? L.package_body_max_bytes : L.body_max_bytes;
+  if (bytes > bodyMax) {
+    error("body-size", 1557, `HTML source is ${bytes} bytes; the UTF-8 body limit is ${bodyMax}${isPackage ? " (package bundle)" : ""}`, null, "html_source_too_large");
     return findings;
   }
   const preamble = bootstrapInsertionOffset(source);
@@ -204,6 +260,7 @@ export function validateHtml(source, { strict = STRICT_DEFAULT } = {}) {
   }
 
   const elements = scanTags(body);
+  findings.push(...sourceKitPolicy(body, elements).findings);
   if (elements.length > L.dom_node_max) error("dom-node-limit", 1203, `static DOM node limit exceeded (${elements.length} elements > ${L.dom_node_max})`);
   let lang = false;
   const titles = [];

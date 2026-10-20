@@ -328,6 +328,9 @@ fn tool_descriptions_explain_the_two_call_recovery_pattern_and_limits() {
         "non-destructive",
         "do not create a v2 copy",
         "previous_seq",
+        "as_of.content_seq",
+        "previous_event_id",
+        "as_of.event_id",
         "get_record",
         "record fields only",
         "not atomic",
@@ -336,11 +339,17 @@ fn tool_descriptions_explain_the_two_call_recovery_pattern_and_limits() {
     }
     for tool in ["delete_record", "archive_record", "manage_links"] {
         let description = description(tool);
-        assert!(
-            description.contains("previous_seq"),
-            "{tool}: {description}"
-        );
-        assert!(description.contains("as_of"), "{tool}: {description}");
+        for phrase in [
+            "previous_seq",
+            "previous_event_id",
+            "as_of.content_seq",
+            "as_of.event_id",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "{tool}: missing '{phrase}' in: {description}"
+            );
+        }
     }
 }
 

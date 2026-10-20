@@ -51,7 +51,7 @@ When an external artifact will matter after this session or to another contribut
 
 ## Large finished content
 
-Write a finished artifact once, not in pieces. `body_append` is for small additions only; each append re-stores the entire body in the record's history, so streaming a finished document through it grows the log quadratically. Commit a finished document with a single `body_set` (one request carries up to about 3 MB of text), and put an app artifact in one `body_set` of at most 512 KiB. Keep `body_append` for genuinely incremental progress where a small delta is the point.
+Write a finished artifact once, not in pieces. `body_append` is for small additions only; a short append or surgical replacement still stores the full resulting body in history today, so streaming a finished document through it grows the log quadratically. Commit a finished document with a single `body_set` (one request carries up to about 3 MB of text), and put an app artifact in one `body_set` of at most 512 KiB. Keep task bodies current rather than journaling every step: record at consequential milestones, replace stale checkpoints, and give independently useful material its own linked record with a concise synthesis.
 
 ## Correct forward
 

@@ -140,7 +140,7 @@ async fn cold_start_preview_is_bounded_catalogue_only_and_write_free() {
     let preview = call(&registry, &db, json!({})).await.unwrap();
 
     assert_eq!(preview["schema"], "native.record_shape_preview.v1");
-    assert_eq!(preview["catalogs"]["types"].as_array().unwrap().len(), 10);
+    assert_eq!(preview["catalogs"]["types"].as_array().unwrap().len(), 11);
     assert_eq!(
         preview["catalogs"]["relationships"]
             .as_array()

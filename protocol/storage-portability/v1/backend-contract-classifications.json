@@ -1,6 +1,6 @@
 {
   "format": "native.backend-contract-classifications.v1",
-  "revision": 20,
+  "revision": 21,
   "profiles": [
     {
       "id": "sqlite-local",
@@ -503,6 +503,19 @@
       }
     },
     {
+      "id": "manage_account_config",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_account_config",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
       "id": "manage_instructions",
       "kind": "tool",
       "surface": "primary",
@@ -573,6 +586,20 @@
       "surface": "primary",
       "profiles": {
         "sqlite-local": "F|sqlite-reference-ci:manage_messages",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
+      "id": "manage_participants",
+      "kind": "tool",
+      "surface": "primary",
+      "notes": "Persona identity is qualified only on SQLite in S1/S2.",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:manage_participants",
         "postgres-server": "N",
         "turso-local": "N",
         "turso-remote": "N",

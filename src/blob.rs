@@ -12,7 +12,7 @@
 //! SQLite's `substr` so a large blob is never materialized whole. The v1.1
 //! sheet tools (`mcp::sheet`, tools 26–30) build on these same helpers.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
@@ -40,7 +40,7 @@ pub(crate) fn new_blob_meta(
 pub const BLOB_REF_FACET_KEY: &str = "blob_ref";
 
 /// A `blobs` row's metadata — never the bytes.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub id: String,
     pub mime: Option<String>,

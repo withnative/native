@@ -40,6 +40,10 @@ fn relationship_writes_are_confined_to_the_kernel_projector_and_data_movement_se
         Path::new("src/relationship/projector.rs"),
         // Narrow in-module corruption/append-only fixtures only.
         Path::new("src/relationship/kernel_tests.rs"),
+        // Minimal v1 snapshot fixture supplies one legacy relationship event;
+        // the ordering fixture stamps its v1 commit act. The importer itself
+        // only reads it and uses governed v2 writes.
+        Path::new("src/v1_import/tests.rs"),
     ];
     let mut violations = Vec::new();
     for path in files {
@@ -47,6 +51,16 @@ fn relationship_writes_are_confined_to_the_kernel_projector_and_data_movement_se
             .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap();
         let source = fs::read_to_string(&path).unwrap();
+        if relative == Path::new("src/v1_import/tests.rs") {
+            let parent = fs::read_to_string(root.join("v1_import.rs"))
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(parent.matches("mod tests;").count(), 1);
+            assert_eq!(parent.matches("#[cfg(test)] mod tests;").count(), 1);
+            assert_eq!(mutation.find_iter(&source).count(), 2);
+        }
         if mutation.is_match(&source) && !allowed.contains(&relative) {
             violations.push(relative.display().to_string());
         }

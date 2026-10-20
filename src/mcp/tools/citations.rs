@@ -62,6 +62,7 @@ enum ManageCitationsArgs {
         citation_id: String,
         target: CitationTargetInput,
         reason: String,
+        idempotency_key: Option<String>,
     },
     Remove {
         citation_id: String,
@@ -260,6 +261,8 @@ pub(crate) async fn prepare_manage_citations_remove(
 
 async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "manage_citations";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ManageCitationsArgs = parse_args(TOOL, arguments)?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
@@ -268,8 +271,11 @@ async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Va
             citation_id,
             target,
             reason,
+            idempotency_key,
         } => {
             require_nonblank_reason(TOOL, &reason)?;
+            let keyed =
+                super::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?.is_some();
             let bearer: Option<String> = sqlx::query_scalar(
                 "SELECT target_id FROM links WHERE source_id = ? AND relationship = 'part_of' LIMIT 1",
             )
@@ -316,6 +322,36 @@ async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Va
             .is_err()
             {
                 return Err(citation_not_found(TOOL, &citation_id));
+            }
+            // Keyed replay: after the bearer-edit and target-view checks,
+            // before the selectors are captured from the source as it is now.
+            if keyed {
+                if let Some(replay) = super::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let [event] = replay.content() else {
+                        return Err(Error::engine(format!(
+                            "{TOOL}: idempotent receipt is incomplete"
+                        )));
+                    };
+                    let receipt = echo_act(
+                        json!({
+                        "citation_id": citation_id,
+                        "action": "reanchored",
+                        "event_seq": event.seq,
+                        "reason": reason
+                        }),
+                        replay.act(),
+                    )?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
             }
             let mut payload = serde_json::to_value(capture_target_in(&mut tx, target).await?)?;
             payload
@@ -381,6 +417,7 @@ async fn manage_citations(db: Db, caller: Caller, arguments: Value) -> Result<Va
         &mut act_alloc,
     )
     .await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     echo_act(
         json!({
@@ -400,12 +437,22 @@ pub(crate) fn target_schema() -> Value {
             "target_record_id": { "type": "string" },
             "source_slot": { "type": "string", "enum": ["body", "blob"] },
             "purpose": { "type": "string" },
+            "source_pin": {
+                "type": "object",
+                "description": "Body-only: event+hash must match in anchor tx before selectors, even for equal bytes; omit=unpinned.",
+                "properties": {
+                    "source_event_id": { "type": "string", "minLength": 1 },
+                    "source_body_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                },
+                "required": ["source_event_id", "source_body_sha256"],
+                "additionalProperties": false
+            },
             "selectors": {
                 "type": "array", "minItems": 1,
                 "items": { "oneOf": [
                     { "type": "object", "properties": { "type": { "const": "text_quote" }, "exact": { "type": "string", "minLength": 1 }, "prefix": { "type": "string" }, "suffix": { "type": "string" } }, "required": ["type", "exact"], "additionalProperties": false },
                     { "type": "object", "properties": { "type": { "const": "data_position" }, "start": { "type": "integer", "minimum": 0 }, "end": { "type": "integer", "minimum": 1 }, "selected_sha256": { "type": "string" } }, "required": ["type", "start", "end"], "additionalProperties": false },
-                    { "type": "object", "description": "Strict v1 CSV fragment: conforms_to must be https://www.rfc-editor.org/rfc/rfc7111 and value must be one positive 1-based row=N or cell=ROW,COLUMN coordinate. Ranges, wildcards, multiple selections, and other conformances are rejected. Row selects raw row bytes without CRLF/LF; cell selects the raw encoded field including quotes. Must pair with data_position and identify exactly the same bytes.", "properties": { "type": { "const": "fragment" }, "conforms_to": { "type": "string" }, "value": { "type": "string", "pattern": "^(row=[1-9][0-9]*|cell=[1-9][0-9]*,[1-9][0-9]*)$" } }, "required": ["type", "conforms_to", "value"], "additionalProperties": false }
+                    { "type": "object", "description": "conforms_to=https://www.rfc-editor.org/rfc/rfc7111; 1-based >0 row=N/cell=ROW,COLUMN only (no ranges/wildcards/multiple). Row excludes CRLF/LF; cell raw+quotes. Pair data_position: same bytes.", "properties": { "type": { "const": "fragment" }, "conforms_to": { "type": "string" }, "value": { "type": "string", "pattern": "^(row=[1-9][0-9]*|cell=[1-9][0-9]*,[1-9][0-9]*)$" } }, "required": ["type", "conforms_to", "value"], "additionalProperties": false }
                 ] }
             }
         },
@@ -435,12 +482,17 @@ pub fn register_citation_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "action": { "type": "string", "enum": ["reanchor", "remove"] },
                 "citation_id": { "type": "string" },
                 "target": { "allOf": [target_schema()], "description": "Required for reanchor and forbidden for remove." },
-                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["action", "citation_id", "reason"],
             "additionalProperties": false
         }),
-        manage_citations,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_citations(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     Ok(())
 }

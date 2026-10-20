@@ -208,9 +208,10 @@ fn production_operations(registry: &ToolRegistry) -> BTreeMap<(String, String), 
     let kinds = ToolKind::ALL
         .into_iter()
         // The ordinary SQLite registry owns the authorization manifest below.
-        // Standby status is registered only when mcp-stdio has an activated
-        // local standby and therefore has a real status provider.
-        .filter(|kind| *kind != ToolKind::StandbyStatus)
+        // Status tools are registered only with their configured providers:
+        // an activated standby, or a hosted outbox/retained status service.
+        // Neither belongs to the ordinary SQLite authorization manifest.
+        .filter(|kind| !matches!(kind, ToolKind::StandbyStatus | ToolKind::OutboxStatus))
         .map(|kind| (kind.name(), kind))
         .collect::<BTreeMap<_, _>>();
     assert_eq!(registered.len(), kinds.len());

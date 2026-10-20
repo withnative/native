@@ -12,6 +12,9 @@
 
 pub mod contract;
 pub mod ddl;
+/// Test support: how to reach an older engine schema from the current DDL.
+#[doc(hidden)]
+pub mod step_down;
 // Slice 0 is intentionally descriptive; delta materialisation consumes this
 // metadata in the next slice.
 #[allow(dead_code)]

@@ -133,8 +133,14 @@ const BOOTSTRAP_CONTRACT_VERSION: &str = "native.bootstrap.v3";
 /// Build-owned tool references emitted structurally by Bootstrap's
 /// `next_steps`. QuickStart's continuation-closure regression consumes this
 /// seam directly instead of inferring dependencies from rendered guidance.
-pub(crate) const ACTIONABLE_NEXT_STEP_TOOLS: [&str; 4] =
-    ["set_intent", "get_record", "get_dashboard", "get_structure"];
+pub(crate) const ACTIONABLE_NEXT_STEP_TOOLS: [&str; 6] = [
+    "set_intent",
+    "get_record",
+    "get_dashboard",
+    "get_structure",
+    "query_sql",
+    "search",
+];
 const RECENT_ACTIVITY_LIMIT: usize = 3;
 const OPEN_WORK_LIMIT: usize = 2;
 const WORKSPACE_VISIBILITY_SCAN_LIMIT: usize = 2_048;
@@ -650,7 +656,7 @@ async fn current_world_preview(db: &Db, caller: &Caller, observed_at: &str) -> R
 }
 
 fn next_steps(intent_declared: bool, world: &Value, run_key: &str) -> Value {
-    let [set_intent_tool, get_record_tool, get_dashboard_tool, get_structure_tool] =
+    let [set_intent_tool, get_record_tool, get_dashboard_tool, get_structure_tool, query_sql_tool, search_tool] =
         ACTIONABLE_NEXT_STEP_TOOLS;
     let mut items = Vec::new();
     if !intent_declared {
@@ -672,10 +678,23 @@ fn next_steps(intent_declared: bool, world: &Value, run_key: &str) -> Value {
         items.push(json!({
             "tool": get_record_tool,
             "label": "Inspect recent activity",
-            "why": "Understand the most recently active visible record and decide whether it is relevant to the user's request.",
+            "why": "Open the most recently active record; use get_record when you already hold a reference.",
             "arguments": { "ids": [id], "run_key": run_key },
         }));
     }
+    items.push(json!({
+        "tool": query_sql_tool,
+        "label": "Choose from a set",
+        "why": "Use SQL to filter, count, or follow links.",
+        "arguments": {"sql": "SELECT id, type, name, lifecycle FROM records WHERE type = 'WorkItem' AND lifecycle IN ('open', 'in_progress', 'blocked') ORDER BY last_activity_at DESC, id LIMIT 20", "run_key": run_key},
+    }));
+    items.push(json!({
+        "tool": search_tool,
+        "label": "Find free text",
+        "why": "Search words in records.",
+        "arguments": {"query": "<words>", "run_key": run_key},
+        "replace_placeholders": ["query"],
+    }));
     items.push(json!({
         "tool": get_dashboard_tool,
         "label": "Check broader attention",
@@ -699,6 +718,11 @@ fn next_steps(intent_declared: bool, world: &Value, run_key: &str) -> Value {
 
 async fn bootstrap(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     let _args: BootstrapArgs = parse_args("bootstrap", arguments)?;
+    // Outage-bootstrap (design 200dc2d §6) takes precedence over every
+    // other leg: it never mints and never enters the member slice.
+    if caller.is_outage_bootstrap() {
+        return resolve_outage_footing(&db, &caller, "bootstrap").await;
+    }
     // Contract c323277 rev 8 §2.3(a): a member copy serves a reduced
     // bootstrap from the admitted slice. Online legs below are unchanged.
     if caller.is_member_copy() {
@@ -707,8 +731,220 @@ async fn bootstrap(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     resolve_session_footing(&db, &caller, "bootstrap").await
 }
 
+/// Product boundaries stated in every bootstrap's standing context.
+const PRODUCT_BOUNDARIES: [&str; 3] = [
+    "Native does not passively learn from or observe activity outside durable recorded state and calls made through currently available tools.",
+    "Do not claim unverified training, egress, encryption, security, compliance, confidentiality, residency, or data-sovereignty properties.",
+    "Do not run unprompted bulk surveys or imports, or offer connectors that are not currently available.",
+];
+
+/// Outage bootstrap (design 200dc2d §6): a bounded local orientation with
+/// no run key minted, no keyed next steps, no session guidance and no
+/// `set_intent` prompt. Standing instruction bodies are resolved with no run
+/// key and kept, since they are local data. Only the node's internal
+/// composition sets the caller flag; this changes neither authorisation nor
+/// persistence. Member-copy callers are refused: the leg needs full-engine
+/// visibility.
+async fn resolve_outage_footing(db: &Db, caller: &Caller, tool: &str) -> Result<Value> {
+    // A member-copy slice cannot serve full-engine visibility reads, so the
+    // outage leg refuses rather than returning a partial orientation.
+    if caller.is_member_copy() {
+        return Err(Error::engine(
+            "outage bootstrap is only supported for full-owner standby",
+        ));
+    }
+    let echoed_run_key: Option<String> = caller.run_key().map(String::from);
+    let not_hidden_r = crate::query::not_hidden_predicate("r");
+    let not_hidden_c = crate::query::not_hidden_predicate("c");
+    let roots_sql = format!(
+        "SELECT r.id, r.type, r.kind, r.name, r.persistence
+          FROM records r
+          WHERE r.home_id IS NULL AND r.deleted_at IS NULL
+            AND {not_hidden_r}
+            AND NOT EXISTS (SELECT 1 FROM facet_values av
+                             WHERE av.record_id = r.id AND av.key = 'archived')
+          ORDER BY r.name, r.id"
+    );
+    let root_rows = sqlx::query(&roots_sql).fetch_all(db.pool()).await?;
+    if root_rows.len() != 1
+        || root_rows[0].try_get::<String, _>("id")? != crate::schema::ROOT_RECORD_ID
+    {
+        return Err(Error::engine(format!(
+            "{tool}: canonical-root invariant violated: expected exactly one live visible parentless record '{}', found {}",
+            crate::schema::ROOT_RECORD_ID,
+            root_rows.len()
+        )));
+    }
+    let root = &root_rows[0];
+    let root_id: String = root.try_get("id")?;
+    if !can_record_in_pool(db.pool(), caller, &root_id, Capability::View).await? {
+        return Err(Error::auth(format!(
+            "{tool}: canonical root is not visible to this caller"
+        )));
+    }
+    let child_ids_sql = format!(
+        "SELECT c.id FROM records c
+          WHERE c.home_id=? AND c.deleted_at IS NULL
+            AND {not_hidden_c}
+            AND NOT EXISTS (SELECT 1 FROM facet_values av
+                              WHERE av.record_id=c.id AND av.key='archived')"
+    );
+    let child_ids: Vec<String> = sqlx::query_scalar(&child_ids_sql)
+        .bind(&root_id)
+        .fetch_all(db.pool())
+        .await?;
+    let mut visible_children = 0i64;
+    for child in child_ids {
+        if can_record_in_pool(db.pool(), caller, &child, Capability::View).await? {
+            visible_children += 1;
+        }
+    }
+    let observed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let principal = principal_footing(db, caller, &observed_at).await?;
+    let workspace = workspace_footing(db, root, caller).await?;
+    let mut current_world = current_world_preview(db, caller, &observed_at).await?;
+    // Outage mode gives no `set_intent` prompt: the shared preview names it
+    // as the resume owner, so restate resumability for the outage.
+    if let Some(resum) = current_world
+        .get_mut("resumability")
+        .and_then(Value::as_object_mut)
+    {
+        resum.insert(
+            "reason".into(),
+            Value::String(
+                "Outage orientation does not assess resumability; hosted bootstrap owns intent and resume once reachable."
+                    .into(),
+            ),
+        );
+    }
+    let engine = json!({
+        "name": ENGINE_NAME,
+        "version": ENGINE_VERSION,
+        "schema_version": CURRENT_ENGINE_SCHEMA_VERSION,
+        "user_version": user_version(db).await?,
+    });
+    let roots = json!({
+        "items": [{
+            "id": root_id,
+            "type": root.try_get::<String, _>("type")?,
+            "kind": root.try_get::<Option<String>, _>("kind")?,
+            "name": root.try_get::<String, _>("name")?,
+            "persistence": root.try_get::<String, _>("persistence")?,
+            "child_count": visible_children,
+        }],
+        "total": 1,
+    });
+    let outage = match echoed_run_key.clone() {
+        Some(key) => json!({
+            "mode": "outage-bootstrap",
+            "hosted_reachable": false,
+            "run_key": key,
+            "run_history": "unavailable",
+            "run_history_note": "Local run and intent history is unavailable (not empty) while hosted Native is unreachable.",
+            "guidance": "Hosted Native is unreachable. Run keys, intents and declarations wait until hosted Native is reachable; bootstrap against hosted then. This bounded local orientation is read-only.",
+        }),
+        None => json!({
+            "mode": "outage-bootstrap",
+            "hosted_reachable": false,
+            "run_key": Value::Null,
+            "run_history": "no_key",
+            "guidance": "Hosted Native is unreachable. Run keys, intents and declarations wait until hosted Native is reachable; bootstrap against hosted then. This bounded local orientation is read-only.",
+        }),
+    };
+    // Standing guidance is local data, so outage mode keeps it: resolved
+    // with no run key and WITHOUT the engine-instruction wrapper (which
+    // names `set_intent`). Keyed next steps and session guidance stay out.
+    let portable_resolution = crate::instructions::resolve_for_account(
+        db.pool(),
+        caller.credential(),
+        caller.is_host_member(),
+        caller.is_host_owner(),
+        None,
+    )
+    .await?;
+    let standing_context = json!({
+        "portable_instructions": {
+            "status": portable_resolution.instructions.status.clone(),
+            "entry_count": portable_resolution.instructions.entries.len(),
+            "exact_entries_path": "/instructions/entries",
+            "diagnostics_path": "/instructions/diagnostics",
+        },
+        "pending_onboarding_obligations": {
+            "count": portable_resolution.pending_obligations.len(),
+            "exact_items_path": "/pending_obligations",
+        },
+        "note": "Permissions and product boundaries still apply when no additional instruction body is present.",
+        "product_boundaries": PRODUCT_BOUNDARIES,
+    });
+    let footing = json!({ "principal": &principal, "workspace": &workspace, "standing_context": &standing_context });
+    let footing_bytes = enforce_component("footing", &footing, MAX_BOOTSTRAP_FOOTING_BYTES)?;
+    let current_world_bytes = enforce_component(
+        "current-world",
+        &current_world,
+        MAX_BOOTSTRAP_CURRENT_WORLD_BYTES,
+    )?;
+    let instruction_context = json!({
+        "instructions": &portable_resolution.instructions,
+        "pending_obligations": &portable_resolution.pending_obligations,
+    });
+    let instruction_context_bytes = enforce_component(
+        "instruction-context",
+        &instruction_context,
+        MAX_BOOTSTRAP_INSTRUCTION_CONTEXT_BYTES,
+    )?;
+    let json_envelope_bytes = bootstrap_json_envelope_bytes()?;
+    if json_envelope_bytes > MAX_BOOTSTRAP_JSON_ENVELOPE_BYTES {
+        return Err(Error::engine(format!(
+            "bootstrap JSON envelope is {json_envelope_bytes} bytes; limit is {MAX_BOOTSTRAP_JSON_ENVELOPE_BYTES} bytes"
+        )));
+    }
+    let contract = json!({
+        "version": BOOTSTRAP_CONTRACT_VERSION,
+        "outage_bootstrap": true,
+        "intent_agnostic": true,
+    });
+    let contract_bytes = enforce_component("contract", &contract, MAX_BOOTSTRAP_CONTRACT_BYTES)?;
+    let diagnostics = json!({
+        "engine": &engine,
+        "component_bytes": {
+            "contract": contract_bytes,
+            "footing": footing_bytes,
+            "current_world": current_world_bytes,
+            "instruction_context": instruction_context_bytes,
+            "json_envelope": json_envelope_bytes,
+        },
+        "instruction_provenance": "Retained under instructions.entries[].source; intentionally omitted from default text.",
+    });
+    enforce_component("diagnostics", &diagnostics, MAX_BOOTSTRAP_DIAGNOSTICS_BYTES)?;
+    let payload = json!({
+        "contract": contract,
+        "principal": principal,
+        "workspace": workspace,
+        "standing_context": standing_context,
+        "current_world": current_world,
+        "outage": outage,
+        "outage_bootstrap": true,
+        "diagnostics": diagnostics,
+        "engine": engine,
+        "roots": roots,
+        "instructions": portable_resolution.instructions,
+        "pending_obligations": portable_resolution.pending_obligations,
+    });
+    let total_bytes = serialized_bytes(&payload)?;
+    if total_bytes > MAX_BOOTSTRAP_TOTAL_BYTES {
+        return Err(Error::engine(format!(
+            "bootstrap payload is {total_bytes} bytes; compositional transport limit is {MAX_BOOTSTRAP_TOTAL_BYTES} bytes"
+        )));
+    }
+    Ok(payload)
+}
+
 /// Resolve Bootstrap's canonical read-only session footing.
 pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str) -> Result<Value> {
+    // Outage-bootstrap branches before any minting (design 200dc2d §6).
+    if caller.is_outage_bootstrap() {
+        return resolve_outage_footing(db, caller, tool).await;
+    }
     // Bootstrap is the sole first-call issuer. QuickStart is a static launcher
     // and deliberately never enters this resolver. The universal `new` /
     // `new:<agent_key>` sentinels remain the same fail-open minting path when a
@@ -858,11 +1094,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
             "exact_items_path": "/pending_obligations",
         },
         "note": "Permissions and product boundaries still apply when no additional instruction body is present.",
-        "product_boundaries": [
-            "Native does not passively learn from or observe activity outside durable recorded state and calls made through currently available tools.",
-            "Do not claim unverified training, egress, encryption, security, compliance, confidentiality, residency, or data-sovereignty properties.",
-            "Do not run unprompted bulk surveys or imports, or offer connectors that are not currently available."
-        ],
+        "product_boundaries": PRODUCT_BOUNDARIES,
     });
     let intentful_sessions = json!({
         "intent_declared_for_run": intent_declared,
@@ -871,7 +1103,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
         "why": "Native uses agent-declared intent to return a purpose-relative briefing, connect work into an inspectable run, surface resumable work and open claims, and leave a more intelligible hand-off.",
         "guidance": "Infer a clear intent from the user's request rather than asking them to repeat it. When the underlying aim materially changes, update it with set_intent; this does not create a new bootstrap boundary.",
         "declared_model": {
-            "how": "Name the model with `model` on the run's first set_intent.",
+            "how": "Name the model with `model` on the admitting set_intent when possible, or later while the run still records none.",
             "why": "So the person or agent later reading this run — e.g. the model evaluation ledger — knows which model claimed it.",
             "limits": "First wins; differing repeats are refused. Unverified, per-run, grants nothing, no launcher-independent source coming; terms in set_intent.",
         },
@@ -897,7 +1129,7 @@ pub(crate) async fn resolve_session_footing(db: &Db, caller: &Caller, tool: &str
     let session = json!({
         "run_key": run["run_key"],
         "reuse_required": true,
-        "guidance": "This successful bootstrap establishes the one run key for this fresh host conversation. Reuse this exact key as run_key on subsequent calls, reads included. Later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries; use set_intent when the aim materially changes. Only the host can determine a fresh conversation: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account.",
+        "guidance": "This successful bootstrap establishes the one run key for this fresh host conversation. Wait for this bootstrap response before issuing dependent calls. Reuse this exact key as run_key on subsequent calls, reads included. Later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries; use set_intent when the aim materially changes. Only the host can determine a fresh conversation: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account.",
         "whole_run_rollback": false,
     });
     let engine = json!({
@@ -1130,11 +1362,7 @@ async fn bootstrap_member(db: Db, caller: Caller) -> Result<Value> {
         },
         "pending_onboarding_obligations": member_bootstrap_marker("bootstrap.claim"),
         "note": "Permissions and product boundaries still apply when no additional instruction body is present.",
-        "product_boundaries": [
-            "Native does not passively learn from or observe activity outside durable recorded state and calls made through currently available tools.",
-            "Do not claim unverified training, egress, encryption, security, compliance, confidentiality, residency, or data-sovereignty properties.",
-            "Do not run unprompted bulk surveys or imports, or offer connectors that are not currently available."
-        ],
+        "product_boundaries": PRODUCT_BOUNDARIES,
     });
     // Run/claim/intent parts are markers, never empty defaults. The session
     // key is functional but explicitly nondurable: minted without storage
@@ -1739,14 +1967,15 @@ async fn get_structure(db: Db, caller: Caller, mut arguments: Value) -> Result<V
     let Some(selector) = as_of else {
         return get_structure_from_lens(&ReadLens::live(&db), Some(&db), &caller, args).await;
     };
-    let resolved = lens::resolve_as_of_in_pool(db.pool(), selector).await?;
+    let resolved =
+        lens::resolve_as_of_in_pool_for(db.pool(), caller.counter_footing(), selector).await?;
     let scratch = open_database(":memory:").await?;
     let result = async {
         apply_schema(&scratch).await?;
         lens::replay_projection_in_pool(db.pool(), &scratch, resolved.resolved_content_seq).await?;
         let read_lens = ReadLens::historical(&scratch, &db, &resolved);
         let mut output = get_structure_from_lens(&read_lens, None, &caller, args).await?;
-        lens::echo_temporal(&mut output, &resolved);
+        lens::echo_temporal(&mut output, &resolved, caller.counter_footing());
         Ok(output)
     }
     .await;
@@ -3088,4 +3317,193 @@ pub fn register_orientation_tools(registry: &mut ToolRegistry) -> Result<()> {
         describe_schema,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod outage_bootstrap_tests {
+    use super::*;
+    use crate::mcp::register_surface_tools;
+
+    async fn setup() -> (ToolRegistry, Db) {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        register_surface_tools(&mut registry).unwrap();
+        (registry, db)
+    }
+
+    #[tokio::test]
+    async fn flag_off_bootstrap_is_unchanged() {
+        let (registry, db) = setup().await;
+        let caller = Caller::local();
+        assert!(!caller.is_outage_bootstrap());
+        let out = registry
+            .call(db.clone(), caller, "bootstrap", json!({}))
+            .await
+            .unwrap();
+        assert!(out.get("outage").is_none());
+        assert!(out.get("outage_bootstrap").is_none());
+        let key = out.pointer("/run/run_key").and_then(Value::as_str);
+        assert!(key.is_some());
+        assert!(out.get("next_steps").is_some());
+        assert!(out.get("session").is_some());
+    }
+
+    #[tokio::test]
+    async fn flag_on_without_key_mints_nothing_and_no_set_intent() {
+        let (registry, db) = setup().await;
+        let caller = Caller::local().with_outage_bootstrap();
+        assert!(caller.is_outage_bootstrap());
+        let out = registry
+            .call(db.clone(), caller, "bootstrap", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.get("outage_bootstrap").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(out.get("run").is_none());
+        assert!(out.get("session").is_none());
+        assert!(out.get("next_steps").is_none());
+        assert!(out.get("intentful_sessions").is_none());
+        // Standing guidance is local data, so it stays even in outage mode.
+        assert!(out.get("instructions").is_some());
+        assert!(out.get("standing_context").is_some());
+        assert!(out.get("pending_obligations").is_some());
+        assert!(out.pointer("/outage/run_key").is_some());
+        assert_eq!(out.pointer("/outage/run_key"), Some(&Value::Null));
+        let flat = serde_json::to_string(&out).unwrap();
+        assert!(!flat.contains("set_intent"));
+        let text = crate::mcp::render::render("bootstrap", &out).unwrap();
+        assert!(text.contains("Hosted Native is unreachable"));
+        assert!(text.contains("bootstrap against hosted"));
+        assert!(!text.contains("set_intent"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_with_key_echoes_it() {
+        let (registry, db) = setup().await;
+        let first = registry
+            .call(db.clone(), Caller::local(), "bootstrap", json!({}))
+            .await
+            .unwrap();
+        let key = first
+            .pointer("/run/run_key")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let caller = Caller::local().with_outage_bootstrap();
+        let out = registry
+            .call(db.clone(), caller, "bootstrap", json!({"run_key": key}))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.pointer("/outage/run_key").and_then(Value::as_str),
+            Some(key.as_str())
+        );
+        assert!(out.get("run").is_none());
+        assert!(out.get("session").is_none());
+        let flat = serde_json::to_string(&out).unwrap();
+        assert!(!flat.contains("set_intent"));
+        assert!(flat.contains("unavailable"));
+        let text = crate::mcp::render::render("bootstrap", &out).unwrap();
+        assert!(text.contains(&key));
+        assert!(!text.contains("set_intent"));
+    }
+
+    #[tokio::test]
+    async fn flag_cannot_be_set_from_tool_arguments() {
+        let (registry, db) = setup().await;
+        let err = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "bootstrap",
+                json!({"outage_bootstrap": true}),
+            )
+            .await
+            .expect_err("unknown bootstrap argument must be refused");
+        assert!(err.to_string().contains("bootstrap"));
+        let err = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "bootstrap",
+                json!({"outage": {}}),
+            )
+            .await
+            .expect_err("unknown bootstrap argument must be refused");
+        assert!(err.to_string().contains("bootstrap"));
+    }
+
+    #[tokio::test]
+    async fn flag_on_keeps_standing_instruction_bodies() {
+        let (registry, db) = setup().await;
+        let doc_id = "b0075000-0000-4000-8000-00000000000b";
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": doc_id, "type": "Document", "kind": "note",
+                    "name": doc_id, "body": "outage standing body v1",
+                    "reason": "outage instruction fixture",
+                }),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "manage_instructions",
+                json!({
+                    "action": "create_binding", "scope": "workspace",
+                    "binding_id": "outage-binding", "source_record_id": doc_id,
+                    "position": 100, "idempotency_key": "outage:binding",
+                    "reason": "outage instruction fixture",
+                }),
+            )
+            .await
+            .unwrap();
+        let out = registry
+            .call(
+                db.clone(),
+                Caller::local().with_outage_bootstrap(),
+                "bootstrap",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let bodies: Vec<&str> = out
+            .pointer("/instructions/entries")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("content").and_then(Value::as_str))
+            .collect();
+        assert!(
+            bodies.contains(&"outage standing body v1"),
+            "workspace standing body is present with the flag on"
+        );
+        let text = crate::mcp::render::render("bootstrap", &out).unwrap();
+        assert!(text.contains("outage standing body v1"));
+        assert!(!text.contains("set_intent"));
+        let flat = serde_json::to_string(&out).unwrap();
+        assert!(!flat.contains("set_intent"));
+    }
+
+    #[tokio::test]
+    async fn member_copy_with_outage_is_refused() {
+        let (_registry, db) = setup().await;
+        let caller = Caller::member_copy("outage-member").with_outage_bootstrap();
+        let err = resolve_outage_footing(&db, &caller, "bootstrap")
+            .await
+            .expect_err("member-copy outage bootstrap must be refused");
+        assert!(
+            err.to_string()
+                .contains("outage bootstrap is only supported for full-owner standby"),
+            "{err}"
+        );
+    }
 }

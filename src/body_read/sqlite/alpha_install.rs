@@ -252,6 +252,9 @@ pub(super) struct CurrentAlphaProof {
     pub(super) binding: ResolvedSource,
     pub(super) body: String,
     pub(super) bundle: String,
+    /// `PACKAGE_BODY_LIMIT` when the source record carries the package marker
+    /// facet, the ordinary `BODY_LIMIT` otherwise.
+    pub(super) body_limit: usize,
     pub(super) mixed_binding: Option<MixedSourceBinding>,
 }
 pub(super) async fn resolve_current(
@@ -489,6 +492,18 @@ async fn resolve_current_profile(
     if source_text(&runtime, "value")? != "native.html.v1" {
         return Err(Failure::SourceIntegrity);
     }
+    let package_marker = row(
+        snapshot,
+        "facet_values",
+        "record_id=? AND key=?",
+        &[&artifact, crate::artifact_html::PACKAGE_FACET_KEY],
+        &[("value", 256, false)],
+        "",
+    )
+    .await?
+    .map(|marker| source_text(&marker, "value"))
+    .transpose()?;
+    let body_limit = crate::artifact_html::body_limit_for_package_marker(package_marker.as_deref());
     snapshot.budget.event()?;
     let retained=row(snapshot,"content_events","record_id=? AND id=? AND type IN ('record.created','record.updated','receipt.committed.v1')",&[&artifact,&revision],&[("payload",PROVENANCE as i64,false)],"").await?.ok_or(Failure::SourceIntegrity)?;
     let raw = source_text(&retained, "payload")?;
@@ -579,6 +594,7 @@ async fn resolve_current_profile(
     Ok(CurrentAlphaProof {
         body,
         bundle: bundle.clone(),
+        body_limit,
         mixed_binding,
         binding: ResolvedSource {
             source: tuple("source", &[&viewer, package, &artifact])?,

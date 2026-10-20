@@ -178,13 +178,79 @@ pub const DEFN2_INTERPRETER: &str = "native.defn/2";
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub const DEFN3_INTERPRETER: &str = "native.defn/3";
 
-/// Which structured definition language an envelope declares. Only `/2` and
-/// `/3` exist today; `/1` envelopes carry no marker.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub const DEFN4_INTERPRETER: &str = "native.defn/4";
+
+/// Which structured definition language an envelope declares. `/1` envelopes
+/// carry no marker; `/4` inherits `/3` scalar features with closed keywords
+/// and adds closed link targets.
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DefnVersion {
     V2,
     V3,
+    V4,
+}
+
+/// Semantic capabilities are centralized so later language versions inherit
+/// features explicitly, rather than masquerading as an earlier marker.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LanguageCapabilities {
+    pub supports_fields: bool,
+    pub supports_record_identity: bool,
+    pub supports_structured_values: bool,
+    pub supports_closed_links: bool,
+    /// `/6`: `text_format` and `max_length` on `text` descriptors, and the
+    /// 26-code-point blank set for required text.
+    pub supports_text_formats: bool,
+    pub requires_required_identity: bool,
+    pub scalar_base_interpreter: Option<&'static str>,
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub fn language_capabilities(marker: Option<&str>) -> LanguageCapabilities {
+    match marker {
+        Some(DEFN2_INTERPRETER) => LanguageCapabilities {
+            supports_fields: true,
+            scalar_base_interpreter: Some(DEFN2_INTERPRETER),
+            ..Default::default()
+        },
+        Some(DEFN3_INTERPRETER) => LanguageCapabilities {
+            supports_fields: true,
+            supports_record_identity: true,
+            scalar_base_interpreter: Some(DEFN3_INTERPRETER),
+            ..Default::default()
+        },
+        Some(DEFN4_INTERPRETER) => LanguageCapabilities {
+            supports_fields: true,
+            supports_record_identity: true,
+            supports_closed_links: true,
+            requires_required_identity: true,
+            scalar_base_interpreter: Some(DEFN4_INTERPRETER),
+            ..Default::default()
+        },
+        Some(crate::structured_values::INTERPRETER) => LanguageCapabilities {
+            supports_fields: true,
+            supports_record_identity: true,
+            supports_structured_values: true,
+            requires_required_identity: true,
+            supports_closed_links: true,
+            supports_text_formats: false,
+            scalar_base_interpreter: Some(DEFN4_INTERPRETER),
+        },
+        // `/6` is `/5` plus text formats; the two markers stay separate so
+        // `/5` bytes, records and events keep their meaning.
+        Some(crate::structured_values::INTERPRETER_V6) => LanguageCapabilities {
+            supports_fields: true,
+            supports_record_identity: true,
+            supports_structured_values: true,
+            requires_required_identity: true,
+            supports_closed_links: true,
+            supports_text_formats: true,
+            scalar_base_interpreter: Some(DEFN4_INTERPRETER),
+        },
+        _ => LanguageCapabilities::default(),
+    }
 }
 
 #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -194,6 +260,7 @@ impl DefnVersion {
         match self {
             DefnVersion::V2 => "defn/2",
             DefnVersion::V3 => "defn/3",
+            DefnVersion::V4 => "defn/4",
         }
     }
 }
@@ -227,11 +294,17 @@ pub fn parse_artifact_envelope(artifact_bytes: &str) -> Result<ParsedArtifactEnv
 
 /// Kernel-side gate for definition bytes (test-only): envelopes without an
 /// `interpreter` key pass as the legacy language; `native.defn/2` and
-/// `native.defn/3` run the full semantic validation below; any other marker
+/// `native.defn/3` and `/4` run semantic validation below; any other marker
 /// fails loudly. Called only from the `#[cfg(test)]` kernel install/fold,
 /// never from production install or replay paths.
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub fn validate_kernel_definition_bytes(artifact_bytes: &str) -> Result<()> {
+    if crate::structured_values::declares_language(artifact_bytes)? {
+        let doc = crate::structured_values::parse_json(artifact_bytes)?;
+        let _ = parse_artifact_envelope(artifact_bytes)?;
+        let legacy = crate::structured_values::validate_definition(&doc)?;
+        return validate_kernel_definition_bytes(&legacy.to_string());
+    }
     let _ = parse_artifact_envelope(artifact_bytes)?;
     let doc: serde_json::Value = serde_json::from_str(artifact_bytes)
         .map_err(|_| Error::engine("definition artifact bytes must be a JSON envelope object"))?;
@@ -245,6 +318,10 @@ pub fn validate_kernel_definition_bytes(artifact_bytes: &str) -> Result<()> {
         Some(DEFN3_INTERPRETER) => validate_defn_envelope(
             doc.as_object().expect("shared parse accepted an object"),
             DefnVersion::V3,
+        ),
+        Some(DEFN4_INTERPRETER) => validate_defn_envelope(
+            doc.as_object().expect("shared parse accepted an object"),
+            DefnVersion::V4,
         ),
         Some(unknown) => Err(Error::engine(format!(
             "unknown definition interpreter '{unknown}'"
@@ -291,6 +368,9 @@ fn validate_defn_envelope(
     obj: &serde_json::Map<String, serde_json::Value>,
     version: DefnVersion,
 ) -> Result<()> {
+    if version == DefnVersion::V4 {
+        validate_defn4_keywords(obj)?;
+    }
     let label = version.label();
     let primary_type = obj
         .get("primary_type")
@@ -348,6 +428,158 @@ fn validate_defn_envelope(
     Ok(())
 }
 
+/// Close only the new grammar before running the inherited scalar semantics.
+/// Kept separate so another new language can add features without widening
+/// this version or changing the retained /1–/3 validators.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+fn validate_defn4_keywords(obj: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    fn keys(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        allowed: &[&str],
+        path: &str,
+    ) -> Result<()> {
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::engine(format!(
+                    "defn/4 {path}.{key}: unknown or unsupported keyword '{key}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+    keys(
+        obj,
+        &[
+            "family",
+            "version",
+            "package_ref",
+            "interpreter",
+            "primary_type",
+            "kinds",
+        ],
+        "$",
+    )?;
+    if let Some(kinds) = obj.get("kinds").and_then(serde_json::Value::as_array) {
+        for (index, kind) in kinds.iter().enumerate() {
+            let path = format!("$.kinds[{index}]");
+            let Some(kind) = kind.as_object() else {
+                continue;
+            };
+            keys(
+                kind,
+                &[
+                    "token",
+                    "fields",
+                    "identity",
+                    "links",
+                    "refines",
+                    "maturity",
+                    "description",
+                ],
+                &path,
+            )?;
+            if let Some(identity) = kind.get("identity").and_then(serde_json::Value::as_object) {
+                keys(identity, &["mode", "field"], &format!("{path}.identity"))?;
+                validate_defn4_field_identity(kind, identity, &path)?;
+            }
+            if let Some(fields) = kind.get("fields").and_then(serde_json::Value::as_array) {
+                for (index, field) in fields.iter().enumerate() {
+                    if let Some(field) = field.as_object() {
+                        let allowed: &[&str] =
+                            if field.get("type").and_then(serde_json::Value::as_str)
+                                == Some("choice")
+                            {
+                                &["name", "type", "required", "description", "values"]
+                            } else {
+                                &["name", "type", "required", "description"]
+                            };
+                        keys(field, allowed, &format!("{path}.fields[{index}]"))?;
+                    }
+                }
+            }
+            if let Some(links) = kind.get("links").and_then(serde_json::Value::as_array) {
+                for (index, link) in links.iter().enumerate() {
+                    let path = format!("{path}.links[{index}]");
+                    if let Some(link) = link.as_object() {
+                        keys(
+                            link,
+                            &[
+                                "predicate",
+                                "relationship_ref",
+                                "target",
+                                "direction",
+                                "cardinality",
+                            ],
+                            &path,
+                        )?;
+                        if let Some(reference) = link.get("relationship_ref") {
+                            if link.contains_key("predicate") {
+                                return Err(Error::engine(format!(
+                                    "{path}.relationship_ref: predicate and relationship_ref are mutually exclusive"
+                                )));
+                            }
+                            validate_relationship_ref(reference).map_err(|error| {
+                                Error::engine(format!("{path}.relationship_ref: {error}"))
+                            })?;
+                        }
+                        if let Some(target) = link.get("target") {
+                            if let Some(target) = target.as_object() {
+                                let allowed: &[&str] = if target.contains_key("any_record") {
+                                    &["any_record"]
+                                } else {
+                                    &["family", "kind"]
+                                };
+                                keys(target, allowed, &format!("{path}.target"))?;
+                            }
+                            parse_link_target4(target).map_err(|error| {
+                                Error::engine(format!("defn/4 {path}.target: {error}"))
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) const DEFN3_FIELD_TYPES: &[&str] = &[
+    "text", "integer", "number", "boolean", "time", "choice", "date",
+];
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) fn validate_defn4_field_identity(
+    kind: &serde_json::Map<String, serde_json::Value>,
+    identity: &serde_json::Map<String, serde_json::Value>,
+    path: &str,
+) -> Result<()> {
+    if identity.get("mode").and_then(serde_json::Value::as_str) == Some("record") {
+        return Ok(());
+    }
+    let name = identity.get("field").and_then(serde_json::Value::as_str);
+    let valid = name.is_some()
+        && kind
+            .get("fields")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|fields| {
+                fields.iter().any(|field| {
+                    field.get("name").and_then(serde_json::Value::as_str) == name
+                        && field.get("required").and_then(serde_json::Value::as_bool) == Some(true)
+                        && field
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|field_type| DEFN3_FIELD_TYPES.contains(&field_type))
+                })
+            });
+    if !valid {
+        return Err(Error::engine(format!(
+            "defn/4 {path}.identity.field: must name a declared, required scalar field"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate one kind entry (test-only). `tokens` are the envelope's declared
 /// kind tokens; link targets must name one of them (install-time scope is
 /// this envelope only — cross-envelope targets are a link-time concern).
@@ -360,13 +592,10 @@ fn validate_defn_kind(
     tokens: &[&str],
 ) -> Result<()> {
     const BASE_FIELD_TYPES: &[&str] = &["text", "integer", "number", "boolean", "time"];
-    const DEFN3_FIELD_TYPES: &[&str] = &[
-        "text", "integer", "number", "boolean", "time", "choice", "date",
-    ];
     let label = version.label();
     let field_types: &[&str] = match version {
         DefnVersion::V2 => BASE_FIELD_TYPES,
-        DefnVersion::V3 => DEFN3_FIELD_TYPES,
+        DefnVersion::V3 | DefnVersion::V4 => DEFN3_FIELD_TYPES,
     };
     let fields = kind_obj
         .get("fields")
@@ -418,7 +647,7 @@ fn validate_defn_kind(
                 "{label} kind '{token}' field '{name}' needs a boolean 'required'"
             )));
         }
-        if version == DefnVersion::V3 {
+        if version != DefnVersion::V2 {
             if let Some(description) = field_obj.get("description") {
                 let valid = description.as_str().is_some_and(|s| !s.trim().is_empty());
                 if !valid {
@@ -467,7 +696,7 @@ fn validate_defn_kind(
     let identity_obj = kind_obj.get("identity").and_then(|v| v.as_object());
     // `/3` adds a per-record identity mode. `/2` ignores any extra keys and
     // keeps requiring `identity.field`, exactly as before.
-    if version == DefnVersion::V3 && identity_obj.and_then(|o| o.get("mode")).is_some() {
+    if version != DefnVersion::V2 && identity_obj.and_then(|o| o.get("mode")).is_some() {
         let mode = identity_obj
             .and_then(|o| o.get("mode"))
             .and_then(serde_json::Value::as_str)
@@ -563,9 +792,30 @@ fn validate_defn_link(
             "{label} kind '{token}' link entries must be objects"
         ))
     })?;
-    let predicate = link_obj
-        .get("predicate")
-        .and_then(serde_json::Value::as_str)
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    let relationship = if version == DefnVersion::V4 {
+        if let Some(reference) = link_obj.get("relationship_ref") {
+            if link_obj.contains_key("predicate") {
+                return Err(Error::engine(
+                    "predicate and relationship_ref are mutually exclusive",
+                ));
+            }
+            validate_relationship_ref(reference)?;
+            Some("governed relationship")
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+    let relationship: Option<&str> = None;
+    let predicate = relationship
+        .or_else(|| {
+            link_obj
+                .get("predicate")
+                .and_then(serde_json::Value::as_str)
+        })
         .unwrap_or_default();
     if predicate.trim().is_empty() {
         return Err(Error::engine(format!(
@@ -580,19 +830,23 @@ fn validate_defn_link(
                 "{label} kind '{token}' link '{predicate}' needs an object 'target'"
             ))
         })?;
-    let target_type = target
-        .get("primary_type")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let target_kind = target
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let _ = envelope_primary_type;
-    if target_type.trim().is_empty() || !tokens.contains(&target_kind) {
-        return Err(Error::engine(format!(
+    if version == DefnVersion::V4 {
+        parse_link_target4(&serde_json::Value::Object(target.clone()))?;
+    } else {
+        let target_type = target
+            .get("primary_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let target_kind = target
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let _ = envelope_primary_type;
+        if target_type.trim().is_empty() || !tokens.contains(&target_kind) {
+            return Err(Error::engine(format!(
             "{label} kind '{token}' link '{predicate}' names unknown link target '{target_type}/{target_kind}'"
         )));
+        }
     }
     let direction = link_obj
         .get("direction")
@@ -795,4 +1049,71 @@ mod definition_artifact_tests {
         assert!(envelope_is_defn2(&bytes).unwrap());
         assert!(!envelope_is_defn3(&bytes).unwrap());
     }
+}
+
+/// Closed /4 structural selector. Legacy primary_type selectors belong only
+/// to retained /1–/3 interpreters.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum LinkTarget4 {
+    Family(FamilyLinkTarget4),
+    AnyRecord(AnyRecordLinkTarget4),
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyLinkTarget4 {
+    pub family: String,
+    pub kind: String,
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnyRecordLinkTarget4 {
+    pub any_record: bool,
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub fn parse_link_target4(value: &serde_json::Value) -> Result<LinkTarget4> {
+    let target: LinkTarget4 = serde_json::from_value(value.clone()).map_err(|_| {
+        Error::engine("defn/4 target must be exactly family+kind or any_record:true")
+    })?;
+    match &target {
+        LinkTarget4::Family(t) if !t.family.trim().is_empty() && !t.kind.trim().is_empty() => {
+            validate_part("family", &t.family)?;
+            validate_part("kind", &t.kind)?;
+        }
+        LinkTarget4::AnyRecord(t) if t.any_record => {}
+        _ => {
+            return Err(Error::engine(
+                "defn/4 target must be exactly family+kind or any_record:true",
+            ))
+        }
+    }
+    Ok(target)
+}
+
+/// Immutable package dependency for governed link semantics; closed syntax.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub fn validate_relationship_ref(value: &serde_json::Value) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ref {
+        namespace: String,
+        package: String,
+        version: u32,
+        relationship: String,
+    }
+    let r: Ref = serde_json::from_value(value.clone())
+        .map_err(|_| Error::engine("invalid relationship_ref"))?;
+    validate_part("namespace", &r.namespace)?;
+    validate_part("package", &r.package)?;
+    validate_part("relationship", &r.relationship)?;
+    if r.version == 0 {
+        return Err(Error::engine("relationship_ref version must be positive"));
+    }
+    Ok(())
 }

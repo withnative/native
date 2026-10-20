@@ -43,7 +43,9 @@ struct SetIntentArgs {
     intent: String,
     /// Optional self-declared model name: the model's own claim about which
     /// model is running this turn. Free prose, stored exactly as given —
-    /// never normalised against a model list — and fixed for the run.
+    /// never normalised against a model list. First present declaration wins:
+    /// declare on the admitting call when possible, or later while the run
+    /// still records none; a later differing declaration is refused.
     #[serde(default)]
     model: Option<String>,
 }
@@ -96,7 +98,11 @@ fn unavailable_briefing(reason: &'static str) -> Value {
 /// validated full run key rather than by untrusted handler arguments. The
 /// empty briefing keeps this route honest while `set_intent` itself remains
 /// unproved on those adapters.
-#[cfg(any(feature = "postgres", feature = "turso-local"))]
+#[cfg(any(
+    feature = "postgres",
+    feature = "turso-local",
+    feature = "v2-kernel-probe"
+))]
 pub(crate) fn declare_without_activity_briefing(arguments: Value) -> Result<Value> {
     let args: SetIntentArgs = parse_args("set_intent", arguments)?;
     Ok(json!({
@@ -107,7 +113,7 @@ pub(crate) fn declare_without_activity_briefing(arguments: Value) -> Result<Valu
             "declared": args.model,
             "recorded": Value::Null,
             "refused": false,
-            "note": "This backend does not stamp run identity, so a declared model is carried but nothing is recorded. Declare `model` on the first set_intent call of runs admitted by the qualified backend instead. A declaration is the model's own unverified claim, fixed per run, and grants no capability.",
+            "note": "This backend does not stamp run identity, so a declared model is carried but nothing is recorded. Declare `model` on the admitting set_intent call of runs admitted by the qualified backend instead, or later while the run still records none; the first present declaration wins. A declaration is the model's own unverified claim and grants no capability.",
         },
     }))
 }
@@ -696,7 +702,7 @@ async fn set_intent(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
 /// source coming), and claims no benefit that is not true: the value grants
 /// no capability and does not affect routing, permission, gating or rendering
 /// priority.
-const DECLARED_MODEL_ABOUT: &str = "Declare once, on the first set_intent of the run: the first declaration wins and a later differing one is refused, while repeating the recorded value is harmless. The value is the model's own unverified claim about itself, fixed per run — a mid-run model switch leaves it naming the earlier model — and no launcher-independent source will correct it. It grants no capability and does not affect routing, permission, gating or rendering priority; it exists so a future reader attributing this run's work to a model, person or agent, has the claim on record.";
+const DECLARED_MODEL_ABOUT: &str = "Declare on the admitting set_intent when possible, or later while the run still records none: the first present declaration wins and a later differing one is refused, while repeating the recorded value is harmless. The value is the model's own unverified claim about itself, fixed once present per run — a mid-run model switch leaves it naming the earlier model — and no launcher-independent source will correct it. It grants no capability and does not affect routing, permission, gating or rendering priority; it exists so a future reader attributing this run's work to a model, person or agent, has the claim on record.";
 
 fn declared_model_note(sentence: String) -> String {
     format!("{sentence} {DECLARED_MODEL_ABOUT}")
@@ -713,12 +719,12 @@ fn declared_model_note(sentence: String) -> String {
 /// unchanged — and the response is where the caller is told.
 ///
 /// This handler runs before the governed wrapper persists the declaration, so
-/// the confirmation is computed optimistically — and it is exact on every
-/// path where the response survives: on an existing run persistence never
-/// touches the model, so the pre-read stored value is the post-call one; on
-/// a new run admission stamps exactly the clamped declaration. A read failure
-/// degrades to the same optimism: anything that breaks the read breaks
-/// persistence too, and a failed call carries no confirmation.
+/// the confirmation is optimistic. The wrapper corrects it from the committed
+/// stored result after persistence: on a missing->present fill the optimistic
+/// accept stands, while a concurrent first declaration that lost the race is
+/// corrected to refused with the winner's value recorded. A read failure
+/// degrades to optimism: anything that breaks the read breaks persistence
+/// too, and a failed call carries no confirmation.
 async fn declared_model(db: &Db, caller: &Caller, declared: Option<String>) -> Value {
     let Some(run_key) = caller.run_key() else {
         return json!({
@@ -746,7 +752,10 @@ async fn declared_model(db: &Db, caller: &Caller, declared: Option<String>) -> V
         Some(recorded) => {
             let (sentence, refused) = match &recorded {
                 Some(recorded) => {
-                    let repeated = declared.as_deref() == Some(recorded.as_str());
+                    // Compare the clamped declaration: an accepted over-long
+                    // declaration repeats as its clamped stored form, so raw
+                    // comparison would falsely refuse it. Display stays raw.
+                    let repeated = declared.is_some() && clamped.as_deref() == Some(recorded.as_str());
                     let refused = declared.is_some() && !repeated;
                     let mut sentence = format!(
                         "This run already records declared model '{recorded}'."
@@ -765,12 +774,12 @@ async fn declared_model(db: &Db, caller: &Caller, declared: Option<String>) -> V
                 }
                 None => match declared {
                     Some(_) => (
-                        "This run records no declared model: none was declared on the call that admitted it, and a later declaration cannot be recorded. The declaration is refused; this call's intent is still recorded normally. Declare 'model' on the first set_intent call of the run."
+                        "This run records no declared model yet; this declaration is recorded if it commits first."
                             .into(),
-                        true,
+                        false,
                     ),
                     None => (
-                        "This run records no declared model: none was declared on the call that admitted it, and a later declaration cannot be recorded."
+                        "This run records no declared model yet; a later set_intent may declare one while none is recorded."
                             .into(),
                         false,
                     ),
@@ -786,7 +795,7 @@ async fn declared_model(db: &Db, caller: &Caller, declared: Option<String>) -> V
         None => {
             let sentence = match clamped.clone() {
                 Some(model) => format!("Recorded '{model}' as this run's declared model."),
-                None => "No model was declared on this call, so this run records none; a later call cannot add one."
+                None => "No model was declared on this call, so this run records none; a later set_intent may declare one while none is recorded."
                     .into(),
             };
             json!({
@@ -817,7 +826,7 @@ pub fn register_intent_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::SetIntent,
         "Declare this run's current intent and receive a bounded structural briefing. \
-         Optionally self-declare the running model with `model`: a free-form name recorded once, at run admission, \
+         Optionally self-declare the running model with `model`: a free-form name recorded once the first present declaration lands, \
          so a future reader attributing this work has the claim on record. \
          The first declaration wins — a later differing one is refused, while repeating the recorded value is harmless. \
          A self-declaration is the model's own unverified claim, fixed per run, and grants nothing. \
@@ -831,7 +840,7 @@ pub fn register_intent_tool(registry: &mut ToolRegistry) -> Result<()> {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Optional self-declared model name for this run (for example the model running this turn). Stored exactly as given up to 256 bytes — never normalised against a list — and fixed for the run: the first declaration wins and a later differing one is refused. Unverified and per-run: it says which model claimed the run at admission, grants no capability, and does not affect routing, permission, gating or rendering priority."
+                    "description": "Optional self-declared model name for this run (for example the model running this turn). Stored exactly as given up to 256 bytes — never normalised against a list — and fixed once present: the first declaration wins and a later differing one is refused. Unverified and per-run: it says which model claimed the run, grants no capability, and does not affect routing, permission, gating or rendering priority."
                 }
             },
             "required": ["intent"],

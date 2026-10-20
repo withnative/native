@@ -1,0 +1,45 @@
+{
+  "family": "native.standard.document",
+  "version": 3,
+  "interpreter": "native.defn/5",
+  "primary_type": "Document",
+  "kinds": [
+    {
+      "token": "note",
+      "description": "An ordinary authored prose or capture document. Each note is distinct; matching titles or content do not make two notes the same.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "title",
+          "type": "text",
+          "required": false,
+          "description": "Short human title. May be absent: v1 notes are often untitled and no title is invented."
+        },
+        {
+          "name": "body",
+          "type": "text",
+          "required": false,
+          "description": "The prose, as Markdown."
+        }
+      ],
+      "links": [
+        {
+          "relationship_ref": {
+            "namespace": "native.relationship",
+            "package": "relates-to",
+            "version": 1,
+            "relationship": "relates_to.v1"
+          },
+          "target": {
+            "any_record": true
+          },
+          "direction": "either",
+          "cardinality": "many"
+        }
+      ]
+    }
+  ]
+}

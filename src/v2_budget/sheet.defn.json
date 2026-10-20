@@ -1,0 +1,19 @@
+{
+  "family": "demo.budget.sheet",
+  "version": 1,
+  "interpreter": "native.defn/3",
+  "primary_type": "Budget",
+  "kinds": [
+    {
+      "token": "sheet",
+      "description": "One budget spreadsheet held as a single ordinary record. Cells live in the text field cells_json, a JSON object mapping grid addresses (A1-Z99) to expression strings; a value with a leading '=' or a bare number is a formula, and disallowed characters are a syntax error. A formula may reference other cells and rectangular SUM ranges. Blank cells are not zero: a reference to an address absent from cells_json is refused rather than treated as 0. Cells_json is stored as written and validated on read by the host table-arithmetic operation, so a malformed field is preserved as source and reported per call.",
+      "maturity": "current",
+      "identity": { "mode": "record" },
+      "fields": [
+        { "name": "title", "type": "text", "required": true, "description": "Short human title for the budget." },
+        { "name": "cells_json", "type": "text", "required": true, "description": "JSON object mapping grid addresses (A1-Z99) to expression strings. Plain numbers and formulas joined by + - * / with parentheses and SUM(A1:B3) ranges. A reference to an absent cell is an error, not zero." }
+      ],
+      "links": []
+    }
+  ]
+}

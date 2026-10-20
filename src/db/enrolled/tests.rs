@@ -1884,3 +1884,51 @@ async fn private_options_preserve_filename_and_capture_opens_admitted_physical_f
     fixture.db.drain_captures_for_tests().await;
     fixture.db.close().await;
 }
+
+#[tokio::test]
+async fn ordinary_query_guard_can_tighten_read_only_without_reopening_writes() {
+    let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE protected(value INTEGER); INSERT INTO protected VALUES(7); CREATE INDEX protected_value ON protected(value)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    install_read_guard(&mut connection).await.unwrap();
+    sqlx::query("CREATE TEMP TABLE scoped(value INTEGER); INSERT INTO scoped VALUES(9); CREATE INDEX temp.scoped_value ON scoped(value); REINDEX temp.scoped_value")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA query_only=ON")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT value FROM temp.scoped")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
+        9
+    );
+    for forbidden in [
+        "PRAGMA query_only=OFF",
+        "PRAGMA application_id=123",
+        "INSERT INTO main.protected VALUES(8)",
+        "REINDEX main.protected_value",
+        "CREATE INDEX main.forbidden ON protected(value)",
+    ] {
+        assert!(
+            sqlx::query(forbidden)
+                .execute(&mut connection)
+                .await
+                .is_err(),
+            "{forbidden}"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM main.protected")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
+        1
+    );
+    connection.close().await.unwrap();
+}

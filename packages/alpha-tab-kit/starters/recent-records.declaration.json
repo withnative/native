@@ -1,0 +1,11 @@
+{
+  "needs": [
+    {
+      "need": "sql.snapshot.v1",
+      "key": "records.recent",
+      "label": "Newest 100 visible records",
+      "sql": "SELECT id, name, type FROM records WHERE deleted_at IS NULL AND archived = 0 ORDER BY updated_at_ms DESC, id ASC LIMIT 100"
+    }
+  ],
+  "effects": []
+}

@@ -70,7 +70,7 @@ const RELATIONSHIP_FEDERATION_COMPANIONS: [&str; 3] = [
 /// companion must be empty. This is deliberately the content/replicated-message/
 /// provenance/blob subset; the three relationship federation companions are not
 /// on the list and must be empty.
-const ALLOWED_NONEMPTY_COMPANIONS: [&str; 10] = [
+const ALLOWED_NONEMPTY_COMPANIONS: [&str; 11] = [
     "content_event_causal_frontier",
     "content_event_sources",
     "replicated_message_provenance",
@@ -80,6 +80,7 @@ const ALLOWED_NONEMPTY_COMPANIONS: [&str; 10] = [
     "provenance_action_attestations",
     "provenance_action_events",
     "provenance_action_outputs",
+    "provenance_action_app_attributions",
     "blobs",
 ];
 

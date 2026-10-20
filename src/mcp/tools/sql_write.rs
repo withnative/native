@@ -1,4 +1,4 @@
-//! Experimental source contract for preview-only `sql_write` (E4 M1).
+//! Experimental SQL source: preview by default, qualified SQLite commit by explicit consent.
 //!
 //! Live runtimes register this source ToolSpec only when the deployment
 //! allowlisted its executor (`NATIVE_CE_EXPERIMENTAL_EXECUTORS=sql_write`);
@@ -25,13 +25,16 @@
 //! same directed proposition as `manage_links.remove` does — Edit source plus
 //! View target, no content-owned `link.removed` fallback, no note — and
 //! refuses absent or inactive propositions rather than previewing a no-op.
-//! Like every op here it is preview only: execution revalidates and never
-//! commits.
+//! Ordinary-catalog rows remain preview only. Qualified folder requests may
+//! sign the explicit SQLite commit profile, admitted only by an opted-in local
+//! runtime; direct source calls never admit a commit.
 
 use serde_json::{json, Value};
 
 use crate::db::Db;
-use crate::error::{Error, Result};
+#[cfg(not(feature = "mcp-executor-prototype"))]
+use crate::error::Error;
+use crate::error::Result;
 
 use super::super::{Caller, CustomInteractionPolicy, ToolExposure, ToolRegistry};
 
@@ -41,7 +44,7 @@ pub const TOOL: &str = "sql_write";
 /// Stable direct-call refusal. There is no direct execution route: preview is
 /// plan-required, so the only truthful direct answer is an explicit error
 /// that appends nothing.
-pub const DIRECT_REFUSAL: &str = "sql_write has no direct execution path: preview is plan-required and commit is withheld; this refusal appended nothing";
+pub const DIRECT_REFUSAL: &str = "sql_write has no direct execution path: use a signed executor plan; local commit requires runtime and prepare-time consent; this refusal appended nothing";
 
 /// One tagged positional parameter, mirroring the `query_sql` value model so
 /// the preview envelope binds exactly what the governed read path
@@ -92,6 +95,9 @@ fn input_schema() -> Value {
        "required": ["statement", "reason"],
        "additionalProperties": false
     });
+    schema["properties"]["execution_profile"] =
+        json!({"const":"native.sql-selected-sqlite-commit.v1"});
+    schema["properties"]["sources"] = super::lifecycle::source_basis_input_schema();
     schema["properties"]["selection_contract"] = json!({"const":"native.sql-write-selection.v1"});
     schema["properties"]["folder_id"] = json!({"type":"string","minLength":1});
     schema["properties"]["write"] = json!({"oneOf":[
@@ -109,7 +115,7 @@ fn input_schema() -> Value {
     // Root constraints remain conjunctive with each arm. Do not repeat the
     // inherited minimum or object type; false schemas forbid wire presence.
     schema["oneOf"] = json!([
-        {"not":{"required":["selection_contract"]},"properties":{"folder_id":false,"write":false}},
+        {"not":{"required":["selection_contract"]},"properties":{"folder_id":false,"write":false,"sources":false,"execution_profile":false}},
         {"required":["selection_contract","folder_id","write"],"properties":{"link_note":false,"expected_version":{"type":"integer"},"parameters":{"items":{"properties":{"type":{"enum":["text","boolean"]},"value":{"maxLength":1024}}}}}}
     ]);
     schema["properties"]["statement"]
@@ -120,22 +126,31 @@ fn input_schema() -> Value {
 }
 
 /// Direct handler: unconditional explicit refusal with no mutation. The
-/// database handle is never touched; preview flows through the plan path.
-async fn execute(_db: Db, _caller: Caller, _arguments: Value) -> Result<Value> {
-    Err(Error::engine(DIRECT_REFUSAL))
+/// Untrusted calls never touch the database. The private approval scope is
+/// installed only by the verified, claimed executor path.
+async fn execute(db: Db, caller: Caller, _arguments: Value) -> Result<Value> {
+    #[cfg(feature = "mcp-executor-prototype")]
+    {
+        crate::mcp::executor_prototype::dispatch_admitted_sql_commit(db, caller).await
+    }
+    #[cfg(not(feature = "mcp-executor-prototype"))]
+    {
+        let _ = (db, caller);
+        Err(Error::engine(DIRECT_REFUSAL))
+    }
 }
 
 pub fn register_sql_write_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register_custom(
         TOOL,
-        // No semantic write occurs, so there is nothing to attribute through
-        // events or run context.
+        // The private admitted commit owns its projections and provenance.
+        // Direct calls remain refusals; retain the existing interaction policy.
         CustomInteractionPolicy::NoRecordInteractions,
         // Same discovery posture as the other build-enabled experimental
         // probe: out of the near-full Focused descriptor, visible under
         // Complete only once a deployment allowlists the executor.
         ToolExposure::extension(false),
-        "Preview only; never commits. selection_contract=native.sql-write-selection.v1, folder_id, write. SELECT id FROM children WHERE current_facet('k')='v'. Legacy rows retained.",
+        "Preview default. SQLite commit needs runtime opt-in + execution_profile. SELECT id FROM children. Legacy preview.",
         input_schema(),
         execute,
     )

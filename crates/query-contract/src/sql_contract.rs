@@ -38,6 +38,8 @@ pub const LOGICAL_CATALOG_REVISION: u32 = 4;
 pub const LOGICAL_RELATION_VERSION: u32 = 1;
 pub const CONTENT_EVENTS_RELATION_VERSION: u32 = 4;
 pub const AGENT_ACTIVITY_RELATION_VERSION: u32 = 3;
+pub const MY_MESSAGE_STATE_RELATION_VERSION: u32 = 2;
+pub const MY_MENTIONS_RELATION_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct QuerySqlRelationContract {
@@ -128,6 +130,22 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "channel_kind",
             "created_at",
             "created_at_ms",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.content-event-apps",
+        name: "content_event_apps",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "event_id",
+            "record_id",
+            "package",
+            "version",
+            "install_event_id",
+            "assertion",
         ],
     },
     QuerySqlRelationContract {
@@ -333,6 +351,78 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         ],
     },
     QuerySqlRelationContract {
+        identity: "native.query-sql.facet-value-json-nodes",
+        name: "facet_value_json_nodes",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "facet_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+            "interpretation",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.facet-observation-json-nodes",
+        name: "facet_observation_json_nodes",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "observation_id",
+            "record_id",
+            "key",
+            "as_of",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+            "interpretation",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.record-body-json-nodes",
+        name: "record_body_json_nodes",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "record_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+            "interpretation",
+        ],
+    },
+    QuerySqlRelationContract {
         identity: "native.query-sql.schema-config",
         name: "schema_config",
         semantic_version: LOGICAL_RELATION_VERSION,
@@ -478,15 +568,45 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         profiles: SQLITE_PROFILE,
         columns: &["message_id"],
     },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.my-participants",
+        name: "my_participants",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "participant_address",
+            "kind",
+            "persona_id",
+            "display_name",
+            "state",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.message-speakers",
+        name: "message_speakers",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "message_id",
+            "speaker_kind",
+            "speaker_address",
+            "display_name",
+            "assurance",
+        ],
+    },
     // Design D6 (task b2583dc): per-viewer message state and mentions. Both
     // hold only the caller's own private state and have no account column,
     // so no join or aggregate can reach another viewer's. Neither carries a
     // sequence, version or head. Additive: no existing relation changes
-    // shape. `message_reactions` follows separately on its own projection.
+    // shape. Exact reactions use their own event metadata projection.
     QuerySqlRelationContract {
         identity: "native.query-sql.my-message-state",
         name: "my_message_state",
-        semantic_version: LOGICAL_RELATION_VERSION,
+        semantic_version: MY_MESSAGE_STATE_RELATION_VERSION,
         caller_relative: true,
         completeness: "complete",
         profiles: SQLITE_PROFILE,
@@ -507,7 +627,7 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
     QuerySqlRelationContract {
         identity: "native.query-sql.my-mentions",
         name: "my_mentions",
-        semantic_version: LOGICAL_RELATION_VERSION,
+        semantic_version: MY_MENTIONS_RELATION_VERSION,
         caller_relative: true,
         completeness: "complete",
         profiles: SQLITE_PROFILE,
@@ -519,6 +639,47 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "mentioned_at",
             "mentioned_at_ms",
             "seen",
+        ],
+    },
+    // Passage anchors of comment roots (task fd58445): one row per visible
+    // comment whose anchor targets the body of a visible record. No row
+    // unless the caller can see both the comment and the anchored record,
+    // exactly like `links`. Additive; the scoped capture provenance
+    // (`source_event_seq`, the stored content-events MAX at capture, with
+    // `source_sha256`) travels with the row and no other sequence does.
+    QuerySqlRelationContract {
+        identity: "native.query-sql.comment-anchors",
+        name: "comment_anchors",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "annotation_id",
+            "target_record_id",
+            "purpose",
+            "selectors",
+            "source_event_seq",
+            "source_sha256",
+        ],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.message-reactions",
+        name: "message_reactions",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "reaction_id",
+            "message_id",
+            "emoji",
+            "actor_record_id",
+            "actor_name",
+            "executor_kind",
+            "reacted_at",
+            "reacted_at_ms",
+            "viewer",
         ],
     },
     QuerySqlRelationContract {
@@ -583,6 +744,28 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         completeness: "complete",
         profiles: ALL_PROFILES,
         columns: &["relation_name", "column_name", "column_position"],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.catalog-operations",
+        name: "catalog_operations",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: false,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "executor",
+            "operation",
+            "surface",
+            "access",
+            "plan_required",
+            "direct_execution_enabled",
+            "contract_version",
+            "contract_digest",
+            "source_tool",
+            "selector_field",
+            "selector_value",
+            "advertised_directly",
+        ],
     },
 ];
 
@@ -1238,6 +1421,7 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("records", "one row per visible record - join links.source_id/target_id, facet_values.record_id and content_events.record_id to records.id - home_id is NULL when the home is not visible - archived is 0 or 1 and does not filter rows or certify currency"),
     ("record_lifecycle_interpretations", "caller-relative live lifecycle meaning for each visible record - join record_id to records.id - derived from the same query snapshot, with no public governance basis token"),
     ("content_events", "append-only history - join record_id to records.id - local_seq orders it - actor, run_key and parent_key are redacted by the get_history disclosure rule - channel_kind travels only where the actor is disclosed"),
+    ("content_event_apps", "content-only: one row per visible content event written by a call a v2 app made through the hosted shell (relationship outputs are not listed) - event_id joins content_events.id - package, version and install_event_id name the exact install - assertion is always host - present only where content_events discloses the actor - invalidated attestations are excluded - online SQLite only - member/offline unavailable"),
     ("body_blocks", "visible record body chunks - join record_id to records.id - page by record_id, block_index, chunk_index with ORDER BY - reassemble text in that order - heading_path is a JSON array of ancestor/self heading objects"),
     ("body_block_headings", "ancestor/self heading per visible body chunk - key record_id,block_index,chunk_index,heading_index - heading_index is zero-based path position - heading_block_index identifies heading within current body revision - title is <=120-character display excerpt, title_truncated 0/1 - empty/opaque paths have no rows - online SQLite only, member/offline unavailable"),
     ("links", "edges - join source_id and target_id to records.id - both endpoints must be visible or the edge is absent"),
@@ -1249,6 +1433,9 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("vocabulary_values", "join vocabulary_id to vocabularies.id"),
     ("vocabulary_value_json_nodes", "caller-independent stored metadata occurrences - value_id joins vocabulary_values.id - unique key value_id, ordinal (zero-based preorder) - parent_ordinal identifies the parent occurrence - paths are escaped JSON Pointers, not unique - roots and empty containers are rows - number_text preserves the token, bool_value is 0/1/NULL"),
     ("schema_config_json_nodes", "complete stored object-root config occurrences - config_id joins caller-filtered schema_config.id - key config_id, ordinal - parent_ordinal disambiguates duplicate parents - escaped JSON Pointer paths repeat - numeric tokens are exact - online SQLite only - member/offline unavailable"),
+    ("facet_value_json_nodes", "complete object/array-root occurrence nodes of facet values - facet_id joins caller-filtered facet_values.id - key facet_id, ordinal - parent_ordinal disambiguates duplicate parents - escaped JSON Pointer paths repeat - numeric tokens are exact - roots and empty containers are rows - scalar, malformed and over-budget values have no nodes - interpretation is always parsed_text_candidate - online SQLite only - member/offline unavailable"),
+    ("facet_observation_json_nodes", "complete object/array-root occurrence nodes of facet observations - observation_id joins caller-filtered facet_observations.id - record_id, key and as_of identify the owning observation - key observation_id, ordinal - parent_ordinal disambiguates duplicate parents - escaped JSON Pointer paths repeat - numeric tokens are exact - roots and empty containers are rows - scalar, malformed and over-budget values have no nodes - interpretation is always parsed_text_candidate - online SQLite only - member/offline unavailable"),
+    ("record_body_json_nodes", "complete object/array-root occurrence nodes of record bodies - record_id joins caller-filtered records.id - key record_id, ordinal - parent_ordinal disambiguates duplicate parents - escaped JSON Pointer paths repeat - numeric tokens are exact - roots and empty containers are rows - scalar, malformed and over-budget bodies have no nodes - interpretation is always parsed_text_candidate - online SQLite only - member/offline unavailable"),
     ("schema_config", "workspace configuration rows"),
     ("effective_relationships", "governed relationships - endpoints is a JSON array with record_id per endpoint"),
     ("effective_relationship_endpoints", "one row per endpoint of a relationship present in effective_relationships - join both relationship_origin_db_id and relationship_id - ordinal is the endpoint order - a relationship with any hidden endpoint yields no rows - online SQLite only, member/offline unavailable"),
@@ -1258,12 +1445,17 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("runs", "durable agent runs of every age whose owner the get_history rule discloses - principal_person_id is the visible person, NULL when there is none - reported_model and reported_client are self-declared, never verified - page by started_at_ms, run_key"),
     ("run_intents", "ordered set_intent declarations of each run in runs - join run_key to runs.run_key - ordinal counts from 1 within a run - empty when the workspace keeps no read log"),
     ("messages_awaiting_reply", "single-column queue of message ids awaiting reply"),
-    ("my_message_state", "the caller's own read state and preferences for each visible Message, private to the caller - join message_id to records.id - stage is unsurfaced, presented, opened or acknowledged - unread is 1 until the caller opens a Message they did not write"),
-    ("my_mentions", "sources that mention the caller, private to the caller - join source_id to records.id - via principal is an addressed @-mention on a Message, via reference is a record reference that resolves to the caller - seen is NULL where Native does not track it"),
+    ("my_participants", "the caller's owner-private registered personas, including retired identities - profile edits cannot change ownership"),
+    ("message_speakers", "immutable advisory speaker facts on visible Messages - names disclose the utterance identity, without access to the private persona profile - assurance is engine-selected"),
+    ("my_message_state", "the caller's own read state and preferences for each visible Message, private to the caller - join message_id to records.id - stage is unsurfaced, presented, opened or acknowledged - unread uses the caller's explicit mark_read/mark_unread preference when set, otherwise derives from opened or acknowledged stage - archived Messages and the caller's human-authored Messages are never unread - persona-spoken Messages use the ordinary unread rule even when owner_id is the caller"),
+    ("my_mentions", "sources that mention the caller, private to the caller - join source_id to records.id - via principal is an addressed @-mention on a Message, via reference is a record reference that resolves to the caller - seen is NULL where Native does not track it - own_source requires human speech or an owned non-Message record"),
+    ("comment_anchors", "passage anchors of visible comment roots on visible records' bodies - join annotation_id to records.id (the comment) and target_record_id to records.id (the bearer) - selectors is the stored JSON array (text_quote, data_position in UTF-8 bytes), and its quote discloses body text - source_event_seq is the stored content-events MAX at capture and source_sha256 the body digest the anchor was captured against, so a later live reopen proves the same recorded range while any later body write invalidates it - sqlite-local only, and the Docs and Spaces alpha tab links needs depend on it"),
+    ("message_reactions", "exact latest additions per actor and legacy emoji partition on visible live Messages. reaction_id is the winning history event UUID, never a sequence. actor_record_id/name and executor_kind follow history disclosure. viewer is 0/1. metadata-only fold preserves duplicate emitted emoji rows. admission bounds are 20000 visible Messages, 100000 visible reaction events, 16 MiB metadata and 20000 winners, complete-or-error. saved receipts remain best_effort/non-replayable because binding, visibility and names are mutable"),
     ("facet_times", "typed time facets (declared date, instant, zoned, when) on the timeline - join record_id to records.id - all_day rows use start_date/end_date, timed rows start_ms/end_ms, end exclusive"),
     ("body_task_items", "GFM task-list items in visible records' current bodies - byte offsets in body, document order by item_index - checked and quoted rows remain present, source event sequence is withheld"),
     ("catalog_relations", "this catalog - one row per declared relation, filter profiles for queryability"),
     ("catalog_columns", "one row per (relation, column) - order by relation_name, column_position"),
+    ("catalog_operations", "one row per serving executor operation from this pinned catalogue - matches describe_operation pairs and digests - order by executor, operation - access is read or mutation, plan_required, direct_execution_enabled and advertised_directly are 0 or 1, advertised_directly is 0 only on a lean surface for operations reachable through call_executor, selector fields are NULL without a selector - online SQLite executor query_sql only with serving standby included, member and offline copies refuse it, saved SQL and alpha-tab needs refuse it, other profiles refuse it"),
 ];
 
 /// Rows of `catalog_relations`, generated from `LOGICAL_RELATIONS`:
@@ -1319,10 +1511,22 @@ fn sql_quote(value: &str) -> String {
 /// `LOGICAL_RELATIONS` so the served catalog cannot drift from the
 /// admission catalog. Every engine executes these verbatim (SQLite/Turso
 /// as TEMP views, Postgres with its own prefix); row content is identical.
-/// Postgres has no `CREATE VIEW IF NOT EXISTS`, so it passes `false`.
-pub fn catalog_view_statements(if_not_exists: bool) -> Vec<String> {
+/// Postgres has no `CREATE VIEW IF NOT EXISTS`, so it passes `false` for
+/// `if_not_exists` and `true` for `collate_c_text`: Postgres compares text
+/// in the database locale, so every text column selects with `COLLATE "C"`
+/// to keep caller `ORDER BY` on text byte-identical with SQLite/Turso
+/// BINARY ordering. Integer columns take no collation. SQLite/Turso pass
+/// `false` and their statements stay byte-identical.
+pub fn catalog_view_statements(if_not_exists: bool, collate_c_text: bool) -> Vec<String> {
     // Postgres has no CREATE VIEW IF NOT EXISTS, so it passes false.
     let guard = if if_not_exists { "IF NOT EXISTS " } else { "" };
+    let text = |literal: String| {
+        if collate_c_text {
+            format!("{literal} COLLATE \"C\"")
+        } else {
+            literal
+        }
+    };
     let mut relations = format!("CREATE TEMP VIEW {guard}catalog_relations AS ");
     for (index, (name, identity, version, caller_relative, completeness, profiles, comment)) in
         catalog_relation_rows().iter().enumerate()
@@ -1334,11 +1538,11 @@ pub fn catalog_view_statements(if_not_exists: bool) -> Vec<String> {
             "SELECT {name} AS relation_name, {identity} AS identity, \
              {version} AS semantic_version, {caller_relative} AS caller_relative, \
              {completeness} AS completeness, {profiles} AS profiles, {comment} AS comment",
-            name = sql_quote(name),
-            identity = sql_quote(identity),
-            profiles = sql_quote(profiles),
-            completeness = sql_quote(completeness),
-            comment = sql_quote(comment),
+            name = text(sql_quote(name)),
+            identity = text(sql_quote(identity)),
+            profiles = text(sql_quote(profiles)),
+            completeness = text(sql_quote(completeness)),
+            comment = text(sql_quote(comment)),
         ));
     }
     let mut columns = format!("CREATE TEMP VIEW {guard}catalog_columns AS ");
@@ -1349,8 +1553,8 @@ pub fn catalog_view_statements(if_not_exists: bool) -> Vec<String> {
         columns.push_str(&format!(
             "SELECT {relation} AS relation_name, {column} AS column_name, \
              {position} AS column_position",
-            relation = sql_quote(relation),
-            column = sql_quote(column),
+            relation = text(sql_quote(relation)),
+            column = text(sql_quote(column)),
         ));
     }
     vec![relations, columns]
@@ -1365,12 +1569,13 @@ const CARD_COLUMN_RELATIONS: &[&str] = &["records", "links", "content_events", "
 /// Relation names render from `LOGICAL_RELATIONS` itself, so only this
 /// prose can drift; the card test pins both directions.
 const CARD_NOTES: &[(&str, &str)] = &[
-    ("records", "home_id parent (hidden=NULL); links.source_id/target_id=id"),
-    ("record_lifecycle_interpretations", "governed/absent/unclassified"),
+    ("records", "home_id parent (hidden=NULL); links.source_id/target_id=id; successor_count live supersedes in, is_current 1 when 0"),
+    ("record_lifecycle_interpretations", "governed/absent/unclassified; terminality open|terminal_positive|terminal_negative (governed only)"),
     ("content_events", "append-only; order local_seq"),
+    ("content_event_apps", "event_id=content_events.id; app package/version/install_event_id; assertion host; member/offline unavailable"),
     ("body_blocks", "chunks; page by record_id, block_index, chunk_index to join text"),
     ("body_block_headings", "chunk key+heading_index; heading_block_index revision ordinal; title excerpt"),
-    ("links", "part_of source part->target whole; both visible"),
+    ("links", "part_of source part->target whole; supersedes source newer->target older; both visible"),
 
     ("facet_values", "current (record_id,key)"),
     ("facet_observations", "history"),
@@ -1381,6 +1586,9 @@ const CARD_NOTES: &[(&str, &str)] = &[
     ("vocabulary_value_json_nodes", "value_id=vocabulary_values.id; key value_id,ordinal; parent_ordinal occurrence; number_text literals"),
     ("schema_config", "global or visible config"),
     ("schema_config_json_nodes", "config_id=schema_config.id; key config_id,ordinal; parent_ordinal occurrence; paths repeat; scalar literals; member/offline unavailable"),
+    ("facet_value_json_nodes", "facet_id=facet_values.id; key facet_id,ordinal; parent_ordinal occurrence; paths repeat; scalar literals; interpretation parsed_text_candidate; member/offline unavailable"),
+    ("facet_observation_json_nodes", "observation_id=facet_observations.id; key observation_id,ordinal; parent_ordinal occurrence; paths repeat; scalar literals; interpretation parsed_text_candidate; member/offline unavailable"),
+    ("record_body_json_nodes", "record_id=records.id; key record_id,ordinal; parent_ordinal occurrence; paths repeat; scalar literals; interpretation parsed_text_candidate; member/offline unavailable"),
     ("effective_relationships", "governed; endpoints JSON record_id array"),
     ("effective_relationship_endpoints", "join on both ids; ordinal order"),
     ("agent_activity", "best-effort run presence, 24h"),
@@ -1389,13 +1597,17 @@ const CARD_NOTES: &[(&str, &str)] = &[
     ("runs", "principal_person_id=records.id; model self-declared; order started_at_ms,run_key"),
     ("run_intents", "run_key=runs.run_key; order ordinal"),
     ("messages_awaiting_reply", "IDs awaiting reply"),
-    ("my_message_state", "private; message_id=records.id; unread by records.home_id"),
+    ("my_participants", "private personas"),
+    ("message_speakers", "advisory"),
+    ("my_message_state", "private; persona speech unread"),
     ("my_mentions", "private; source_id=records.id; order mentioned_at_ms"),
+    ("comment_anchors", "annotation_id,target_record_id=records.id; selectors JSON"),
     ("facet_times", "all_day dates; timed millis; end exclusive"),
     ("body_task_items", "GFM tasks; item_index order; checked/in_quote"),
     ("catalog_relations", "filter by profiles"),
     ("catalog_columns", "order relation_name,column_position"),
-
+    ("catalog_operations", "serving executor catalogue; matches describe_operation pairs/digests; order executor,operation; advertised_directly=0 marks lean call_executor-only operations; online executor query_sql only (standby serves advertised reads; member/offline copies refuse)"),
+    ("message_reactions", "exact winners; message_id to records.id; actor/executor redacted; reaction_id event UUID"),
 ];
 
 /// Worked statements shipped in the card. Each runs verbatim (plus a seed
@@ -1406,10 +1618,16 @@ const CARD_NOTES: &[(&str, &str)] = &[
 /// review placeholder-behavior changes there, not in this text.
 pub const CARD_WORKED_STATEMENTS: &[(&str, &str)] = &[
     ("Current work", "SELECT id, type, name, lifecycle FROM records WHERE type = 'WorkItem' AND lifecycle IN ('open', 'in_progress', 'blocked') ORDER BY last_activity_at DESC, id LIMIT 20"),
-    ("Direct children of a folder or record", "SELECT id, type, name FROM records WHERE home_id = ?1 ORDER BY name, id"),
-    ("Parts of a record (semantic part_of links run child source -> parent target)", "SELECT l.source_id, r.name FROM links l JOIN records r ON r.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' ORDER BY r.name, l.source_id"),
-    ("Recent history of one record", "SELECT local_seq, type, created_at FROM content_events WHERE record_id = ?1 ORDER BY local_seq DESC LIMIT 10"),
+    ("Direct children", "SELECT id, type, name FROM records WHERE home_id = ?1 ORDER BY name, id"),
+    ("Parts (part_of child source -> parent target)", "SELECT l.source_id, r.name FROM links l JOIN records r ON r.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' ORDER BY r.name, l.source_id"),
+    ("Record history", "SELECT local_seq, type, created_at FROM content_events WHERE record_id = ?1 ORDER BY local_seq DESC LIMIT 10"),
 ];
+
+/// Ancestor-path recipe inlined on the card (sqlite-local only: the other
+/// profiles refuse recursive CTEs, so it stays out of
+/// [`CARD_WORKED_STATEMENTS`], which also run in the Postgres parity loop).
+/// `sql_conformance` runs it verbatim against the containment fixtures.
+pub const CARD_ANCESTOR_PATH_SQL: &str = "WITH RECURSIVE up(id, home_id, d) AS (SELECT id, home_id, 0 FROM records WHERE id = ?1 UNION ALL SELECT r.id, r.home_id, d + 1 FROM records r JOIN up ON r.id = up.home_id WHERE up.id <> 'native:root' AND d < 32) SELECT id, d FROM up ORDER BY d DESC";
 
 /// Budget for the served card (bytes).
 pub const SQL_READ_CARD_MAX_BYTES: usize = 6 * 1024;
@@ -1422,11 +1640,16 @@ pub const SQL_READ_DESCRIPTOR_MAX_BYTES: usize = 8 * 1024;
 /// never inside a SQL batch, so its notes may use semicolons freely.
 pub fn sql_read_catalog_card() -> String {
     let mut card = String::from(
-        "Unordered top-level LIMIT sorts all outputs (assumed_order). \
+        "Top-level LIMIT without ORDER BY adds assumed_order. \
          Saved SQL, nested/CTE LIMITs, OFFSET and FETCH require ORDER BY. \
-         Unique tie-breakers. record_id=records.id. Queryable relations: \
+         Unique ties. record_id=records.id. Queryable relations: \
          SELECT * FROM catalog_relations ORDER BY relation_name. \
-         Columns: SELECT * FROM catalog_columns ORDER BY relation_name,column_position.",
+         Columns: SELECT * FROM catalog_columns ORDER BY relation_name,column_position. \
+         'Open'=lifecycle='open'; in_progress, blocked are distinct (Current work \
+         below is all three): for not-done use terminality, and state the reading used. \
+         Words in bodies: prefer search; body LIKE is a fallback. \
+         Recipes (ancestor path, superseded-by): \
+         guidance_read(operation=\"read_guide\", arguments={\"topic\":\"query-sql\"}).",
     );
     for relation in LOGICAL_RELATIONS {
         let note = CARD_NOTES
@@ -1444,15 +1667,20 @@ pub fn sql_read_catalog_card() -> String {
         }
     }
     card.push_str(
-        "\nValues: UTC-millis timestamp text + integer *_ms; bool 0/1; \
+        "\nValues: UTC-millis text/integer *_ms; bool 0/1; \
          binary text order; SQL NULL=JSON null. ?N contiguous from 1. \
-         LIKE wildcards, not words; '%- [ ]%' includes quoted checklists. \
+         LIKE wildcards, not words; '%- [ ]%' includes quotes. \
          Physical tables/sqlite_master/pragma_*/information_schema \
-         blocked; errors give fixes.",
+         blocked; errors give fixes. Ad-hoc sqlite-local SQL may use \
+         json_*/->/->>, json_each, date/time with explicit values (now_ms() \
+         is the clock), instr, printf; saved SQL, Turso, Postgres: portable set.",
     );
     for (intent, sql) in CARD_WORKED_STATEMENTS {
         card.push_str(&format!("\n{intent}: {sql}"));
     }
+    card.push_str(&format!(
+        "\nAncestor path (sqlite-local; d=0 is the record): {CARD_ANCESTOR_PATH_SQL}"
+    ));
     card
 }
 
@@ -2493,6 +2721,23 @@ pub enum FunctionAllowance {
     /// Native e25665c: already-stored governed SQL keeps working
     /// under the legacy allowance (pre-I2 allowlist ∪ portable subset).
     LegacySavedSql,
+    /// Ad-hoc online sqlite-local `query_sql` only (Native 702de73): the
+    /// portable subset plus [`SQLITE_AD_HOC_FUNCTIONS`], with clock reads
+    /// refused. Never used for SQL being saved, Turso or Postgres, and
+    /// ignored (treated as `Portable`) for any profile but `SqliteLocal`.
+    SqliteAdHoc,
+}
+
+/// Ad-hoc online sqlite-local `query_sql`: the I2 portable rules relaxed to
+/// SQLite's read-only dialect (see [`SQLITE_AD_HOC_FUNCTIONS`]). Every other
+/// check is identical to [`classify_single_read_statement`].
+pub fn classify_sqlite_ad_hoc_statement(sql: &str) -> Result<String> {
+    classify_single_read_statement_impl(
+        QuerySqlProfile::SqliteLocal,
+        sql,
+        true,
+        FunctionAllowance::SqliteAdHoc,
+    )
 }
 
 /// Inspection/execution of already-stored governed SQL. See
@@ -2955,8 +3200,7 @@ pub enum FunctionKind {
     /// Pure deterministic computation executed by the engine itself.
     Scalar,
     /// Server-supplied value bound as a hidden parameter, never executed by
-    /// the engine under its own name. A future `current_principal()` is a
-    /// second member of this class, not a special case.
+    /// the engine under its own name: `now_ms()` and `current_principal()`.
     ContextInput,
 }
 
@@ -3030,6 +3274,12 @@ pub const FUNCTION_REGISTRY: &[FunctionDecl] = &[
         name: "cume_dist",
         kind: FunctionKind::Scalar,
         engines: SQLITE_AND_POSTGRES,
+        time_dependent: false,
+    },
+    FunctionDecl {
+        name: "current_principal",
+        kind: FunctionKind::ContextInput,
+        engines: ALL_ENGINE_PROFILES,
         time_dependent: false,
     },
     FunctionDecl {
@@ -3148,8 +3398,8 @@ pub const FUNCTION_REGISTRY: &[FunctionDecl] = &[
     },
 ];
 
-const PORTABLE_FUNCTION_NAMES: [&str; 24] = {
-    let mut names = [""; 24];
+const PORTABLE_FUNCTION_NAMES: [&str; 25] = {
+    let mut names = [""; 25];
     let mut i = 0;
     while i < FUNCTION_REGISTRY.len() {
         names[i] = FUNCTION_REGISTRY[i].name;
@@ -3160,7 +3410,7 @@ const PORTABLE_FUNCTION_NAMES: [&str; 24] = {
 
 // Fail closed at compile time if the registry grows or shrinks: shrinkage
 // would otherwise leave trailing `""` phantoms in the derived list.
-const _: [(); 24] = [(); FUNCTION_REGISTRY.len()];
+const _: [(); 25] = [(); FUNCTION_REGISTRY.len()];
 
 /// I2 (E1 M2 portability validator): the portable function names, derived
 /// from [`FUNCTION_REGISTRY`] so the two can never drift apart.
@@ -3195,6 +3445,249 @@ pub fn function_supported_on(name: &str, profile: QuerySqlProfile) -> bool {
 /// call.
 pub fn is_portable_function(name: &str) -> bool {
     function_decl(name).is_some()
+}
+
+/// What a [`SQLITE_AD_HOC_FUNCTIONS`] entry is, for the layers that treat the
+/// kinds differently: the SQLite authorizer sees table-valued functions as
+/// table reads, not function calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteAdHocKind {
+    Scalar,
+    /// `json_each` / `json_tree`: only meaningful in `FROM`.
+    TableValued,
+    /// `->` / `->>`: SQLite reports these to the authorizer as functions
+    /// named by the operator.
+    Operator,
+}
+
+/// Native 702de73: ad-hoc online sqlite-local `query_sql` is SQLite's
+/// read-only dialect. These are the names admitted on top of the portable
+/// registry for [`FunctionAllowance::SqliteAdHoc`] — deterministic, read-only
+/// SQLite builtins only. The classifier and the SQLite authorizer both read
+/// this one list, so they cannot drift apart. Saved SQL, Turso and Postgres
+/// never consult it.
+///
+/// Date/time names are listed here but additionally need an explicit time
+/// value (see [`SQLITE_AD_HOC_CLOCK_FUNCTIONS`]). `floor`/`ceil`/`ceiling`
+/// are absent because the pinned SQLite build omits its math functions; a
+/// test ties their absence to the build so they join this list the day the
+/// build gains them.
+pub const SQLITE_AD_HOC_FUNCTIONS: &[(&str, SqliteAdHocKind)] = &[
+    ("->", SqliteAdHocKind::Operator),
+    ("->>", SqliteAdHocKind::Operator),
+    ("char", SqliteAdHocKind::Scalar),
+    ("date", SqliteAdHocKind::Scalar),
+    ("datetime", SqliteAdHocKind::Scalar),
+    ("format", SqliteAdHocKind::Scalar),
+    ("glob", SqliteAdHocKind::Scalar),
+    ("group_concat", SqliteAdHocKind::Scalar),
+    ("hex", SqliteAdHocKind::Scalar),
+    ("ifnull", SqliteAdHocKind::Scalar),
+    ("iif", SqliteAdHocKind::Scalar),
+    ("instr", SqliteAdHocKind::Scalar),
+    ("json", SqliteAdHocKind::Scalar),
+    ("json_array", SqliteAdHocKind::Scalar),
+    ("json_array_length", SqliteAdHocKind::Scalar),
+    ("json_each", SqliteAdHocKind::TableValued),
+    ("json_extract", SqliteAdHocKind::Scalar),
+    ("json_group_array", SqliteAdHocKind::Scalar),
+    ("json_group_object", SqliteAdHocKind::Scalar),
+    ("json_insert", SqliteAdHocKind::Scalar),
+    ("json_object", SqliteAdHocKind::Scalar),
+    ("json_patch", SqliteAdHocKind::Scalar),
+    ("json_quote", SqliteAdHocKind::Scalar),
+    ("json_remove", SqliteAdHocKind::Scalar),
+    ("json_replace", SqliteAdHocKind::Scalar),
+    ("json_set", SqliteAdHocKind::Scalar),
+    ("json_tree", SqliteAdHocKind::TableValued),
+    ("json_type", SqliteAdHocKind::Scalar),
+    ("json_valid", SqliteAdHocKind::Scalar),
+    ("julianday", SqliteAdHocKind::Scalar),
+    ("ltrim", SqliteAdHocKind::Scalar),
+    ("printf", SqliteAdHocKind::Scalar),
+    ("rtrim", SqliteAdHocKind::Scalar),
+    ("sign", SqliteAdHocKind::Scalar),
+    ("strftime", SqliteAdHocKind::Scalar),
+    ("substring", SqliteAdHocKind::Scalar),
+    ("time", SqliteAdHocKind::Scalar),
+    ("total", SqliteAdHocKind::Scalar),
+    ("typeof", SqliteAdHocKind::Scalar),
+    ("unicode", SqliteAdHocKind::Scalar),
+    ("unixepoch", SqliteAdHocKind::Scalar),
+];
+
+/// The [`SQLITE_AD_HOC_FUNCTIONS`] entries that can read the engine clock
+/// (zero arguments, or `'now'`). Ad-hoc SQL must give them an explicit time
+/// value; the current time is `now_ms()`, bound once per statement.
+pub const SQLITE_AD_HOC_CLOCK_FUNCTIONS: &[&str] = &[
+    "date",
+    "datetime",
+    "julianday",
+    "strftime",
+    "time",
+    "unixepoch",
+];
+
+/// Time-value / modifier literals that read the clock or the host timezone.
+const SQLITE_AD_HOC_CLOCK_LITERALS: &[&str] = &["now", "localtime", "utc"];
+
+/// Known SQLite builtins that are impure or expose the engine, refused by
+/// name with a legible repair. The authorizer's default deny is the
+/// authority; this list only improves the message for the likely attempts.
+const SQLITE_AD_HOC_REFUSED_FUNCTIONS: &[&str] = &[
+    "changes",
+    "last_insert_rowid",
+    "load_extension",
+    "random",
+    "randomblob",
+    "total_changes",
+    "zeroblob",
+];
+
+/// True for a name in [`SQLITE_AD_HOC_FUNCTIONS`] (case-insensitive).
+pub fn is_sqlite_ad_hoc_extra_function(name: &str) -> bool {
+    SQLITE_AD_HOC_FUNCTIONS
+        .iter()
+        .any(|(allowed, _)| allowed.eq_ignore_ascii_case(name))
+}
+
+/// True for a `json_each` / `json_tree`-style table-valued entry.
+pub fn is_sqlite_ad_hoc_table_function(name: &str) -> bool {
+    SQLITE_AD_HOC_FUNCTIONS.iter().any(|(allowed, kind)| {
+        *kind == SqliteAdHocKind::TableValued && allowed.eq_ignore_ascii_case(name)
+    })
+}
+
+/// The one function predicate the SQLite authorizer applies to ad-hoc
+/// sqlite-local SQL: the portable registry, `like`, and the ad-hoc list.
+pub fn is_sqlite_ad_hoc_function(name: &str) -> bool {
+    is_portable_function(name)
+        || name.eq_ignore_ascii_case("like")
+        || is_sqlite_ad_hoc_extra_function(name)
+}
+
+fn sqlite_ad_hoc_refused_detail(lower: &str) -> Option<String> {
+    if SQLITE_AD_HOC_REFUSED_FUNCTIONS.contains(&lower) || lower.starts_with("sqlite_") {
+        Some(format!(
+            "function '{lower}' is unavailable — ad-hoc sqlite-local SQL admits only deterministic, read-only SQLite functions; this one is non-deterministic, mutates, or exposes the engine"
+        ))
+    } else {
+        None
+    }
+}
+
+const AD_HOC_CLOCK_REPAIR: &str = "date/time functions on ad-hoc sqlite-local SQL need an explicit time value: the engine clock is not readable (no zero-argument calls, no 'now', no 'localtime' or 'utc'). Use now_ms() for the current time, e.g. datetime(now_ms() / 1000, 'unixepoch')";
+
+/// Date/time call under the ad-hoc dialect: refuse the shapes that read the
+/// engine clock or host timezone. Zero arguments (and `strftime`'s format-
+/// only form) default to `'now'`; `'now'` and the `'localtime'`/`'utc'`
+/// modifiers are refused wherever they appear as a string literal inside
+/// the call's arguments. A value built at runtime (`'no' || 'w'`, a column
+/// holding `now`) is beyond a static scan; bound parameters are covered at
+/// execution by [`validate_ad_hoc_clock_bound_args`].
+fn check_ad_hoc_clock_call(
+    lower: &str,
+    paren: usize,
+    index: &ParenIndex,
+    statement: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let Some(&close) = index.close.get(&paren) else {
+        // Unbalanced tail: left for the engines to syntax-error.
+        return Ok(());
+    };
+    let refuse = || {
+        Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            AD_HOC_CLOCK_REPAIR,
+        ))
+    };
+    let empty = skip_ws_and_comments(bytes, paren + 1, false)? >= close;
+    let arguments = if empty {
+        0
+    } else {
+        index.top_commas.get(&paren).map_or(0, Vec::len) + 1
+    };
+    let minimum = if lower == "strftime" { 2 } else { 1 };
+    if arguments < minimum {
+        return refuse();
+    }
+    let mut i = paren + 1;
+    while i < close {
+        match bytes[i] {
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < close && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = block_comment_end(bytes, i, false)?;
+            }
+            b'\'' => {
+                let end = quoted_end(bytes, i, b'\'', false)?;
+                let literal = unquote_doubled(&statement[i + 1..end - 1], '\'');
+                if is_ad_hoc_clock_literal(&literal) {
+                    return refuse();
+                }
+                i = end;
+            }
+            b'"' => i = quoted_end(bytes, i, b'"', false)?,
+            b'`' => i = quoted_end(bytes, i, b'`', false)?,
+            b'[' => i = bracket_identifier_end(bytes, i)?,
+            _ => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn is_ad_hoc_clock_literal(text: &str) -> bool {
+    let trimmed = text.trim();
+    SQLITE_AD_HOC_CLOCK_LITERALS
+        .iter()
+        .any(|clock| trimmed.eq_ignore_ascii_case(clock))
+}
+
+/// Bound-parameter half of the ad-hoc clock refusal: a statement that calls
+/// any date/time function may not bind the text `now`, `localtime` or `utc`
+/// (case-insensitive, trimmed) as a parameter — that would reach the engine
+/// clock through the placeholder. Deliberately statement-wide rather than
+/// per-argument so an indirection such as a CTE over `?1` is covered too.
+pub fn validate_ad_hoc_clock_bound_args(
+    profile: QuerySqlProfile,
+    statement: &str,
+    parameters: &[QuerySqlParameter],
+) -> Result<()> {
+    let mut uses_clock_function = false;
+    scan_calls(
+        statement,
+        profile,
+        &mut |name, _name_start, _paren, _index, _statement, _bytes| {
+            if SQLITE_AD_HOC_CLOCK_FUNCTIONS
+                .iter()
+                .any(|clock| clock.eq_ignore_ascii_case(name))
+            {
+                uses_clock_function = true;
+            }
+            Ok(())
+        },
+    )?;
+    if !uses_clock_function {
+        return Ok(());
+    }
+    let reads_clock = parameters.iter().any(|parameter| {
+        matches!(
+            parameter,
+            QuerySqlParameter::Text { value: Some(value) } if is_ad_hoc_clock_literal(value)
+        )
+    });
+    if reads_clock {
+        return Err(categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            AD_HOC_CLOCK_REPAIR,
+        ));
+    }
+    Ok(())
 }
 
 const M1_TIMESTAMP_REPAIR: &str =
@@ -3263,9 +3756,18 @@ pub fn portable_function_repair(lower_name: &str) -> Option<&'static str> {
 /// with `QuerySqlErrorCategory::UnsafeStatement`, matching the classifier.
 pub fn unavailable_function_detail(found_name: &str) -> Option<String> {
     let lower = found_name.to_ascii_lowercase();
-    portable_function_repair(&lower)
-        .map(|repair| format!("function '{lower}' is unavailable — {repair}"))
+    portable_function_repair(&lower).map(|repair| {
+        let mut detail = format!("function '{lower}' is unavailable — {repair}");
+        if is_sqlite_ad_hoc_extra_function(&lower) {
+            detail.push_str(AD_HOC_AVAILABILITY_NOTE);
+        }
+        detail
+    })
 }
+
+/// Appended to a portable refusal of a name the ad-hoc sqlite-local dialect
+/// does admit, so an author learns where the function is and is not usable.
+const AD_HOC_AVAILABILITY_NOTE: &str = " (ad-hoc query_sql on sqlite-local accepts this function; saved SQL, Turso and Postgres use the portable set)";
 
 /// I2: enforce the portable function subset on a classified statement.
 /// Every `word(` outside strings, comments and quoted identifiers is a
@@ -3426,6 +3928,14 @@ fn validate_portable_calls(
     statement: &str,
     allowance: FunctionAllowance,
 ) -> Result<()> {
+    // The ad-hoc dialect is sqlite-local only; any other profile keeps the
+    // portable rules whatever the caller asked for.
+    let allowance =
+        if allowance == FunctionAllowance::SqliteAdHoc && profile != QuerySqlProfile::SqliteLocal {
+            FunctionAllowance::Portable
+        } else {
+            allowance
+        };
     scan_calls(
         statement,
         profile,
@@ -3479,6 +3989,12 @@ fn check_call(
     if lower == "now_ms" {
         return check_now_ms_arity(paren, index, statement);
     }
+    // `current_principal()` takes no arguments either, under both
+    // allowances; execution binds the caller's principal as one hidden
+    // parameter (see `rewrite_current_principal_calls`).
+    if lower == "current_principal" {
+        return check_zero_arg_arity(paren, index, statement, CURRENT_PRINCIPAL_ARITY_REPAIR);
+    }
     // Native e25665c: `utc_date_label(ms)` takes exactly one argument.
     // Runs under both allowances like `now_ms`/`regexp`; the engines never
     // see the name — execution lowers it per engine (see
@@ -3489,6 +4005,20 @@ fn check_call(
     }
     if allowance == FunctionAllowance::LegacySavedSql {
         return Ok(());
+    }
+    if allowance == FunctionAllowance::SqliteAdHoc {
+        if SQLITE_AD_HOC_CLOCK_FUNCTIONS.contains(&lower.as_str()) {
+            return check_ad_hoc_clock_call(&lower, paren, index, statement, bytes);
+        }
+        if is_sqlite_ad_hoc_extra_function(&lower) {
+            return Ok(());
+        }
+        if let Some(detail) = sqlite_ad_hoc_refused_detail(&lower) {
+            return Err(categorized_error(
+                QuerySqlErrorCategory::UnsafeStatement,
+                detail,
+            ));
+        }
     }
     if lower == "round" {
         return check_round_arity(paren, index);
@@ -3708,13 +4238,23 @@ pub const NOW_MS_ARITY_REPAIR: &str =
 /// write the bare call), takes the arity repair. An unbalanced tail (no
 /// index entry) is left for the engines to syntax-error.
 fn check_now_ms_arity(paren: usize, index: &ParenIndex, statement: &str) -> Result<()> {
+    check_zero_arg_arity(paren, index, statement, NOW_MS_ARITY_REPAIR)
+}
+
+/// The zero-argument shape shared by every context input.
+fn check_zero_arg_arity(
+    paren: usize,
+    index: &ParenIndex,
+    statement: &str,
+    repair: &'static str,
+) -> Result<()> {
     let Some(close) = index.close.get(&paren) else {
         return Ok(());
     };
     if index.top_comma.contains(&paren) {
         return Err(categorized_error(
             QuerySqlErrorCategory::UnsafeStatement,
-            NOW_MS_ARITY_REPAIR,
+            repair,
         ));
     }
     if !statement[paren + 1..*close]
@@ -3723,7 +4263,7 @@ fn check_now_ms_arity(paren: usize, index: &ParenIndex, statement: &str) -> Resu
     {
         return Err(categorized_error(
             QuerySqlErrorCategory::UnsafeStatement,
-            NOW_MS_ARITY_REPAIR,
+            repair,
         ));
     }
     Ok(())
@@ -3779,15 +4319,34 @@ pub fn rewrite_now_ms_calls(
     statement: &str,
     hidden_placeholder: &str,
 ) -> Result<(String, usize)> {
+    rewrite_context_input_calls(
+        profile,
+        statement,
+        "now_ms",
+        NOW_MS_ARITY_REPAIR,
+        hidden_placeholder,
+    )
+}
+
+/// The shared `?N` rewrite behind every context input: discovery is the
+/// shared `scan_calls` site and the arity rule is the shared zero-argument
+/// check, so classifier and rewrite agree by construction.
+fn rewrite_context_input_calls(
+    profile: QuerySqlProfile,
+    statement: &str,
+    function: &'static str,
+    arity_repair: &'static str,
+    hidden_placeholder: &str,
+) -> Result<(String, usize)> {
     let mut spans: Vec<(usize, usize)> = Vec::new();
     scan_calls(
         statement,
         profile,
         &mut |name, name_start, paren, index, statement, _bytes| {
-            if !name.eq_ignore_ascii_case("now_ms") {
+            if !name.eq_ignore_ascii_case(function) {
                 return Ok(());
             }
-            check_now_ms_arity(paren, index, statement)?;
+            check_zero_arg_arity(paren, index, statement, arity_repair)?;
             if let Some(close) = index.close.get(&paren) {
                 spans.push((name_start, close + 1));
             }
@@ -3805,15 +4364,15 @@ pub fn rewrite_now_ms_calls(
         cursor = *end;
     }
     rewritten.push_str(&statement[cursor..]);
-    // Fail closed: no balanced `now_ms()` call may survive the rewrite.
-    // (Unbalanced tails stay for the engines to syntax-error, as everywhere
-    // else in this classifier.)
+    // Fail closed: no balanced call may survive the rewrite. (Unbalanced
+    // tails stay for the engines to syntax-error, as everywhere else in
+    // this classifier.)
     let mut survivors = 0;
     scan_calls(
         &rewritten,
         profile,
         &mut |name, _name_start, paren, index, _statement, _bytes| {
-            if name.eq_ignore_ascii_case("now_ms") && index.close.contains_key(&paren) {
+            if name.eq_ignore_ascii_case(function) && index.close.contains_key(&paren) {
                 survivors += 1;
             }
             Ok(())
@@ -3822,10 +4381,62 @@ pub fn rewrite_now_ms_calls(
     if survivors > 0 {
         return Err(categorized_error(
             QuerySqlErrorCategory::Engine,
-            "now_ms() rewrite left a call behind — refusing to run",
+            format!("{function}() rewrite left a call behind — refusing to run"),
         ));
     }
     Ok((rewritten, spans.len()))
+}
+
+/// The shared arity repair for `current_principal`.
+pub const CURRENT_PRINCIPAL_ARITY_REPAIR: &str =
+    "current_principal() takes no arguments — it always names the caller; use current_principal() with empty parentheses";
+
+/// Count the balanced `current_principal()` calls in a statement (any
+/// profile), enforcing the zero-argument shape like `count_now_ms_calls`.
+pub fn count_current_principal_calls(profile: QuerySqlProfile, statement: &str) -> Result<usize> {
+    let mut count = 0;
+    scan_calls(
+        statement,
+        profile,
+        &mut |name, _name_start, paren, index, statement, _bytes| {
+            if !name.eq_ignore_ascii_case("current_principal") {
+                return Ok(());
+            }
+            check_zero_arg_arity(paren, index, statement, CURRENT_PRINCIPAL_ARITY_REPAIR)?;
+            if index.close.contains_key(&paren) {
+                count += 1;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(count)
+}
+
+/// True when a statement uses `current_principal()`, so its result depends
+/// on who runs it: the same text returns different rows for different
+/// callers.
+pub fn statement_uses_current_principal(profile: QuerySqlProfile, statement: &str) -> Result<bool> {
+    Ok(count_current_principal_calls(profile, statement)? > 0)
+}
+
+/// Rewrite every `current_principal()` call to one hidden positional
+/// placeholder, exactly as `rewrite_now_ms_calls` does for the clock. The
+/// execution path binds the caller's authenticated principal id (the value
+/// stamped as `content_events.actor`) to it. The placeholder must be fresh
+/// past the caller's own parameters and any hidden clock, which the
+/// exact-set positional check makes unspoofable.
+pub fn rewrite_current_principal_calls(
+    profile: QuerySqlProfile,
+    statement: &str,
+    hidden_placeholder: &str,
+) -> Result<(String, usize)> {
+    rewrite_context_input_calls(
+        profile,
+        statement,
+        "current_principal",
+        CURRENT_PRINCIPAL_ARITY_REPAIR,
+        hidden_placeholder,
+    )
 }
 
 /// Native e25665c: the shared arity repair for `utc_date_label`, used by
@@ -4931,6 +5542,10 @@ mod tests {
             "my_message_state",
             "my_mentions",
             "effective_relationship_endpoints",
+            "facet_value_json_nodes",
+            "facet_observation_json_nodes",
+            "record_body_json_nodes",
+            "content_event_apps",
             "catalog_columns",
         ] {
             assert!(
@@ -4956,6 +5571,13 @@ mod tests {
             !pg_list.contains("effective_relationship_endpoints"),
             "{pg_list}"
         );
+        assert!(!pg_list.contains("facet_value_json_nodes"), "{pg_list}");
+        assert!(
+            !pg_list.contains("facet_observation_json_nodes"),
+            "{pg_list}"
+        );
+        assert!(!pg_list.contains("record_body_json_nodes"), "{pg_list}");
+        assert!(!pg_list.contains("content_event_apps"), "{pg_list}");
         assert!(pg_list.contains("body_task_items"), "{pg_list}");
         assert!(pg_list.contains("catalog_columns"), "{pg_list}");
         assert!(blocked_relation_repair("records", SqliteLocal).is_none());
@@ -5212,7 +5834,7 @@ mod tests {
             );
             seen.insert(*relation, position + 1);
         }
-        let statements = catalog_view_statements(true);
+        let statements = catalog_view_statements(true, false);
         assert_eq!(statements.len(), 2);
         for statement in &statements {
             // Installers split the contract batch on semicolons, so a
@@ -5221,7 +5843,7 @@ mod tests {
             assert!(!statement.contains(';'), "{statement}");
             assert!(statement.contains("IF NOT EXISTS"), "{statement}");
         }
-        let bare = catalog_view_statements(false);
+        let bare = catalog_view_statements(false, false);
         assert_eq!(bare.len(), 2);
         for statement in &bare {
             assert!(!statement.contains("IF NOT EXISTS"), "{statement}");
@@ -5234,6 +5856,61 @@ mod tests {
             statements[1].matches("UNION ALL").count(),
             column_rows.len() - 1
         );
+        // The shared SQLite generation stays collation-free.
+        for statement in statements.iter().chain(bare.iter()) {
+            assert!(!statement.contains("COLLATE"), "{statement}");
+        }
+        // The Postgres variant pins every text output field to C so
+        // locale ordering cannot reorder catalog rows; integer columns
+        // take no collation.
+        let pg = catalog_view_statements(false, true);
+        assert_eq!(pg.len(), 2);
+        for text_column in [
+            "relation_name",
+            "identity",
+            "completeness",
+            "profiles",
+            "comment",
+        ] {
+            assert_eq!(
+                pg[0]
+                    .matches(&format!("COLLATE \"C\" AS {text_column}"))
+                    .count(),
+                relation_rows.len(),
+                "{text_column}"
+            );
+        }
+        for text_column in ["relation_name", "column_name"] {
+            assert_eq!(
+                pg[1]
+                    .matches(&format!("COLLATE \"C\" AS {text_column}"))
+                    .count(),
+                column_rows.len(),
+                "{text_column}"
+            );
+        }
+        for int_column in ["semantic_version", "caller_relative", "column_position"] {
+            assert!(
+                !pg.iter()
+                    .any(|statement| statement.contains(&format!("COLLATE \"C\" AS {int_column}"))),
+                "{int_column}"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_comments_survive_naive_semicolon_splitting() {
+        // Relation comments render inside single-quoted SQL literals in
+        // `catalog_view_statements`, and several installers still split the
+        // contract on ';' without comment or literal awareness. A semicolon
+        // inside a comment would split a CREATE VIEW mid-literal and execute
+        // prose as SQL, so comments use ' - ' separators, never ';'.
+        for (name, comment) in RELATION_COMMENTS {
+            assert!(
+                !comment.contains(';'),
+                "relation comment for '{name}' contains a semicolon"
+            );
+        }
     }
 
     #[test]
@@ -5308,6 +5985,10 @@ mod tests {
         for (_, sql) in CARD_WORKED_STATEMENTS {
             assert!(card.contains(sql), "card omits a worked statement");
         }
+        assert!(card.contains(CARD_ANCESTOR_PATH_SQL));
+        assert!(card
+            .contains(r#"guidance_read(operation="read_guide", arguments={"topic":"query-sql"})"#));
+        assert!(!card.contains("get_record, or"));
     }
 
     #[test]
@@ -5485,6 +6166,24 @@ mod tests {
                     "{profile:?}: {sql}/{len}: {error}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reused_placeholders_share_one_parameter_chunk() {
+        // Foci membership shape (task 5b5bfa5): the same ?1..=?n set
+        // appears in both the source_id and target_id IN lists, so the
+        // caller sends ONE chunk of n parameters, not one chunk per list.
+        // Sending 2n must refuse rather than bind a shifted second copy.
+        let sql = "SELECT source_id, target_id FROM links \
+            WHERE source_id IN (?1, ?2) OR target_id IN (?1, ?2)";
+        for profile in PROFILES {
+            check_positional_arguments(*profile, sql, 2).unwrap();
+            let error = check_positional_arguments(*profile, sql, 4).unwrap_err();
+            assert!(
+                error.to_string().contains("must match exactly"),
+                "{profile:?}: {error}"
+            );
         }
     }
 
@@ -6052,6 +6751,93 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("takes no arguments"), "{error}");
+    }
+
+    #[test]
+    fn current_principal_is_admitted_with_empty_parentheses_on_every_profile() {
+        for sql in [
+            "SELECT current_principal() FROM records",
+            "SELECT CURRENT_PRINCIPAL( ) FROM records",
+            "SELECT actor FROM actors WHERE actor = current_principal()",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    classify_single_read_statement(*profile, sql).is_ok(),
+                    "{profile:?}: {sql}"
+                );
+                assert!(
+                    classify_stored_saved_sql(*profile, sql).is_ok(),
+                    "{profile:?} stored: {sql}"
+                );
+                assert!(
+                    statement_uses_current_principal(*profile, sql).unwrap(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+        for sql in [
+            "SELECT 'current_principal()' FROM records",
+            "SELECT id FROM records -- current_principal()",
+        ] {
+            for profile in PROFILES {
+                assert!(
+                    !statement_uses_current_principal(*profile, sql).unwrap(),
+                    "{profile:?}: {sql}"
+                );
+            }
+        }
+        // It always names the caller: no argument can redirect it.
+        for sql in [
+            "SELECT current_principal('acct_other') FROM records",
+            "SELECT current_principal(?1) FROM records",
+        ] {
+            for profile in PROFILES {
+                let error = classify_single_read_statement(*profile, sql).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("current_principal() takes no arguments"),
+                    "{profile:?}: {sql}: {error}"
+                );
+                let error = classify_stored_saved_sql(*profile, sql).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("current_principal() takes no arguments"),
+                    "{profile:?} stored: {sql}: {error}"
+                );
+            }
+        }
+        let decl = function_decl("current_principal").expect("registered");
+        assert_eq!(decl.kind, FunctionKind::ContextInput);
+        assert!(!decl.time_dependent);
+    }
+
+    #[test]
+    fn current_principal_rewrite_takes_the_slot_after_the_clock() {
+        // Execution paths rewrite the clock first, then the principal at the
+        // next fresh index, and push the hidden values in that order.
+        let sql = "SELECT now_ms() AS t, current_principal() AS p FROM actors \
+                   WHERE actor = CURRENT_PRINCIPAL() AND actor <> ?1";
+        let (clocked, clock_uses) =
+            rewrite_now_ms_calls(QuerySqlProfile::SqliteLocal, sql, "?2").unwrap();
+        assert_eq!(clock_uses, 1);
+        let (rewritten, principal_uses) =
+            rewrite_current_principal_calls(QuerySqlProfile::SqliteLocal, &clocked, "?3").unwrap();
+        assert_eq!(principal_uses, 2);
+        assert_eq!(
+            rewritten,
+            "SELECT ?2 AS t, ?3 AS p FROM actors \
+                   WHERE actor = ?3 AND actor <> ?1"
+        );
+        let (same, count) = rewrite_current_principal_calls(
+            QuerySqlProfile::PostgresServer,
+            "SELECT id FROM records",
+            "?1",
+        )
+        .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(same, "SELECT id FROM records");
     }
 
     #[test]
@@ -6799,7 +7585,16 @@ mod tests {
         ] {
             let contract = relation(name);
             assert_eq!(contract.identity, identity);
-            assert_eq!(contract.semantic_version, 1);
+            assert_eq!(
+                contract.semantic_version,
+                if name == "my_message_state" {
+                    MY_MESSAGE_STATE_RELATION_VERSION
+                } else if name == "my_mentions" {
+                    MY_MENTIONS_RELATION_VERSION
+                } else {
+                    LOGICAL_RELATION_VERSION
+                }
+            );
             assert!(contract.caller_relative);
             assert_eq!(contract.completeness, "complete");
             assert_eq!(contract.profiles, &["sqlite-local"]);
@@ -6813,6 +7608,41 @@ mod tests {
                 }
             }
         }
+        let anchors = relation("comment_anchors");
+        assert_eq!(anchors.identity, "native.query-sql.comment-anchors");
+        assert_eq!(anchors.profiles, &["sqlite-local"]);
+        assert_eq!(
+            anchors.columns,
+            &[
+                "annotation_id",
+                "target_record_id",
+                "purpose",
+                "selectors",
+                "source_event_seq",
+                "source_sha256"
+            ]
+        );
+        // Only the scoped capture sequence travels here: the stored
+        // content-events MAX at capture beside its digest, so a later live
+        // reopen can prove the same recorded range. No other sequence does.
+        let mut seq_columns: Vec<&&str> = anchors
+            .columns
+            .iter()
+            .filter(|column| column.contains("seq"))
+            .collect();
+        seq_columns.sort_unstable();
+        assert_eq!(seq_columns, vec![&"source_event_seq"]);
+        assert!(
+            !anchors
+                .columns
+                .iter()
+                .any(|column| column.contains("version")
+                    || column.contains("head")
+                    || column.contains("account")
+                    || column.contains("subject")
+                    || column.contains("actor")),
+            "comment_anchors names a forbidden column"
+        );
         let facet_times = relation("facet_times");
         assert_eq!(facet_times.identity, "native.query-sql.facet-times");
         assert_eq!(facet_times.semantic_version, 1);
@@ -6853,7 +7683,12 @@ mod tests {
         );
         assert!(LOGICAL_RELATIONS
             .iter()
-            .filter(|relation| { !matches!(relation.name, "content_events" | "agent_activity") })
+            .filter(|relation| {
+                !matches!(
+                    relation.name,
+                    "content_events" | "agent_activity" | "my_message_state" | "my_mentions"
+                )
+            })
             .all(|relation| relation.semantic_version == LOGICAL_RELATION_VERSION));
     }
 
@@ -7066,7 +7901,8 @@ mod tests {
     fn function_registry_covers_exactly_the_prior_portable_names() {
         // E1 M3: the registry table must cover exactly the portable names —
         // the 23 the validator admitted before the registry existed, plus
-        // `utc_date_label` (Native e25665c). No removals, no renames.
+        // `utc_date_label` (Native e25665c) and `current_principal` (Native
+        // 4e3900f). No removals, no renames.
         // `PORTABLE_FUNCTIONS` is derived from the table, so this pins the
         // table itself.
         let expected = [
@@ -7075,6 +7911,7 @@ mod tests {
             "coalesce",
             "count",
             "cume_dist",
+            "current_principal",
             "dense_rank",
             "length",
             "lower",
@@ -7173,11 +8010,11 @@ mod tests {
             assert!(is_portable_function(decl.name));
         }
         assert!(!function_supported_on(
-            "current_principal",
+            "current_user",
             QuerySqlProfile::SqliteLocal
         ));
-        assert!(function_decl("current_principal").is_none());
-        assert!(!is_portable_function("current_principal"));
+        assert!(function_decl("current_user").is_none());
+        assert!(!is_portable_function("current_user"));
     }
 
     #[test]
@@ -7201,9 +8038,20 @@ mod tests {
         }
         // Case-insensitive lookup returns the same declaration.
         assert_eq!(function_decl("NOW_MS"), Some(now_ms));
+        // The principal is a context input on every engine, but not a clock.
+        let principal =
+            function_decl("current_principal").expect("current_principal is registered");
+        assert_eq!(principal.kind, FunctionKind::ContextInput);
+        assert!(!principal.time_dependent);
+        for profile in PROFILES {
+            assert!(
+                function_supported_on("current_principal", *profile),
+                "current_principal on {profile:?}"
+            );
+        }
         // Everything else is a non-time-dependent scalar.
         for decl in FUNCTION_REGISTRY {
-            if decl.name == "now_ms" {
+            if decl.name == "now_ms" || decl.name == "current_principal" {
                 continue;
             }
             assert_eq!(decl.kind, FunctionKind::Scalar, "{}", decl.name);
@@ -7277,5 +8125,215 @@ mod tests {
             assert!(parameter_type_known(tag), "{tag}");
         }
         assert!(!parameter_type_known("frob"));
+    }
+
+    fn ad_hoc(sql: &str) -> Result<String> {
+        classify_sqlite_ad_hoc_statement(sql)
+    }
+
+    fn ad_hoc_error(sql: &str) -> String {
+        ad_hoc(sql).expect_err(sql).to_string()
+    }
+
+    #[test]
+    fn sqlite_ad_hoc_admits_json_and_date_functions_the_portable_set_drops() {
+        for sql in [
+            "SELECT json_extract(body, '$.a') FROM records",
+            "SELECT json(body), json_type(body), json_valid(body), json_quote(name) FROM records",
+            "SELECT json_array_length(body), json_array(1, 2), json_object('a', 1) FROM records",
+            "SELECT json_group_array(name), json_group_object(id, name) FROM records",
+            "SELECT json_patch(body, '{}'), json_remove(body, '$.a'), json_set(body, '$.a', 1), json_insert(body, '$.a', 1), json_replace(body, '$.a', 1) FROM records",
+            "SELECT body -> '$.a', body ->> '$.a' FROM records",
+            "SELECT j.value FROM records AS r, json_each(r.body) AS j",
+            "SELECT j.value FROM records AS r, json_tree(r.body, '$.a') AS j",
+            "SELECT date(created_at_ms / 1000, 'unixepoch'), time(created_at), datetime(created_at, '+1 day') FROM records",
+            "SELECT julianday(created_at), unixepoch(created_at), strftime('%Y', created_at) FROM records",
+            "SELECT datetime(now_ms() / 1000, 'unixepoch') FROM records",
+            "SELECT instr(name, 'x'), glob('a*', name), typeof(name), unicode(name), total(id) FROM records",
+            "SELECT substring(name, 1, 2), group_concat(name), char(65), hex(name), printf('%d', 1) FROM records",
+            "SELECT format('%d', 1), ltrim(name), rtrim(name), ifnull(name, ''), iif(1, 2, 3) FROM records",
+        ] {
+            ad_hoc(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+    }
+
+    #[test]
+    fn sqlite_ad_hoc_refuses_clock_reads_with_the_now_ms_repair() {
+        for sql in [
+            "SELECT date() FROM records",
+            "SELECT time() FROM records",
+            "SELECT datetime() FROM records",
+            "SELECT julianday() FROM records",
+            "SELECT unixepoch() FROM records",
+            "SELECT strftime('%s') FROM records",
+            "SELECT date('now') FROM records",
+            "SELECT DATETIME('NOW') FROM records",
+            "SELECT datetime(' now ') FROM records",
+            "SELECT date(created_at, 'localtime') FROM records",
+            "SELECT date(created_at, 'UTC') FROM records",
+            "SELECT strftime('%Y', 'now') FROM records",
+            "SELECT julianday(coalesce(deleted_at, 'now')) FROM records",
+            "SELECT unixepoch(created_at, 'start of day', 'localtime') FROM records",
+        ] {
+            let error = ad_hoc_error(sql);
+            assert!(error.contains("now_ms()"), "{sql}: {error}");
+            assert!(error.contains("explicit time value"), "{sql}: {error}");
+        }
+        // The same words outside a date/time call are ordinary text.
+        ad_hoc("SELECT id FROM records WHERE name = 'now' OR name = 'utc'").unwrap();
+        ad_hoc("SELECT json_extract(body, '$.now') FROM records").unwrap();
+        // Keyword clocks stay refused by the shared rule, as everywhere.
+        assert!(ad_hoc("SELECT current_timestamp").is_err());
+    }
+
+    #[test]
+    fn sqlite_ad_hoc_clock_bound_parameters_are_refused_in_date_calls() {
+        let text = |value: &str| QuerySqlParameter::Text {
+            value: Some(value.to_owned()),
+        };
+        let profile = QuerySqlProfile::SqliteLocal;
+        let with_clock = "SELECT date(?1) FROM records";
+        for clock in ["now", " NOW ", "localtime", "UTC"] {
+            let error = validate_ad_hoc_clock_bound_args(profile, with_clock, &[text(clock)])
+                .expect_err(clock)
+                .to_string();
+            assert!(error.contains("now_ms()"), "{clock}: {error}");
+        }
+        validate_ad_hoc_clock_bound_args(profile, with_clock, &[text("2026-01-01")]).unwrap();
+        // No date/time call: the word is just a value.
+        validate_ad_hoc_clock_bound_args(
+            profile,
+            "SELECT id FROM records WHERE name = ?1",
+            &[text("now")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqlite_ad_hoc_refuses_impure_and_engine_functions() {
+        for name in [
+            "random()",
+            "randomblob(4)",
+            "load_extension('x')",
+            "changes()",
+            "total_changes()",
+            "last_insert_rowid()",
+            "zeroblob(4)",
+            "sqlite_version()",
+            "sqlite_source_id()",
+            "SQLITE_compileoption_used('x')",
+        ] {
+            let sql = format!("SELECT {name} FROM records");
+            let error = ad_hoc_error(&sql);
+            assert!(error.contains("is unavailable"), "{sql}: {error}");
+        }
+    }
+
+    #[test]
+    fn sqlite_ad_hoc_keeps_the_non_function_portable_rules() {
+        // Not part of the brief's allowlist: still the portable refusals.
+        assert!(ad_hoc_error("SELECT round(1.5, 1) FROM records").contains("round"));
+        assert!(ad_hoc_error("SELECT max(1, 2) FROM records").contains("CASE"));
+        // Absent from the pinned SQLite build, so absent from the allowlist
+        // and still carrying the portable repair.
+        assert!(ad_hoc_error("SELECT floor(1.5) FROM records").contains("unavailable"));
+        assert!(!is_sqlite_ad_hoc_extra_function("floor"));
+        // Writes and control tokens are unchanged.
+        assert!(ad_hoc("DELETE FROM records").is_err());
+        assert!(ad_hoc("SELECT 1; SELECT 2").is_err());
+    }
+
+    #[test]
+    fn portable_profiles_and_saved_sql_classification_are_unchanged() {
+        for sql in [
+            "SELECT json_extract(body, '$.a') FROM records",
+            "SELECT date(created_at) FROM records",
+            "SELECT instr(name, 'x') FROM records",
+            "SELECT j.value FROM records AS r, json_each(r.body) AS j",
+        ] {
+            for profile in [
+                QuerySqlProfile::SqliteLocal,
+                QuerySqlProfile::TursoLocal,
+                QuerySqlProfile::PostgresServer,
+            ] {
+                let error = classify_single_read_statement(profile, sql)
+                    .expect_err(sql)
+                    .to_string();
+                assert!(error.contains("is unavailable"), "{sql}: {error}");
+            }
+            // The ad-hoc allowance is ignored off sqlite-local.
+            for profile in [QuerySqlProfile::TursoLocal, QuerySqlProfile::PostgresServer] {
+                assert!(
+                    classify_single_read_statement_impl(
+                        profile,
+                        sql,
+                        true,
+                        FunctionAllowance::SqliteAdHoc
+                    )
+                    .is_err(),
+                    "{sql}"
+                );
+            }
+            // Stored saved SQL keeps the legacy allowance (no name scan).
+            classify_stored_saved_sql(QuerySqlProfile::SqliteLocal, sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+    }
+
+    #[test]
+    fn portable_refusal_of_an_ad_hoc_function_names_where_it_is_available() {
+        let error = classify_single_read_statement(
+            QuerySqlProfile::SqliteLocal,
+            "SELECT json_extract(body, '$.a') FROM records",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(JSON_REPAIR), "{error}");
+        assert!(
+            error.contains("ad-hoc query_sql on sqlite-local"),
+            "{error}"
+        );
+        // A function the ad-hoc dialect does not admit gets no such note.
+        let other = classify_single_read_statement(
+            QuerySqlProfile::SqliteLocal,
+            "SELECT greatest(1, 2) FROM records",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!other.contains("ad-hoc"), "{other}");
+    }
+
+    #[test]
+    fn exact_reaction_reads_catalog_preserves_sequence_free_identity() {
+        let relation = LOGICAL_RELATIONS
+            .iter()
+            .find(|r| r.name == "message_reactions")
+            .unwrap();
+        assert_eq!(relation.identity, "native.query-sql.message-reactions");
+        assert_eq!(relation.semantic_version, 1);
+        assert_eq!(relation.completeness, "complete");
+        assert!(relation.caller_relative);
+        assert_eq!(relation.profiles, SQLITE_PROFILE);
+        assert_eq!(
+            relation.columns,
+            &[
+                "reaction_id",
+                "message_id",
+                "emoji",
+                "actor_record_id",
+                "actor_name",
+                "executor_kind",
+                "reacted_at",
+                "reacted_at_ms",
+                "viewer"
+            ]
+        );
+        for column in relation.columns {
+            assert!(
+                !column.contains("seq")
+                    && !column.contains("payload")
+                    && !column.contains("account")
+            );
+        }
     }
 }

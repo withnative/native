@@ -1,0 +1,226 @@
+{
+  "pins": {
+    "package": {
+      "namespace": "native.relationship",
+      "name": "relates-to",
+      "version": 1,
+      "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+    },
+    "relationship": {
+      "family": "native.relationship.relates_to",
+      "version": 1,
+      "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+    },
+    "provider": "host.relates-to/3:20b395c2b26762ddfb86a603cfd0be8fbe04951254baa600bca022312eb922d1",
+    "decoder": "relates_to.payload/3",
+    "reducer": "relates_to.fold/3",
+    "payload_version": 3
+  },
+  "events": [
+    {
+      "seq": 10,
+      "record_id": "relation:golden",
+      "actor": "golden-host",
+      "created_at": "2026-10-11T00:00:00Z",
+      "payload": {
+        "request": {
+          "principal_id": "golden-host",
+          "operation_key": "golden.first",
+          "anchor": {
+            "record_id": "a",
+            "head": 1,
+            "binding_revision": 1,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "counterpart": {
+            "record_id": "b",
+            "head": 2,
+            "binding_revision": 2,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "declaration": null,
+          "scope_home": "kernel:root",
+          "selection_head": 3,
+          "authority_head": 4,
+          "expected_head": null,
+          "aggregate_id": "relation:golden",
+          "pins": {
+            "package": {
+              "namespace": "native.relationship",
+              "name": "relates-to",
+              "version": 1,
+              "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+            },
+            "relationship": {
+              "family": "native.relationship.relates_to",
+              "version": 1,
+              "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+            },
+            "provider": "host.relates-to/3:20b395c2b26762ddfb86a603cfd0be8fbe04951254baa600bca022312eb922d1",
+            "decoder": "relates_to.payload/3",
+            "reducer": "relates_to.fold/3",
+            "payload_version": 3
+          },
+          "command": {
+            "Assert": {
+              "sources": [
+                {
+                  "source_id": "legacy.0",
+                  "from": "a",
+                  "to": "b",
+                  "note": "fixed provenance",
+                  "claimed_author": "claimed-author",
+                  "claimed_timestamp": "2001-01-01T00:00:00Z"
+                }
+              ]
+            }
+          },
+          "request_digest": "0e221d72e790ea17c810f8ad78aa5ed912e02e432f166a3ad362a34359980370",
+          "policy_head": 0
+        },
+        "assertion_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}",
+      "attribution_bytes": "null",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    },
+    {
+      "seq": 11,
+      "record_id": "relation:golden",
+      "actor": "golden-editor",
+      "created_at": "2026-10-11T00:00:01Z",
+      "payload": {
+        "request": {
+          "principal_id": "golden-editor",
+          "operation_key": "golden.second",
+          "anchor": {
+            "record_id": "b",
+            "head": 1,
+            "binding_revision": 1,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "counterpart": {
+            "record_id": "a",
+            "head": 2,
+            "binding_revision": 2,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "declaration": null,
+          "scope_home": "kernel:root",
+          "selection_head": 3,
+          "authority_head": 4,
+          "expected_head": 10,
+          "aggregate_id": "relation:golden",
+          "pins": {
+            "package": {
+              "namespace": "native.relationship",
+              "name": "relates-to",
+              "version": 1,
+              "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+            },
+            "relationship": {
+              "family": "native.relationship.relates_to",
+              "version": 1,
+              "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+            },
+            "provider": "host.relates-to/3:20b395c2b26762ddfb86a603cfd0be8fbe04951254baa600bca022312eb922d1",
+            "decoder": "relates_to.payload/3",
+            "reducer": "relates_to.fold/3",
+            "payload_version": 3
+          },
+          "command": {
+            "Assert": {
+              "sources": [
+                {
+                  "source_id": "legacy.1",
+                  "from": "b",
+                  "to": "a",
+                  "note": "fixed provenance",
+                  "claimed_author": null,
+                  "claimed_timestamp": null
+                }
+              ]
+            }
+          },
+          "request_digest": "77f9cf9c0fc0fc4813ab49842955cc0165ed3ee6dc5cf9e1d09e623c2572c74f",
+          "policy_head": 0
+        },
+        "assertion_id": "22222222-2222-4222-8222-222222222222"
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null},{\"id\":\"22222222-2222-4222-8222-222222222222\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":null,\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}",
+      "attribution_bytes": "null",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null},{\"id\":\"22222222-2222-4222-8222-222222222222\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":null,\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    },
+    {
+      "seq": 12,
+      "record_id": "relation:golden",
+      "actor": "golden-manager",
+      "created_at": "2026-10-11T00:00:02Z",
+      "payload": {
+        "request": {
+          "principal_id": "golden-manager",
+          "operation_key": "golden.retract",
+          "anchor": {
+            "record_id": "a",
+            "head": 1,
+            "binding_revision": 1,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "counterpart": {
+            "record_id": "b",
+            "head": 2,
+            "binding_revision": 2,
+            "binding": {
+              "state": "Bare"
+            }
+          },
+          "declaration": null,
+          "scope_home": "kernel:root",
+          "selection_head": 3,
+          "authority_head": 4,
+          "expected_head": 11,
+          "aggregate_id": "relation:golden",
+          "pins": {
+            "package": {
+              "namespace": "native.relationship",
+              "name": "relates-to",
+              "version": 1,
+              "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+            },
+            "relationship": {
+              "family": "native.relationship.relates_to",
+              "version": 1,
+              "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+            },
+            "provider": "host.relates-to/3:20b395c2b26762ddfb86a603cfd0be8fbe04951254baa600bca022312eb922d1",
+            "decoder": "relates_to.payload/3",
+            "reducer": "relates_to.fold/3",
+            "payload_version": 3
+          },
+          "command": {
+            "Retract": {
+              "assertion_id": "11111111-1111-4111-8111-111111111111"
+            }
+          },
+          "request_digest": "7374ad6f24f544a779c05c350ed1845f4e18ee2779d26eb932d98a8245cfeab1",
+          "policy_head": 0
+        },
+        "assertion_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":true,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":\"golden-manager\",\"retracted_at\":\"2026-10-11T00:00:02Z\",\"retracted_seq\":12},{\"id\":\"22222222-2222-4222-8222-222222222222\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":null,\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}",
+      "attribution_bytes": "null",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":true,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":\"golden-manager\",\"retracted_at\":\"2026-10-11T00:00:02Z\",\"retracted_seq\":12},{\"id\":\"22222222-2222-4222-8222-222222222222\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":null,\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    }
+  ],
+  "source_sha256": "20b395c2b26762ddfb86a603cfd0be8fbe04951254baa600bca022312eb922d1"
+}

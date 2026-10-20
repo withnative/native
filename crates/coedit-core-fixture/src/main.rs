@@ -13,6 +13,12 @@ mod refusal;
 #[allow(dead_code)]
 #[path = "../../../src/coedit/registry.rs"]
 mod registry;
+#[allow(dead_code)]
+#[path = "../../../src/coedit/span_map.rs"]
+mod span_map;
+#[allow(dead_code)]
+#[path = "../../../src/coedit/text_diff.rs"]
+mod text_diff;
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
@@ -149,7 +155,9 @@ impl Fixture {
                         "fixture_version": 1,
                         "source_sha256": {
                             "src/coedit/registry.rs": env!("COEDIT_REGISTRY_SHA256"),
-                            "src/coedit/refusal.rs": env!("COEDIT_REFUSAL_SHA256")
+                            "src/coedit/refusal.rs": env!("COEDIT_REFUSAL_SHA256"),
+                            "src/coedit/span_map.rs": env!("COEDIT_SPAN_MAP_SHA256"),
+                            "src/coedit/text_diff.rs": env!("COEDIT_TEXT_DIFF_SHA256")
                         },
                         "seed": SEED, "record_id": RECORD,
                         "max_frame_bytes": MAX_FRAME_BYTES, "max_links": MAX_LINKS

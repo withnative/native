@@ -7,7 +7,7 @@
 // shell's own lifecycle (experiments/demo-shell/check-tab-read-queue-headless.mjs):
 // every accepted read is answered exactly once, on its own port, before
 // that port closes, and nothing reaches a retired frame or a successor.
-import { test, afterEach } from "node:test";
+import { test, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,6 +24,20 @@ process.on("exit", () => rmSync(dir, { recursive: true, force: true }));
 
 const VERSION = LIMITS.bridge.version;
 const flush = async () => { for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+// Drain microtasks only, so the shell's deferred admission pump dispatches a
+// queued read without advancing to the timer phase. A read armed with a short
+// timeout is then on the wire before that timeout can fire; a macrotask
+// `flush()` can starve under load and let the timeout win the race.
+const microtaskDrain = async () => { await Promise.resolve(); await Promise.resolve(); };
+// A shrunk deadline (30 ms) raced the test's own steps: under load the
+// `flush()` hops between arming and asserting can outlast it, so the deadline
+// fired before the state the test describes existed. Tests that exercise a
+// deadline run the shell's setTimeout on a mocked clock instead and advance it
+// by hand, so the deadline passes exactly when the test says and never before.
+const withMockedTimers = async (body) => {
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try { await body(); } finally { mock.timers.reset(); }
+};
 let loads = 0;
 const open = [];
 
@@ -88,7 +102,9 @@ async function loadShell({ mode = "live", handshakeTimeoutMs = 60_000, readTimeo
       for (let pass = 0; pass < 16; pass += 1) {
         const pending = fetches.filter((call) => !call.settled && !call.aborted);
         if (pending.length === 0) break;
-        for (const call of pending) call.resolve({ result: { rows: [] } });
+        for (const call of pending) call.resolve(Array.isArray(call.body.reads)
+          ? { results: call.body.reads.map((item) => ({ need: item.need, result: { rows: [] } })) }
+          : { result: { rows: [] } });
         await flush();
       }
     },
@@ -112,23 +128,24 @@ for (const [mode, code] of [["live", "unsupported_host"], ["sample", "preview_sa
   });
 }
 
-test("fake host: a handshake timeout answers every accepted read once, then closes; the late answer changes nothing", async () => {
+test("fake host: a handshake timeout answers every accepted read once, then closes; the late answer changes nothing", () => withMockedTimers(async () => {
   const shell = await loadShell({ handshakeTimeoutMs: 30 });
   const channel = await shell.bootstrap("doc-1");
   shell.read(channel, "read-1", "r1");
   shell.read(channel, "read-2", "r2");
   await flush();
-  assert.equal(shell.fetches.length, 2, "both accepted reads are in flight");
-  // The one bounded timer wait: the shrunk handshake deadline.
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(shell.fetches.length, 1, "the same-task pair coalesces into one call");
+  // The shrunk handshake deadline passes.
+  mock.timers.tick(30);
+  await flush();
   assert.deepEqual(shell.replies(channel), ["read-1:unavailable/tab_closed", "read-2:unavailable/tab_closed"]);
   assert.ok(channel.closed);
-  shell.fetches[0].resolve({ result: { rows: [{ id: "r1" }] } });
+  shell.fetches[0].resolve({ results: [] });
   await flush();
   assert.equal(shell.replies(channel).length, 2, "no second answer");
   assert.equal(channel.postedAfterClose.length, 0);
-  assert.equal(shell.fetches.length, 2, "nothing more is dispatched after close");
-});
+  assert.equal(shell.fetches.length, 1, "nothing more is dispatched after close");
+}));
 
 test("fake host: a message error drains once, closes and dispatches nothing more", async () => {
   const shell = await loadShell();
@@ -140,13 +157,13 @@ test("fake host: a message error drains once, closes and dispatches nothing more
   channel.port1.onmessageerror();
   assert.deepEqual(shell.replies(channel), ["read-1:unavailable/tab_closed", "read-2:unavailable/tab_closed"]);
   assert.ok(channel.closed);
-  shell.fetches[0].resolve({ result: { rows: [{ id: "r1" }] } });
+  shell.fetches[0].resolve({ results: [] });
   await flush();
   assert.equal(shell.replies(channel).length, 2);
-  assert.equal(shell.fetches.length, 2, "nothing more is dispatched after close");
+  assert.equal(shell.fetches.length, 1, "nothing more is dispatched after close");
   shell.read(channel, "read-3", "r3");
   await flush();
-  assert.equal(shell.fetches.length, 2);
+  assert.equal(shell.fetches.length, 1);
   assert.ok(!shell.events().some((event) => event.type === "read-queued" && event.request_id === "read-3"));
 });
 
@@ -155,8 +172,8 @@ test("fake host: several reads are in flight at once, up to the in-flight cap", 
   const channel = await shell.bootstrap("doc-1");
   shell.send(channel, { type: "ready" });
   const cap = LIMITS.shell.reads_in_flight;
-  for (let i = 0; i < cap; i += 1) shell.read(channel, `read-${i}`, `r${i}`);
-  await flush();
+  // One per task, so each is its own call rather than one coalesced batch.
+  for (let i = 0; i < cap; i += 1) { shell.read(channel, `read-${i}`, `r${i}`); await flush(); }
   assert.equal(shell.fetches.length, cap, `${cap} reads are on the wire together`);
   assert.equal(shell.events().filter((event) => event.type === "read-start").length, cap);
   // The next read waits in the queue rather than dispatching a (cap + 1)th.
@@ -171,11 +188,58 @@ test("fake host: several reads are in flight at once, up to the in-flight cap", 
     ["r0", "r1", "r2", "r3", "r-over"]);
 });
 
-test("fake host: a timed-out read retires only its ticket; the frame's other reads keep going", async () => {
+test("fake host: a same-task burst of declared reads coalesces into one batched call", async () => {
+  const shell = await loadShell();
+  const channel = await shell.bootstrap("doc-1");
+  shell.send(channel, { type: "ready" });
+  for (let i = 0; i < 6; i += 1) shell.read(channel, `read-${i}`, `r${i}`);
+  await flush();
+  assert.equal(shell.fetches.length, 1, "six reads issued in one task are one call");
+  const batch = shell.fetches[0];
+  assert.deepEqual(batch.body.reads, [
+    { need: "probe.body", params: { id: "r0" } }, { need: "probe.body", params: { id: "r1" } },
+    { need: "probe.body", params: { id: "r2" } }, { need: "probe.body", params: { id: "r3" } },
+    { need: "probe.body", params: { id: "r4" } }, { need: "probe.body", params: { id: "r5" } },
+  ], "one batched body carries the reads in request order");
+  batch.resolve({ results: Array.from({ length: 6 }, (_, i) => ({ need: "probe.body", result: { rows: [{ id: `r${i}` }] } })) });
+  await flush();
+  const replies = new Map(channel.posted.filter((m) => m.type === "read-result").map((m) => [m.request_id, m]));
+  for (let i = 0; i < 6; i += 1) {
+    assert.deepEqual(replies.get(`read-${i}`)?.result?.rows?.[0], { id: `r${i}` },
+      `read-${i} gets the rows a single call would have returned`);
+  }
+});
+
+test("fake host: one item's error settles only its ticket in a batch", async () => {
+  const shell = await loadShell();
+  const channel = await shell.bootstrap("doc-1");
+  shell.send(channel, { type: "ready" });
+  for (let i = 0; i < 4; i += 1) shell.read(channel, `read-${i}`, `r${i}`);
+  await flush();
+  assert.equal(shell.fetches.length, 1, "the four reads are one batched call");
+  const batch = shell.fetches[0];
+  batch.resolve({ results: [
+    { need: "probe.body", result: { rows: [{ id: "r0" }] } },
+    { need: "probe.body", result: { rows: [{ id: "r1" }] } },
+    { need: "probe.body", error: { code: "sql_need_failed", message: "manage_alpha_tabs: live read refused [sql_need_failed]" } },
+    { need: "probe.body", result: { rows: [{ id: "r3" }] } },
+  ] });
+  await flush();
+  const replies = new Map(channel.posted.filter((m) => m.type === "read-result").map((m) => [m.request_id, m]));
+  assert.equal(replies.get("read-0").status, "ok");
+  assert.deepEqual(replies.get("read-1").result?.rows?.[0], { id: "r1" });
+  assert.equal(replies.get("read-2").status, "refused");
+  assert.equal(replies.get("read-2").code, "sql_need_failed");
+  assert.equal(replies.get("read-2").result, undefined, "a refused item carries no rows");
+  assert.deepEqual(replies.get("read-3").result?.rows?.[0], { id: "r3" });
+});
+
+test("fake host: a timed-out read retires only its ticket; the frame's other reads keep going", () => withMockedTimers(async () => {
   const shell = await loadShell({ readTimeoutMs: 30 });
   const channel = await shell.bootstrap("doc-1");
   shell.send(channel, { type: "ready" });
   shell.read(channel, "read-1", "hang");
+  await flush();
   shell.read(channel, "read-2", "r2");
   await flush();
   assert.equal(shell.fetches.length, 2, "both accepted reads are in flight");
@@ -183,8 +247,9 @@ test("fake host: a timed-out read retires only its ticket; the frame's other rea
   shell.fetches[1].resolve({ result: { rows: [{ id: "r2" }] } });
   await flush();
   assert.deepEqual(shell.replies(channel), ["read-2:ok/"]);
-  // The one bounded timer wait: past the hung read's deadline.
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  // Past the hung read's deadline.
+  mock.timers.tick(30);
+  await flush();
   assert.deepEqual(shell.replies(channel), ["read-2:ok/", "read-1:unavailable/unavailable"]);
   assert.ok(!channel.closed, "one read's timeout does not close the frame");
   assert.ok(!shell.events().some((event) => event.type === "frame-closed"), "no terminal teardown for one timeout");
@@ -195,7 +260,7 @@ test("fake host: a timed-out read retires only its ticket; the frame's other rea
   shell.fetches[2].resolve({ result: { rows: [{ id: "r3" }] } });
   await flush();
   assert.equal(shell.replies(channel).at(-1), "read-3:ok/");
-});
+}));
 
 test("fake host: the per-tab admission cap still answers extra reads busy without queueing them", async () => {
   const shell = await loadShell();
@@ -207,7 +272,7 @@ test("fake host: the per-tab admission cap still answers extra reads busy withou
   assert.equal(shell.replies(channel).filter((reply) => reply === `read-${cap}:busy/busy`).length, 1,
     "the read past the cap is answered busy at once");
   assert.equal(shell.replies(channel).length, 1, "only the over-cap read is answered before any settles");
-  assert.equal(shell.fetches.length, LIMITS.shell.reads_in_flight, "the over-cap read is not dispatched");
+  assert.equal(shell.fetches.length, 1, "the accepted reads are one batched call, under the in-flight cap");
   assert.ok(!shell.events().some((event) => event.type === "read-queued" && event.request_id === `read-${cap}`));
 });
 
@@ -217,7 +282,7 @@ test("fake host: a reload with a read on the wire drains the old port once and r
   shell.send(oldChannel, { type: "ready" });
   shell.read(oldChannel, "read-1", "r1");
   shell.read(oldChannel, "read-2", "r2");
-  await flush();
+  await microtaskDrain();
   const before = shell.channels.length;
   await shell.bootstrap("doc-2");
   assert.equal(shell.channels.length, before, "no channel is opened for the new document");
@@ -226,11 +291,11 @@ test("fake host: a reload with a read on the wire drains the old port once and r
   // Past the old reads' deadline: both were disarmed by the drain.
   await new Promise((resolve) => setTimeout(resolve, 90));
   assert.ok(!shell.events().some((event) => event.type === "read-timeout"));
-  shell.fetches[0].resolve({ result: { rows: [{ id: "r1" }] } });
+  shell.fetches[0].resolve({ results: [] });
   await flush();
   assert.equal(shell.replies(oldChannel).length, 2);
   assert.equal(oldChannel.postedAfterClose.length, 0);
-  assert.equal(shell.fetches.length, 2, "nothing more is dispatched");
+  assert.equal(shell.fetches.length, 1, "nothing more is dispatched");
 });
 
 test("fake host: an idle reload re-handshakes; the old document's handler is ignored and a reused read-1 is answered on the new port only", async () => {

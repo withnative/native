@@ -23,6 +23,7 @@ pub enum GuideSource {
     ProductModel,
     FrozenSqliteDdl,
     CompleteToolRegistry,
+    SuppliedKitRelease,
 }
 
 /// One callable guide topic, its final Markdown body, and its source class.
@@ -34,7 +35,12 @@ pub struct GuideSpec {
 }
 
 /// The canonical ordered topic table for the shipped guide corpus.
-pub const GUIDE_SPECS: [GuideSpec; 24] = [
+pub const GUIDE_SPECS: [GuideSpec; 28] = [
+    GuideSpec {
+        topic: "app-builder-1.0.0",
+        markdown: include_str!("app-builder-1.0.0.md"),
+        source: GuideSource::HandwrittenTemplate,
+    },
     GuideSpec {
         topic: "about",
         markdown: include_str!("about.md"),
@@ -136,6 +142,11 @@ pub const GUIDE_SPECS: [GuideSpec; 24] = [
         source: GuideSource::HandwrittenTemplate,
     },
     GuideSpec {
+        topic: "app-skins",
+        markdown: include_str!("app-skins.md"),
+        source: GuideSource::HandwrittenTemplate,
+    },
+    GuideSpec {
         topic: "change-summaries",
         markdown: include_str!("change-summaries.md"),
         source: GuideSource::HandwrittenTemplate,
@@ -154,6 +165,16 @@ pub const GUIDE_SPECS: [GuideSpec; 24] = [
         topic: "capabilities",
         markdown: include_str!("capabilities.md"),
         source: GuideSource::CompleteToolRegistry,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.0.0",
+        markdown: include_str!("app-kit-core-1.0.0.md"),
+        source: GuideSource::SuppliedKitRelease,
+    },
+    GuideSpec {
+        topic: "app-kit-core-1.1.0",
+        markdown: include_str!("app-kit-core-1.1.0.md"),
+        source: GuideSource::SuppliedKitRelease,
     },
 ];
 
@@ -224,6 +245,7 @@ mod tests {
         assert_eq!(
             valid_topics(),
             vec![
+                "app-builder-1.0.0",
                 "about",
                 "entering-a-live-shared-world",
                 "earning-intelligent-independence",
@@ -244,10 +266,13 @@ mod tests {
                 "messaging",
                 "attachment",
                 "compositions",
+                "app-skins",
                 "change-summaries",
                 "interpretive-claims",
                 "sql-schema",
                 "capabilities",
+                "app-kit-core-1.0.0",
+                "app-kit-core-1.1.0",
             ]
         );
         let searching = GUIDE_SPECS
@@ -341,7 +366,14 @@ mod tests {
         assert!(error.contains("unknown topic 'future-topic'"), "{error}");
         assert!(error.ends_with(&valid_topics().join(", ")), "{error}");
 
-        for topic in ["interpretive-claims", "sql-schema", "capabilities"] {
+        for topic in [
+            "app-builder-1.0.0",
+            "app-kit-core-1.0.0",
+            "app-kit-core-1.1.0",
+            "interpretive-claims",
+            "sql-schema",
+            "capabilities",
+        ] {
             let guide = GUIDE_SPECS
                 .iter()
                 .find(|guide| guide.topic == topic)
@@ -352,6 +384,160 @@ mod tests {
             assert_eq!(value, json!({ "topic": topic, "markdown": guide.markdown }));
         }
         db.close().await;
+    }
+
+    #[test]
+    fn app_requests_route_to_the_callable_installed_app_builder() {
+        let builder = GUIDE_SPECS
+            .iter()
+            .find(|guide| guide.topic == "app-builder-1.0.0")
+            .unwrap();
+        for prerequisite in [
+            "app-kit-core-1.1.0",
+            "artifacts_read.manage_alpha_tabs.prepare_install",
+            "Preview",
+            "Adopt",
+        ] {
+            assert!(builder.markdown.contains(prerequisite), "{prerequisite}");
+        }
+        let prose = builder.markdown.split("```").step_by(2).collect::<String>();
+        let prose = prose.to_ascii_lowercase();
+        for scenario in ["meeting", "inbox"] {
+            assert!(!prose.contains(scenario), "builder prose must stay generic");
+        }
+        let compositions = GUIDE_SPECS
+            .iter()
+            .find(|guide| guide.topic == "compositions")
+            .unwrap();
+        let routing = compositions
+            .markdown
+            .split_once("\n## ")
+            .expect("compositions has recipe sections")
+            .0;
+        for text in [
+            routing,
+            crate::instructions::ENGINE_ORIENTATION,
+            super::super::tools::quickstart::MARKDOWN,
+        ] {
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            for cue in ["app-builder-1.0.0", "installed apps", "Preview/Adopt"] {
+                assert!(normalized.contains(cue), "missing {cue}: {normalized}");
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        register_guide_tool(&mut registry).unwrap();
+        let tool = registry.get("read_guide").unwrap();
+        assert!(tool.input_schema["properties"]["topic"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(builder.topic)));
+    }
+
+    #[test]
+    fn app_builder_operation_pairs_exist_in_generated_catalogue() {
+        let catalogue: Value = serde_json::from_str(include_str!(
+            "../executor_prototype/candidate-audit.public.generated.json"
+        ))
+        .unwrap();
+        let pairs: std::collections::BTreeSet<_> = catalogue["audit_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}.{}",
+                    row["candidate_executor"].as_str().unwrap(),
+                    row["candidate_operation"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let legacy_tools: std::collections::BTreeSet<_> = catalogue["audit_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["legacy_tool"].as_str().unwrap())
+            .collect();
+        let executors: std::collections::BTreeSet<_> = catalogue["audit_rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["candidate_executor"].as_str().unwrap())
+            .collect();
+        let preparation = "artifacts_read.manage_alpha_tabs.prepare_install";
+        assert!(
+            pairs.contains(preparation),
+            "install preparation must exist in the catalogue"
+        );
+        let guide = GUIDE_SPECS
+            .iter()
+            .find(|guide| guide.topic == "app-builder-1.0.0")
+            .unwrap();
+        let names =
+            regex::Regex::new(r"\b([a-z][a-z0-9]*_[a-z0-9_]+)\.([a-z][a-z0-9_.]+)\b").unwrap();
+        let mut named: std::collections::BTreeSet<_> = names
+            .find_iter(guide.markdown)
+            .filter(|name| {
+                let prefix = name.as_str().split('.').next().unwrap();
+                // `manage_alpha_tabs.prepare_install` alone is an action name,
+                // not an executor pair; its separate executor is checked below.
+                prefix != "next_call"
+                    && (!legacy_tools.contains(prefix) || executors.contains(prefix))
+            })
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        let dispatch =
+            regex::Regex::new(r"executor `([a-z_]+)`,\s*operation `([a-z0-9_.]+)`").unwrap();
+        for capture in dispatch.captures_iter(guide.markdown) {
+            named.insert(format!("{}.{}", &capture[1], &capture[2]));
+        }
+        assert!(
+            named.contains(preparation),
+            "builder must name the preparation prerequisite"
+        );
+        for name in named {
+            assert!(
+                pairs.contains(&name),
+                "builder names unknown executor/operation pair: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn core_release_guide_contains_exact_canonical_types_and_hashes() {
+        for (topic, manifest_text, types) in [
+            (
+                "app-kit-core-1.0.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.0.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.0.0/core.d.ts"),
+            ),
+            (
+                "app-kit-core-1.1.0",
+                include_str!("../../../crates/artifact-html/kit-releases/1.1.0/manifest.json"),
+                include_str!("../../../crates/artifact-html/kit-releases/1.1.0/core.d.ts"),
+            ),
+        ] {
+            let guide = GUIDE_SPECS
+                .iter()
+                .find(|guide| guide.topic == topic)
+                .unwrap();
+            let manifest: Value = serde_json::from_str(manifest_text).unwrap();
+            assert!(guide
+                .markdown
+                .contains(&format!("```typescript\n{types}```")));
+            for key in ["js", "types"] {
+                assert!(guide
+                    .markdown
+                    .contains(manifest[key]["sha256"].as_str().unwrap()));
+            }
+            assert!(guide
+                .markdown
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("synchronously before the first author script"));
+            assert!(guide.markdown.contains("kit_major_unavailable"));
+            assert_eq!(guide.source, GuideSource::SuppliedKitRelease);
+        }
     }
 
     /// E2 I-6: every SQL statement an agent can read in the shipped guides
@@ -368,8 +554,22 @@ mod tests {
             if guide.source == GuideSource::FrozenSqliteDdl {
                 continue;
             }
+            // Native 702de73: examples in the ad-hoc SQLite section are
+            // validated under the ad-hoc allowance; every other example must
+            // still pass the portable validator, so saved-SQL teaching is
+            // unchanged.
+            let ad_hoc_section = guide
+                .markdown
+                .split_once("## SQLite functions in ad-hoc SQL")
+                .map(|(_, rest)| rest.split("\n## ").next().unwrap_or(rest))
+                .unwrap_or("");
             for (origin, statement) in guide_sql_examples(guide.topic, guide.markdown) {
-                crate::query::sql::validate(&statement).unwrap_or_else(|error| {
+                let validated = if ad_hoc_section.contains(statement.as_str()) {
+                    crate::query::sql::validate_ad_hoc(&statement)
+                } else {
+                    crate::query::sql::validate(&statement)
+                };
+                validated.unwrap_or_else(|error| {
                     panic!("guide {origin} teaches a rejected statement: {error}\n{statement}")
                 });
                 checked += 1;

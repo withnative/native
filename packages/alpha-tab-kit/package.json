@@ -26,7 +26,12 @@
     "./body-transport": {
       "types": "./src/body-transport.d.mts",
       "import": "./src/body-transport.mjs"
-    }
+    },
+    "./supplied-kit/1.0.0/types": "./supplied-kit/1.0.0/core.d.ts",
+    "./supplied-kit/1.0.0/manifest.json": "./supplied-kit/1.0.0/manifest.json",
+    "./supplied-kit/1.1.0/types": "./supplied-kit/1.1.0/core.d.ts",
+    "./supplied-kit/1.1.0/manifest.json": "./supplied-kit/1.1.0/manifest.json",
+    "./supplied-kit/catalog.json": "./supplied-kit/catalog.json"
   },
   "bin": {
     "alpha-tab-kit": "bin/alpha-tab-kit.mjs"
@@ -47,7 +52,8 @@
     "src/",
     "limits.json",
     "README.md",
-    "docs/"
+    "docs/",
+    "supplied-kit/"
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",

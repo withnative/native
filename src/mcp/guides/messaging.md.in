@@ -71,6 +71,24 @@ under every reader who already saw the flat message.
   including multibyte text. `span_end` must be greater than `span_start`, and
   `mention_id` values must be non-empty and unique within the send.
 
+## Private read preferences
+
+Use `manage_messages.set_preference` with `preference: "mark_read"` or
+`"mark_unread"`, one visible `message_id`, `expected_version`,
+`idempotency_key`, and `reason`. Read the current preference version from
+`list_message_state.messages[].attention.version` (zero before any preference
+write). A successful receipt returns `version = expected_version + 1` and
+`unread_override` false or true. An exact retry returns that original receipt
+before checking a stale version; it does not undo a later write.
+
+`attention.unread` and `my_message_state.unread` are the authoritative unread
+value. Human `stage` records monotonic awareness; marking unread changes neither
+opened/acknowledged history nor obligations. A missing or null override uses
+legacy awareness-derived unread. Archive and own human-authored Messages remain
+read, while persona-spoken Messages use the ordinary unread rule. Other
+preference actions preserve the override. These are caller-private writes and
+reads: they do not change shared message content or another viewer's state.
+
 ## Complete examples
 
 A direct-message reply with a mention after multibyte prose. `é` is two UTF-8
@@ -136,3 +154,46 @@ A Collection channel post and a reply to it. `✓` is three UTF-8 bytes, so in
 - **Flat send sent by mistake.** The message cannot be re-parented. Send a new
   reply with a creation-time `reply_to` link; the flat message remains as
   authored history.
+
+
+## Persona identity and message speakers
+
+`manage_participants.register_persona` creates an owner-private `Entity/persona`
+profile (name, body and open facets), or registers an existing owned profile by
+`record_id` only if it is already owner-only. When using `record_id`, omit
+name, body and home_id; edit those through ordinary record operations first.
+`manage_participants.list` lists the caller's active and retired
+personas. `manage_participants.retire_persona` preserves identity and history.
+A registered persona cannot change owner, type, placement or policy, or be
+deleted. Edit its name, body and open facets with ordinary record operations.
+Personas never hold credentials or receive policy grants.
+
+`manage_messages.send` accepts advisory `speaker: {persona_id}`. A live owned
+persona produces an immutable speaker fact with engine-selected
+`client_asserted` assurance; its Message author remains the human owner.
+After ordinary permission checks, invalid, foreign, nonexistent, retired or
+malformed claims are refused with one common `speaker not found` error. A claim
+never grants authority or changes permission evaluation. Self-addressing is
+allowed only with a valid speaker. Every send receipt, including an idempotent
+retry, reports `speaker_claim_status: recorded|absent` for the committed Message.
+Retries validate any supplied claim and preserve the original speaker fact;
+retirement refuses new claims, including claims supplied on retries.
+A persona may speak in
+any thread its owner can write, under that thread's normal visibility. Its
+current display name on a visible utterance does not share the private persona
+profile. Renaming a persona changes its displayed name on historical Messages;
+the stored speaker identity and assurance remain immutable.
+Non-message writes have no speaker. No agent address or participant DM/inbox
+operation is provided by these slices; run keys remain correlation only.
+
+Caller-visible SQL `my_participants` lists the caller's personas;
+`message_speakers` exposes identity and assurance on visible Messages.
+`my_message_state.is_own` is true only for a human-spoken Message owned by the
+caller; a persona-spoken Message uses the ordinary caller-private unread
+rule. `get_attention` uses the same authorship distinction. Persona-spoken
+replies never count as human recipient evidence. A human reply with an explicit `reply_to` in the same
+Collection can satisfy that owner's obligation to a persona utterance.
+Speaker-bearing Messages, including self-addressed ones, are explicitly refused
+by federation export (`participant_message_not_federatable`); the v1 peer wire
+has no speaker field and continues to refuse ordinary sender-in-audience input.
+Canonical interchange preserves these Messages, audiences and speaker facts.

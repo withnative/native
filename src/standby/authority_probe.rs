@@ -16,13 +16,13 @@
 //! consistent read transaction. That statement is a SQLite `json_object`
 //! assembly of the closed contract: the JSON1 primitives are what let one
 //! statement carry the scalar singletons, the ten mechanically generated
-//! per-log maxima, the three non-sequenced max-act watermarks, the ten act
+//! per-log maxima, the four non-sequenced max-act watermarks, the ten act
 //! cutovers, the four governed binding seeds and the webhook pins together.
 //! No export handle or snapshot is created.
 //!
 //! V2 is deliberately strict about the two webhook tables: non-empty state
 //! refuses the delta path and falls back to whole-snapshot handling. This is
-//! only safe because a native revision-5 authority has no webhook writers
+//! only safe because a native revision-8 authority has no webhook writers
 //! today; the refusal is the fail-closed guard, not a permanent carriage
 //! decision.
 
@@ -40,16 +40,18 @@ pub const AUTHORITY_ACT_HEAD_CONTRACT: &str = "native.standby-authority-act-head
 /// The only contract version this core understands.
 pub const AUTHORITY_ACT_HEAD_VERSION: u32 = 2;
 
-/// The only canonical-interchange revision an authority may author for
-/// exhaustively-carried canonical history. Kept mechanically tied to
+/// The only canonical-interchange revision whose act sections this contract
+/// can carry. It describes the wire shape, not the database's source history,
+/// which may be unknown before a standby's checkpoint. Kept mechanically tied to
 /// [`crate::interchange::REVISION`] by
 /// `required_native_revision_matches_interchange`, so a revision bump cannot
 /// silently change what this contract accepts.
-pub const REQUIRED_NATIVE_INTERCHANGE_REVISION: u64 = 5;
+pub const REQUIRED_NATIVE_INTERCHANGE_REVISION: u64 = 8;
 
-/// The closed authority act-head document. Every field is required and
-/// unknown fields are refused, so a newer producer cannot smuggle a
-/// coordinate past an older consumer.
+/// The closed authority act-head document. Every field is required but
+/// unknown fields are ignored, so an additive producer extension parses
+/// tolerantly on an older consumer; new coordinates only take effect after
+/// the consumer's validation is updated to understand them.
 ///
 /// This is the authoritative act-range evidence for one workspace database:
 /// [`head_act`](Self::head_act) is the equivalence/freshness coordinate (the
@@ -59,7 +61,6 @@ pub const REQUIRED_NATIVE_INTERCHANGE_REVISION: u64 = 5;
 /// `seq` maxima are diagnostics (local fold positions), and the engine
 /// schema is advisory provenance only.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AuthorityActHeadV1 {
     pub contract: String,
     pub version: u32,
@@ -98,21 +99,18 @@ pub struct AuthorityActHeadV1 {
 pub(crate) type AuthorityActHeadV2 = AuthorityActHeadV1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct LogMaxSeqV1 {
     pub table: String,
     pub max_seq: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct NonSequencedMaxActV1 {
     pub table: String,
     pub max_act: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct StoragePortabilityPolicyHeadV1 {
     pub policy_revision: i64,
     pub source_profile_id: String,
@@ -121,7 +119,6 @@ pub struct StoragePortabilityPolicyHeadV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ActCutoverV1 {
     pub domain: String,
     pub last_legacy_seq: i64,
@@ -130,7 +127,6 @@ pub struct ActCutoverV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ContentCausalCutoverV1 {
     pub last_legacy_local_seq: i64,
     pub cutover_at: String,
@@ -138,7 +134,6 @@ pub struct ContentCausalCutoverV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct BindingSystemSeedV1 {
     pub system: String,
     pub normalizer: String,
@@ -295,6 +290,23 @@ impl AuthorityActHeadCoordinates<'_> {
     /// The one closed-contract validator for both the observed head and the
     /// replicated wire evidence.
     pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_inventory(
+            REQUIRED_NATIVE_INTERCHANGE_REVISION,
+            &crate::act::CANONICAL_EVENT_TABLES,
+            &crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES,
+            &expected_binding_system_seeds(),
+        )
+    }
+
+    // Release-only historical validation supplies frozen inventories. Delta
+    // callers always enter through validate(), whose revision remains strict.
+    pub(crate) fn validate_inventory(
+        &self,
+        revision: u64,
+        logs: &[&str],
+        non_sequenced: &[&str],
+        seeds: &[BindingSystemSeedV1],
+    ) -> Result<()> {
         require(
             self.contract == AUTHORITY_ACT_HEAD_CONTRACT,
             "unknown authority act-head contract",
@@ -312,19 +324,15 @@ impl AuthorityActHeadCoordinates<'_> {
             "authority act-head act counter is negative",
         )?;
         require(
-            self.native_interchange_revision == REQUIRED_NATIVE_INTERCHANGE_REVISION,
-            "authority act-head requires native canonical-interchange revision 5",
+            self.native_interchange_revision == revision,
+            "authority act-head has an unsupported canonical-interchange revision",
         )?;
 
         require(
-            self.per_log_max_seq.len() == crate::act::CANONICAL_EVENT_TABLES.len(),
+            self.per_log_max_seq.len() == logs.len(),
             "authority act-head per-log diagnostics are incomplete",
         )?;
-        for (row, expected) in self
-            .per_log_max_seq
-            .iter()
-            .zip(crate::act::CANONICAL_EVENT_TABLES)
-        {
+        for (row, expected) in self.per_log_max_seq.iter().zip(logs.iter().copied()) {
             require(
                 row.table == expected,
                 "authority act-head per-log diagnostics are out of order",
@@ -336,13 +344,13 @@ impl AuthorityActHeadCoordinates<'_> {
         }
 
         require(
-            self.non_sequenced_max_acts.len() == crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES.len(),
+            self.non_sequenced_max_acts.len() == non_sequenced.len(),
             "authority act-head non-sequenced act watermarks are incomplete",
         )?;
         for (row, expected) in self
             .non_sequenced_max_acts
             .iter()
-            .zip(crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES)
+            .zip(non_sequenced.iter().copied())
         {
             require(
                 row.table == expected,
@@ -359,14 +367,10 @@ impl AuthorityActHeadCoordinates<'_> {
         }
 
         require(
-            self.act_cutovers.len() == crate::act::CANONICAL_EVENT_TABLES.len(),
+            self.act_cutovers.len() == logs.len(),
             "authority act-head act cutovers are incomplete",
         )?;
-        let expected_cutover_domains = crate::act::CANONICAL_EVENT_TABLES
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter();
+        let expected_cutover_domains = logs.iter().copied().collect::<BTreeSet<_>>().into_iter();
         let mut domains = BTreeSet::new();
         for (cutover, expected_domain) in self.act_cutovers.iter().zip(expected_cutover_domains) {
             require(
@@ -387,14 +391,14 @@ impl AuthorityActHeadCoordinates<'_> {
             )?;
         }
         require(
-            domains.len() == crate::act::CANONICAL_EVENT_TABLES.len(),
+            domains.len() == logs.len(),
             "authority act-head is missing an act cutover",
         )?;
 
         self.content_causal_cutover.validate()?;
 
         require(
-            self.binding_systems == expected_binding_system_seeds(),
+            self.binding_systems == seeds,
             "authority act-head binding systems differ from the governed seeds",
         )?;
 
@@ -487,12 +491,19 @@ pub async fn read_authority_act_head_from_path(path: &Path) -> Result<AuthorityA
 /// The one-statement seam: run the probe on an already-open connection that
 /// is inside a consistent read transaction. It executes exactly one SQL
 /// statement, proven by `authority_read_is_one_statement_in_one_read_transaction`.
+///
+/// The database's source-history marker (`PRAGMA application_id`) is
+/// deliberately not part of this contract. A standby starts from a whole
+/// snapshot and treats that snapshot's head act as its checkpoint: deltas
+/// after the checkpoint are complete regardless of whether the history before
+/// it is known to be exhaustive. History before the checkpoint stays reported
+/// as unknown by the standby status, never relabelled here.
 pub(crate) async fn read_authority_act_head_on(
     conn: &mut SqliteConnection,
 ) -> Result<AuthorityActHeadV1> {
     let sql = authority_act_head_sql();
     let raw: String = sqlx::query_scalar(&sql).fetch_one(&mut *conn).await?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
         Error::engine(format!(
             "authority act-head probe is not valid JSON: {error}"
         ))
@@ -500,19 +511,6 @@ pub(crate) async fn read_authority_act_head_on(
     require_present(&value, "origin_database_id", "database_identity")?;
     require_present(&value, "head_act", "act_state")?;
     require_present(&value, "source_engine_schema", "engine schema")?;
-    require_present(&value, "source_history_revision", "source history")?;
-    let source_history_revision = value
-        .get("source_history_revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    require(
-        source_history_revision == REQUIRED_NATIVE_INTERCHANGE_REVISION,
-        "authority act-head source history is not exhaustively current",
-    )?;
-    value
-        .as_object_mut()
-        .expect("probe SQL always returns an object")
-        .remove("source_history_revision");
     require_present(
         &value,
         "content_causal_cutover",
@@ -603,7 +601,19 @@ pub(crate) fn expected_binding_system_seeds() -> Vec<BindingSystemSeedV1> {
 /// in that order, so the vector is tied to the shared inventory rather than
 /// a second copy.
 fn authority_act_head_sql() -> String {
-    let per_log_max_seq = crate::act::CANONICAL_EVENT_TABLES
+    authority_act_head_sql_for(
+        crate::interchange::REVISION,
+        &crate::act::CANONICAL_EVENT_TABLES,
+        &crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES,
+    )
+}
+
+pub(crate) fn authority_act_head_sql_for(
+    revision: u64,
+    logs: &[&str],
+    non_sequenced: &[&str],
+) -> String {
+    let per_log_max_seq = logs
         .iter()
         .map(|table| {
             format!(
@@ -614,7 +624,7 @@ fn authority_act_head_sql() -> String {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let non_sequenced_max_acts = crate::act::NON_SEQUENCED_ACT_STAMPED_TABLES
+    let non_sequenced_max_acts = non_sequenced
         .iter()
         .map(|table| {
             format!(
@@ -632,7 +642,6 @@ fn authority_act_head_sql() -> String {
 'origin_database_id',(SELECT origin_db_id FROM database_identity WHERE singleton=1),\
 'head_act',(SELECT next_act FROM act_state WHERE singleton=1),\
 'native_interchange_revision',{native_revision},\
-'source_history_revision',(SELECT CASE application_id WHEN {history_marker} THEN {native_revision} ELSE 0 END FROM pragma_application_id),\
 'source_engine_schema',(SELECT user_version FROM pragma_user_version),\
 'per_log_max_seq',json_array({per_log_max_seq}),\
 'non_sequenced_max_acts',json_array({non_sequenced_max_acts}),\
@@ -645,8 +654,7 @@ fn authority_act_head_sql() -> String {
 )",
         contract = sql_literal(AUTHORITY_ACT_HEAD_CONTRACT),
         version = AUTHORITY_ACT_HEAD_VERSION,
-        native_revision = crate::interchange::REVISION,
-        history_marker = crate::interchange::source_history_application_id(crate::interchange::REVISION),
+        native_revision = revision,
         per_log_max_seq = per_log_max_seq,
         non_sequenced_max_acts = non_sequenced_max_acts,
     )
@@ -668,6 +676,16 @@ fn require(condition: bool, message: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::engine(message))
+    }
+}
+
+/// True when a probe failure is an unsupported canonical-interchange
+/// revision rather than a generic protocol break. Callers use this to
+/// report a distinct actionable state instead of `ProtocolFailed`.
+pub fn is_revision_unsupported(error: &Error) -> bool {
+    match error {
+        Error::Engine(message) => message.contains("unsupported canonical-interchange revision"),
+        _ => false,
     }
 }
 
@@ -1044,9 +1062,11 @@ mod tests {
         let probe = read_authority_act_head(&db).await.unwrap();
         probe.validate().unwrap();
 
-        let mut wrong_revision = probe.clone();
-        wrong_revision.native_interchange_revision = 4;
-        assert!(wrong_revision.validate().is_err());
+        for revision in [4, 5] {
+            let mut wrong_revision = probe.clone();
+            wrong_revision.native_interchange_revision = revision;
+            assert!(wrong_revision.validate().is_err());
+        }
 
         let mut wrong_version = probe.clone();
         wrong_version.version = 1;
@@ -1100,10 +1120,12 @@ mod tests {
         });
         assert!(tampered_pin.validate().is_err());
 
-        // Unknown fields are refused by the closed contract.
+        // Additive unknown fields parse tolerantly; required coordinates
+        // still validate.
         let mut value = serde_json::to_value(&probe).unwrap();
         value["future_coordinate"] = serde_json::json!(1);
-        assert!(serde_json::from_value::<AuthorityActHeadV1>(value).is_err());
+        let tolerant: AuthorityActHeadV1 = serde_json::from_value(value).unwrap();
+        tolerant.validate().unwrap();
 
         // Canonical JSON is stable and round-trips the validated contract.
         let bytes = probe.canonical_json().unwrap();
@@ -1142,6 +1164,26 @@ mod tests {
         db.close().await;
     }
 
+    /// Unknown source history (`application_id` 0, as on a legacy import) is
+    /// not a probe refusal: a standby checkpoint makes the history before it
+    /// irrelevant to forward deltas, and the marker itself is left untouched.
+    #[tokio::test]
+    async fn unknown_source_history_still_probes_without_relabelling() {
+        let db = fresh_authority().await;
+        sqlx::query("PRAGMA application_id = 0")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let probe = read_authority_act_head(&db).await.unwrap();
+        probe.validate().unwrap();
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(marker, 0);
+        db.close().await;
+    }
+
     /// The compiled catalog ties this contract's required revision and
     /// inventories to the shared constants rather than a second copy.
     #[test]
@@ -1156,7 +1198,8 @@ mod tests {
             [
                 "awareness_command_intents",
                 "external_observations",
-                "provenance_attestation_validity_events"
+                "provenance_attestation_validity_events",
+                "sql_write_receipts"
             ]
         );
     }
@@ -1309,7 +1352,7 @@ mod tests {
             crate::CURRENT_ENGINE_SCHEMA_VERSION
         );
         assert_eq!(first.act_cutovers.len(), 10);
-        assert_eq!(first.non_sequenced_max_acts.len(), 3);
+        assert_eq!(first.non_sequenced_max_acts.len(), 4);
         assert_eq!(first.binding_systems, expected_binding_system_seeds());
         assert_eq!(first.webhook_endpoint_count, 0);
         assert_eq!(first.webhook_credential_count, 0);
@@ -1386,6 +1429,45 @@ mod tests {
             .unwrap();
         connection.close().await.unwrap();
         assert!(read_authority_act_head_from_path(&path).await.is_err());
+    }
+
+    /// Additive producer extensions parse tolerantly: unknown top-level and
+    /// nested fields are ignored while required coordinates still validate.
+    #[tokio::test]
+    async fn additive_act_head_fields_parse_tolerantly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = file_authority(&dir, "authority.db").await;
+        let head = read_authority_act_head_from_path(&path).await.unwrap();
+        let mut value = serde_json::to_value(&head).unwrap();
+        value["future_additive_field"] = serde_json::json!("ignored");
+        value["non_sequenced_max_acts"][0]["future_nested"] = serde_json::json!(1);
+        let parsed: AuthorityActHeadV1 = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, head);
+        parsed.validate().unwrap();
+        // A revision the consumer does not understand stays a distinct
+        // unsupported-revision failure, not a generic break.
+        let mut bumped = serde_json::to_value(&head).unwrap();
+        bumped["native_interchange_revision"] =
+            serde_json::json!(REQUIRED_NATIVE_INTERCHANGE_REVISION + 1);
+        let bumped: AuthorityActHeadV1 = serde_json::from_value(bumped).unwrap();
+        let error = AuthorityActHeadCoordinates {
+            contract: &bumped.contract,
+            version: bumped.version,
+            origin_database_id: &bumped.origin_database_id,
+            head_act: bumped.head_act,
+            native_interchange_revision: bumped.native_interchange_revision,
+            per_log_max_seq: &bumped.per_log_max_seq,
+            non_sequenced_max_acts: &bumped.non_sequenced_max_acts,
+            storage_portability_policy: bumped.storage_portability_policy.as_ref(),
+            act_cutovers: &bumped.act_cutovers,
+            content_causal_cutover: &bumped.content_causal_cutover,
+            binding_systems: &bumped.binding_systems,
+            webhook_endpoint_count: bumped.webhook_endpoint_count,
+            webhook_credential_count: bumped.webhook_credential_count,
+        }
+        .validate()
+        .unwrap_err();
+        assert!(is_revision_unsupported(&error));
     }
 
     /// A schema-complete database with a damaged coordinate — one act

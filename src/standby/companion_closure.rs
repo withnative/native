@@ -23,8 +23,13 @@
 //! * `provenance_action_events` and `provenance_action_outputs` are keyed by
 //!   in-window content and relationship event ids by their declared
 //!   output-event link. Only the attestations those rows reference, and only
-//!   the interaction receipts those attestations reference, are pulled. The
-//!   closure never fans out from a receipt or attestation into all history.
+//!   the interaction receipts those attestations reference, are pulled, with
+//!   the app attribution rows keyed by those same attestations. The closure
+//!   never fans out from a receipt, attestation or app into all history.
+//! * `provenance_local_attestation_authority` follows those same attestations.
+//!   This authority-local evidence is retained by whole snapshots and copied
+//!   only by authenticated, same-database standby replication. It remains
+//!   excluded from portable interchange and is never minted from origin claims.
 //! * the relationship federation companions are keyed by in-window
 //!   relationship event ids and the explicit
 //!   `authoring_action_attestation_id` declared in a selected assertion's
@@ -56,7 +61,7 @@ use crate::interchange::{Section, SelectionBind};
 /// list and the classified [`crate::schema::standby_classification::StandbyTableKind::ImmutableCanonicalCompanion`]
 /// set ever diverge, so a new companion cannot ship uncarried and a removed
 /// one cannot ship carried.
-pub(crate) const COMPANION_TABLES: [&str; 13] = [
+pub(crate) const COMPANION_TABLES: [&str; 15] = [
     "content_event_causal_frontier",
     "content_event_sources",
     "replicated_message_provenance",
@@ -64,8 +69,10 @@ pub(crate) const COMPANION_TABLES: [&str; 13] = [
     "replicated_message_references",
     "provenance_interaction_receipts",
     "provenance_action_attestations",
+    "provenance_local_attestation_authority",
     "provenance_action_events",
     "provenance_action_outputs",
+    "provenance_action_app_attributions",
     "relationship_federation_events",
     "relationship_foreign_action_attestations",
     "relationship_foreign_action_outputs",
@@ -172,22 +179,46 @@ fn companion_selection(table: &str, from: i64, to: i64) -> Result<(String, Vec<i
         ),
         "provenance_action_attestations" => (
             format!(
-                "id IN ({} UNION {} UNION {})",
+                "id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to],
+        ),
+        // This is authenticated same-database standby replication, not portable
+        // interchange. Copy only anchors the authority actually holds; never
+        // infer local issuance from an attestation's claimed origin. FULL copies
+        // retain these rows too. Imported/foreign attestations have no anchor.
+        "provenance_local_attestation_authority" => (
+            format!(
+                "attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
+                provenance_action_events_selection(),
+                provenance_action_outputs_selection(),
+                validity_attestation_selection(),
+            ),
+            vec![from, to, from, to, from, to, from, to, from, to],
+        ),
+        // App attributions follow exactly the attestations selected above;
+        // the closure never fans out from an app into its history.
+        "provenance_action_app_attributions" => (
+            format!(
+                "action_attestation_id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?)",
+                provenance_action_events_selection(),
+                provenance_action_outputs_selection(),
+                validity_attestation_selection(),
+            ),
+            vec![from, to, from, to, from, to, from, to, from, to],
         ),
         "provenance_interaction_receipts" => (
             format!(
                 "id IN (SELECT interaction_receipt_id FROM provenance_action_attestations \
-                 WHERE interaction_receipt_id IS NOT NULL AND id IN ({} UNION {} UNION {}))",
+                 WHERE interaction_receipt_id IS NOT NULL AND id IN ({} UNION {} UNION {} UNION SELECT anchor_id FROM sql_write_receipts WHERE act > ? AND act <= ?))",
                 provenance_action_events_selection(),
                 provenance_action_outputs_selection(),
                 validity_attestation_selection(),
             ),
-            vec![from, to, from, to, from, to, from, to],
+            vec![from, to, from, to, from, to, from, to, from, to],
         ),
         // The relationship companions are selected by the exact
         // `(issuer_origin_db_id, id)` and
@@ -400,10 +431,17 @@ mod tests {
                 !crate::act::ACT_STAMPED_TABLES.contains(&table),
                 "companion {table} is also act-stamped"
             );
-            assert!(
-                crate::interchange::SECTION_NAMES.contains(&table),
-                "companion {table} is missing from canonical interchange"
-            );
+            if table == "provenance_local_attestation_authority" {
+                assert!(
+                    !crate::interchange::SECTION_NAMES.contains(&table),
+                    "authority-local anchors must never become portable"
+                );
+            } else {
+                assert!(
+                    crate::interchange::SECTION_NAMES.contains(&table),
+                    "companion {table} is missing from canonical interchange"
+                );
+            }
         }
         assert!(
             DERIVED_GLOBAL_TABLES.is_empty(),

@@ -366,6 +366,18 @@ pub struct CommentBodyDecl {
     pub max_bytes: usize,
 }
 
+/// The optional passage anchor of a root `comment.create` entry: the
+/// invocation `values` key that may carry the anchor (`source_slot`,
+/// optional `purpose`, `selectors`). The anchored record is always the
+/// entry's bearer and the slot always its body; the engine validates the
+/// selectors against the stored bytes. Absent, the entry posts unanchored
+/// comments only, exactly as before.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CommentAnchorDecl {
+    pub input: String,
+}
+
 /// The manifest-authored part of a governed comment creation: the thread
 /// position and the body input. The bearer record travels in the entry's
 /// single `bound_input` slot; the destination home is derived from the
@@ -375,6 +387,10 @@ pub struct CommentBodyDecl {
 pub struct CommentCreateDecl {
     pub position: CommentPosition,
     pub body: CommentBodyDecl,
+    /// Root only. Omitted from serialization when absent, so existing
+    /// manifests keep their exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<CommentAnchorDecl>,
 }
 
 /// Byte cap range for one `comment.create` body bound (UTF-8 bytes,
@@ -2349,6 +2365,23 @@ fn validate_comment_create(
         return Err(format!(
             "bound_input slot names non-record input port '{port}'"
         ));
+    }
+    if let Some(anchor) = &comment.anchor {
+        if comment.position != CommentPosition::Root {
+            return Err("comment 'anchor' is valid only on a root comment; replies inherit the root's passage".into());
+        }
+        if !valid_port(&anchor.input) {
+            return Err(format!(
+                "comment anchor 'input' '{}' is not a stable identifier",
+                anchor.input
+            ));
+        }
+        if &anchor.input == slot_name || anchor.input == comment.body.input {
+            return Err(format!(
+                "comment anchor input '{}' must differ from the bearer slot and the body input",
+                anchor.input
+            ));
+        }
     }
     Ok(())
 }
@@ -4853,6 +4886,83 @@ export const nativeStyles = ".card { color: red }"
                 .is_none(),
             "absent comment envelope skips serialization"
         );
+    }
+
+    #[test]
+    fn comment_anchor_is_root_only_and_never_reuses_a_slot_or_body_input() {
+        let entry = |position: &str, anchor: &str| {
+            format!(
+                r#"{{ id: "post", label: "Post", effect: "comment.create",
+                     slots: {{ bearer: {{ domain: {{ kind: "bound_input", port: "orders" }} }} }},
+                     comment: {{ position: "{position}", body: {{ input: "text", max_bytes: 4096 }}{anchor} }} }}"#
+            )
+        };
+        let parsed = parse_artifact(&interaction_artifact(&entry(
+            "root",
+            r#", anchor: { input: "target" }"#,
+        )))
+        .expect("a root entry may declare an anchor input");
+        let normalized = parsed.manifest.normalized();
+        assert_eq!(
+            normalized["interactions"][0]["comment"]["anchor"]["input"],
+            "target"
+        );
+        let Manifest::Artifact(manifest) = parsed.manifest else {
+            unreachable!()
+        };
+        assert_eq!(
+            manifest.interactions[0]
+                .comment
+                .as_ref()
+                .unwrap()
+                .anchor
+                .as_ref()
+                .unwrap()
+                .input,
+            "target"
+        );
+        // Without an anchor the normalized envelope keeps its exact historical shape.
+        let plain = parse_artifact(&interaction_artifact(&entry("root", "")))
+            .unwrap()
+            .manifest
+            .normalized();
+        assert!(plain["interactions"][0]["comment"].get("anchor").is_none());
+        for (anchor, position, expected) in [
+            (
+                r#", anchor: { input: "target" }"#,
+                "reply",
+                "valid only on a root comment",
+            ),
+            (
+                r#", anchor: { input: "text" }"#,
+                "root",
+                "must differ from the bearer slot and the body input",
+            ),
+            (
+                r#", anchor: { input: "bearer" }"#,
+                "root",
+                "must differ from the bearer slot and the body input",
+            ),
+            (
+                r#", anchor: { input: "has space" }"#,
+                "root",
+                "is not a stable identifier",
+            ),
+        ] {
+            let failure = parse_artifact(&interaction_artifact(&entry(position, anchor)))
+                .expect_err("invalid anchor is refused at compile");
+            assert!(
+                failure.message.contains(expected),
+                "expected {expected:?} in {:?}",
+                failure.message
+            );
+        }
+        let unknown = parse_artifact(&interaction_artifact(&entry(
+            "root",
+            r#", anchor: { input: "target", slot: "blob" }"#,
+        )))
+        .expect_err("anchor carries only its input");
+        assert_eq!(unknown.code, "module_descriptor_invalid");
     }
 
     #[test]

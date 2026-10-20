@@ -1357,6 +1357,214 @@ mod tests {
             .unwrap()
     }
 
+    async fn tool(source: &crate::Db, name: &str, mut args: Value) -> Value {
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        if name != "manage_links" {
+            args["reason"] =
+                serde_json::json!("Exercise production authoring and exact-act replication");
+        }
+        registry
+            .call(source.clone(), crate::mcp::Caller::local(), name, args)
+            .await
+            .unwrap()
+    }
+
+    async fn raw_links(db: &crate::Db) -> Vec<String> {
+        sqlx::query_scalar("SELECT json_array(id,source_id,target_id,relationship,note,created_at) FROM links ORDER BY id")
+            .fetch_all(db.pool()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn production_legacy_links_survive_act_delta_retraction_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = fresh_source().await;
+        append_record(&source, SEED_RECORD_ID, "link target").await;
+        append_record(&source, RECORD_B_ID, "manage source").await;
+        let f1 = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "links.db").await;
+        tool(&source, "create_record", serde_json::json!({
+            "id":RECORD_A_ID,"type":"Document","kind":"note","name":"linked creation",
+            "links":[{"target_id":SEED_RECORD_ID,"relationship":"relates_to","note":"created link"}]
+        })).await;
+        let managed = tool(
+            &source,
+            "manage_links",
+            serde_json::json!({
+                "action":"add","source_id":RECORD_B_ID,"target_id":SEED_RECORD_ID,
+                "relationship":"relates_to","note":"managed link"
+            }),
+        )
+        .await;
+        let (bytes, _) = build_delta(&source, f1).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            raw_links(&destination).await,
+            raw_links(&source).await,
+            "production create_record and manage_links rows replicate exactly"
+        );
+        let diff = crate::conformance::rebuild_and_diff_relationship(&destination)
+            .await
+            .unwrap();
+        assert!(diff.equal, "relationship rebuild: {diff:?}");
+
+        let f2 = head_act(&source).await;
+        // Retraction removes the supporting assertion, independently of the
+        // compatibility remove command (which creates a contest assertion).
+        tool(&source, "manage_relationships", serde_json::json!({
+            "action":"retract", "assertion_issuer_origin_db_id":managed["relationship_origin_db_id"],
+            "assertion_id":managed["assertion_id"], "idempotency_key":"retract-replicated-link"
+        })).await;
+        let (bytes, _) = build_delta(&source, f2).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_links(&destination).await, raw_links(&source).await);
+        let f3 = head_act(&source).await;
+        tool(
+            &source,
+            "manage_links",
+            serde_json::json!({
+                "action":"add","source_id":RECORD_B_ID,"target_id":SEED_RECORD_ID,
+                "relationship":"relates_to"
+            }),
+        )
+        .await;
+        tool(
+            &source,
+            "manage_links",
+            serde_json::json!({
+                "action":"remove","source_id":RECORD_B_ID,"target_id":SEED_RECORD_ID,
+                "relationship":"relates_to"
+            }),
+        )
+        .await;
+        let (bytes, _) = build_delta(&source, f3).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_links(&destination).await, raw_links(&source).await);
+        let f4 = head_act(&source).await;
+        tool(
+            &source,
+            "delete_record",
+            serde_json::json!({"id":RECORD_A_ID}),
+        )
+        .await;
+        let (bytes, _) = build_delta(&source, f4).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw_links(&destination).await, raw_links(&source).await);
+        // Soft-deleted endpoints still have physical links; caller-visible
+        // queries filter them. Raw surplus is not evidence of stale projection.
+        let deleted_links: i64 = sqlx::query_scalar("SELECT count(*) FROM links l JOIN records r ON r.id=l.source_id WHERE r.deleted_at IS NOT NULL AND l.relationship='relates_to'")
+            .fetch_one(destination.pool()).await.unwrap();
+        assert_eq!(deleted_links, 1);
+        destination.close().await;
+        source.close().await;
+    }
+
+    /// Model the v1 producer omission with the test-only trust mint. This is
+    /// deliberately an incomplete authority response, never a v2 producer.
+    #[tokio::test]
+    async fn legacy_anchor_gap_passes_rebuild_and_requires_full_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = fresh_source().await;
+        append_record(&source, SEED_RECORD_ID, "target").await;
+        append_record(&source, RECORD_A_ID, "source").await;
+        let f1 = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "old.db").await;
+        tool(
+            &source,
+            "manage_links",
+            serde_json::json!({
+                "action":"add","source_id":RECORD_A_ID,"target_id":SEED_RECORD_ID,
+                "relationship":"relates_to"
+            }),
+        )
+        .await;
+        let (_, mut incomplete) = build_delta(&source, f1).await;
+        let i = section_index(
+            &incomplete,
+            "companion_sections",
+            "provenance_local_attestation_authority",
+        );
+        assert!(!incomplete["companion_sections"][i]["rows"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        incomplete["companion_sections"][i]["rows"] = serde_json::json!([]);
+        resign(&mut incomplete);
+        let bytes = serde_jcs::to_vec(&incomplete).unwrap();
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(raw_links(&destination).await, raw_links(&source).await);
+        assert_eq!(
+            count(&destination, "provenance_local_attestation_authority").await,
+            0
+        );
+        let states: Vec<String> =
+            sqlx::query_scalar("SELECT local_admission_state FROM relationship_local_admissions")
+                .fetch_all(destination.pool())
+                .await
+                .unwrap();
+        assert_eq!(states, vec!["unresolved"]);
+        // Rebuild uses the replica's own missing authority evidence. Agreement
+        // is internal consistency, not equality with the hosted authority.
+        let relationship = crate::conformance::rebuild_and_diff_relationship(&destination)
+            .await
+            .unwrap();
+        assert!(relationship.equal, "{relationship:?}");
+        let content = crate::conformance::rebuild_and_diff(&destination)
+            .await
+            .unwrap();
+        assert!(content.equal, "{content:?}");
+
+        // An unrelated, complete v2 delta cannot recover historical anchors.
+        let f2 = head_act(&source).await;
+        append_record(&source, RECORD_B_ID, "unrelated next act").await;
+        let (bytes, _) = build_delta(&source, f2).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_ne!(raw_links(&destination).await, raw_links(&source).await);
+        assert_eq!(
+            count(&destination, "provenance_local_attestation_authority").await,
+            0
+        );
+        let full = destination_at_current_head(&source, dir.path(), "full.db").await;
+        assert_eq!(raw_links(&full).await, raw_links(&source).await);
+        assert_eq!(
+            count(&full, "provenance_local_attestation_authority").await,
+            count(&source, "provenance_local_attestation_authority").await
+        );
+        full.close().await;
+        destination.close().await;
+        source.close().await;
+    }
+
     fn value_of(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).unwrap()
     }
@@ -2843,7 +3051,7 @@ mod tests {
             &mut tx,
             "acct:r31",
             "message:r31",
-            crate::awareness::PreferenceAction::Mute,
+            crate::awareness::PreferenceAction::MarkUnread,
             None,
             0,
             "idem-pref-r31",
@@ -3019,17 +3227,41 @@ mod tests {
         );
         // The awareness preference projection, not just its log.
         assert_eq!(
-            sqlx::query_as::<_, (String, String, i64, i64, Option<String>, i64, i64)>(
+            sqlx::query_as::<
+                _,
+                (
+                    String,
+                    String,
+                    i64,
+                    i64,
+                    Option<String>,
+                    i64,
+                    i64,
+                    Option<bool>
+                ),
+            >(
                 "SELECT subject_account_id, message_id, attention_flag, muted,
-                        snoozed_until, archived, version
+                        snoozed_until, archived, version, unread_override
                    FROM message_preferences ORDER BY subject_account_id, message_id",
             )
             .fetch_all(destination.pool())
             .await
             .unwrap(),
-            sqlx::query_as::<_, (String, String, i64, i64, Option<String>, i64, i64)>(
+            sqlx::query_as::<
+                _,
+                (
+                    String,
+                    String,
+                    i64,
+                    i64,
+                    Option<String>,
+                    i64,
+                    i64,
+                    Option<bool>
+                ),
+            >(
                 "SELECT subject_account_id, message_id, attention_flag, muted,
-                        snoozed_until, archived, version
+                        snoozed_until, archived, version, unread_override
                    FROM message_preferences ORDER BY subject_account_id, message_id",
             )
             .fetch_all(source.pool())

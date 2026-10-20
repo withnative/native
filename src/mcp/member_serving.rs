@@ -75,6 +75,7 @@ use sqlx::SqlitePool;
 use crate::domain_transaction::request::ToolCallOutcome;
 use crate::error::{Error, Result};
 use crate::holding::HoldingDisclosureV2;
+use crate::mcp::counter_fence;
 use crate::mcp::interactions::ToolKind;
 use crate::mcp::member_scope::MemberScope;
 use crate::member_copy_lifecycle::{CopyStatus, MemberCopyLifecycle, ReadDecision};
@@ -651,36 +652,13 @@ pub(crate) fn scrub_member_response(tool: &str, value: &mut Value) {
 }
 
 /// Envelope positions that are always server metadata: the owner manifest
-/// coordinates (never sent to a member) and the §2.6 log-position fields.
+/// coordinates (never sent to a member) and the §2.6 log-position fields. The
+/// key list is [`counter_fence`], shared with the non-owner counter guard and
+/// the member-copy fence tests so the three cannot drift.
 fn remove_envelope_counter_fields(object: &mut serde_json::Map<String, Value>) {
-    for key in [
-        "act",
-        "head_act",
-        "frontier",
-        "as_of_seq",
-        "content_head_seq",
-        "previous_seq",
-        "local_seq",
-        "event_seq",
-        "source_event_seq",
-        "authorization_revision",
-        "authorization_revision_epoch",
-    ] {
-        object.remove(key);
-    }
-    if object.get("acts").is_some_and(|acts| !acts.is_null()) {
-        object.remove("acts");
-    }
+    counter_fence::remove_counter_keys(object);
     if let Some(as_of) = object.get_mut("as_of").and_then(Value::as_object_mut) {
-        for key in [
-            "content_seq",
-            "content_head_seq",
-            "content_event_seq",
-            "meta_event_seq",
-            "authorization_revision",
-        ] {
-            as_of.remove(key);
-        }
+        counter_fence::remove_counter_keys(as_of);
     }
 }
 
@@ -1057,12 +1035,18 @@ mod tests {
             "act": 5,
             "head_act": 7,
             "frontier": {"a": 1},
+            "causal_frontier": ["a"],
+            "seq": 5,
+            "heads": {"a": 1},
+            "content_head": 9,
             "as_of_seq": 9,
             "content_head_seq": 9,
             "previous_seq": 9,
             "local_seq": 1,
             "event_seq": 4,
             "source_event_seq": 2,
+            "resolved_content_seq": 9,
+            "authorization_epoch": 3,
             "authorization_revision_epoch": 3,
             "as_of": {"content_seq": 8, "page_digest": "opaque"},
             "acts": [1, 2, 3],
@@ -1088,12 +1072,18 @@ mod tests {
             "act",
             "head_act",
             "frontier",
+            "causal_frontier",
+            "seq",
+            "heads",
+            "content_head",
             "as_of_seq",
             "content_head_seq",
             "previous_seq",
             "local_seq",
             "event_seq",
             "source_event_seq",
+            "resolved_content_seq",
+            "authorization_epoch",
             "authorization_revision_epoch",
             "acts",
         ] {
@@ -2980,6 +2970,68 @@ mod tests {
             assert!(!oracle.contains(id), "hidden id {id} must be outside E(B)");
         }
 
+        member_db.close().await;
+    }
+
+    /// A member copy is never an owner for outward receipt counters, even for
+    /// a caller that is trusted-local or owner-marked on the surface: the
+    /// registry derives the footing from the engine's open mode, so the
+    /// projection withholds the engine `act` / `acts` (design 08b4c21 §4 S2a).
+    #[tokio::test]
+    async fn member_copy_receipt_acts_are_withheld_even_for_an_owner_marked_caller() {
+        use crate::mcp::registry::ToolRegistry;
+        use crate::mcp::ToolKind;
+        use crate::member_offline_fixtures::{two_caller, ACCT_A};
+
+        let world = two_caller::build().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (member_db, lifecycle) = admit_member_copy_of(&dir, &world.db, ACCT_A, SCOPE).await;
+        // Only the probe is registered (no builtin `ping`), so its handler is
+        // the one dispatched.
+        let mut online = ToolRegistry::new();
+        let mut offline = ToolRegistry::new();
+        let probe = |registry: &mut ToolRegistry| {
+            registry
+                .register(
+                    ToolKind::Ping,
+                    "receipt probe",
+                    json!({"type": "object"}),
+                    |_db, _caller, _args| async move {
+                        Ok(json!({"ok": true, "act": 5, "acts": [1], "body": {"act": 2}}))
+                    },
+                )
+                .expect("register probe");
+        };
+        probe(&mut online);
+        probe(&mut offline);
+        offline.set_member_copy_gate(lifecycle, SCOPE.to_owned(), 1, Vec::new());
+
+        // Control: the same probe on the canonical engine, as a local owner,
+        // keeps its act.
+        let owner = online
+            .call(world.db.clone(), Caller::local(), "ping", json!({}))
+            .await
+            .expect("owner ping");
+        assert_eq!(owner["act"], json!(5));
+        assert_eq!(owner["acts"], json!([1]));
+
+        for caller in [
+            Caller::member_copy(ACCT_A),
+            Caller::local(),
+            Caller::local_owner(ACCT_A),
+        ] {
+            let served = offline
+                .call(member_db.clone(), caller, "ping", json!({}))
+                .await
+                .expect("member ping");
+            assert_eq!(served["ok"], json!(true));
+            assert!(served.get("act").is_none(), "{served}");
+            assert!(served.get("acts").is_none(), "{served}");
+            // Authored-shaped nested JSON is not touched, and the member
+            // decoration still lands.
+            assert_eq!(served["body"], json!({"act": 2}));
+            assert!(served.get("standby_context").is_some(), "{served}");
+        }
         member_db.close().await;
     }
 
@@ -6245,6 +6297,30 @@ mod tests {
                 "SELECT id FROM records WHERE EXISTS (SELECT 1 FROM schema_config_json_nodes)",
                 "schema_config_json_nodes",
             ),
+            (
+                "SELECT facet_id FROM facet_value_json_nodes",
+                "facet_value_json_nodes",
+            ),
+            (
+                "SELECT count(*) AS c FROM facet_value_json_nodes",
+                "facet_value_json_nodes",
+            ),
+            (
+                "SELECT observation_id FROM facet_observation_json_nodes",
+                "facet_observation_json_nodes",
+            ),
+            (
+                "SELECT count(*) AS c FROM facet_observation_json_nodes",
+                "facet_observation_json_nodes",
+            ),
+            (
+                "SELECT record_id FROM record_body_json_nodes",
+                "record_body_json_nodes",
+            ),
+            (
+                "SELECT count(*) AS c FROM record_body_json_nodes",
+                "record_body_json_nodes",
+            ),
             ("SELECT count(*) AS c FROM body_blocks", "body_blocks"),
             (
                 "SELECT title FROM body_block_headings",
@@ -6364,6 +6440,10 @@ mod tests {
             "WITH actors AS (SELECT id FROM records) SELECT id FROM actors",
             "SELECT 'content_events' AS v",
             "SELECT id FROM records -- facet_observations",
+            "WITH facet_observation_json_nodes AS (SELECT 1 AS x) SELECT count(*) AS c FROM facet_observation_json_nodes",
+            "SELECT 'facet_observation_json_nodes' AS v",
+            "WITH record_body_json_nodes AS (SELECT 1 AS x) SELECT count(*) AS c FROM record_body_json_nodes",
+            "SELECT 'record_body_json_nodes' AS v",
         ] {
             let online_outcome = online
                 .call(

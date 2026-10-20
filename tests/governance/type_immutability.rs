@@ -1,6 +1,6 @@
 //! TYPE IS RIGID (task 1ed2c74, closing F6a of the OntoClean verdict 6285fa8).
 //!
-//! A record carries one of the 10 spine types for life. That was previously a
+//! A record carries one of the closed spine types for life. That was previously a
 //! convention of ONE STRUCT'S FIELD LIST — `UpdateRecordArgs` simply had no
 //! `type` field — while `store::update_record` is `pub`, takes arbitrary JSON,
 //! and the projector's `RECORD_COLUMN_FOR` happily mapped `type` onto the

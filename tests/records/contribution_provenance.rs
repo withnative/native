@@ -730,17 +730,10 @@ async fn one_composite_call_creates_the_exploration_every_candidate_and_every_me
             .iter()
             .any(|limit| limit == "alternative_set_membership_has_no_authored_order"));
         let rendered = native_ce::mcp::render::render("get_record", &read).unwrap();
-        // Default text keeps the membership link and discloses the omitted
-        // contribution envelope; JSON above retains its exact provenance.
+        // Default text keeps the membership link and a compact provenance cue.
+        // JSON above retains the exact contribution envelope.
         assert!(rendered.contains(&exploration_id), "{rendered}");
-        assert!(
-            rendered.lines().any(|line| {
-                line.contains("Additional record fields omitted from text:")
-                    && line.contains("\"contribution\"")
-                    && line.contains("format:\"json\"")
-            }),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Contribution:"), "{rendered}");
         for omitted in [
             "visible_member_count",
             "content_creation_does_not_establish_stance",

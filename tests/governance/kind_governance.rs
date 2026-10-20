@@ -410,7 +410,27 @@ async fn reconciled_core_kinds_resolve_and_project_from_governed_registry() {
         ),
     ];
 
-    for record_type in native_ce::schema::SPINE_TYPES {
+    // `Configuration` is the one spine type seeded with its `kind:Configuration`
+    // vocabulary but no kinds: kinds are registered separately, per app, after
+    // the type exists (task 6ec81db). Every other type ships governed kinds.
+    let vocabulary: Option<String> =
+        sqlx::query_scalar("SELECT id FROM vocabularies WHERE name = 'kind:Configuration'")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(vocabulary.as_deref(), Some("voc:kind:Configuration"));
+    assert!(native_ce::meta::kind::list_active(&db, "Configuration")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(preview_active_kinds(&registry, &db, "Configuration")
+        .await
+        .is_empty());
+
+    for record_type in native_ce::schema::SPINE_TYPES
+        .into_iter()
+        .filter(|record_type| *record_type != "Configuration")
+    {
         let active = native_ce::meta::kind::list_active(&db, record_type)
             .await
             .unwrap();

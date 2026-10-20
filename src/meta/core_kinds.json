@@ -275,6 +275,21 @@
     },
     {
       "type": "Entity",
+      "token": "persona",
+      "value_id": "vv:voc:kind:Entity:persona",
+      "metadata": {
+        "schema_version": 1,
+        "provenance_ref": "rec:e0374f5",
+        "definition": "An editable profile for a durable persona owned by one human principal; registration and retirement are engine identity facts.",
+        "identity": {
+          "criterion": "Each registered persona is distinct by record id, with one immutable human owner.",
+          "dedup": { "mode": "record_id", "keys": [] }
+        },
+        "declared_capabilities": []
+      }
+    },
+    {
+      "type": "Entity",
       "token": "organization",
       "value_id": "vv:voc:kind:Entity:organization",
       "metadata": {

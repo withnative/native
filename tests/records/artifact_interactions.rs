@@ -821,6 +821,118 @@ async fn record_create_commits_once_with_initial_facets_and_an_authoritative_ref
     assert!(reused.to_string().contains("conflicting action input"));
 }
 
+/// A committed creation carries the act twice: hoisted to the top level and
+/// inside the nested `refresh.record` create receipt. A non-owner sees neither
+/// (design 08b4c21 §4 S2a), on the first commit and on the keyed replay, while
+/// the act is still allocated and stored; the owner keeps both exactly.
+#[tokio::test]
+async fn non_owner_creation_invocation_withholds_act_at_both_positions() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = create_fixture().await;
+    let invocation = |key: &str, title: &str| {
+        json!({
+            "version": INVOCATION_VERSION,
+            "artifact_id": ARTIFACT,
+            "entry_id": "create_task",
+            "source_digest": digest,
+            "values": { "title": title, "triage": "ready" },
+            "idempotency_key": key,
+            "gesture": "submit"
+        })
+    };
+    let owner = call(
+        &registry,
+        &db,
+        "invoke_artifact_interaction",
+        invocation("act:owner", "Owner task"),
+    )
+    .await;
+    assert_eq!(owner["status"], "committed", "{owner:#}");
+    let owner_act = owner["act"].as_i64().expect("owner keeps the hoisted act");
+    assert_eq!(
+        owner["refresh"]["record"]["act"].as_i64(),
+        Some(owner_act),
+        "owner keeps the nested create receipt act"
+    );
+
+    // A non-local caller needs a portable account binding to write.
+    for (label, account) in [("Member", "acct:member"), ("Unhosted", "acct:unhosted")] {
+        let person = call(
+            &registry,
+            &db,
+            "create_record",
+            json!({ "type": "Entity", "kind": "person", "name": label,
+                    "reason": "Bind a non-owner account." }),
+        )
+        .await;
+        for (system, identifier) in [
+            ("account", account.to_string()),
+            ("native-principal", format!("native/{label}")),
+        ] {
+            sqlx::query(
+                "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+                 VALUES (?, ?, ?, 1)",
+            )
+            .bind(person["id"].as_str().unwrap())
+            .bind(system)
+            .bind(identifier)
+            .execute(&crate::common::fixture_write_pool(&db).await)
+            .await
+            .unwrap();
+        }
+    }
+    for member in [
+        Caller::authenticated("acct:member")
+            .with_hosting_context("host:member", "db:test")
+            .with_hosting_owner(false)
+            .with_hosting_member(true),
+        Caller::authenticated("acct:unhosted"),
+    ] {
+        let key = format!("act:{}", member.credential());
+        let first = call_as(
+            &registry,
+            &db,
+            member.clone(),
+            "invoke_artifact_interaction",
+            invocation(&key, "Member task"),
+        )
+        .await
+        .expect("a non-owner can commit the creation");
+        assert_eq!(first["status"], "committed", "{first:#}");
+        assert!(first.get("act").is_none(), "{first:#}");
+        assert!(first["refresh"]["record"].get("act").is_none(), "{first:#}");
+        let created_id = first["refresh"]["record"]["id"].as_str().unwrap();
+        let stored_act: Option<i64> = sqlx::query_scalar(
+            "SELECT act FROM content_events WHERE record_id=? AND type='record.created'",
+        )
+        .bind(created_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            stored_act.is_some(),
+            "the act is still allocated and stored"
+        );
+
+        let replay = call_as(
+            &registry,
+            &db,
+            member,
+            "invoke_artifact_interaction",
+            invocation(&key, "Member task"),
+        )
+        .await
+        .expect("keyed replay");
+        assert_eq!(replay["refresh"]["record"]["id"], created_id);
+        assert_eq!(replay["refresh"]["record"]["idempotent_retry"], true);
+        assert!(replay.get("act").is_none(), "{replay:#}");
+        assert!(
+            replay["refresh"]["record"].get("act").is_none(),
+            "{replay:#}"
+        );
+    }
+}
+
 /// A comment citation is classified from its actual immutable source and
 /// refused publicly (`comment_unavailable`); it must never fall through to the
 /// generic creation kernel or write anything.
@@ -3144,6 +3256,52 @@ async fn a_forged_carry_for_a_changed_port_is_rejected() {
     );
 }
 
+/// Keyed `update_record` (task 8bef361, A0): an artifact source edit that
+/// reports artifact-input continuity cannot be replayed, so a keyed miss is
+/// refused before commit and leaves nothing behind; the unkeyed edit is
+/// unaffected.
+#[tokio::test]
+async fn a_keyed_source_edit_with_input_continuity_is_refused_and_writes_nothing() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let footprint = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT COUNT(*) FROM content_events)
+                  + (SELECT COUNT(*) FROM provenance_action_attestations)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    };
+    let before = footprint().await;
+    let edit = json!({ "id": ARTIFACT, "body_set": artifact_source("Keyed edit"),
+                       "if_body_digest": digest,
+                       "reason": "A keyed source edit cannot replay its continuity." });
+    let mut keyed = edit.clone();
+    keyed["idempotency_key"] = json!("artifact-continuity");
+    let refused = call_as(&registry, &db, Caller::local(), "update_record", keyed)
+        .await
+        .unwrap_err();
+    // appHost's body-save fallback (task 8bef361 Phase 2) reads this off the
+    // plain HTTP tool route, which sends an `Error::Engine` as 400
+    // `{"error": <message>}`: pin the variant and the exact text.
+    assert!(
+        matches!(refused, native_ce::Error::Engine(_)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.to_string(),
+        "update_record: idempotency_key is not supported for an artifact source change that carries artifact-input continuity; retry without a key"
+    );
+    assert_eq!(footprint().await, before, "the refused keyed edit wrote");
+
+    let updated = call(&registry, &db, "update_record", edit).await;
+    assert!(
+        updated["artifact_input_continuity"]["status"].is_string(),
+        "{updated:#}"
+    );
+}
+
 #[tokio::test]
 async fn a_v2_body_edit_without_an_exact_snapshot_reports_no_existing_state() {
     let _runtime_config = crate::runtime_config_fixture::reader().await;
@@ -3671,6 +3829,216 @@ async fn a_spine_facet_conflicts_at_record_level_and_that_difference_is_intended
     open["observed"] = observed(&registry, &db, INSIDE, "triage").await;
     let committed = call(&registry, &db, "invoke_artifact_interaction", open).await;
     assert_eq!(committed["status"], "committed", "{committed:#}");
+}
+
+/// The event-id spelling of a host-issued version token (design 08b4c21 S3a):
+/// `obs:N` becomes `obsv:<id of the event at N>`, `rec:N` becomes
+/// `rev:<id>`, and the zero tokens become `origin`.
+async fn event_id_token(db: &Db, record: &str, token: &str) -> String {
+    let (prefix, seq) = token.split_once(':').expect("a sequence version token");
+    let seq: i64 = seq.parse().unwrap();
+    let id = if seq == 0 {
+        "origin".to_owned()
+    } else {
+        sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? AND seq=?")
+            .bind(record)
+            .bind(seq)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    };
+    let prefix = match prefix {
+        "obs" => "obsv",
+        "rec" => "rev",
+        other => panic!("not a sequence token: {other}"),
+    };
+    format!("{prefix}:{id}")
+}
+
+#[tokio::test]
+async fn event_id_version_tokens_are_accepted_beside_the_sequence_forms() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+
+    // Open facet: `obsv:origin` stands for "never observed" (`obs:0`).
+    let mut first = envelope("mark_triaged", &digest, "k-ev-1");
+    first["slots"] = json!({ "record": INSIDE });
+    first["observed"] = json!({ INSIDE: { "triage": "obsv:origin" } });
+    let committed = call(&registry, &db, "invoke_artifact_interaction", first).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+
+    // The token the read path now issues, quoted back by event id.
+    let issued = facet_of(&registry, &db, INSIDE, "triage").await.unwrap()["version"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let by_id = event_id_token(&db, INSIDE, &issued).await;
+    assert!(by_id.starts_with("obsv:"), "{by_id}");
+    let mut second = envelope("mark_triaged", &digest, "k-ev-2");
+    second["slots"] = json!({ "record": INSIDE });
+    second["observed"] = json!({ INSIDE: { "triage": by_id.clone() } });
+    let committed = call(&registry, &db, "invoke_artifact_interaction", second).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+
+    // The token has moved on: the old event id is a stale precondition, not an
+    // invalid one.
+    let mut stale = envelope("mark_triaged", &digest, "k-ev-3");
+    stale["slots"] = json!({ "record": INSIDE });
+    stale["observed"] = json!({ INSIDE: { "triage": by_id } });
+    let conflict = call(&registry, &db, "invoke_artifact_interaction", stale).await;
+    assert_eq!(conflict["status"], "conflict", "{conflict:#}");
+
+    // Spine facet: `rev:<event id>` is the record-wide token.
+    let record_token = record_version(&registry, &db, INSIDE).await;
+    let rev = event_id_token(&db, INSIDE, &record_token).await;
+    assert!(rev.starts_with("rev:"), "{rev}");
+    let mut start = envelope("start_work", &digest, "k-ev-4");
+    start["slots"] = json!({ "record": INSIDE });
+    start["observed"] = json!({ INSIDE: { "lifecycle": rev } });
+    let committed = call(&registry, &db, "invoke_artifact_interaction", start).await;
+    assert_eq!(committed["status"], "committed", "{committed:#}");
+    assert_eq!(committed["changes"][0]["after"], "in_progress");
+
+    // Numbers are still what is emitted; these forms are accepted, not issued.
+    assert!(committed["changes"][0]["version"]
+        .as_str()
+        .unwrap()
+        .starts_with("rec:"));
+}
+
+#[tokio::test]
+async fn an_unresolvable_event_id_version_token_is_one_invalid_precondition() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let unknown = "5b6f0d52-9d1c-4a8e-8f0b-3c2d1e0f9a8b";
+    let mut messages = Vec::new();
+    for (key, entry, facet, token) in [
+        (
+            "k-ev-u1",
+            "mark_triaged",
+            "triage",
+            format!("obsv:{unknown}"),
+        ),
+        (
+            "k-ev-u2",
+            "start_work",
+            "lifecycle",
+            format!("rev:{unknown}"),
+        ),
+    ] {
+        let mut invocation = envelope(entry, &digest, key);
+        invocation["slots"] = json!({ "record": INSIDE });
+        invocation["observed"] = json!({ INSIDE: { facet: token } });
+        let refused = call(&registry, &db, "invoke_artifact_interaction", invocation).await;
+        assert_eq!(refused["status"], "rejected", "{key}: {refused:#}");
+        assert_eq!(
+            refused["error"]["code"], "invalid_precondition",
+            "{key}: {refused:#}"
+        );
+        messages.push(refused["error"]["message"].clone());
+    }
+    assert_eq!(messages[0], messages[1]);
+}
+
+/// Review cbf90e9 (L4): for a non-owner, `rev:`/`obsv:` tokens that cannot be
+/// honoured are `invalid_precondition` with no sequence number in the text.
+/// A non-v4 id (a replicated id the guard refuses) reads exactly like an
+/// unknown one; an id that names an event of a different record resolves, but
+/// is not a token the host issued for that facet, and says so without a number.
+#[tokio::test]
+async fn a_non_owner_event_id_token_that_cannot_be_honoured_is_refused_without_a_number() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let (db, registry, digest, _guard) = fixture().await;
+    let unknown = "5b6f0d52-9d1c-4a8e-8f0b-3c2d1e0f9a8b";
+    let non_v4 = "00000000-0000-1000-8000-0000000000aa";
+    let other_record_event: String =
+        sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? ORDER BY seq LIMIT 1")
+            .bind(OUTSIDE)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    // A replicated-looking id on an event of the record itself.
+    let inside_event: String =
+        sqlx::query_scalar("SELECT id FROM content_events WHERE record_id=? ORDER BY seq LIMIT 1")
+            .bind(INSIDE)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    let write_pool = crate::common::fixture_write_pool(&db).await;
+    for trigger in ["content_events_no_update", "content_events_no_delete"] {
+        sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+            .execute(&write_pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&write_pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE content_events SET id=? WHERE id=?")
+        .bind(non_v4)
+        .bind(&inside_event)
+        .execute(&write_pool)
+        .await
+        .unwrap();
+
+    let caller = Caller::authenticated("acct:bea");
+    let mut messages = Vec::new();
+    for (key, entry, facet, token) in [
+        ("k-nv-1", "mark_triaged", "triage", format!("obsv:{non_v4}")),
+        ("k-nv-2", "start_work", "lifecycle", format!("rev:{non_v4}")),
+        (
+            "k-nv-3",
+            "mark_triaged",
+            "triage",
+            format!("obsv:{unknown}"),
+        ),
+        (
+            "k-nv-4",
+            "mark_triaged",
+            "triage",
+            format!("obsv:{other_record_event}"),
+        ),
+        (
+            "k-nv-5",
+            "start_work",
+            "lifecycle",
+            format!("rev:{other_record_event}"),
+        ),
+    ] {
+        let mut invocation = envelope(entry, &digest, key);
+        invocation["slots"] = json!({ "record": INSIDE });
+        invocation["observed"] = json!({ INSIDE: { facet: token } });
+        let refused = call_as(
+            &registry,
+            &db,
+            caller.clone(),
+            "invoke_artifact_interaction",
+            invocation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "rejected", "{key}: {refused:#}");
+        assert_eq!(
+            refused["error"]["code"], "invalid_precondition",
+            "{key}: {refused:#}"
+        );
+        let message = refused["error"]["message"].as_str().unwrap().to_owned();
+        // The text names the record (a fixed id with digits of its own) and
+        // the facet key; with the record id removed it carries no digit at
+        // all, so no counter such as `revision42` can hide in it.
+        assert!(
+            !message
+                .replace(INSIDE, "<record>")
+                .chars()
+                .any(|c| c.is_ascii_digit()),
+            "{key}: {message}"
+        );
+        messages.push(message);
+    }
+    // Non-v4 and unknown are one refusal, whichever token family carried them.
+    assert_eq!(messages[0], messages[1]);
+    assert_eq!(messages[0], messages[2]);
 }
 
 #[tokio::test]
@@ -6899,6 +7267,66 @@ async fn facet_set_replay_settles_after_target_leaves_need() {
     .await;
     assert_eq!(fresh["status"], "rejected", "{fresh:#}");
     assert_eq!(fresh["error"]["code"], "record_outside_need", "{fresh:#}");
+}
+
+/// A viewer who lost Edit on the record after installing the tab is refused by
+/// the guarded `facet.set` arm, with nothing written. Extracted from the
+/// hosted facet-grid browser proof (an alpha-tab journey): the same
+/// "mounted-while-enabled, then revoked" refusal, without a browser.
+#[tokio::test]
+async fn facet_set_guard_refuses_a_viewer_whose_edit_was_revoked() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    replace_explicit_policy(
+        &setup.db,
+        "test:policy",
+        INSIDE,
+        vec![AllowEntry::account(ALPHA_GUARD_ACCOUNT, Capability::View)],
+    )
+    .await
+    .unwrap();
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:edit-revoked:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "permission_denied", "{refused:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:edit-revoked:no").await,
+        0
+    );
+    assert_eq!(facet_set_effort_value(&setup.db).await, None);
+}
+
+/// A record the caller cannot see at all (no View, so no Edit) is refused by
+/// the guarded `facet.set` arm, with nothing written. Extracted from the
+/// hosted facet-grid browser proof's forged-private refusal.
+#[tokio::test]
+async fn facet_set_guard_refuses_a_row_hidden_from_the_caller() {
+    let _runtime_config = crate::runtime_config_fixture::reader().await;
+    let setup = facet_set_setup(facet_set_grid_declaration()).await;
+    replace_explicit_policy(&setup.db, "test:policy", INSIDE, vec![])
+        .await
+        .unwrap();
+    let refused = facet_set_invoke(
+        &setup,
+        "note_effort",
+        INSIDE,
+        json!({ "effort": "obs:0" }),
+        "facet:hidden:no",
+    )
+    .await;
+    assert_eq!(refused["status"], "rejected", "{refused:#}");
+    assert_eq!(refused["error"]["code"], "permission_denied", "{refused:#}");
+    assert_eq!(
+        alpha_guard_keyed_writes(&setup.db, "facet:hidden:no").await,
+        0
+    );
+    assert_eq!(facet_set_effort_value(&setup.db).await, None);
 }
 
 #[tokio::test]

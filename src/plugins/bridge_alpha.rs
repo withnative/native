@@ -209,13 +209,12 @@ async fn visible_triple_collision_in(
 
 /// Newest body-carrying content event for an artifact record.
 async fn newest_body_event(tx: &mut Tx, artifact_id: &str) -> Result<Option<(String, String)>> {
-    let row = sqlx::query(
-        "SELECT id, json_extract(payload, '$.body') AS body FROM content_events
-          WHERE record_id = ? AND json_type(payload, '$.body') IS NOT NULL
-          ORDER BY seq DESC LIMIT 1",
+    let row = crate::record_body::live_artifact::latest_present_source_with_policy_on(
+        &mut **tx,
+        artifact_id,
+        crate::record_body::live_artifact::PresentSourceFamilies::Unrestricted,
+        None,
     )
-    .bind(artifact_id)
-    .fetch_optional(&mut **tx)
     .await?;
     row.map(|row| {
         Ok((
@@ -614,6 +613,97 @@ mod tests {
         .unwrap();
         assert_eq!(stored, revision.digest);
     }
+    #[tokio::test]
+    async fn reimport_uses_unrestricted_latest_body_identity() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let home_id = home(&db).await;
+        let revision = revision_for("0.1.0", BODY);
+        let first = import_revision_into_alpha(&db, &local_caller(), &revision, &home_id, "First.")
+            .await
+            .unwrap();
+        let source = uuid::Uuid::new_v4().to_string();
+        // A non-three-family event carries identical bytes. Reuse must return
+        // its identity, while retaining manifest/digest verification.
+        sqlx::query(r#"INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'bridge.other.family',?,1,'legacy_unknown')"#)
+            .bind(&source).bind(&first.artifact_id).bind(serde_json::json!({"body":std::str::from_utf8(BODY).unwrap()}).to_string()).execute(db.write_pool()).await.unwrap();
+        sqlx::query(r#"INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated','{"name":"metadata only"}',1,'legacy_unknown')"#)
+            .bind(uuid::Uuid::new_v4().to_string()).bind(&first.artifact_id).execute(db.write_pool()).await.unwrap();
+        let second =
+            import_revision_into_alpha(&db, &local_caller(), &revision, &home_id, "Reuse.")
+                .await
+                .unwrap();
+        assert!(!second.created);
+        assert_eq!(second.artifact_id, first.artifact_id);
+        assert_eq!(second.source_revision, source);
+        // A later other-family body is authoritative here and must refuse
+        // reuse rather than fall back to the matching original create.
+        sqlx::query(r#"INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'bridge.other.family','{"body":"changed"}',1,'legacy_unknown')"#)
+            .bind(uuid::Uuid::new_v4().to_string()).bind(&first.artifact_id).execute(db.write_pool()).await.unwrap();
+        let error = import_revision_into_alpha(
+            &db,
+            &local_caller(),
+            &revision,
+            &home_id,
+            "Refuse changed source.",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("revision_record_modified"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn newest_body_event_keeps_nullable_string_duplicate_and_malformed_semantics() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        assert!(newest_body_event(&mut tx, "fixture")
+            .await
+            .unwrap()
+            .is_none());
+        for (payload, expected) in [
+            (r#"{"body":"café🦮","body":"last"}"#, Some("café🦮")),
+            (r#"{"body":null,"body":"last"}"#, Some("")),
+            (r#"{"body":""}"#, Some("")),
+            (r#"{"body":["value"]}"#, Some(r#"["value"]"#)),
+            (r#"{"body":true}"#, None),
+            (r#"{"body":42}"#, None),
+        ] {
+            let id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,'fixture','unit.revision.recorded.v1',?,1,'legacy_unknown')")
+                .bind(&id).bind(payload).execute(&mut *tx).await.unwrap();
+            let result = newest_body_event(&mut tx, "fixture").await;
+            if let Some(body) = expected {
+                assert_eq!(result.unwrap().unwrap(), (id, body.into()));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Sqlx(sqlx::Error::ColumnDecode { .. }))
+                ));
+            }
+        }
+        // Only legacy metadata admission is isolated, then restored before
+        // the read. Append-only guards remain enabled throughout.
+        let ddl: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'")
+            .fetch_one(&mut *tx).await.unwrap();
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .persistent(false)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,'fixture','bridge.other.family','{malformed',1,'legacy_unknown')")
+            .bind(uuid::Uuid::new_v4().to_string()).execute(&mut *tx).await.unwrap();
+        sqlx::query(&ddl)
+            .persistent(false)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let error = newest_body_event(&mut tx, "fixture").await.unwrap_err();
+        assert!(matches!(error, Error::Sqlx(sqlx::Error::Database(_))));
+        assert!(error.to_string().contains("malformed JSON"));
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn reimport_appends_second_receipt_without_new_record() {
         let db = crate::create_database(":memory:").await.unwrap();

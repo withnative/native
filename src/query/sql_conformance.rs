@@ -31,7 +31,7 @@ use serde_json::Value;
 use super::sql_contract::ASSUMED_ORDER_REASON;
 use super::sql_contract::{
     catalog_column_rows, catalog_relation_rows, QuerySqlParameter, QuerySqlRequest, QuerySqlResult,
-    CARD_WORKED_STATEMENTS,
+    CARD_ANCESTOR_PATH_SQL, CARD_WORKED_STATEMENTS,
 };
 
 /// A card worked statement scoped to the `conf:%` seed, derived from
@@ -192,6 +192,7 @@ pub(crate) const SEED_SQL: &[&str] = &[
     // record plus blob_ref plus part_of link (follow-on).
     "INSERT INTO facet_observations(id,record_id,key,value,op,vocab_ref,as_of,observed_at,event_seq) VALUES
       ('conf:obs-common','conf:common','color','blue','set',NULL,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z',91001),
+      ('conf:obs-common-unset','conf:common','color',NULL,'unset',NULL,'2026-01-02T00:00:00.000Z','2026-01-02T00:00:00.000Z',91005),
       ('conf:obs-hidden','conf:bea','color','red','set',NULL,'2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z',91002)",
     "INSERT INTO vocabularies(id,name,created_at) VALUES
       ('conf:vocab','Conf vocabulary','2026-01-01T00:00:00.000Z')",
@@ -282,6 +283,63 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
             expected_rows: vec![
                 serde_json::json!({"id": "conf:link-open", "source_id": "conf:common", "target_id": "conf:alice", "relationship": "relates_to"}),
                 serde_json::json!({"id": "conf:link-part", "source_id": "conf:common", "target_id": "conf:alice", "relationship": "part_of"}),
+            ],
+        },
+        ConformanceCase {
+            name: "record_body",
+            sql: guide_recipe_sql("<!-- RECORD_BODY -->"),
+            parameters: vec![QuerySqlParameter::Text { value: Some("conf:common".into()) }],
+            expected_columns: vec!["id", "name", "body"],
+            expected_rows: vec![serde_json::json!({"id":"conf:common","name":"Common","body":"common body quoting `- [ ]` inline"})],
+        },
+        ConformanceCase {
+            name: "record_body_hidden",
+            sql: guide_recipe_sql("<!-- RECORD_BODY -->"),
+            parameters: vec![QuerySqlParameter::Text { value: Some("conf:bea".into()) }],
+            expected_columns: vec!["id", "name", "body"],
+            expected_rows: vec![],
+        },
+        ConformanceCase {
+            name: "record_currency_superseded",
+            sql: guide_recipe_sql("<!-- RECORD_CURRENCY -->"),
+            parameters: vec![QuerySqlParameter::Text { value: Some("conf:common".into()) }],
+            expected_columns: vec!["id", "is_current", "successor_count", "successor_id", "successor_name"],
+            expected_rows: vec![serde_json::json!({"id":"conf:common","is_current":null,"successor_count":1,"successor_id":"conf:alice","successor_name":"Alice note"})],
+        },
+        ConformanceCase {
+            name: "record_currency_current",
+            sql: guide_recipe_sql("<!-- RECORD_CURRENCY -->"),
+            parameters: vec![QuerySqlParameter::Text { value: Some("conf:alice".into()) }],
+            expected_columns: vec!["id", "is_current", "successor_count", "successor_id", "successor_name"],
+            expected_rows: vec![serde_json::json!({"id":"conf:alice","is_current":1,"successor_count":0,"successor_id":null,"successor_name":null})],
+        },
+        ConformanceCase {
+            name: "record_currency_hidden",
+            sql: guide_recipe_sql("<!-- RECORD_CURRENCY -->"),
+            parameters: vec![QuerySqlParameter::Text { value: Some("conf:bea".into()) }],
+            expected_columns: vec!["id", "is_current", "successor_count", "successor_id", "successor_name"],
+            expected_rows: vec![],
+        },
+        ConformanceCase {
+            name: "links_of_record",
+            sql: links_of_record_sql(),
+            parameters: vec![
+                QuerySqlParameter::Text {
+                    value: Some("conf:common".into()),
+                },
+                QuerySqlParameter::Text {
+                    value: Some("conf:common".into()),
+                },
+            ],
+            expected_columns: vec!["id", "source_id", "target_id", "relationship", "note"],
+            // The guide recipe binds the record twice (source ?1, target
+            // ?2). conf:link-sealed touches hidden conf:bea and stays
+            // absent; the two currency: links stay, both ends visible.
+            expected_rows: vec![
+                serde_json::json!({"id": "conf:link-open", "source_id": "conf:common", "target_id": "conf:alice", "relationship": "relates_to", "note": null}),
+                serde_json::json!({"id": "conf:link-part", "source_id": "conf:common", "target_id": "conf:alice", "relationship": "part_of", "note": null}),
+                serde_json::json!({"id": "currency:cited-unknown", "source_id": "conf:sort-a", "target_id": "conf:common", "relationship": "cites", "note": null}),
+                serde_json::json!({"id": "currency:edge", "source_id": "conf:alice", "target_id": "conf:common", "relationship": "supersedes", "note": null}),
             ],
         },
         ConformanceCase {
@@ -687,7 +745,7 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
         },
         ConformanceCase {
             name: "worked_direct_children_of_a_record",
-            sql: scoped_card_sql("Direct children of a folder or record", "id LIKE 'conf:%'"),
+            sql: scoped_card_sql("Direct children", "id LIKE 'conf:%'"),
             parameters: vec![QuerySqlParameter::Text {
                 value: Some("conf:common".into()),
             }],
@@ -699,7 +757,7 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
         ConformanceCase {
             name: "worked_parts_of_a_record",
             sql: scoped_card_sql(
-                "Parts of a record (semantic part_of links run child source -> parent target)",
+                "Parts (part_of child source -> parent target)",
                 "r.id LIKE 'conf:%'",
             ),
             parameters: vec![QuerySqlParameter::Text {
@@ -714,7 +772,7 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
         },
         ConformanceCase {
             name: "worked_recent_history_of_one_record",
-            sql: scoped_card_sql("Recent history of one record", "record_id LIKE 'conf:%'"),
+            sql: scoped_card_sql("Record history", "record_id LIKE 'conf:%'"),
             parameters: vec![QuerySqlParameter::Text {
                 value: Some("conf:common".into()),
             }],
@@ -768,9 +826,29 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
             parameters: Vec::new(),
             expected_columns: vec!["record_id", "key", "value"],
             // conf:obs-hidden sits on conf:bea, which alice must never
-            // see; only the conf:common observation survives.
+            // see; the set and the later unset on conf:common survive.
             expected_rows: vec![
                 serde_json::json!({"record_id": "conf:common", "key": "color", "value": "blue"}),
+                serde_json::json!({"record_id": "conf:common", "key": "color", "value": null}),
+            ],
+        },
+        ConformanceCase {
+            name: "facet_history",
+            sql: facet_history_sql(),
+            parameters: vec![
+                QuerySqlParameter::Text {
+                    value: Some("conf:common".into()),
+                },
+                QuerySqlParameter::Text {
+                    value: Some("color".into()),
+                },
+            ],
+            expected_columns: vec!["record_id", "key", "value", "op", "vocab_ref", "as_of", "observed_at", "event_seq"],
+            // `op` tells the set from the later unset; distinct `as_of`
+            // values pin the recipe's order.
+            expected_rows: vec![
+                serde_json::json!({"record_id": "conf:common", "key": "color", "value": "blue", "op": "set", "vocab_ref": null, "as_of": "2026-01-01T00:00:00.000Z", "observed_at": "2026-01-01T00:00:00.000Z", "event_seq": 91001}),
+                serde_json::json!({"record_id": "conf:common", "key": "color", "value": null, "op": "unset", "vocab_ref": null, "as_of": "2026-01-02T00:00:00.000Z", "observed_at": "2026-01-02T00:00:00.000Z", "event_seq": 91005}),
             ],
         },
         ConformanceCase {
@@ -790,6 +868,18 @@ pub(crate) fn corpus() -> Vec<ConformanceCase> {
             expected_rows: vec![
                 serde_json::json!({"value": "blue", "ordinal": 1.0}),
                 serde_json::json!({"value": "green", "ordinal": 2.0}),
+            ],
+        },
+        ConformanceCase {
+            name: "vocabulary_values",
+            sql: vocabulary_values_sql(),
+            parameters: vec![QuerySqlParameter::Text {
+                value: Some("conf:vocab".into()),
+            }],
+            expected_columns: vec!["value", "gloss", "terminality", "ordinal"],
+            expected_rows: vec![
+                serde_json::json!({"value": "blue", "gloss": "Conf blue", "terminality": "open", "ordinal": 1.0}),
+                serde_json::json!({"value": "green", "gloss": null, "terminality": "open", "ordinal": 2.0}),
             ],
         },
         ConformanceCase {
@@ -877,6 +967,128 @@ pub(crate) fn containment_sql() -> &'static str {
         .split_once("\n```")
         .expect("containment recipe fence")
         .0
+}
+
+/// The shipped ancestor-path recipe, extracted from the guide like
+/// [`containment_sql`] so the two cannot drift.
+pub(crate) fn ancestor_path_sql() -> &'static str {
+    include_str!("../mcp/guides/query-sql.md.in")
+        .split_once("<!-- ANCESTOR_PATH -->\n```sql\n")
+        .expect("ancestor path recipe marker")
+        .1
+        .split_once("\n```")
+        .expect("ancestor path recipe fence")
+        .0
+}
+
+/// One shipped call_executor recipe, extracted from the guide by its marker
+/// comment like [`containment_sql`], so guide edits cannot silently diverge
+/// from conformance. Markers live in the "SQL for reads behind
+/// call_executor" section of `query-sql.md.in`.
+pub(crate) fn guide_recipe_sql(marker: &str) -> &'static str {
+    let template: &'static str = include_str!("../mcp/guides/query-sql.md.in");
+    template
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("guide recipe marker {marker}"))
+        .1
+        .split_once("```sql\n")
+        .expect("guide recipe fence")
+        .1
+        .split_once("\n```")
+        .expect("guide recipe fence")
+        .0
+}
+
+/// Links of a record, as `manage_links.list` sees them.
+pub(crate) fn links_of_record_sql() -> &'static str {
+    guide_recipe_sql("<!-- LINKS_OF_RECORD -->")
+}
+
+/// Facet history for one record and key, as
+/// `manage_facet_observations.list` sees it.
+pub(crate) fn facet_history_sql() -> &'static str {
+    guide_recipe_sql("<!-- FACET_HISTORY -->")
+}
+
+/// Values of one vocabulary, as `manage_vocabularies.list_values` sees them.
+pub(crate) fn vocabulary_values_sql() -> &'static str {
+    guide_recipe_sql("<!-- VOCABULARY_VALUES -->")
+}
+
+/// Relationships touching a record with counterpart names, as
+/// `manage_relationships.find` sees them (SQLite-local).
+pub(crate) fn relationship_counterparts_sql() -> &'static str {
+    guide_recipe_sql("<!-- RELATIONSHIP_COUNTERPARTS -->")
+}
+
+/// Recent runs with their intents, as `get_run_activity` sees them
+/// (SQLite-local).
+pub(crate) fn run_activity_intents_sql() -> &'static str {
+    guide_recipe_sql("<!-- RUN_ACTIVITY_INTENTS -->")
+}
+
+/// SQLite-only ancestor-path cases over the M2 containment fixtures.
+pub(crate) fn ancestor_path_corpus() -> Vec<ConformanceCase> {
+    let row =
+        |id: &str, name: &str, depth: i64| serde_json::json!({"id":id,"name":name,"depth":depth});
+    let deep: Vec<Value> = (1..=33)
+        .map(|n| row(&format!("m2:deep:{n:02}"), &format!("Deep {n:02}"), 33 - n))
+        .collect();
+    let cases: Vec<ConformanceCase> = vec![
+        (
+            "ancestor_path_chain",
+            "m2:c",
+            vec![
+                row("m2:root", "Root", 3),
+                row("m2:a", "A", 2),
+                row("m2:b", "B", 1),
+                row("m2:c", "C", 0),
+            ],
+        ),
+        (
+            "ancestor_path_top_record",
+            "m2:root",
+            vec![row("m2:root", "Root", 0)],
+        ),
+        // The parent is private, so home_id reads NULL and the walk stops.
+        (
+            "ancestor_path_hidden_parent",
+            "m2:private-child",
+            vec![row("m2:private-child", "Visible child", 0)],
+        ),
+        ("ancestor_path_missing", "m2:missing", vec![]),
+        // 32 steps above m2:deep:33 is m2:deep:01; m2:deep:00 is out of bound.
+        ("ancestor_path_depth_bound", "m2:deep:33", deep),
+    ]
+    .into_iter()
+    .map(|(name, id, expected_rows)| ConformanceCase {
+        name,
+        sql: ancestor_path_sql(),
+        parameters: vec![QuerySqlParameter::Text {
+            value: Some(id.into()),
+        }],
+        expected_columns: vec!["id", "name", "depth"],
+        expected_rows,
+    })
+    .collect();
+    // The card's compact form must agree with the guide's recipe on ids and
+    // depths, so both are run over the same inputs.
+    let card_cases = cases.iter().map(|case| {
+        let rows = case
+            .expected_rows
+            .iter()
+            .map(|row| serde_json::json!({"id": row["id"], "d": row["depth"]}))
+            .collect();
+        ConformanceCase {
+            name: "card_ancestor_path",
+            sql: CARD_ANCESTOR_PATH_SQL,
+            parameters: case.parameters.clone(),
+            expected_columns: vec!["id", "d"],
+            expected_rows: rows,
+        }
+    });
+    let card_cases: Vec<_> = card_cases.collect();
+    cases.into_iter().chain(card_cases).collect()
 }
 
 /// Exact SQLite visible sets; other profiles test refusal of this same SQL.
@@ -1072,6 +1284,26 @@ pub(crate) fn containment_corpus() -> Vec<ConformanceCase> {
             },
         )
         .collect()
+}
+
+/// SQLite-only run-activity cases over runs the dedicated test owns
+/// (`scout-chair-aaaa11` newer than `scout-chair-bbbb22`, both inside the
+/// 24-hour presence window). Newest run first, each run's declarations in
+/// ordinal order; timestamps stay out of the projection so the seed needs
+/// no fixture clock. The newer run declares nothing, so the LEFT JOIN
+/// keeps it with a NULL intent.
+pub(crate) fn run_activity_intents_corpus() -> Vec<ConformanceCase> {
+    vec![ConformanceCase {
+        name: "run_activity_intents",
+        sql: run_activity_intents_sql(),
+        parameters: Vec::new(),
+        expected_columns: vec!["run_key", "ordinal", "intent"],
+        expected_rows: vec![
+            serde_json::json!({"run_key": "scout-chair-aaaa11", "ordinal": null, "intent": null}),
+            serde_json::json!({"run_key": "scout-chair-bbbb22", "ordinal": 1, "intent": "Old aim one"}),
+            serde_json::json!({"run_key": "scout-chair-bbbb22", "ordinal": 2, "intent": "Old aim two"}),
+        ],
+    }]
 }
 
 /// One server-default-ordering case: an unordered top-level LIMIT plus the
@@ -1838,8 +2070,271 @@ mod tests {
     #[tokio::test]
     async fn sqlite_runs_conformance_corpus() {
         let (db, alice, head) = seeded_sqlite().await;
-        for case in corpus().into_iter().chain(containment_corpus()) {
+        for case in corpus()
+            .into_iter()
+            .chain(containment_corpus())
+            .chain(ancestor_path_corpus())
+        {
             let result = query_sql_request_owned(db.clone(), alice.clone(), case.request())
+                .await
+                .unwrap_or_else(|error| panic!("sqlite failed {}: {error}", case.name));
+            check_case(&result, &case, head);
+        }
+    }
+
+    #[tokio::test]
+    async fn sqlite_guide_supersession_cue_reads_links_both_ways() {
+        let (db, alice, _) = seeded_sqlite().await;
+        // The newer record is the link source: m2:c supersedes m2:b supersedes m2:a.
+        for (id, source, target) in [("m2:sup-cb", "m2:c", "m2:b"), ("m2:sup-ba", "m2:b", "m2:a")] {
+            sqlx::query("INSERT INTO links(id,source_id,target_id,relationship,note,created_at) VALUES (?1,?2,?3,'supersedes',NULL,'2026-01-01T00:00:00.000Z')")
+                .bind(id).bind(source).bind(target)
+                .execute(db.write_pool()).await.unwrap();
+        }
+        let superseded_by = run_params(
+            &db,
+            alice.clone(),
+            "SELECT source_id FROM links WHERE target_id = ?1 AND relationship = 'supersedes' ORDER BY source_id",
+            vec![QuerySqlParameter::Text { value: Some("m2:b".into()) }],
+        )
+        .await;
+        assert_eq!(
+            serde_json::json!(superseded_by.rows),
+            serde_json::json!([{"source_id":"m2:c"}])
+        );
+        let superseded = run_params(
+            &db,
+            alice.clone(),
+            "SELECT target_id FROM links WHERE source_id = ?1 AND relationship = 'supersedes' ORDER BY target_id",
+            vec![QuerySqlParameter::Text { value: Some("m2:b".into()) }],
+        )
+        .await;
+        assert_eq!(
+            serde_json::json!(superseded.rows),
+            serde_json::json!([{"target_id":"m2:a"}])
+        );
+    }
+
+    /// One `manage_relationships` call against the test database through
+    /// the governed tool, returning the tool response. The caller is
+    /// trusted local, so a hidden endpoint passes admission and the
+    /// read-time fence stays the only visibility gate.
+    async fn call_conf_relationships(db: &Db, payload: serde_json::Value) -> serde_json::Value {
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::local(),
+                "manage_relationships",
+                payload,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Assert one relates_to relationship between two records through the
+    /// governed tool, returning the assert response.
+    async fn assert_conf_relationship(
+        db: &Db,
+        endpoint_a: &str,
+        endpoint_b: &str,
+        idempotency_key: &str,
+    ) -> serde_json::Value {
+        call_conf_relationships(
+            db,
+            serde_json::json!({
+                "action": "assert",
+                "relationship_type": "relates_to",
+                "endpoints": [
+                    {"role": "participant", "record_id": endpoint_a},
+                    {"role": "participant", "record_id": endpoint_b},
+                ],
+                "idempotency_key": idempotency_key,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn sqlite_call_executor_relationship_counterparts() {
+        let (db, alice, _) = seeded_sqlite().await;
+        let rel1 = assert_conf_relationship(&db, "conf:common", "conf:alice", "conf:rel-1").await;
+        let rel2 = assert_conf_relationship(&db, "conf:common", "conf:sort-a", "conf:rel-2").await;
+        // Retract rel-2's only assertion: it stays physically active but
+        // reads back effectively inactive, which the recipe still returns
+        // (it filters nothing on state).
+        call_conf_relationships(
+            &db,
+            serde_json::json!({
+                "action": "retract",
+                "assertion_issuer_origin_db_id": rel2["assertion_issuer_origin_db_id"].as_str().unwrap(),
+                "assertion_id": rel2["assertion_id"].as_str().unwrap(),
+                "reason": "conformance fixture",
+                "idempotency_key": "conf:rel-2-retract",
+            }),
+        )
+        .await;
+        // The recipe does not project state, so prove the retraction took
+        // effect directly: still physically active, effectively inactive.
+        let rel2_origin = rel2["relationship_origin_db_id"].as_str().unwrap();
+        let rel2_id = rel2["relationship_id"].as_str().unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM relationships WHERE relationship_origin_db_id = ?1 AND relationship_id = ?2",
+        )
+        .bind(rel2_origin)
+        .bind(rel2_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "active");
+        let effective_state: String = sqlx::query_scalar(
+            "SELECT effective_state FROM effective_relationships WHERE relationship_origin_db_id = ?1 AND relationship_id = ?2",
+        )
+        .bind(rel2_origin)
+        .bind(rel2_id)
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(effective_state, "inactive");
+        // Hidden endpoint: admitted by the trusted-local caller, dropped
+        // for alice by the all-endpoints-visible fence.
+        assert_conf_relationship(&db, "conf:common", "conf:bea", "conf:rel-hidden").await;
+        let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        // Server-issued ids cannot be pinned; everything else is. One row
+        // per counterpart endpoint, in recipe order.
+        let mut expected_rows = [
+            (&rel1, 0, "conf:alice", "Alice note"),
+            (&rel2, 1, "conf:sort-a", "apple"),
+        ]
+        .into_iter()
+        .map(|(rel, ordinal, record_id, counterpart_name)| {
+            serde_json::json!({
+                "relationship_origin_db_id": rel["relationship_origin_db_id"].as_str().unwrap(),
+                "relationship_id": rel["relationship_id"].as_str().unwrap(),
+                "relationship_type": "relates_to",
+                "ordinal": ordinal,
+                "role": "participant",
+                "record_id": record_id,
+                "counterpart_name": counterpart_name,
+            })
+        })
+        .collect::<Vec<_>>();
+        expected_rows.sort_by(|left, right| {
+            (
+                left["relationship_origin_db_id"].as_str().unwrap(),
+                left["relationship_id"].as_str().unwrap(),
+            )
+                .cmp(&(
+                    right["relationship_origin_db_id"].as_str().unwrap(),
+                    right["relationship_id"].as_str().unwrap(),
+                ))
+        });
+        let case = ConformanceCase {
+            name: "relationship_counterparts",
+            sql: relationship_counterparts_sql(),
+            parameters: vec![
+                QuerySqlParameter::Text {
+                    value: Some("conf:common".into()),
+                },
+                QuerySqlParameter::Text {
+                    value: Some("conf:common".into()),
+                },
+            ],
+            expected_columns: vec![
+                "relationship_origin_db_id",
+                "relationship_id",
+                "relationship_type",
+                "ordinal",
+                "role",
+                "record_id",
+                "counterpart_name",
+            ],
+            expected_rows,
+        };
+        let result = query_sql_request_owned(db.clone(), alice.clone(), case.request())
+            .await
+            .unwrap_or_else(|error| panic!("sqlite failed {}: {error}", case.name));
+        check_case(&result, &case, head);
+    }
+
+    #[tokio::test]
+    async fn sqlite_call_executor_run_activity_intents() {
+        let (db, _, _) = seeded_sqlite().await;
+        // Shape-valid full run keys (`handle-disambiguator-run_id`);
+        // `ensure_agent_run` refuses anything else. Runs are admitted
+        // through the sanctioned path with the default identity (this
+        // file carries a reviewed entry in the model fence allowlist);
+        // the starts are then moved inside the 24-hour presence window.
+        for (run_key, hours_ago) in [("scout-chair-aaaa11", 1_i64), ("scout-chair-bbbb22", 2_i64)] {
+            crate::control::ensure_agent_run(
+                &db,
+                run_key,
+                "alice",
+                crate::control::ReportedRunIdentity::default(),
+            )
+            .await
+            .unwrap();
+            let started_at = (chrono::Utc::now() - chrono::Duration::hours(hours_ago))
+                .format("%Y-%m-%dT%H:%M:%S.000Z")
+                .to_string();
+            sqlx::query("UPDATE agent_runs SET started_at = ?1 WHERE run_key = ?2")
+                .bind(&started_at)
+                .bind(run_key)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        }
+        for (id, run_key, intent, at) in [
+            (
+                "conf:ri-old-1",
+                "scout-chair-bbbb22",
+                "Old aim one",
+                "2026-01-05T09:00:01.000Z",
+            ),
+            (
+                "conf:ri-old-2",
+                "scout-chair-bbbb22",
+                "Old aim two",
+                "2026-01-05T09:00:02.000Z",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO read_log_calls (id, tool, run_key, actor, intent, outcome, started_at, ended_at)
+                 VALUES (?, 'set_intent', ?, 'alice', ?, 'ok', ?, ?)",
+            )
+            .bind(id)
+            .bind(run_key)
+            .bind(intent)
+            .bind(at)
+            .bind(at)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        let head: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        // SAFETY: this test models the authenticated hosted ingress after it
+        // has admitted alice's live member context; no SQL argument controls it.
+        let reader = unsafe {
+            QueryPrincipal::activity_reader_unchecked(
+                "alice",
+                vec![
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "alice",
+                        "native:workspace-member:alice",
+                    ),
+                ],
+                true,
+            )
+        };
+        for case in run_activity_intents_corpus() {
+            let result = query_sql_request_owned(db.clone(), reader.clone(), case.request())
                 .await
                 .unwrap_or_else(|error| panic!("sqlite failed {}: {error}", case.name));
             check_case(&result, &case, head);

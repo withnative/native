@@ -1,0 +1,302 @@
+{
+  "pins": {
+    "package": {
+      "namespace": "native.relationship",
+      "name": "relates-to",
+      "version": 1,
+      "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+    },
+    "relationship": {
+      "family": "native.relationship.relates_to",
+      "version": 1,
+      "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+    },
+    "provider": "host.relates-to/1:0b01f4006ee5d6218d921f26e0262412825ec9e062a7d8b16415567f392c8ee0",
+    "decoder": "relates_to.payload/1",
+    "reducer": "relates_to.fold/1",
+    "payload_version": 1
+  },
+  "events": [
+    {
+      "seq": 10,
+      "record_id": "a",
+      "actor": "golden-host",
+      "created_at": "2026-10-11T00:00:00Z",
+      "payload": {
+        "principal_id": "golden-host",
+        "operation_key": "golden.first",
+        "anchor": {
+          "record_id": "a",
+          "head": 1,
+          "binding_revision": 1,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "counterpart": {
+          "record_id": "b",
+          "head": 2,
+          "binding_revision": 2,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "declaration": null,
+        "scope_home": "kernel:root",
+        "selection_head": 3,
+        "authority_head": 4,
+        "expected_head": null,
+        "aggregate_id": "relation:golden",
+        "pins": {
+          "package": {
+            "namespace": "native.relationship",
+            "name": "relates-to",
+            "version": 1,
+            "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+          },
+          "relationship": {
+            "family": "native.relationship.relates_to",
+            "version": 1,
+            "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+          },
+          "provider": "host.relates-to/1:0b01f4006ee5d6218d921f26e0262412825ec9e062a7d8b16415567f392c8ee0",
+          "decoder": "relates_to.payload/1",
+          "reducer": "relates_to.fold/1",
+          "payload_version": 1
+        },
+        "command": {
+          "Assert": {
+            "sources": [
+              {
+                "source_id": "legacy.0",
+                "from": "a",
+                "to": "b",
+                "note": "fixed provenance",
+                "author": "claimed-author",
+                "timestamp": "2001-01-01T00:00:00Z"
+              }
+            ]
+          }
+        },
+        "assertion_id": "assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b",
+        "outcome": {
+          "left": "a",
+          "right": "b",
+          "assertions": [
+            {
+              "id": "assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b",
+              "sources": [
+                {
+                  "source_id": "legacy.0",
+                  "from": "a",
+                  "to": "b",
+                  "note": "fixed provenance",
+                  "author": "claimed-author",
+                  "timestamp": "2001-01-01T00:00:00Z"
+                }
+              ],
+              "retracted": false
+            }
+          ]
+        }
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"author\":\"claimed-author\",\"timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false}]}",
+      "attribution_bytes": "{\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\":{\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}}",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    },
+    {
+      "seq": 11,
+      "record_id": "b",
+      "actor": "golden-editor",
+      "created_at": "2026-10-11T00:00:01Z",
+      "payload": {
+        "principal_id": "golden-editor",
+        "operation_key": "golden.second",
+        "anchor": {
+          "record_id": "b",
+          "head": 1,
+          "binding_revision": 1,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "counterpart": {
+          "record_id": "a",
+          "head": 2,
+          "binding_revision": 2,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "declaration": null,
+        "scope_home": "kernel:root",
+        "selection_head": 3,
+        "authority_head": 4,
+        "expected_head": 10,
+        "aggregate_id": "relation:golden",
+        "pins": {
+          "package": {
+            "namespace": "native.relationship",
+            "name": "relates-to",
+            "version": 1,
+            "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+          },
+          "relationship": {
+            "family": "native.relationship.relates_to",
+            "version": 1,
+            "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+          },
+          "provider": "host.relates-to/1:0b01f4006ee5d6218d921f26e0262412825ec9e062a7d8b16415567f392c8ee0",
+          "decoder": "relates_to.payload/1",
+          "reducer": "relates_to.fold/1",
+          "payload_version": 1
+        },
+        "command": {
+          "Assert": {
+            "sources": [
+              {
+                "source_id": "legacy.1",
+                "from": "b",
+                "to": "a",
+                "note": "fixed provenance",
+                "author": null,
+                "timestamp": "2001-01-01T00:00:00Z"
+              }
+            ]
+          }
+        },
+        "assertion_id": "assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec",
+        "outcome": {
+          "left": "a",
+          "right": "b",
+          "assertions": [
+            {
+              "id": "assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b",
+              "sources": [
+                {
+                  "source_id": "legacy.0",
+                  "from": "a",
+                  "to": "b",
+                  "note": "fixed provenance",
+                  "author": "claimed-author",
+                  "timestamp": "2001-01-01T00:00:00Z"
+                }
+              ],
+              "retracted": false
+            },
+            {
+              "id": "assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec",
+              "sources": [
+                {
+                  "source_id": "legacy.1",
+                  "from": "b",
+                  "to": "a",
+                  "note": "fixed provenance",
+                  "author": null,
+                  "timestamp": "2001-01-01T00:00:00Z"
+                }
+              ],
+              "retracted": false
+            }
+          ]
+        }
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"author\":\"claimed-author\",\"timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false},{\"id\":\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"author\":null,\"timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false}]}",
+      "attribution_bytes": "{\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\":{\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null},\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\":{\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}}",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null},{\"id\":\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    },
+    {
+      "seq": 12,
+      "record_id": "a",
+      "actor": "golden-manager",
+      "created_at": "2026-10-11T00:00:02Z",
+      "payload": {
+        "principal_id": "golden-manager",
+        "operation_key": "golden.retract",
+        "anchor": {
+          "record_id": "a",
+          "head": 1,
+          "binding_revision": 1,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "counterpart": {
+          "record_id": "b",
+          "head": 2,
+          "binding_revision": 2,
+          "binding": {
+            "state": "Bare"
+          }
+        },
+        "declaration": null,
+        "scope_home": "kernel:root",
+        "selection_head": 3,
+        "authority_head": 4,
+        "expected_head": 11,
+        "aggregate_id": "relation:golden",
+        "pins": {
+          "package": {
+            "namespace": "native.relationship",
+            "name": "relates-to",
+            "version": 1,
+            "digest": "ba9dbd1f736f84e7963bce48a9bd57088651833c52056258fafb60b691a47071"
+          },
+          "relationship": {
+            "family": "native.relationship.relates_to",
+            "version": 1,
+            "digest": "2430d84271a2e23457a1ecf6a684a4bcb146c5f4085a2b0dadf29b8a2dca0926"
+          },
+          "provider": "host.relates-to/1:0b01f4006ee5d6218d921f26e0262412825ec9e062a7d8b16415567f392c8ee0",
+          "decoder": "relates_to.payload/1",
+          "reducer": "relates_to.fold/1",
+          "payload_version": 1
+        },
+        "command": {
+          "Retract": {
+            "assertion_id": "assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b"
+          }
+        },
+        "assertion_id": "assertion:c8a62e403d57872f4158b3676870390053f41d72a747df29c153febf194aacc7",
+        "outcome": {
+          "left": "a",
+          "right": "b",
+          "assertions": [
+            {
+              "id": "assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b",
+              "sources": [
+                {
+                  "source_id": "legacy.0",
+                  "from": "a",
+                  "to": "b",
+                  "note": "fixed provenance",
+                  "author": "claimed-author",
+                  "timestamp": "2001-01-01T00:00:00Z"
+                }
+              ],
+              "retracted": true
+            },
+            {
+              "id": "assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec",
+              "sources": [
+                {
+                  "source_id": "legacy.1",
+                  "from": "b",
+                  "to": "a",
+                  "note": "fixed provenance",
+                  "author": null,
+                  "timestamp": "2001-01-01T00:00:00Z"
+                }
+              ],
+              "retracted": false
+            }
+          ]
+        }
+      },
+      "state_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"author\":\"claimed-author\",\"timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":true},{\"id\":\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"author\":null,\"timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false}]}",
+      "attribution_bytes": "{\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\":{\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":\"golden-manager\",\"retracted_at\":\"2026-10-11T00:00:02Z\",\"retracted_seq\":12},\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\":{\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}}",
+      "view_bytes": "{\"left\":\"a\",\"right\":\"b\",\"assertions\":[{\"id\":\"assertion:b0635aae696a5e93ef76ae89d3cdb1f9b6cba812b88558f39e805655f8bda09b\",\"sources\":[{\"source_id\":\"legacy.0\",\"from\":\"a\",\"to\":\"b\",\"claimed_author\":\"claimed-author\",\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":true,\"asserted_by\":\"golden-host\",\"asserted_at\":\"2026-10-11T00:00:00Z\",\"asserted_seq\":10,\"retracted_by\":\"golden-manager\",\"retracted_at\":\"2026-10-11T00:00:02Z\",\"retracted_seq\":12},{\"id\":\"assertion:39d8d5f75164fc62f93b9f0019deb583d68343f71c87ec1c7ef76077ee7f41ec\",\"sources\":[{\"source_id\":\"legacy.1\",\"from\":\"b\",\"to\":\"a\",\"claimed_author\":null,\"claimed_timestamp\":\"2001-01-01T00:00:00Z\",\"note\":\"fixed provenance\"}],\"retracted\":false,\"asserted_by\":\"golden-editor\",\"asserted_at\":\"2026-10-11T00:00:01Z\",\"asserted_seq\":11,\"retracted_by\":null,\"retracted_at\":null,\"retracted_seq\":null}]}"
+    }
+  ],
+  "source_sha256": "2958fe1ea0d8ee573141de2a87778bb9ea3db6ab381b27ae5fc4249e86a02bc9"
+}

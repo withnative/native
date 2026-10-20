@@ -19,6 +19,9 @@ use crate::query::events::{
     content_retention_floor_on,
 };
 
+#[cfg(feature = "v2-kernel-probe")]
+pub mod v2;
+
 mod personal_registry;
 mod personal_registry_test_support;
 mod personal_scope;
@@ -54,6 +57,10 @@ pub struct InboxInvalidationVector {
 }
 
 async fn inbox_vector_on(pool: &SqlitePool) -> crate::Result<InboxInvalidationVector> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2_pool(pool).await? {
+        return crate::kernel::notifications::vector(pool).await;
+    }
     let mut tx = pool.begin().await?;
     let value = InboxInvalidationVector {
         content: sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM content_events")
@@ -104,6 +111,10 @@ pub async fn inbox_addressed_since(
     prev: &InboxInvalidationVector,
     cur: &InboxInvalidationVector,
 ) -> crate::Result<bool> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2_pool(pool).await? {
+        return crate::kernel::notifications::addressed(pool, account, prev, cur).await;
+    }
     if cur.awareness > prev.awareness {
         let hit = sqlx::query_scalar::<_, i64>(
             "SELECT seq FROM awareness_events WHERE subject_account_id = ?1 AND seq > ?2 AND seq <= ?3 LIMIT 1",
@@ -137,6 +148,8 @@ pub async fn inbox_addressed_since(
 #[derive(Debug)]
 pub struct RealtimeHub {
     database_id: String,
+    #[cfg(feature = "v2-kernel-probe")]
+    app_data_needs: RwLock<Option<Arc<dyn v2::AppDataNeeds>>>,
     pool: RwLock<SqlitePool>,
     sender: RwLock<Option<broadcast::Sender<ContentInvalidation>>>,
     inbox_sender: RwLock<Option<broadcast::Sender<InboxInvalidationVector>>>,
@@ -179,6 +192,26 @@ pub struct RealtimeHub {
 }
 
 impl RealtimeHub {
+    #[doc(hidden)]
+    pub async fn durable_database_identity(db: &Db) -> crate::Result<String> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if crate::kernel::notifications::is_v2(db).await? {
+            // The first immutable event is minted once per owned database,
+            // preserved by backup/replay and never a v1 identity singleton.
+            let id: String =
+                sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq LIMIT 1")
+                    .fetch_one(db.pool())
+                    .await?;
+            return Ok(format!("kernel-v2:{id}"));
+        }
+        crate::identity::database_id(db).await
+    }
+
+    /// Stable identity used by stream/need bindings for this opened engine.
+    pub fn database_identity(&self) -> &str {
+        &self.database_id
+    }
+
     /// Return the durable realtime capability installed on an opened database.
     ///
     /// Callers should retain this hub, rather than the opened [`Db`]: when the
@@ -200,7 +233,7 @@ impl RealtimeHub {
     pub async fn attach(db: Db, existing: Option<Arc<Self>>) -> crate::Result<(Db, Arc<Self>)> {
         match existing {
             Some(hub) => {
-                let database_id = crate::identity::database_id(&db).await?;
+                let database_id = Self::durable_database_identity(&db).await?;
                 if database_id != hub.database_id {
                     return Err(crate::Error::engine(format!(
                         "realtime hub database identity mismatch: expected {}, got {database_id}",
@@ -215,13 +248,15 @@ impl RealtimeHub {
     }
 
     pub(crate) async fn install(db: Db) -> crate::Result<(Db, Arc<Self>)> {
-        let database_id = crate::identity::database_id(&db).await?;
+        let database_id = Self::durable_database_identity(&db).await?;
         let last_published_seq = content_high_water_on(db.write_pool()).await?;
         let (sender, _) = broadcast::channel(HUB_CAPACITY);
         let (inbox_sender, _) = broadcast::channel(HUB_CAPACITY);
         let last_inbox_vector = inbox_vector_on(db.write_pool()).await?;
         let hub = Arc::new(Self {
             database_id,
+            #[cfg(feature = "v2-kernel-probe")]
+            app_data_needs: RwLock::new(None),
             pool: RwLock::new(db.write_pool().clone()),
             sender: RwLock::new(Some(sender)),
             inbox_sender: RwLock::new(Some(inbox_sender)),
@@ -251,6 +286,27 @@ impl RealtimeHub {
         let installed = db.with_realtime_hub(hub.clone());
         hub.set_current_db(installed.clone().without_realtime_hub());
         Self::spawn_pump(&hub);
+        #[cfg(feature = "v2-kernel-probe")]
+        if crate::kernel::notifications::is_v2(&installed).await? {
+            // Cross-handle kernel writes also use raw SQLite transactions.
+            // A bounded durable tail tick closes that wakeup gap; ordinary
+            // messaging commits additionally wake immediately.
+            let weak = Arc::downgrade(&hub);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let Some(hub) = weak.upgrade() else {
+                        return;
+                    };
+                    if hub.is_terminal() {
+                        return;
+                    }
+                    if hub.current_db().is_some() {
+                        hub.wake();
+                    }
+                }
+            });
+        }
         Ok((installed, hub))
     }
 
@@ -648,6 +704,65 @@ impl RealtimeHub {
         is_member: bool,
         envelope: &ContentInvalidation,
     ) -> bool {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.database_identity().starts_with("kernel-v2:") {
+            let Some(db) = self.current_db() else {
+                return false;
+            };
+            if crate::kernel::notifications::is_v2(&db)
+                .await
+                .unwrap_or(true)
+            {
+                if !is_member {
+                    return false;
+                }
+                let Ok(Some((principal, _, _))) =
+                    crate::kernel::resolve_caller_principal_by_binding(&db, account_id).await
+                else {
+                    return false;
+                };
+                let Ok(mut tx) = db.pool().begin().await else {
+                    return false;
+                };
+                if !crate::kernel::hosted_identity::admitted(&mut tx, &principal)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                drop(tx);
+                if envelope.event_type == crate::kernel::messaging::EVENT {
+                    return crate::kernel::messaging::change_as(
+                        &db,
+                        &principal,
+                        envelope.local_seq,
+                    )
+                    .await
+                    .is_ok_and(|row| {
+                        row.is_some_and(|row| {
+                            row.id == envelope.id && row.record_id == envelope.record_id
+                        })
+                    });
+                }
+                return crate::kernel::history_page_in_range_as(
+                    &db,
+                    &principal,
+                    &envelope.record_id,
+                    Some(envelope.local_seq.saturating_sub(1)),
+                    false,
+                    1,
+                    false,
+                    false,
+                    (envelope.local_seq, envelope.local_seq),
+                )
+                .await
+                .is_ok_and(|rows| {
+                    rows.first()
+                        .is_some_and(|row| row.seq == envelope.local_seq && row.id == envelope.id)
+                });
+            }
+            return false;
+        }
         if matches!(
             envelope.event_type.as_str(),
             "reconciliation.recorded.v1" | "unit.superseded.v1" | "receipt.dependency_audited.v1"

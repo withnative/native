@@ -815,7 +815,23 @@ async fn hosted_verbose_replay_enrichment_allows_concurrent_writer_progress() {
     )
     .await
     .unwrap();
-    let (replay, writer) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    // This is the end-to-end smoke of a hosted verbose replay beside a writer.
+    // It deliberately makes no latency promise and no claim that the full view
+    // was rebuilt: a verbose replay opens a scratch database and applies the
+    // whole schema behind two process-wide rebuild permits that every other
+    // test in this binary shares, so it took about 0.4 s alone and 2 to 4 s in
+    // the parallel group, and the engine's keyed replay deadline is 5 s. Under
+    // enough load the rebuild may legitimately degrade to the marked summary.
+    //
+    // The property that matters, that a writer runs while a rebuild is in
+    // flight and that the rebuild's enrichment then completes without
+    // self-locking, is asserted without a clock in the library test
+    // `a_writer_runs_while_a_hosted_verbose_rebuild_is_parked_and_the_rebuild_then_completes`
+    // (a parked rebuild, a private permit pool, a 120 s deadline). Here the
+    // outer bound is a hang detector, and the receipt must be the first call's
+    // either in full or as the marked summary of the same write.
+    const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
+    let (replay, writer) = tokio::time::timeout(HANG_DETECTOR, async {
         tokio::join!(
             create(&registry, &db, hosted("acct:verbose-alice"), args),
             create(
@@ -827,8 +843,16 @@ async fn hosted_verbose_replay_enrichment_allows_concurrent_writer_progress() {
         )
     })
     .await
-    .expect("live enrichment/contribution/filter reads must not self-lock or stall the writer");
-    assert_eq!(replay.unwrap(), first);
+    .expect("a replay beside a writer must not hang");
+    let replay = replay.unwrap();
+    if replay.get("replay_view").is_some() {
+        assert_eq!(replay["replay_view"], "summary", "{replay}");
+        for field in ["id", "body_digest", "act"] {
+            assert_eq!(replay[field], first[field], "{field}");
+        }
+    } else {
+        assert_eq!(replay, first);
+    }
     assert_eq!(writer.unwrap()["name"], "parallel writer");
     db.close().await;
 }

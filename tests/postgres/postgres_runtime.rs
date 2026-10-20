@@ -82,12 +82,12 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let logical_database_id = format!("contract-legacy-v2-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let migrations = database.qualified_table("schema_migrations").unwrap();
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut transaction = database.pool().begin().await.unwrap();
     sqlx::query(&format!(
-        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
+        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9,10)"
     ))
     .execute(&mut *transaction)
     .await
@@ -108,7 +108,7 @@ async fn legacy_v2_binding_audit_shape_is_refused_on_runtime_reopen() {
     let error = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         error,
-        "Postgres logical database uses legacy schema v2; authoritative substrate v9 requires operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v2; authoritative substrate v10 requires operator-controlled reprovisioning"
     );
     config.drop_owned().await.unwrap();
 }
@@ -121,7 +121,7 @@ async fn v7_to_v8_backfills_live_successors_without_changing_archive() {
     let logical_database_id = format!("contract-currency-v7-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let records = database.qualified_table("records").unwrap();
     let links = database.qualified_table("links").unwrap();
     let migrations = database.qualified_table("schema_migrations").unwrap();
@@ -182,7 +182,7 @@ async fn v7_to_v8_backfills_live_successors_without_changing_archive() {
         .await
         .unwrap();
     sqlx::query(&format!(
-        "UPDATE {migrations} SET version=7 WHERE version=9"
+        "UPDATE {migrations} SET version=7 WHERE version=10"
     ))
     .execute(&mut *tx)
     .await
@@ -191,7 +191,7 @@ async fn v7_to_v8_backfills_live_successors_without_changing_archive() {
     database.close().await;
 
     let (migrated, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let target_row: (Option<bool>, i64, bool) = sqlx::query_as(&format!(
         "SELECT is_current,successor_count,archived FROM {records} WHERE id=$1"
     ))
@@ -234,7 +234,7 @@ async fn v8_to_v9_backfills_task_items_with_exact_body_event_provenance() {
     let logical_database_id = format!("contract-tasks-v8-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let records = database.qualified_table("records").unwrap();
     let events = database.qualified_table("content_events").unwrap();
     let items = database.qualified_table("body_task_items").unwrap();
@@ -304,7 +304,7 @@ async fn v8_to_v9_backfills_task_items_with_exact_body_event_provenance() {
         .await
         .unwrap();
     sqlx::query(&format!(
-        "UPDATE {migrations} SET version=8 WHERE version=9"
+        "UPDATE {migrations} SET version=8 WHERE version=10"
     ))
     .execute(&mut *tx)
     .await
@@ -313,7 +313,7 @@ async fn v8_to_v9_backfills_task_items_with_exact_body_event_provenance() {
     database.close().await;
 
     let (migrated, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let rows: Vec<(i64, i64, String, bool, bool)> = sqlx::query_as(&format!(
         "SELECT item_index,source_event_seq,marker,checked,in_quote \
          FROM {items} WHERE record_id=$1 ORDER BY item_index"
@@ -353,8 +353,8 @@ async fn v8_to_v9_backfills_task_items_with_exact_body_event_provenance() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    // The first upgrade appended 9 beside the retained 8 row.
-    sqlx::query(&format!("DELETE FROM {migrations} WHERE version=9"))
+    // The first upgrade appended 9 and 10 beside the retained 8 row.
+    sqlx::query(&format!("DELETE FROM {migrations} WHERE version IN (9,10)"))
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -380,7 +380,7 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     let logical_database_id = format!("contract-search-v4-{}", uuid::Uuid::new_v4().simple());
     let config = runtime_config(&url, &logical_database_id);
     let (database, report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(report.schema_version, 9);
+    assert_eq!(report.schema_version, 10);
     let records = database.qualified_table("records").unwrap();
     let events = database.qualified_table("content_events").unwrap();
     let event_cursor = database.qualified_table("event_cursor").unwrap();
@@ -422,16 +422,35 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
         .contract_rewind_schema_v5_to_v4_for_test()
         .await
         .unwrap();
+    // The rewind restores the ten-type CHECK, so the v9-to-v10 edge below is
+    // what makes `Configuration` admissible.
+    let too_early = sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,name,policy_anchor_id,created_at,updated_at) VALUES('contract:v4-config-too-early','Configuration','record_view','Too early','native:root',transaction_timestamp(),transaction_timestamp())"
+    ))
+    .execute(database.pool())
+    .await;
+    assert!(too_early.is_err());
+    let vocabularies = database.qualified_table("vocabularies").unwrap();
+    let before: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {vocabularies} WHERE id='voc:kind:Configuration'"
+    ))
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        before, 0,
+        "a released v9 database has no Configuration vocabulary"
+    );
     database.close().await;
 
     let refusal = config.connect().await.unwrap_err().to_string();
     assert_eq!(
         refusal,
-        "Postgres logical database uses legacy schema v4; authoritative substrate v9 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
+        "Postgres logical database uses legacy schema v4; authoritative substrate v10 requires provision_and_connect exact v4-to-v5 migration or operator-controlled reprovisioning"
     );
 
     let (migrated, migrated_report) = config.provision_and_connect().await.unwrap();
-    assert_eq!(migrated_report.schema_version, 9);
+    assert_eq!(migrated_report.schema_version, 10);
     let survivor: bool = sqlx::query_scalar(&format!(
         "SELECT EXISTS(SELECT 1 FROM {records} WHERE id='contract:v4-search-survivor' AND body='migrationneedle')"
     ))
@@ -439,6 +458,43 @@ async fn main_era_v4_reopens_through_the_exact_v5_search_index_migration() {
     .await
     .unwrap();
     assert!(survivor);
+    // Fresh and upgraded databases end up with the same vocabularies.
+    let fresh_config = runtime_config(
+        &url,
+        &format!("contract-vocab-fresh-{}", uuid::Uuid::new_v4().simple()),
+    );
+    let (fresh, _) = fresh_config.provision_and_connect().await.unwrap();
+    let list = |db: &native_ce::postgres::PostgresDb| {
+        let table = db.qualified_table("vocabularies").unwrap();
+        let pool = db.pool().clone();
+        async move {
+            sqlx::query_as::<_, (String, String)>(&format!(
+                "SELECT id,name FROM {table} ORDER BY id"
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let migrated_vocabularies = list(&migrated).await;
+    assert_eq!(migrated_vocabularies, list(&fresh).await);
+    assert!(migrated_vocabularies
+        .iter()
+        .any(|(id, name)| id == "voc:kind:Configuration" && name == "kind:Configuration"));
+    fresh.close().await;
+    fresh_config.drop_owned().await.unwrap();
+    sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,name,policy_anchor_id,created_at,updated_at) VALUES('contract:v10-config','Configuration','record_view','Migrated configuration','native:root',transaction_timestamp(),transaction_timestamp())"
+    ))
+    .execute(migrated.pool())
+    .await
+    .unwrap();
+    let unknown_type = sqlx::query(&format!(
+        "INSERT INTO {records}(id,record_type,kind,name,policy_anchor_id,created_at,updated_at) VALUES('contract:v10-bogus','Bogus','x','Bogus','native:root',transaction_timestamp(),transaction_timestamp())"
+    ))
+    .execute(migrated.pool())
+    .await;
+    assert!(unknown_type.is_err());
     let index_exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(format!("{}.records_native_fts", migrated.schema()))
         .fetch_one(migrated.pool())
@@ -571,7 +627,7 @@ async fn provisioning_is_owned_idempotent_and_least_privilege() {
         Some("42501")
     );
 
-    assert_eq!(migration_version(&second).await.unwrap(), 9);
+    assert_eq!(migration_version(&second).await.unwrap(), 10);
     assert_eq!(
         current_search_path(&second).await.unwrap(),
         "\"$user\", public"

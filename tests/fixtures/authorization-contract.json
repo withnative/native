@@ -1303,6 +1303,54 @@
     },
     {
       "tool": "manage_messages",
+      "action": "mark_no_longer_relevant",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-reactions",
+      "expected_threshold": "local-message-viewer-own-mark",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/records/message_expectation.rs",
+        "test": "no_longer_relevant_mark_closes_any_expectation_for_recipient_or_sender",
+        "claim": "Authorized manage_messages.mark_no_longer_relevant succeeds at threshold local-message-viewer-own-mark."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/records/message_expectation.rs",
+        "test": "no_longer_relevant_mark_requires_message_view",
+        "claim": "manage_messages.mark_no_longer_relevant rejects a caller below local-message-viewer-own-mark and leaves its governed writes unchanged."
+      },
+      "rationale": "Marking records caller-owned evidence any message viewer may author; only recipient or sender authorship satisfies the expectation."
+    },
+    {
+      "tool": "manage_messages",
+      "action": "unmark_no_longer_relevant",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-reactions",
+      "expected_threshold": "local-message-viewer-own-mark",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/records/message_expectation.rs",
+        "test": "no_longer_relevant_mark_drops_and_restores_messages_awaiting_reply",
+        "claim": "Authorized manage_messages.unmark_no_longer_relevant succeeds at threshold local-message-viewer-own-mark."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/records/message_expectation.rs",
+        "test": "no_longer_relevant_mark_requires_message_view",
+        "claim": "manage_messages.unmark_no_longer_relevant rejects a caller below local-message-viewer-own-mark and leaves its governed writes unchanged."
+      },
+      "rationale": "Unmarking removes only the caller's own live mark links and reopens the expectation; it never touches another caller's marks."
+    },
+    {
+      "tool": "manage_messages",
       "action": "list_message_state",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -2515,6 +2563,30 @@
         "claim": "get_workspace_snapshot.catch_up restarts with no rows after a revoke instead of diffing from a stale pin."
       },
       "rationale": "Catch-up diffs the old pin against a fresh filtered view; fence moves and unheld indexes never yield old rows."
+    },
+    {
+      "tool": "get_workspace_snapshot",
+      "action": "resume",
+      "disposition": "caller_filtered_read",
+      "risk_tier": "high",
+      "fixture": "snapshot-visibility",
+      "expected_threshold": "caller-filtered",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_resume_reconciles_manifest_without_disclosure",
+        "claim": "Authorized get_workspace_snapshot.resume succeeds at threshold caller-filtered."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/authorization_tools.rs",
+        "test": "workspace_snapshot_resume_reconciles_manifest_without_disclosure",
+        "claim": "get_workspace_snapshot.resume resolves manifest keys outside the caller view to delete addresses, never rows; malformed manifests restart with no rows."
+      },
+      "rationale": "Resume reconciles untrusted manifest hints against the fresh caller-filtered view; every key outside the view becomes a delete, and all returned contents come from the current view."
     },
     {
       "tool": "manage_vocabularies",
@@ -4884,6 +4956,78 @@
       "rationale": "Messaging combines sealed audiences, exact human/agent authority, snapshot paging, and per-action mutations."
     },
     {
+      "tool": "manage_participants",
+      "action": "list",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "persona-owner",
+      "expected_threshold": "canonical-owner-person-and-view-of-each-owned-persona",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "manage_participants_list_is_owner_scoped_and_discloses_no_foreign_persona",
+        "claim": "Authorized manage_participants.list returns the owner's personas, active and retired, at threshold canonical-owner-person-and-view-of-each-owned-persona."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "manage_participants_list_is_owner_scoped_and_discloses_no_foreign_persona",
+        "claim": "manage_participants.list returns no persona to another person and refuses a caller with no canonical owner Person, without disclosing any persona."
+      },
+      "rationale": "Persona profiles have one immutable owner Person; registration, retirement and listing are owner-scoped and the profile stays private to its owner (no grants, no foreign disclosure)."
+    },
+    {
+      "tool": "manage_participants",
+      "action": "register_persona",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "persona-owner",
+      "expected_threshold": "canonical-owner-person-with-edit-on-home-or-manage-on-owner-only-profile",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "register_persona_requires_an_owner_person_and_home_edit_and_a_refusal_writes_nothing",
+        "claim": "Authorized manage_participants.register_persona creates an owner-only active persona at threshold canonical-owner-person-with-edit-on-home-or-manage-on-owner-only-profile."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "register_persona_requires_an_owner_person_and_home_edit_and_a_refusal_writes_nothing",
+        "claim": "manage_participants.register_persona rejects a home the caller cannot Edit, a caller with no canonical owner Person, and another person's profile, and leaves its governed writes unchanged."
+      },
+      "rationale": "Persona profiles have one immutable owner Person; registration, retirement and listing are owner-scoped and the profile stays private to its owner (no grants, no foreign disclosure)."
+    },
+    {
+      "tool": "manage_participants",
+      "action": "retire_persona",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "persona-owner",
+      "expected_threshold": "canonical-owner-person-with-manage-on-active-owned-persona",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "retire_persona_requires_owner_manage_of_an_active_persona_and_a_refusal_writes_nothing",
+        "claim": "Authorized manage_participants.retire_persona retires an active owned persona at threshold canonical-owner-person-with-manage-on-active-owned-persona."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/participants_tests.rs",
+        "test": "retire_persona_requires_owner_manage_of_an_active_persona_and_a_refusal_writes_nothing",
+        "claim": "manage_participants.retire_persona rejects another person (indistinguishably from a missing persona), a caller with no canonical owner Person, a non-persona record and an already-retired persona, and leaves its governed writes unchanged."
+      },
+      "rationale": "Persona profiles have one immutable owner Person; registration, retirement and listing are owner-scoped and the profile stays private to its owner (no grants, no foreign disclosure)."
+    },
+    {
       "tool": "save_account",
       "action": "$tool",
       "disposition": "specialized",
@@ -5026,6 +5170,102 @@
         "claim": "A caller below the scope-edit threshold cannot remove another scope's binding and leaves it intact."
       },
       "rationale": "Reset removes the caller's own scoped override; it never reaches a scope the caller cannot edit."
+    },
+    {
+      "tool": "manage_account_config",
+      "action": "inspect",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-account-config",
+      "expected_threshold": "canonical-account-own-mapping",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "two_accounts_first_commit_private_stray_ignored_and_hit_zero_effects",
+        "claim": "Canonical callers inspect only their own mapping; absent inspection writes nothing, stray rows are ignored, and a healthy receipt matches content and policy guard bytes."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "malformed_identity_payload_and_missing_registration_write_nothing",
+        "claim": "Non-canonical credentials and payload authority fields are refused with unchanged effects."
+      },
+      "rationale": "Engine-owned caller-account mapping, exact owner-only health predicate, atomic private provisioning and replay-first compare-and-set recovery; request fields never select an account."
+    },
+    {
+      "tool": "manage_account_config",
+      "action": "ensure",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-account-config",
+      "expected_threshold": "canonical-account-own-mapping-and-unfiled-edit",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "two_accounts_first_commit_private_stray_ignored_and_hit_zero_effects",
+        "claim": "Ensure creates a private account-scoped record with exact guard bytes, while a healthy hit preserves edited content and writes nothing."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "malformed_identity_payload_and_missing_registration_write_nothing",
+        "claim": "Missing registration, non-canonical identities, payload authority fields and malformed reasons are refused with unchanged effects."
+      },
+      "rationale": "Engine-owned caller-account mapping, exact owner-only health predicate, atomic private provisioning and replay-first compare-and-set recovery; request fields never select an account."
+    },
+    {
+      "tool": "manage_account_config",
+      "action": "replace",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "canonical-account-config",
+      "expected_threshold": "canonical-account-own-mapping-cas-and-supported-unusable-reason",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "replacement_cas_retry_old_unchanged_and_mapping_advanced",
+        "claim": "Replacement of the caller mapping creates a private new winner, leaves the old record unchanged, and retry preserves edited winner state with zero effects."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/account_config/tests.rs",
+        "test": "replacement_cas_retry_old_unchanged_and_mapping_advanced",
+        "claim": "Absent and healthy mappings, wrong expected ids, unusable replay winners and advanced mappings are refused; retry refusal leaves effects unchanged."
+      },
+      "rationale": "Engine-owned caller-account mapping, exact owner-only health predicate, atomic private provisioning and replay-first compare-and-set recovery; request fields never select an account."
+    },
+    {
+      "tool": "manage_alpha_tabs",
+      "action": "prepare_install",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "alpha-tab-install",
+      "expected_threshold": "view-artifact",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_prepare_install.rs",
+        "test": "prepare_install_authorization_requires_view_and_scopes_install_to_caller",
+        "claim": "A caller with View can prepare the artifact; current-install metadata addresses only that authenticated caller, including when two accounts install the same package."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/alpha_tabs_prepare_install.rs",
+        "test": "prepare_install_authorization_requires_view_and_scopes_install_to_caller",
+        "claim": "Without artifact View, preparation returns the same refusal as a missing artifact, without control events or acts; granting View exposes no other account install."
+      },
+      "rationale": "Preparation requires View on the live artifact and reads installs only under the authenticated caller account. It validates source pins without installation, consent, a receipt or any durable write."
     },
     {
       "tool": "manage_alpha_tabs",

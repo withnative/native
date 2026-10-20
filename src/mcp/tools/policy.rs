@@ -212,7 +212,7 @@ fn capability_name(capability: Capability) -> &'static str {
     }
 }
 
-async fn policy_snapshot(
+pub(super) async fn policy_snapshot(
     tx: &mut Transaction<'static, Sqlite>,
     record_id: &str,
 ) -> Result<PolicySnapshot> {
@@ -586,6 +586,35 @@ fn assert_revision(snapshot: &PolicySnapshot, expected: Option<&str>) -> Result<
     if expected.is_some_and(|expected| expected != snapshot.revision) {
         return Err(Error::engine(format!(
             "{TOOL}: policy revision conflict; list the policy and retry"
+        )));
+    }
+    Ok(())
+}
+
+/// Content writes compare the same opaque token returned by policy `list`,
+/// inside their own write transaction. Content timestamps do not version
+/// policy changes; the two preconditions are deliberately independent.
+pub(crate) async fn assert_write_policy_revision_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    record_id: &str,
+    expected: Option<&str>,
+    tool: &str,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.trim().is_empty() {
+        return Err(Error::engine(format!(
+            "{tool}: 'if_policy_revision' must be a non-empty opaque policy revision"
+        )));
+    }
+    // List follows a derived record to its authorization bearer. Match that
+    // exact revision domain rather than inventing a token for the derived row.
+    let bearer = crate::authorization::authorization_target_on(tx, record_id).await?;
+    let current = policy_snapshot(tx, &bearer).await?;
+    if expected != current.revision {
+        return Err(Error::conflict(format!(
+            "{tool}: policy revision conflict; list the policy and retry"
         )));
     }
     Ok(())

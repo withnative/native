@@ -466,7 +466,7 @@ async fn read_canvas(db: Db, caller: Caller, mut arguments: Value) -> Result<Val
             let Some(selector) = as_of else {
                 return get_scene(&db, None, &caller, &canvas_id, include_deleted, None).await;
             };
-            let resolved = lens::resolve_as_of(&db, selector).await?;
+            let resolved = lens::resolve_as_of_for(&db, caller.counter_footing(), selector).await?;
             let scratch = crate::db::open_database(":memory:").await?;
             let result = async {
                 crate::db::apply_schema(&scratch).await?;
@@ -480,7 +480,7 @@ async fn read_canvas(db: Db, caller: Caller, mut arguments: Value) -> Result<Val
                     Some(resolved.resolved_content_seq),
                 )
                 .await?;
-                lens::echo_temporal(&mut output, &resolved);
+                lens::echo_temporal(&mut output, &resolved, caller.counter_footing());
                 Ok(output)
             }
             .await;

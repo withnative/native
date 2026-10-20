@@ -38,9 +38,11 @@ pub mod meta;
 
 mod artifact;
 mod attribution;
+mod body_deferral;
 mod freshness;
 mod intervention;
 mod messaging;
+mod persona;
 
 use artifact::{
     project_artifact_input_bound, project_artifact_input_carried, project_artifact_input_unbound,
@@ -52,6 +54,7 @@ use attribution::{
     project_attribution_asserted, project_attribution_evidence_added,
     project_attribution_retracted, project_attribution_target_bound,
 };
+pub(crate) use body_deferral::BodyDeferrals;
 use freshness::{
     project_occurrence_bound, project_receipt_committed_aggregate,
     project_receipt_dependency_audited, project_reconciliation_recorded, project_unit_created,
@@ -421,6 +424,19 @@ pub async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()
     project_intent(conn, event, &intent).await
 }
 
+/// [`project`], recording body derivations in `defer` instead of running them.
+/// Only a private scratch fold that flushes `defer` before exposing its
+/// database may call this; see [`BodyDeferrals`].
+async fn project_deferred(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    defer: &mut BodyDeferrals,
+) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
+    let intent = ProjectorIntent::from_event(event)?;
+    project_intent_with(conn, event, &intent, Some(defer)).await
+}
+
 /// Apply an intent already parsed by the append boundary. Replay calls
 /// [`project`] and therefore performs the same parse exactly once.
 pub(crate) async fn project_intent(
@@ -428,20 +444,153 @@ pub(crate) async fn project_intent(
     event: &EventRow,
     intent: &ProjectorIntent,
 ) -> Result<()> {
+    project_intent_with(conn, event, intent, None).await
+}
+
+async fn project_intent_with(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    intent: &ProjectorIntent,
+    defer: Option<&mut BodyDeferrals>,
+) -> Result<()> {
     crate::db::enrolled::require_content_connection(conn, None).await?;
     if !matches!(intent, ProjectorIntent::Extended { .. }) {
-        return project_canonical_intent(conn, event, intent).await;
+        return project_canonical_intent(conn, event, intent, defer).await;
     }
+    project_extended(conn, event, intent, defer).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if event.event_type.starts_with("kernel.") {
+        crate::kernel::v1_state::validate_native_event(conn, event).await?;
+        crate::kernel::record_metadata::touch_event(conn, event).await?;
+    }
+    Ok(())
+}
+
+async fn project_extended(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    intent: &ProjectorIntent,
+    defer: Option<&mut BodyDeferrals>,
+) -> Result<()> {
     match intent.event_type() {
         "annotation.target.set" => project_annotation_target_set(conn, event).await,
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         crate::events::KERNEL_GENESIS_EVENT => project_kernel_root_created(conn, event).await,
+        #[cfg(test)]
+        "kernel.record_rebound.v1" => {
+            crate::kernel::project_kernel_record_rebound(conn, event, false).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.generic_link_note_updated.v1"
+        | "kernel.generic_link_note_imported.v1"
+        | "kernel.generic_link_added.v1"
+        | "kernel.generic_link_imported.v1"
+        | "kernel.generic_link_removed.v1"
+        | "kernel.generic_link_removal_imported.v1" => {
+            crate::kernel::generic_links::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.message_destination_imported.v1" | "kernel.message_destination_set.v1" => {
+            crate::kernel::messaging::project_destination(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.message_command_committed.v1" => {
+            crate::kernel::messaging::project_command(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.persona_registered.v1" | "kernel.persona_retired.v1" => {
+            crate::kernel::messaging::project_persona(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.message_created.v1" | "kernel.message_state.v1" => {
+            crate::kernel::messaging::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.comment_anchor_set.v1" | "kernel.comment_anchor_imported.v1" => {
+            crate::kernel::comments_v2::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.app_state_imported.v1" => crate::kernel::app_state::project(conn, event).await,
+
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.app_installs_activated.v1"
+        | "kernel.app_install_removed.v1"
+        | "kernel.app_install_recorded.v1"
+        | "kernel.app_install_adopted.v1"
+        | "kernel.app_action_started.v1"
+        | "kernel.app_action_recorded.v1" => {
+            crate::kernel::app_installs::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_deleted.v1" => crate::kernel::deletion::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.v1_state_imported.v1" => crate::kernel::v1_state::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.metadata_set.v1" => crate::kernel::record_metadata::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.workspace_metadata_imported.v1" => {
+            crate::kernel::workspace_metadata::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.attachment_bound.v1" => crate::kernel::blobs::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.hosted_offboarding.v1"
+        | "kernel.hosted_membership.v1"
+        | "kernel.import_member_policy.v1"
+        | "kernel.import_hosted_accounts.v1" => {
+            crate::kernel::hosted_identity::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.host_import_created.v1"
+        | "kernel.legacy_recorded.v1"
+        | "kernel.import_state.v1"
+        | "kernel.import_state_delta.v1"
+        | "kernel.import_removed.v1"
+        | "kernel.import_source_head.v1"
+        | "kernel.import_receipt.v1"
+        | "kernel.body_set.v1"
+        | "kernel.facet_observed.v1"
+        | "kernel.archive_changed.v1"
+        | "kernel.import_home.v1"
+        | "kernel.import_home_delta.v1"
+        | "kernel.import_home_policy.v1"
+        | "kernel.import_members_roster.v1"
+        | "kernel.import_record_created.v1"
+        | "kernel.link_removed.v1" => crate::kernel::hq::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.instruction_binding_imported.v1" | "kernel.instruction_binding_updated.v1" => {
+            crate::kernel::instruction_bindings::project(conn, event).await
+        }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.record_created.v1" => {
             crate::kernel::project_kernel_record_created(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
-        "kernel.link_added.v1" => crate::kernel::project_kernel_link_added(conn, event).await,
+        "kernel.link_added.v1" => {
+            crate::kernel::admit_link_event(conn, event).await?;
+            crate::kernel::project_kernel_link_added(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.provider_outcome.v1" => {
+            crate::kernel::project_provider_outcome(conn, event, false).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.link_added.v2" => {
+            crate::kernel::check_link4_projection_authority(conn, event).await?;
+            crate::kernel::project_link4_added(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.host_transform_created.v1" => {
+            crate::kernel::project_host_transform_created(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.run_opened.v1" | "kernel.run_closed.v1" | "kernel.run_intent_set.v1" => {
+            crate::kernel::run_ledger::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.slot_provisioned.v1" | "kernel.slot_replaced.v1" | "kernel.home_created_for.v1" => {
+            crate::kernel::slots::project(conn, event).await
+        }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.principal_created.v1" => {
             crate::kernel::project_kernel_principal_created(conn, event).await
@@ -461,6 +610,8 @@ pub(crate) async fn project_intent(
             crate::kernel::project_kernel_record_rehomed(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.record_rehomed.v2" => crate::kernel::project_kernel_record_moved(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.definition_adopted.v1" => {
             crate::kernel::project_kernel_definition_adopted(conn, event).await
         }
@@ -469,7 +620,7 @@ pub(crate) async fn project_intent(
             crate::kernel::project_kernel_package_adopted(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
-        "kernel.record_revised.v1" => {
+        "kernel.record_revised.v1" | "kernel.record_revised.v2" => {
             crate::kernel::project_kernel_record_revised(conn, event).await
         }
         "annotation.target.removed" => project_annotation_target_removed(conn, event).await,
@@ -480,6 +631,9 @@ pub(crate) async fn project_intent(
         crate::canvas::CANVAS_BATCH_EVENT_TYPE => {
             crate::canvas::project_batch_committed(conn, event).await
         }
+        "persona.registered.v1" => persona::project_persona_registered(conn, event).await,
+        "persona.retired.v1" => persona::project_persona_retired(conn, event).await,
+        "message.speaker.declared.v1" => persona::project_message_speaker(conn, event).await,
         "message.audience.declared" => project_message_audience_declared(conn, event).await,
         "message.audience.legacy_unknown" => {
             project_message_audience_legacy_unknown(conn, event).await
@@ -523,9 +677,9 @@ pub(crate) async fn project_intent(
         "artifact.module_grant_carried" => project_artifact_module_grant_carried(conn, event).await,
         "artifact.module_grant_unset" => project_artifact_module_grant_unset(conn, event).await,
         "unit.created.v1" => project_unit_created(conn, event).await,
-        "unit.revision.recorded.v1" => project_unit_revision_recorded(conn, event).await,
+        "unit.revision.recorded.v1" => project_unit_revision_recorded(conn, event, defer).await,
         "occurrence.bound.v1" => project_occurrence_bound(conn, event).await,
-        "receipt.committed.v1" => project_receipt_committed_aggregate(conn, event).await,
+        "receipt.committed.v1" => project_receipt_committed_aggregate(conn, event, defer).await,
         "reconciliation.recorded.v1" => project_reconciliation_recorded(conn, event).await,
         "unit.superseded.v1" => project_unit_superseded(conn, event).await,
         "receipt.dependency_audited.v1" => project_receipt_dependency_audited(conn, event).await,
@@ -691,14 +845,33 @@ pub async fn replay_with_blob_seeds(
     events: &[EventRow],
     hydrate_annotation_id: Option<&str>,
 ) -> Result<()> {
-    replay_with_blob_source(Some(live.write_pool()), conn, events, hydrate_annotation_id).await
+    replay_with_blob_source(
+        Some(live.write_pool()),
+        conn,
+        events,
+        hydrate_annotation_id,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn replay_with_blob_placeholders(
     conn: &mut SqliteConnection,
     events: &[EventRow],
 ) -> Result<()> {
-    replay_with_blob_source(None, conn, events, None).await
+    replay_with_blob_source(None, conn, events, None, None).await
+}
+
+/// [`replay_with_blob_placeholders`] for a private scratch fold that defers
+/// body derivations into `defer`. The caller owns the transaction and MUST
+/// flush `defer` before exposing the database: until then the four
+/// body-derived tables are incomplete. See [`BodyDeferrals`].
+pub(crate) async fn replay_with_blob_placeholders_deferred(
+    conn: &mut SqliteConnection,
+    events: &[EventRow],
+    defer: &mut BodyDeferrals,
+) -> Result<()> {
+    replay_with_blob_source(None, conn, events, None, Some(defer)).await
 }
 
 async fn replay_with_blob_source(
@@ -706,6 +879,7 @@ async fn replay_with_blob_source(
     conn: &mut SqliteConnection,
     events: &[EventRow],
     hydrate_annotation_id: Option<&str>,
+    mut defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     crate::db::enrolled::require_content_connection(conn, None).await?;
     let mut blob_ids = BTreeMap::<String, bool>::new();
@@ -803,7 +977,10 @@ async fn replay_with_blob_source(
             .execute(&mut *conn)
             .await?;
         }
-        project(conn, event).await?;
+        match defer.as_deref_mut() {
+            Some(defer) => project_deferred(conn, event, defer).await?,
+            None => project(conn, event).await?,
+        }
     }
     let last_legacy_local_seq: i64 = events
         .iter()
@@ -830,18 +1007,20 @@ async fn project_canonical_intent(
     conn: &mut SqliteConnection,
     event: &EventRow,
     intent: &ProjectorIntent,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     let plan = {
         let mut state = SqliteSemanticState { conn };
         crate::domain_transaction::plan_projection(&mut state, event, intent).await?
     };
-    apply_projection_plan(conn, event, plan).await
+    apply_projection_plan(conn, event, plan, defer).await
 }
 
 async fn apply_projection_plan(
     conn: &mut SqliteConnection,
     event: &EventRow,
     plan: ProjectionPlan,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     match plan {
         ProjectionPlan::RecordCreated {
@@ -857,17 +1036,18 @@ async fn apply_projection_plan(
                 &kind,
                 &policy_anchor_id,
                 message_mentions,
+                defer,
             )
             .await
         }
         ProjectionPlan::RecordUpdated {
             fields,
             refresh_policy_anchor,
-        } => apply_record_updated(conn, event, &fields, refresh_policy_anchor).await,
+        } => apply_record_updated(conn, event, &fields, refresh_policy_anchor, defer).await,
         ProjectionPlan::RecordTypeCorrected { record_type, kind } => {
             apply_record_type_corrected(conn, event, &record_type, &kind).await
         }
-        ProjectionPlan::RecordDeleted => apply_record_deleted(conn, event).await,
+        ProjectionPlan::RecordDeleted => apply_record_deleted(conn, event, defer).await,
         ProjectionPlan::FacetSet {
             payload,
             spine,
@@ -894,6 +1074,7 @@ async fn apply_record_type_corrected(
     record_type: &str,
     kind: &str,
 ) -> Result<()> {
+    crate::persona::require_unregistered(conn, &event.record_id, "correct_record_type").await?;
     let updated_at = next_record_updated_at(conn, &event.record_id, &event.created_at).await?;
     sqlx::query("UPDATE records SET type=?, kind=?, updated_at=?, last_activity_at=? WHERE id=?")
         .bind(record_type)
@@ -962,6 +1143,7 @@ async fn apply_record_created(
     kind: &str,
     policy_anchor_id: &str,
     message_mentions: Option<Vec<crate::domain_transaction::MessageMention>>,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
     let ts = event.created_at.as_str();
     let mut args = SqliteArguments::default();
@@ -1046,8 +1228,11 @@ async fn apply_record_created(
     }
     let body_value = fields.get("body");
     let body_text = body_value.and_then(crate::record_body::coerce_body);
-    crate::body_blocks_projection::replace_sqlite(
+    // Blocks, mentions, task rows and record-body nodes all fold the same
+    // coerced stored text — creation stores the body's extraction, if any.
+    body_deferral::replace_body_derivations(
         conn,
+        defer,
         &event.record_id,
         event.local_seq,
         body_text.as_deref(),
@@ -1055,24 +1240,7 @@ async fn apply_record_created(
             .map(crate::body_blocks_projection::body_format)
             .unwrap_or(crate::body_blocks::BodyFormat::Markdown),
     )
-    .await?;
-    replace_record_mentions(
-        conn,
-        &event.record_id,
-        event.local_seq,
-        fields.get("body").and_then(crate::record_body::coerce_body),
-    )
-    .await?;
-    // E3 M3 increment 2A: body-task rows fold with the same body the mention
-    // rows scan — creation stores the body's extraction, if any.
-    replace_body_task_items(
-        conn,
-        &event.record_id,
-        event.local_seq,
-        fields.get("body").and_then(crate::record_body::coerce_body),
-    )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Replace the current-state body-mention rows for one record (plan a9392df
@@ -1190,9 +1358,13 @@ async fn replace_body_task_items(
     Ok(())
 }
 
-async fn project_record_updated(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+async fn project_record_updated(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    defer: Option<&mut BodyDeferrals>,
+) -> Result<()> {
     let intent = ProjectorIntent::from_event(event)?;
-    project_canonical_intent(conn, event, &intent).await
+    project_canonical_intent(conn, event, &intent, defer).await
 }
 
 async fn apply_record_updated(
@@ -1200,7 +1372,30 @@ async fn apply_record_updated(
     event: &EventRow,
     fields: &[RecordFieldUpdate],
     refresh_policy_anchor: bool,
+    defer: Option<&mut BodyDeferrals>,
 ) -> Result<()> {
+    if crate::persona::registered(conn, &event.record_id).await? {
+        let row = sqlx::query("SELECT owner_id, kind, home_id FROM records WHERE id=?")
+            .bind(&event.record_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        for field in fields {
+            let column = match field {
+                RecordFieldUpdate::OwnerId(_) => Some("owner_id"),
+                RecordFieldUpdate::Kind(_) => Some("kind"),
+                RecordFieldUpdate::HomeId(_) => Some("home_id"),
+                _ => None,
+            };
+            if let Some(column) = column {
+                let current: Option<String> = row.try_get(column)?;
+                if field.write().value != &current.map(Value::String).unwrap_or(Value::Null) {
+                    return Err(Error::engine(
+                        "registered persona owner, kind and placement are locked",
+                    ));
+                }
+            }
+        }
+    }
     let updated_at = next_record_updated_at(conn, &event.record_id, &event.created_at).await?;
     // Name only the columns this event actually carries. The previous form
     // wrote every column as `CASE WHEN ? THEN ? ELSE col END`, which is
@@ -1242,29 +1437,18 @@ async fn apply_record_updated(
         _ => None,
     }) {
         let body_text = crate::record_body::coerce_body(body);
-        crate::body_blocks_projection::replace_sqlite(
+        // The same four derivations as creation, so removal yields no rows. An
+        // update naming no body leaves both the rows and their provenance
+        // untouched. Record-body nodes follow the carried body too, including
+        // an explicit null or a non-string JSON value the column stores as
+        // text.
+        body_deferral::replace_body_derivations(
             conn,
+            defer,
             &event.record_id,
             event.local_seq,
             body_text.as_deref(),
             crate::body_blocks_projection::body_format(body),
-        )
-        .await?;
-        replace_record_mentions(
-            conn,
-            &event.record_id,
-            event.local_seq,
-            crate::record_body::coerce_body(body),
-        )
-        .await?;
-        // E3 M3 increment 2A: a carried body re-scans task rows exactly as
-        // creation does, so removal yields no rows. An update naming no body
-        // leaves both the rows and their provenance untouched.
-        replace_body_task_items(
-            conn,
-            &event.record_id,
-            event.local_seq,
-            crate::record_body::coerce_body(body),
         )
         .await?;
     }
@@ -1274,7 +1458,12 @@ async fn apply_record_updated(
     Ok(())
 }
 
-async fn apply_record_deleted(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+async fn apply_record_deleted(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    defer: Option<&mut BodyDeferrals>,
+) -> Result<()> {
+    crate::persona::require_unregistered(conn, &event.record_id, "delete_record").await?;
     let updated_at = next_record_updated_at(conn, &event.record_id, &event.created_at).await?;
     sqlx::query(
         "UPDATE records SET deleted_at = ?, updated_at = ?, last_activity_at = ? WHERE id = ?",
@@ -1294,7 +1483,7 @@ async fn apply_record_deleted(conn: &mut SqliteConnection, event: &EventRow) -> 
     // Delete the source's rows explicitly: a deleted record has no current
     // body and the backfill excludes it, so any retained row would be a
     // replay divergence.
-    replace_record_mentions(conn, &event.record_id, event.local_seq, None).await?;
+    body_deferral::clear_record_mentions(conn, defer, &event.record_id, event.local_seq).await?;
     // E3 M3 increment 2A: unlike mentions, a tombstone keeps the record's
     // body-task rows. A deletion carries no body, so there is nothing to
     // re-scan, and the caller-visible view excludes deleted records; keeping
@@ -1332,6 +1521,8 @@ async fn apply_facet_set(
                 "UPDATE records SET lifecycle=?, updated_at=?, last_activity_at=? WHERE id=?"
             }
             SpineFacet::Owner => {
+                crate::persona::require_unregistered(conn, &event.record_id, "facet.set owner")
+                    .await?;
                 "UPDATE records SET owner_id=?, updated_at=?, last_activity_at=? WHERE id=?"
             }
             SpineFacet::Persistence => {
@@ -1414,6 +1605,27 @@ async fn apply_facet_set(
     .bind(&event.created_at)
     .bind(event.local_seq)
     .execute(&mut *conn)
+    .await?;
+    // The observation changed, so its JSON occurrence projection must be
+    // replaced in the same transaction. Only object/array roots produce
+    // nodes; anything else leaves the observation with no nodes and never
+    // refuses the write. Read the row's actual id rather than assuming the
+    // computed `fo:` form: the upsert keeps a pre-existing row's id on
+    // conflict, so nodes must key to the id that exists.
+    let observation_id: String = sqlx::query_scalar(
+        "SELECT id FROM facet_observations WHERE record_id=? AND key=? AND as_of=?",
+    )
+    .bind(&event.record_id)
+    .bind(&payload.key)
+    .bind(as_of)
+    .fetch_one(&mut *conn)
+    .await?;
+    crate::facet_value_json_nodes::replace_into(
+        conn,
+        crate::facet_value_json_nodes::NodeTarget::FacetObservation,
+        &observation_id,
+        payload.value.as_deref(),
+    )
     .await?;
     touch(conn, &event.record_id, &event.created_at).await
 }
@@ -1617,6 +1829,8 @@ async fn apply_facet_unset(
                 "UPDATE records SET lifecycle=NULL, updated_at=?, last_activity_at=? WHERE id=?"
             }
             SpineFacet::Owner => {
+                crate::persona::require_unregistered(conn, &event.record_id, "facet.unset owner")
+                    .await?;
                 "UPDATE records SET owner_id=NULL, updated_at=?, last_activity_at=? WHERE id=?"
             }
             SpineFacet::Persistence => unreachable!("shared planner rejects persistence unset"),
@@ -1667,6 +1881,24 @@ async fn apply_facet_unset(
     .bind(&event.created_at)
     .bind(event.local_seq)
     .execute(&mut *conn)
+    .await?;
+    // An unset observation carries no value, so it carries no nodes. It can
+    // still replace a prior set observation on `(record_id, key, as_of)`
+    // conflict, so clear by the row's actual id, as in `apply_facet_set`.
+    let observation_id: String = sqlx::query_scalar(
+        "SELECT id FROM facet_observations WHERE record_id=? AND key=? AND as_of=?",
+    )
+    .bind(&event.record_id)
+    .bind(&payload.key)
+    .bind(as_of)
+    .fetch_one(&mut *conn)
+    .await?;
+    crate::facet_value_json_nodes::replace_into(
+        conn,
+        crate::facet_value_json_nodes::NodeTarget::FacetObservation,
+        &observation_id,
+        None,
+    )
     .await?;
     touch(conn, &event.record_id, &event.created_at).await
 }
@@ -2009,4 +2241,142 @@ mod facet_value_json_node_id_tests {
                 .unwrap();
         assert_eq!(computed, 0);
     }
+}
+
+#[cfg(test)]
+mod record_body_json_node_tests {
+    use crate::store::{create_record, delete_record, update_record};
+    use serde_json::json;
+
+    async fn nodes(db: &crate::Db, id: &str) -> Vec<(i64, String, String)> {
+        sqlx::query_as(
+            "SELECT ordinal,path,node_type FROM record_body_json_nodes WHERE record_id=? ORDER BY ordinal",
+        )
+        .bind(id)
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_projects_object_and_updates_replace_or_clear() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record(
+            &db,
+            json!({"type": "Document", "kind": "note", "body": {"a": 1}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            nodes(&db, &id).await,
+            vec![
+                (0, "".into(), "object".into()),
+                (1, "/a".into(), "number".into())
+            ]
+        );
+        // Array body replaces the object nodes; receipt commits funnel
+        // through this same `record.updated` path (freshness.rs synthesizes
+        // `record.updated`), so no duplicate hook is maintained there.
+        update_record(&db, &id, json!({"body": [1, 2]}))
+            .await
+            .unwrap();
+        assert_eq!(
+            nodes(&db, &id).await,
+            vec![
+                (0, "".into(), "array".into()),
+                (1, "/0".into(), "number".into()),
+                (2, "/1".into(), "number".into())
+            ]
+        );
+        // Each cleanup case reseeds a valid object first, so every case
+        // proves removal of stale nodes rather than absence of nodes.
+        let oversize = format!(
+            "{{\"a\":\"{}\"}}",
+            "x".repeat(crate::json_nodes::MAX_JSON_SOURCE_BYTES)
+        );
+        for body in [
+            json!("5"),
+            json!("plain text"),
+            json!("{oops"),
+            json!(null),
+            json!(oversize),
+        ] {
+            update_record(&db, &id, json!({"body": {"seed": [1]}}))
+                .await
+                .unwrap();
+            assert_eq!(nodes(&db, &id).await.len(), 3);
+            update_record(&db, &id, json!({"body": body}))
+                .await
+                .unwrap();
+            assert_eq!(nodes(&db, &id).await, Vec::new(), "{body}");
+        }
+        // An update carrying no body leaves the nodes untouched.
+        update_record(&db, &id, json!({"body": {"b": true}}))
+            .await
+            .unwrap();
+        update_record(&db, &id, json!({"name": "renamed"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            nodes(&db, &id).await,
+            vec![
+                (0, "".into(), "object".into()),
+                (1, "/b".into(), "boolean".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_keeps_nodes_physically_and_replay_converges() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record(
+            &db,
+            json!({"type": "Document", "kind": "note", "body": {"t": 1}}),
+        )
+        .await
+        .unwrap();
+        delete_record(&db, &id).await.unwrap();
+        assert_eq!(
+            nodes(&db, &id).await,
+            vec![
+                (0, "".into(), "object".into()),
+                (1, "/t".into(), "number".into())
+            ]
+        );
+        let diff = crate::conformance::rebuild_and_diff(&db).await.unwrap();
+        assert!(diff.equal);
+    }
+}
+
+/// Explicit gated retained-event fold. Ordinary projector entry points check
+/// current endpoint authority; kernel replay checks the recorded witness at
+/// its historical boundary without repeating live admission.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn replay_kernel_link4(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
+    let _ = ProjectorIntent::from_event(event)?;
+    if event.event_type != "kernel.link_added.v2" {
+        return Err(crate::error::Error::engine(
+            "invalid retained link dispatch",
+        ));
+    }
+    crate::kernel::project_link4_added(conn, event).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn replay_kernel_provider(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
+    let _ = ProjectorIntent::from_event(event)?;
+    if event.event_type != "kernel.provider_outcome.v1" {
+        return Err(crate::error::Error::engine(
+            "invalid retained provider dispatch",
+        ));
+    }
+    crate::kernel::project_provider_outcome(conn, event, true).await
 }

@@ -14,9 +14,9 @@ contracts.
 
 ## Canonical rules
 
-- The manifest format is `native.canonical-interchange.v1`, revision `5`, and
+- The manifest format is `native.canonical-interchange.v1`, revision `8`, and
   the section format is `native.canonical-interchange.section.v1`, revision
-  `5`. Revision 1 engine-45 inputs remain readable: import classifies every
+  `8`. Revision 1 engine-45 inputs remain readable: import classifies every
   legacy content event as `legacy_unknown`, records the engine-45 cutover, and
   never fabricates frontier edges. Revision 2 inputs remain readable: import
   leaves every revision-2 event unstamped (`act` NULL, grouping unknown),
@@ -31,8 +31,14 @@ contracts.
   their ordered names select the upgrade path. Revision 4 inputs remain
   readable: both `external_observations` and `awareness_command_intents`
   sections gain a trailing NULL `act` cell per row (grouping unknown, never
-  fabricated), the source revision stays `4`, and only revision-5 documents
-  are exhaustive for native deltas. A revision-5 manifest may carry
+  fabricated), the source revision stays `4`, and only revision-8 documents
+  are exhaustive for current native deltas. Revision 5 inputs gain empty
+  `personas` and `message_speakers` sections without changing existing data.
+  Revision 6 inputs gain an empty `account_configs` section; its frozen
+  inventory stays readable, without changing older section data. Revision 7 inputs
+  gain an empty `sql_write_receipts` section, retaining their original history
+  revision and every older section.
+  A revision-8 manifest may carry
   `source_history_revision` to preserve this original-history classification
   across re-export; absence means unknown rather than exhaustive.
 - The logical contract is `native.logical.v1`. Implementations reject unknown
@@ -52,6 +58,15 @@ contracts.
   `content_sha256` is SHA-256 over the compact canonical JSON section array.
 - Exports containing profile-specific embeddings or external blob references
   are rejected because those values are not self-contained logical data.
+
+Engines 81 and 82 retain the revision-5 logical contract; engine82’s facet-value JSON nodes are rebuilt locally and are not a section. Engine83 introduces the persona/speaker sections at revision6. The 82→83 physical migration advances only an exact revision-5 Native history stamp to6 because these new sections fold from existing content history. Unstamped and other markers remain unchanged.
+
+Schema89 introduces canonical account-config mappings at interchange revision7. The 88→89 physical migration advances only an exact revision6 Native history stamp to7: no prior writer could emit the new control identities, so the new projection is empty. Unknown and older source-history stamps remain unchanged. The internal projection is caller-bound in member copies and is absent from the public SQL query catalog.
+
+Schema90 introduces immutable SQL batch receipts at interchange revision8. The
+89→90 physical migration advances only an exact revision7 Native history stamp
+to8. Unknown and older stamps remain unchanged. Receipts retain original batch
+intent and output identities without altering semantic event payloads.
 
 ## Import safety
 
@@ -76,7 +91,7 @@ or a lossless full-database migration.
 
 ## Section inventory
 
-Revision 5 contains exactly these sections, in this order:
+Revision 6 contains exactly these sections, in this order:
 
 ```text
 content_events
@@ -104,6 +119,7 @@ provenance_action_attestations
 provenance_action_events
 provenance_attestation_validity_events
 provenance_action_outputs
+provenance_action_app_attributions
 webhook_endpoints
 webhook_credentials
 webhook_deliveries
@@ -120,6 +136,8 @@ message_audience_state
 message_audiences
 message_origin_state
 message_origin_principals
+personas
+message_speakers
 message_conversations
 awareness_command_intents
 human_message_awareness
@@ -178,8 +196,16 @@ member_obligation_progress
 seeded_instruction_sources
 control_event_applications
 storage_portability_policy
+account_configs
+sql_write_receipts
 ```
 
 Revision 4 removed the read log from the portable surface: a person's reads
 are receiver-local surveillance state, not shared workspace history. Revision
 5 retains that boundary while adding derivation history and act coordinates.
+
+Engine 84 adds `provenance_action_app_attributions` to revision 6: one row per
+action attestation that a v2 app's call issued, naming the app's package,
+version and install event. No earlier engine could populate it, so an export
+from engine 83 or older, or from any older wire revision, imports with the
+section empty.

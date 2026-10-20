@@ -477,14 +477,11 @@ async fn exact_source_definition_before(
     source_sha256: &str,
     upper_exclusive: Option<i64>,
 ) -> Result<RecipeDefinition> {
-    let row = sqlx::query(
-        "SELECT id,record_id,type,seq,json_type(payload,'$.body') AS body_type,
-                json_extract(payload,'$.body') AS body
-           FROM content_events
-          WHERE id=?",
+    let row = crate::record_body::pinned::exact_source_on(
+        &mut *conn,
+        source_event_id,
+        crate::record_body::pinned::ExactSourcePolicy::AnyEvent,
     )
-    .bind(source_event_id)
-    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| Error::engine("recipe source event does not exist"))?;
     let actual_event_id: String = row.try_get("id")?;
@@ -511,37 +508,13 @@ async fn exact_source_definition_before(
             ));
         }
     }
-    let intervening: i64 = match upper_exclusive {
-        Some(upper) => {
-            sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM content_events
-                     WHERE record_id=? AND seq>? AND seq<?
-                       AND type IN ('record.created','record.updated','receipt.committed.v1')
-                       AND json_type(payload,'$.body') IS NOT NULL
-                 )",
-            )
-            .bind(program_id)
-            .bind(source_seq)
-            .bind(upper)
-            .fetch_one(&mut *conn)
-            .await?
-        }
-        None => {
-            sqlx::query_scalar(
-                "SELECT EXISTS(
-                    SELECT 1 FROM content_events
-                     WHERE record_id=? AND seq>?
-                       AND type IN ('record.created','record.updated','receipt.committed.v1')
-                       AND json_type(payload,'$.body') IS NOT NULL
-                 )",
-            )
-            .bind(program_id)
-            .bind(source_seq)
-            .fetch_one(&mut *conn)
-            .await?
-        }
-    };
+    let intervening = crate::record_body::pinned::has_intervening_source_on(
+        &mut *conn,
+        program_id,
+        source_seq,
+        upper_exclusive,
+    )
+    .await?;
     if intervening != 0 {
         return Err(Error::engine(
             "recipe source event changed since publication preflight",
@@ -1326,6 +1299,173 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match"));
+    }
+
+    #[tokio::test]
+    async fn pinned_recipe_source_preserves_duplicates_horizon_and_identity() {
+        let (db, id, _, source_sha, expected) = fixture().await;
+        let body = canonical_recipe_definition(&expected).unwrap();
+        let duplicate = format!(
+            r#"{{"body":{},"body":"invalid replacement"}}"#,
+            serde_json::to_string(&body).unwrap()
+        );
+        let source_event = "duplicate-source";
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'complete')")
+            .bind(source_event).bind(&id).bind(duplicate)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let mut tx = begin_write(db.write_pool()).await.unwrap();
+        let seq: i64 = sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+            .bind(source_event)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, Some(seq + 1))
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, Some(seq))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("must precede")
+        );
+        assert!(exact_source_definition_before(
+            &mut tx,
+            "other-program",
+            source_event,
+            &source_sha,
+            None
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not an exact body event"));
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES ('equal-body',?,'receipt.committed.v1',?,1,'complete')")
+            .bind(&id).bind(json!({"body": body}).to_string()).execute(&mut *tx).await.unwrap();
+        let equal_seq: i64 =
+            sqlx::query_scalar("SELECT seq FROM content_events WHERE id='equal-body'")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(
+            exact_source_definition_before(
+                &mut tx,
+                &id,
+                source_event,
+                &source_sha,
+                Some(equal_seq)
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        assert!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed since publication preflight")
+        );
+        let source_event = "equal-body";
+        // Metadata is not a body writer. A later clear is, even though it
+        // cannot itself provide a valid definition. The exclusive horizon
+        // ignores that clear for old replay; present-day preflight refuses.
+        for (event, payload) in [("metadata", "{}"), ("clear", r#"{"body":null}"#)] {
+            sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'complete')")
+                .bind(event).bind(&id).bind(payload).execute(&mut *tx).await.unwrap();
+        }
+        let clear_seq: i64 = sqlx::query_scalar("SELECT seq FROM content_events WHERE id='clear'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            exact_source_definition_before(
+                &mut tx,
+                &id,
+                source_event,
+                &source_sha,
+                Some(clear_seq)
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        assert!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed since publication preflight")
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pinned_recipe_source_preserves_budget_and_authorization_order() {
+        let (db, id, _, source_sha, expected) = fixture().await;
+        // UTF-8 bytes, not character count; size refusal precedes digest
+        // parsing. A refactor must not import a different helper budget.
+        let large = "é".repeat(MAX_DEFINITION_BYTES / 2 + 1);
+        let source_event = "large-source";
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'complete')")
+            .bind(source_event).bind(&id).bind(json!({"body": large}).to_string())
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let mut tx = begin_write(db.write_pool()).await.unwrap();
+        assert!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source body exceeds")
+        );
+        tx.rollback().await.unwrap();
+        // This disposable :memory: fixture inserts one malformed legacy row
+        // without current metadata admission, retaining append-only guards.
+        let mut legacy_fixture = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let trigger: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'")
+            .fetch_one(&mut *legacy_fixture).await.unwrap();
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        let source_event = "malformed-source";
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated','{',1,'legacy_unknown')")
+            .bind(source_event).bind(&id)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        // Restore before publication authorization and all following work.
+        sqlx::query(&trigger)
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        legacy_fixture.commit().await.unwrap();
+        let denied = publish_recipe_release(
+            &db,
+            Principal::bound("acct:other", true),
+            publish_input(&id, source_event, &source_sha, expected),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(denied.to_string(), RECIPE_UNAVAILABLE);
+        let mut tx = begin_write(db.write_pool()).await.unwrap();
+        assert!(
+            exact_source_definition_before(&mut tx, &id, source_event, &source_sha, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("malformed JSON")
+        );
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]

@@ -208,7 +208,12 @@ fn default_limit() -> i64 {
     20
 }
 
-pub(crate) fn parse_resolve_external(arguments: Value) -> Result<ResolveExternalRequest> {
+pub(crate) fn parse_resolve_external(mut arguments: Value) -> Result<ResolveExternalRequest> {
+    crate::mcp::tools::keyed_replay::refuse_key_on_naturally_idempotent_write(
+        "resolve_external",
+        crate::mcp::tools::keyed_replay::RESOLVE_EXTERNAL_IS_IDEMPOTENT,
+        &mut arguments,
+    )?;
     serde_json::from_value(arguments)
         .map_err(|error| Error::engine(format!("invalid arguments for resolve_external: {error}")))
 }

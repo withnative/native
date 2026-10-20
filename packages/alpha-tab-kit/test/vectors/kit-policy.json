@@ -1,0 +1,200 @@
+[
+  {
+    "name": "legacy source",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1></main></body></html>",
+    "valid": true,
+    "major": 0
+  },
+  {
+    "name": "major 1",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "major 65535",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":65535}</script></main></body></html>",
+    "valid": true,
+    "major": 65535
+  },
+  {
+    "name": "major 1.0",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1.0}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "major 1e0",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1e0}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "invalid major 0",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":0}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major -1",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":-1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major 65536",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":65536}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major 1.5",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1.5}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major \"1\"",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":\"1\"}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major true",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":true}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major null",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":null}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major 1e999",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1e999}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "invalid major 9007199254740993",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":9007199254740993}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "array",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">[]</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "null",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">null</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "empty",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "unknown field",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1,\"release\":\"1.0.0\"}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "missing schema",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"major\":1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "missing major",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\"}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "wrong schema",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"other\",\"major\":1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "malformed",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "too much whitespace",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                {\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "duplicate markers",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "executable marker",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "wrong element",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><div id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</div></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "case-insensitive marker",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script TYPE=\"APPLICATION/JSON\" ID=\"NATIVE-APP-KIT\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "entity marker id",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-ki&#116;\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "comment is not a policy",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><!--<script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script>--></main></body></html>",
+    "valid": true,
+    "major": 0
+  },
+  {
+    "name": "textarea is not a policy",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><textarea><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></textarea></main></body></html>",
+    "valid": true,
+    "major": 0
+  },
+  {
+    "name": "template policy",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><template><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></template></main></body></html>",
+    "valid": true,
+    "major": 1
+  },
+  {
+    "name": "duplicate template policy",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script><template><script type=\"application/json\" id=\"native-app-kit\">{\"schema\":\"native.app-kit.v1\",\"major\":1}</script></template></main></body></html>",
+    "valid": false,
+    "major": null
+  },
+  {
+    "name": "JSON exactly 1024 bytes",
+    "source": "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>T</title></head><body><main><h1>T</h1><script type=\"application/json\" id=\"native-app-kit\">                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        {\"schema\":\"native.app-kit.v1\",\"major\":1}</script></main></body></html>",
+    "valid": true,
+    "major": 1
+  }
+]

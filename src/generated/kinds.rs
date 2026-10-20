@@ -2,7 +2,7 @@
 
 pub const CORE_KIND_MANIFEST_SCHEMA_VERSION: u64 = 1;
 pub const CORE_KIND_MANIFEST_DIGEST: &str =
-    "d54af53b9babdcc4e2d317b7404d0455c0a527bc3d2382c802a75a73a8b708ad";
+    "dff7b67eb36ba4c870eb7ab15501ecac7705262795d7998238b68534374fc1e3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreKind {
@@ -24,6 +24,7 @@ pub enum CoreKind {
     DocumentSheet,
     DocumentSlides,
     EntityPerson,
+    EntityPersona,
     EntityOrganization,
     MessageText,
     OutcomeImpact,
@@ -59,6 +60,7 @@ impl CoreKind {
             Self::DocumentSheet => "Document",
             Self::DocumentSlides => "Document",
             Self::EntityPerson => "Entity",
+            Self::EntityPersona => "Entity",
             Self::EntityOrganization => "Entity",
             Self::MessageText => "Message",
             Self::OutcomeImpact => "Outcome",
@@ -94,6 +96,7 @@ impl CoreKind {
             Self::DocumentSheet => "sheet",
             Self::DocumentSlides => "slides",
             Self::EntityPerson => "person",
+            Self::EntityPersona => "persona",
             Self::EntityOrganization => "organization",
             Self::MessageText => "text",
             Self::OutcomeImpact => "impact",
@@ -129,6 +132,7 @@ impl CoreKind {
             Self::DocumentSheet => "vv:voc:kind:Document:sheet",
             Self::DocumentSlides => "vv:voc:kind:Document:slides",
             Self::EntityPerson => "vv:voc:kind:Entity:person",
+            Self::EntityPersona => "vv:voc:kind:Entity:persona",
             Self::EntityOrganization => "vv:voc:kind:Entity:organization",
             Self::MessageText => "vv:voc:kind:Message:text",
             Self::OutcomeImpact => "vv:voc:kind:Outcome:impact",

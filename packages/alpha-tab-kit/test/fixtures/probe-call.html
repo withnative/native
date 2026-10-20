@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit call probe</title>
+</head>
+<body>
+<main>
+<h1>Kit call probe</h1>
+<p id="surface">pending</p>
+<button id="call" type="button">Call</button>
+<pre id="result"></pre>
+</main>
+<script>
+// App contract v2: native.call exists only when the host offers app.call.v2.
+// `show` records what a call settled with; `window.probe` lets a test drive
+// bounds (oversize args, a burst) without a second page.
+const show = (value) => { document.getElementById("result").textContent = JSON.stringify(value); };
+const failure = (error) => ({ rejected: true, status: error.status, code: error.code, message: error.message });
+window.probe = {
+  surface: () => ({
+    call: typeof window.nativeArtifact.call,
+    native: typeof window.native,
+    nativeCall: typeof (window.native && window.native.call),
+    nativeFrozen: window.native ? Object.isFrozen(window.native) : null,
+    same: window.native ? window.native.call === window.nativeArtifact.call : null,
+    artifactFrozen: Object.isFrozen(window.nativeArtifact),
+  }),
+  call: (operation, args) => {
+    const started = window.nativeArtifact.call(operation, args);
+    return started.confirmed.then((result) => ({ request_id: started.request_id, result }), (error) => ({ request_id: started.request_id, ...failure(error) }));
+  },
+  burst: (count) => {
+    const started = Array.from({ length: count }, (_, index) => window.nativeArtifact.call("probe_echo", { index }));
+    return Promise.all(started.map((item) => item.confirmed.then(() => "ok", (error) => error.code || error.status)));
+  },
+};
+window.nativeArtifact.ready.then(() => {
+  const surface = window.probe.surface();
+  document.getElementById("surface").textContent = `call:${surface.call} native:${surface.native}`;
+});
+document.getElementById("call").addEventListener("click", () => {
+  window.probe.call("probe_echo", { hello: "world" }).then(show);
+});
+</script>
+</body>
+</html>

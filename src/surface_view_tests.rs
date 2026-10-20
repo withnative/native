@@ -40,6 +40,7 @@ fn shared_entry() -> DefinitionEntry {
 
 fn manifest(name: &str, view: &str, fallback: &str) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: "acme".to_string(),
         name: name.to_string(),
         version: 1,

@@ -324,6 +324,7 @@ async fn seeds_governed_pack_vocabularies_and_shapes_idempotently() {
             ("kind:Document".into(), "slides".into()),
             ("kind:Entity".into(), "organization".into()),
             ("kind:Entity".into(), "person".into()),
+            ("kind:Entity".into(), "persona".into()),
             ("kind:Message".into(), "text".into()),
             ("kind:Outcome".into(), "impact".into()),
             ("kind:Outcome".into(), "milestone".into()),

@@ -80,6 +80,7 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     // Caller-bound: only rows about the caller (section 3.2 "Caller-bound").
     ("bindings", CallerBound),
     ("member_contexts", CallerBound),
+    ("account_configs", CallerBound),
     ("instruction_bindings", CallerBound),
     // Caller-bound in v1-excluded form (section 3.2 "Caller-bound (v1:
     // excluded)" row: "would be subject = caller", not shipped in Q5 v1).
@@ -125,8 +126,12 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     ("replicated_message_references", Excluded),
     ("provenance_interaction_receipts", Excluded),
     ("provenance_action_attestations", Excluded),
+    ("sql_write_receipts", Excluded),
     ("provenance_action_events", Excluded),
     ("provenance_action_outputs", Excluded),
+    // App attribution annotates an excluded attestation, so it is excluded
+    // with it (v83).
+    ("provenance_action_app_attributions", Excluded),
     ("relationship_federation_events", Excluded),
     ("relationship_foreign_action_attestations", Excluded),
     ("relationship_foreign_action_outputs", Excluded),
@@ -154,6 +159,8 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     ("message_audience_state", Excluded),
     ("message_origin_state", Excluded),
     ("message_origin_principals", Excluded),
+    ("personas", Excluded),
+    ("message_speakers", Excluded),
     ("message_inbox_routing", Excluded),
     // Excluded: relationships, Units/freshness, attributions, artifacts,
     // canvas, derivation, agent runs, onboarding (section 3.2 "Excluded
@@ -235,6 +242,12 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     // Facet-value nodes normalise `facet_values.value`; a member image rebuilds
     // meaning from the shipped value column rather than carrying node rows.
     ("facet_value_json_nodes", Excluded),
+    // Observation nodes normalise `facet_observations.value` the same way; a
+    // member image rebuilds meaning from the shipped value column.
+    ("facet_observation_json_nodes", Excluded),
+    // Record-body nodes normalise `records.body`; a member image rebuilds
+    // meaning from the shipped body column rather than carrying node rows.
+    ("record_body_json_nodes", Excluded),
     // Excluded: evidence for the excluded awareness logs (contract R3;
     // section 2.3b refuses manage_interventions and the awareness folds
     // have no v1 surface). Named explicitly in rev 5 §3.2
@@ -410,6 +423,10 @@ pub(crate) const MEMBER_COLUMN_DISPOSITIONS: &[(&str, &str, MemberColumnKind)] =
     ("member_contexts", "person_record_id", ShippedCol),
     ("member_contexts", "root_record_id", ShippedCol),
     ("member_contexts", "created_at", ShippedCol),
+    ("account_configs", "account_id", ShippedCol),
+    ("account_configs", "kind", ShippedCol),
+    ("account_configs", "record_id", ShippedCol),
+    ("account_configs", "created_at", ShippedCol),
     ("instruction_bindings", "id", ShippedCol),
     ("instruction_bindings", "scope_kind", ShippedCol),
     ("instruction_bindings", "scope_id", ShippedCol),
@@ -903,6 +920,7 @@ mod tests {
         "record_mentions",
         "bindings",
         "member_contexts",
+        "account_configs",
         "instruction_bindings",
         "human_message_awareness",
         "agent_message_dispositions",
@@ -937,8 +955,10 @@ mod tests {
         "replicated_message_references",
         "provenance_interaction_receipts",
         "provenance_action_attestations",
+        "sql_write_receipts",
         "provenance_action_events",
         "provenance_action_outputs",
+        "provenance_action_app_attributions",
         "relationship_federation_events",
         "relationship_foreign_action_attestations",
         "relationship_foreign_action_outputs",
@@ -960,6 +980,8 @@ mod tests {
         "message_audience_state",
         "message_origin_state",
         "message_origin_principals",
+        "personas",
+        "message_speakers",
         "message_inbox_routing",
         "relationships",
         "relationship_endpoints",
@@ -1023,6 +1045,8 @@ mod tests {
         "vocabulary_value_json_nodes",
         "schema_config_json_nodes",
         "facet_value_json_nodes",
+        "facet_observation_json_nodes",
+        "record_body_json_nodes",
         "awareness_event_evidence",
         "provenance_local_attestation_authority",
         "webhook_deliveries",

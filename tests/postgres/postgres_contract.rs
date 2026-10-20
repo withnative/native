@@ -18,8 +18,9 @@ use native_ce::postgres::{
 };
 use native_ce::query::sql::query_sql as sqlite_query_sql;
 use native_ce::query::sql_contract::{
-    truncation_hint, QuerySqlParameter, QuerySqlRequest, CARD_WORKED_STATEMENTS, LOGICAL_RELATIONS,
-    MAX_CELL_ENCODED_BYTES, MAX_COLUMNS, MAX_RESULT_ENCODED_BYTES, MAX_ROWS,
+    catalog_view_statements, truncation_hint, QuerySqlParameter, QuerySqlRequest,
+    CARD_WORKED_STATEMENTS, LOGICAL_RELATIONS, MAX_CELL_ENCODED_BYTES, MAX_COLUMNS,
+    MAX_RESULT_ENCODED_BYTES, MAX_ROWS,
 };
 use native_ce::store::{create_record, set_facet};
 use serde_json::{json, Value};
@@ -129,7 +130,7 @@ async fn postgres_describe_schema_is_normalized_allowlisted_and_owner_gated() {
     assert_eq!(owner["engine"]["storage_profile"], "postgres-server");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "73ef84e9fcdf81de2fe48dc5304314590516907fcf3ed907146a87b43c46d6a7"
+        "9acc0431ed95dbb73850eb5def6f00d032578a445adc989dd511c85dd7fe1cc8"
     );
     assert_eq!(owner["tables"].as_array().unwrap().len(), 38);
     assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 58);
@@ -1084,6 +1085,41 @@ async fn postgres_query_sql_full_boundary_contract() {
         bea.rows,
         [json!({"id":"9c150000-0000-4000-8000-100000000003"})]
     );
+    // `current_principal()` binds each caller after the caller's own
+    // parameters and the hidden clock, and its slot cannot be spoofed.
+    for account in ["acct:alice", "acct:bea"] {
+        let principal = qualification_query_sql(
+            database.clone(),
+            Caller::authenticated(account),
+            QuerySqlRequest {
+                sql: "SELECT ?1::text AS x, now_ms() AS t, current_principal() AS p".into(),
+                parameters: vec![QuerySqlParameter::Text {
+                    value: Some("x".into()),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(principal.rows[0]["x"], json!("x"));
+        assert_eq!(principal.rows[0]["p"], json!(account));
+        assert_eq!(
+            principal.rows[0]["t"].as_i64(),
+            principal.now_ms_ms,
+            "clock slot precedes the principal slot"
+        );
+    }
+    let spoof = qualification_query_sql(
+        database.clone(),
+        Caller::authenticated("acct:alice"),
+        QuerySqlRequest {
+            sql: "SELECT current_principal() AS p, ?2::text AS q".into(),
+            parameters: vec![QuerySqlParameter::Text {
+                value: Some("acct:bea".into()),
+            }],
+        },
+    )
+    .await;
+    assert!(spoof.is_err(), "{spoof:?}");
     let registered = harness
         .call(
             &database,
@@ -1622,6 +1658,54 @@ async fn postgres_query_sql_full_boundary_contract() {
         );
     }
     sqlite.close().await;
+
+    // Catalog text collation guard: every text output field of both
+    // caller catalog views must use COLLATE "C", or a locale-ordered
+    // database reorders catalog rows against SQLite BINARY order.
+    // pg_attribute detects a missing pin even when this database
+    // defaults to C, where row-order probes would pass regardless.
+    {
+        let mut tx = database.pool().begin().await.unwrap();
+        for statement in catalog_view_statements(false, true) {
+            sqlx::query(&statement).execute(&mut *tx).await.unwrap();
+        }
+        let collations: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT t.relname::text, a.attname::text, COALESCE(c.collname::text, '') \
+             FROM pg_attribute a JOIN pg_class t ON t.oid = a.attrelid \
+             LEFT JOIN pg_collation c ON c.oid = a.attcollation \
+             WHERE t.relnamespace = pg_my_temp_schema() \
+             AND t.relname IN ('catalog_relations', 'catalog_columns') \
+             AND a.attnum > 0 AND NOT a.attisdropped",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+        let exempt = [
+            ("catalog_relations", "semantic_version"),
+            ("catalog_relations", "caller_relative"),
+            ("catalog_columns", "column_position"),
+        ];
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for (table, column, collation) in &collations {
+            seen.push((table.clone(), column.clone()));
+            if exempt.contains(&(table.as_str(), column.as_str())) {
+                assert_eq!(collation, "", "{table}.{column} must carry no collation");
+            } else {
+                assert_eq!(collation, "C", "{table}.{column} must use COLLATE \"C\"");
+            }
+        }
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for relation in LOGICAL_RELATIONS.iter().filter(|relation| {
+            relation.name == "catalog_relations" || relation.name == "catalog_columns"
+        }) {
+            for column in relation.columns {
+                expected.push((relation.name.to_string(), column.to_string()));
+            }
+        }
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected, "catalog field set drifted");
+    }
 
     let duplicate = qualification_query_sql(
         database.clone(),
@@ -2457,11 +2541,9 @@ async fn postgres_worked_statements_match_sqlite() {
     for (intent, card_sql) in CARD_WORKED_STATEMENTS {
         let sql = match *intent {
             "Current work" => card_sql.to_string(),
-            "Direct children of a folder or record" => card_sql.replace("?1", "'wk:root'"),
-            "Parts of a record (semantic part_of links run child source -> parent target)" => {
-                card_sql.replace("?1", "'wk:a'")
-            }
-            "Recent history of one record" => card_sql.replace("?1", "'wk:a'"),
+            "Direct children" => card_sql.replace("?1", "'wk:root'"),
+            "Parts (part_of child source -> parent target)" => card_sql.replace("?1", "'wk:a'"),
+            "Record history" => card_sql.replace("?1", "'wk:a'"),
             unknown => panic!("no Postgres fixture binding for card statement '{unknown}'"),
         };
         let postgres_result = qualification_query_sql(
@@ -2576,7 +2658,7 @@ async fn postgres_ddl_migration_and_pool_contract() {
     let database = harness.fresh_logical_database().await.unwrap();
     let search_path_before = current_search_path(&database).await.unwrap();
 
-    assert_eq!(migration_version(&database).await.unwrap(), 9);
+    assert_eq!(migration_version(&database).await.unwrap(), 10);
     assert_eq!(
         physical_tables(&database).await.unwrap(),
         [
@@ -2657,7 +2739,7 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
     let binding_audit = database.qualified_table("binding_audit").unwrap();
     let mut tx = database.pool().begin().await.unwrap();
     sqlx::query(&format!(
-        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
+        "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9,10)"
     ))
     .execute(&mut *tx)
     .await
@@ -2676,7 +2758,7 @@ async fn postgres_legacy_v3_shape_never_reports_ready_under_the_v5_runtime() {
 
     let health = database.health().await.unwrap();
     assert_eq!(health.observed_schema_version, Some(3));
-    assert_eq!(health.expected_schema_version, 9);
+    assert_eq!(health.expected_schema_version, 10);
     assert_eq!(health.schema_currency, PostgresSchemaCurrency::Behind);
     assert!(!health.ready);
     assert!(!health.write_ready);
@@ -4521,6 +4603,317 @@ async fn postgres_governed_writes_rollback_on_in_flight_cancellation_and_reuse_c
 
     harness.close(&database).await;
     harness.shutdown().await;
+}
+
+/// An imported database replays with genesis seeding off, so the v9→v10 edge
+/// must not hand it projection rows its own log cannot recreate. The importer
+/// materializes no vocabularies, so an imported v9 database has none and gets
+/// none; one that later acquired the earlier kind vocabularies as events gets
+/// exactly the missing `kind:Configuration` as an event. Both replay equal.
+#[tokio::test]
+async fn postgres_v9_to_v10_keeps_an_imported_database_replay_equivalent() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let source = create_database(temp.path().join("v9-import.db").to_str().unwrap())
+        .await
+        .unwrap();
+    create_record(
+        &source,
+        json!({
+            "id": "9c150000-0000-4000-8000-002000000049",
+            "type": "Document",
+            "kind": "note",
+            "name": "Imported before Configuration"
+        }),
+    )
+    .await
+    .unwrap();
+    let canonical = export_canonical_interchange(&source).await.unwrap();
+    let cluster = PostgresCluster::connect(&url).await.unwrap();
+    let cleanup_tag = uuid::Uuid::new_v4().simple().to_string();
+    let cleanup_tag = &cleanup_tag[..8];
+    let (database, _) = cluster
+        .import_canonical_interchange_with_tag(&canonical, cleanup_tag)
+        .await
+        .unwrap();
+    let vocabularies = database.qualified_table("vocabularies").unwrap();
+    let meta_events = database.qualified_table("meta_events").unwrap();
+    let count = |sql: String| {
+        let pool = database.pool().clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(&sql)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    let vocabulary = "voc:kind:Configuration";
+
+    // (a) An imported database holds no vocabularies; the edge adds none.
+    assert_eq!(
+        count(format!("SELECT COUNT(*) FROM {vocabularies}")).await,
+        0
+    );
+    database
+        .contract_rewind_schema_v10_to_v9_for_test()
+        .await
+        .unwrap();
+    database
+        .contract_migrate_v9_to_v10_for_test()
+        .await
+        .unwrap();
+    assert_eq!(
+        count(format!("SELECT COUNT(*) FROM {vocabularies}")).await,
+        0
+    );
+    assert_eq!(
+        count(format!("SELECT COUNT(*) FROM {meta_events}")).await,
+        0
+    );
+    database.assert_replay_equivalent().await.unwrap();
+
+    // (b) The earlier kind vocabularies arrive as events (as a replayed
+    // imported log would carry them); only the missing one is added, as an event.
+    for record_type in native_ce::schema::SPINE_TYPES
+        .into_iter()
+        .filter(|record_type| *record_type != "Configuration")
+    {
+        database
+            .append_meta_event(native_ce::postgres::PostgresMetaEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject_id: format!("voc:kind:{record_type}"),
+                event_type: "vocabulary.created".into(),
+                payload: json!({ "name": format!("kind:{record_type}") }),
+                actor: Some("engine:seed".into()),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                act: None,
+            })
+            .await
+            .unwrap();
+    }
+    database.assert_replay_equivalent().await.unwrap();
+    database
+        .contract_rewind_schema_v10_to_v9_for_test()
+        .await
+        .unwrap();
+    database
+        .contract_migrate_v9_to_v10_for_test()
+        .await
+        .unwrap();
+    assert_eq!(
+        count(format!("SELECT COUNT(*) FROM {vocabularies}")).await,
+        11
+    );
+    assert_eq!(
+        count(format!("SELECT COUNT(*) FROM {meta_events}")).await,
+        11
+    );
+    assert_eq!(
+        count(format!(
+            "SELECT COUNT(*) FROM {meta_events} WHERE subject_id='{vocabulary}' AND type='vocabulary.created'"
+        ))
+        .await,
+        1
+    );
+    database.assert_replay_equivalent().await.unwrap();
+
+    database.drop_schema().await.unwrap();
+    source.close().await;
+    cluster.close().await;
+}
+
+async fn count_rows(database: &native_ce::postgres::PostgresDb, sql: String) -> i64 {
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
+}
+
+async fn delete_kind_vocabularies(database: &native_ce::postgres::PostgresDb, types: &[&str]) {
+    // A low-level meta event deletes a seeded vocabulary; its values go first.
+    for record_type in types {
+        let id = format!("voc:kind:{record_type}");
+        let values = database.qualified_table("vocabulary_values").unwrap();
+        sqlx::query(&format!("DELETE FROM {values} WHERE vocabulary_id=$1"))
+            .bind(&id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        database
+            .append_meta_event(native_ce::postgres::PostgresMetaEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject_id: id,
+                event_type: "vocabulary.deleted".into(),
+                payload: json!({}),
+                actor: Some("test".into()),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                act: None,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// The v9→v10 edge touches only `kind:Configuration`. On a native database a
+/// seeded vocabulary that v9 history deleted stays deleted (replay replays the
+/// deletion), and Configuration is seeded as v10 replay seeds it.
+async fn native_v9_upgrade_keeps_deletions(deleted: &[&str]) {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    let vocabularies = database.qualified_table("vocabularies").unwrap();
+    delete_kind_vocabularies(&database, deleted).await;
+    // A released v9 database has no Configuration vocabulary (native: projection only).
+    sqlx::query(&format!(
+        "DELETE FROM {vocabularies} WHERE id='voc:kind:Configuration'"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    database
+        .contract_rewind_schema_v10_to_v9_for_test()
+        .await
+        .unwrap();
+    let before = count_rows(&database, format!("SELECT COUNT(*) FROM {vocabularies}")).await;
+    database
+        .contract_migrate_v9_to_v10_for_test()
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows(&database, format!("SELECT COUNT(*) FROM {vocabularies}")).await,
+        before + 1,
+        "only Configuration is added"
+    );
+    assert_eq!(
+        count_rows(
+            &database,
+            format!("SELECT COUNT(*) FROM {vocabularies} WHERE id='voc:kind:Configuration'")
+        )
+        .await,
+        1
+    );
+    for record_type in deleted {
+        assert_eq!(
+            count_rows(
+                &database,
+                format!("SELECT COUNT(*) FROM {vocabularies} WHERE id='voc:kind:{record_type}'")
+            )
+            .await,
+            0,
+            "{record_type} stays deleted"
+        );
+    }
+    database.assert_replay_equivalent().await.unwrap();
+    harness.close(&database).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn postgres_v9_to_v10_native_upgrade_keeps_some_deleted_vocabularies_deleted() {
+    native_v9_upgrade_keeps_deletions(&["Document", "Entity", "Message"]).await;
+}
+
+#[tokio::test]
+async fn postgres_v9_to_v10_native_upgrade_with_every_old_kind_vocabulary_deleted() {
+    native_v9_upgrade_keeps_deletions(&[
+        "Document",
+        "Program",
+        "WorkItem",
+        "Outcome",
+        "Entity",
+        "Collection",
+        "Resolution",
+        "Conversation",
+        "Message",
+        "Annotation",
+    ])
+    .await;
+}
+
+/// An imported v9 database holding only some kind vocabularies gets
+/// `kind:Configuration` as exactly one event under one act, and the act
+/// counter advances by one.
+#[tokio::test]
+async fn postgres_v9_to_v10_imported_partial_inventory_gets_one_event_under_one_act() {
+    let Some(url) = postgres_url() else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let source = create_database(temp.path().join("v9-partial.db").to_str().unwrap())
+        .await
+        .unwrap();
+    create_record(
+        &source,
+        json!({
+            "id": "9c150000-0000-4000-8000-002000000059",
+            "type": "Document",
+            "kind": "note",
+            "name": "Imported with a partial inventory"
+        }),
+    )
+    .await
+    .unwrap();
+    let canonical = export_canonical_interchange(&source).await.unwrap();
+    let cluster = PostgresCluster::connect(&url).await.unwrap();
+    let cleanup_tag = uuid::Uuid::new_v4().simple().to_string();
+    let cleanup_tag = &cleanup_tag[..8];
+    let (database, _) = cluster
+        .import_canonical_interchange_with_tag(&canonical, cleanup_tag)
+        .await
+        .unwrap();
+    for record_type in ["Document", "Entity", "Message"] {
+        database
+            .append_meta_event(native_ce::postgres::PostgresMetaEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject_id: format!("voc:kind:{record_type}"),
+                event_type: "vocabulary.created".into(),
+                payload: json!({ "name": format!("kind:{record_type}") }),
+                actor: Some("engine:seed".into()),
+                created_at: "2026-10-01T00:00:00Z".into(),
+                act: None,
+            })
+            .await
+            .unwrap();
+    }
+    database.assert_replay_equivalent().await.unwrap();
+    database
+        .contract_rewind_schema_v10_to_v9_for_test()
+        .await
+        .unwrap();
+    let act_state = database.qualified_table("act_state").unwrap();
+    let meta_events = database.qualified_table("meta_events").unwrap();
+    let vocabularies = database.qualified_table("vocabularies").unwrap();
+    let acts_before = count_rows(&database, format!("SELECT next_act FROM {act_state}")).await;
+    database
+        .contract_migrate_v9_to_v10_for_test()
+        .await
+        .unwrap();
+    assert_eq!(
+        count_rows(&database, format!("SELECT COUNT(*) FROM {vocabularies}")).await,
+        4
+    );
+    let configuration_acts: Vec<Option<i64>> = sqlx::query_scalar(&format!(
+        "SELECT act FROM {meta_events} WHERE subject_id='voc:kind:Configuration' AND type='vocabulary.created'"
+    ))
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        configuration_acts,
+        vec![Some(acts_before + 1)],
+        "one event, one new act"
+    );
+    assert_eq!(
+        count_rows(&database, format!("SELECT next_act FROM {act_state}")).await,
+        acts_before + 1
+    );
+    database.assert_replay_equivalent().await.unwrap();
+    database.drop_schema().await.unwrap();
+    source.close().await;
+    cluster.close().await;
 }
 
 #[tokio::test]

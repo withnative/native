@@ -89,16 +89,17 @@ pub const NON_CANONICAL_SEQUENCED_TABLES: [&str; 2] = ["read_log_calls", "webhoo
 /// authority-head contract emits its per-table max-act vector in this order,
 /// so a new non-sequenced canonical act-stamped table cannot ship unstamped,
 /// unindexed, or unpinned.
-pub const NON_SEQUENCED_ACT_STAMPED_TABLES: [&str; 3] = [
+pub const NON_SEQUENCED_ACT_STAMPED_TABLES: [&str; 4] = [
     "awareness_command_intents",
     "external_observations",
     "provenance_attestation_validity_events",
+    "sql_write_receipts",
 ];
 
 /// Every canonical table stamped with a workspace act: the ten sequenced logs
-/// plus the three non-sequenced act-stamped logs. The act-coverage test
+/// plus the four non-sequenced act-stamped logs. The act-coverage test
 /// iterates this list, so it cannot silently omit either category.
-pub const ACT_STAMPED_TABLES: [&str; 13] = [
+pub const ACT_STAMPED_TABLES: [&str; 14] = [
     "content_events",
     "policy_events",
     "awareness_events",
@@ -112,6 +113,7 @@ pub const ACT_STAMPED_TABLES: [&str; 13] = [
     "awareness_command_intents",
     "external_observations",
     "provenance_attestation_validity_events",
+    "sql_write_receipts",
 ];
 
 /// The first act a workspace allocates: `act_state.next_act` is seeded at 0

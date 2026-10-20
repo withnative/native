@@ -917,6 +917,7 @@ pub(crate) fn call_error_content(
     let deployment_operation = error.deployment_read_only_operation();
     let draining_operation = error.deployment_draining_operation();
     let pool_timeout = matches!(error, Error::Sqlx(sqlx::Error::PoolTimedOut));
+    let replay_bounded = error.replay_bounded_fields();
     let message = if let Some((message, _)) = &member {
         message.clone()
     } else if standby_read_only {
@@ -935,6 +936,12 @@ pub(crate) fn call_error_content(
     } else if draining_operation.is_some() {
         text.push_str("\n\nRecovery: ");
         text.push_str(super::DEPLOYMENT_DRAINING_RECOVERY);
+    } else if deployment_operation.is_some() {
+        text.push_str("\n\nRecovery: ");
+        text.push_str(super::DEPLOYMENT_READ_ONLY_RECOVERY);
+    } else if let Some(fields) = &replay_bounded {
+        text.push_str("\n\nRecovery: ");
+        text.push_str(fields["recovery"].as_str().unwrap_or_default());
     }
     text.push_str(&render::render_run_context(&run_context));
     let mut result = json!({
@@ -952,6 +959,9 @@ pub(crate) fn call_error_content(
         result["structuredContent"]["retryable"] = json!(true);
         result["structuredContent"]["applied"] = json!(false);
         result["structuredContent"]["operation"] = json!(operation);
+        result["structuredContent"]["recovery"] = json!(super::DEPLOYMENT_READ_ONLY_RECOVERY);
+        result["structuredContent"]["retry_after_secs"] =
+            json!(super::DEPLOYMENT_READ_ONLY_RETRY_AFTER_SECS);
     } else if let Some(operation) = draining_operation {
         // A drain-paused refusal lands mid-operation: earlier effects may
         // have committed, so never claim `applied: false` or blanket
@@ -970,6 +980,18 @@ pub(crate) fn call_error_content(
         result["structuredContent"]["error_code"] = json!(DATABASE_POOL_TIMEOUT);
         result["structuredContent"]["outcome"] = json!("unknown");
         result["structuredContent"]["recovery"] = json!(DATABASE_POOL_TIMEOUT_RECOVERY);
+    } else if let Some(fields) = replay_bounded {
+        // A replay found its committed write and could not rebuild the receipt
+        // inside a replay bound: `applied` is `true` for a single write and
+        // `"partial"` for a multi-write call, and either is safe to retry with
+        // the same key. Never a refusal.
+        let structured = result["structuredContent"]
+            .as_object_mut()
+            .expect("tool error structuredContent is an object");
+        structured.extend(fields);
+    } else if error.is_idempotency_conflict() {
+        // A reused key naming a different command: refused, never retryable.
+        result["structuredContent"]["error_code"] = json!(crate::error::IDEMPOTENCY_CONFLICT_CODE);
     }
     if let Some((message, extra)) = member {
         // The typed member refusals replace the generic error text and carry
@@ -1002,7 +1024,7 @@ fn preflight_read_only_call(
 ) -> crate::Result<()> {
     registry.admit_standby_call(name, arguments)?;
     if let Some(lease) = persistence_lease {
-        registry.reuse_deployment_admission(lease)?;
+        registry.reuse_deployment_admission(lease, name, arguments)?;
         return Ok(());
     }
     registry.preflight_deployment_call(name, arguments)
@@ -1066,6 +1088,10 @@ async fn tools_call_kernel(
             }
         }
     };
+    // Install/app admission runs before the handler and therefore before the
+    // registry's detailed outcome exists. It is an ordinary call refusal,
+    // not a broken stdio connection. Keep unrelated ingress errors unchanged.
+    let standby_app = registry.is_standby_read_only() && caller.host_asserted_app().is_some();
     let dispatched = match persistence_lease {
         Some(lease) => {
             registry
@@ -1101,6 +1127,13 @@ async fn tools_call_kernel(
                 tool.ui.as_ref().map(|ui| ui.resource_uri),
             ));
         }
+        Err(error @ Error::Engine(_)) if standby_app => {
+            return Ok(call_error_content(
+                &error,
+                Value::Null,
+                tool.ui.as_ref().map(|ui| ui.resource_uri),
+            ));
+        }
         Err(error) => return Err((INTERNAL_ERROR, error.to_string())),
     };
     match call.outcome {
@@ -1114,6 +1147,7 @@ async fn tools_call_kernel(
             ))
         }
         Err(err @ (Error::Engine(_) | Error::Conflict(_) | Error::Auth(_)))
+        | Err(err @ Error::ReplayBounded { .. })
         | Err(err @ Error::DeploymentDraining(_))
         | Err(err @ Error::Sqlx(sqlx::Error::PoolTimedOut)) => Ok(call_error_content(
             &err,
@@ -1142,6 +1176,7 @@ async fn legacy_tools_call_result(
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
     let (reported_name, reported_version) = reported_mcp_client(params.get("_meta"));
+    let caller = standby_app_caller(registry, caller, params.get("_meta"))?;
     tools_call_kernel(
         registry,
         engine,
@@ -1151,6 +1186,42 @@ async fn legacy_tools_call_result(
         persistence_lease,
     )
     .await
+}
+
+/// Local desktop main carries an installed app's identity outside tool
+/// arguments. It never selects the principal: the standby caller is already
+/// bound to the admitted copy's account. The registry checks the install and
+/// ordinary app refusals before dispatch. Writable MCP has no such ingress.
+pub(crate) const STANDBY_APP_META: &str = "native/app";
+
+fn standby_app_caller(
+    registry: &ToolRegistry,
+    mut caller: Caller,
+    meta: Option<&Value>,
+) -> std::result::Result<Caller, (i64, String)> {
+    let Some(value) = meta.and_then(|meta| meta.get(STANDBY_APP_META)) else {
+        return Ok(caller);
+    };
+    if !registry.is_standby_read_only() {
+        return Err((
+            INVALID_PARAMS,
+            "native/app metadata is supported only on the read-only owner standby".into(),
+        ));
+    }
+    let app = value
+        .as_str()
+        .ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                "native/app metadata must be an app identity string".into(),
+            )
+        })
+        .and_then(|raw| {
+            crate::mcp::app_attribution::parse_header(raw)
+                .map_err(|error| (INVALID_PARAMS, error.to_string()))
+        })?;
+    caller.set_host_asserted_app(app);
+    Ok(caller)
 }
 
 pub(crate) fn validate_implementation(value: &Value) -> std::result::Result<(), String> {
@@ -1445,6 +1516,7 @@ async fn tools_call_result(
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> std::result::Result<Value, (i64, String)> {
     let (reported_name, reported_version) = reported_mcp_client(params.get("_meta"));
+    let caller = standby_app_caller(registry, caller, params.get("_meta"))?;
     let result = tools_call_kernel(
         registry,
         engine,
@@ -1513,6 +1585,57 @@ mod tests {
     use super::*;
     use crate::mcp::{register_surface_tools, TransientEvidence};
     use crate::member_offline_fixtures::assert_no_counter_fields;
+
+    #[test]
+    fn standby_app_carrier_rejects_malformed_and_writable_ingress() {
+        let mut registry = ToolRegistry::new();
+        let meta = json!({STANDBY_APP_META:"docs@1; install=evt"});
+        let error = standby_app_caller(&registry, Caller::authenticated("acct:alice"), Some(&meta))
+            .err()
+            .unwrap();
+        assert_eq!(error.0, INVALID_PARAMS);
+        registry.set_standby_read_only(true);
+        for value in [
+            json!(null),
+            json!(42),
+            json!({"package":"docs"}),
+            json!("docs@1"),
+        ] {
+            assert_eq!(
+                standby_app_caller(
+                    &registry,
+                    Caller::authenticated("acct:alice"),
+                    Some(&json!({STANDBY_APP_META:value}))
+                )
+                .err()
+                .unwrap()
+                .0,
+                INVALID_PARAMS
+            );
+        }
+        let caller =
+            standby_app_caller(&registry, Caller::authenticated("acct:alice"), Some(&meta))
+                .unwrap();
+        assert_eq!(caller.credential(), "acct:alice");
+        assert_eq!(caller.host_asserted_app().unwrap().install_event_id, "evt");
+    }
+
+    #[test]
+    fn reused_idempotency_keys_carry_a_machine_code_and_keep_their_text() {
+        let error = Error::engine(format!(
+            "update_record: {}",
+            crate::provenance::IDEMPOTENCY_CONFLICTING_INPUT
+        ));
+        let result = call_error_content(&error, Value::Null, None);
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error_code"],
+            crate::error::IDEMPOTENCY_CONFLICT_CODE
+        );
+        assert_eq!(result["structuredContent"]["error"], error.to_string());
+        let other = call_error_content(&Error::engine("plain refusal"), Value::Null, None);
+        assert!(other["structuredContent"].get("error_code").is_none());
+    }
 
     fn complete_record_payload() -> Value {
         json!({
@@ -2064,7 +2187,22 @@ mod tests {
             assert_eq!(error["retryable"], true);
             assert_eq!(error["applied"], false);
             assert_eq!(error["operation"], "create_record");
+            assert_eq!(
+                error["recovery"],
+                json!(crate::mcp::DEPLOYMENT_READ_ONLY_RECOVERY)
+            );
+            assert_eq!(
+                error["retry_after_secs"],
+                json!(crate::mcp::DEPLOYMENT_READ_ONLY_RETRY_AFTER_SECS)
+            );
             assert_eq!(error["run_context"], Value::Null);
+            let text = called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                text.contains(crate::mcp::DEPLOYMENT_READ_ONLY_RECOVERY),
+                "frozen text must carry the shared recovery guidance: {text}"
+            );
             if modern_era {
                 assert_eq!(called["result"]["resultType"], "complete");
             }
@@ -2288,6 +2426,89 @@ mod tests {
         );
         assert_eq!(unknown["error"]["code"], INVALID_PARAMS);
         db.close().await;
+    }
+
+    /// The transport renders `ToolResult.structured` after the registry
+    /// returns, so a non-owner's text and JSON both come from the projected
+    /// value (design 08b4c21 §4 S2a); an owner's still carry the act.
+    #[tokio::test]
+    async fn a_non_owner_write_receipt_has_no_act_in_text_or_structured_content() {
+        let registry = registry();
+        for (caller, owner) in [
+            (Caller::local(), true),
+            (Caller::authenticated("acct:unhosted"), false),
+        ] {
+            let db = crate::create_database(":memory:").await.unwrap();
+            // A non-local caller needs a portable account binding to write.
+            let person = registry
+                .call(
+                    db.clone(),
+                    Caller::local(),
+                    "create_record",
+                    json!({
+                        "type": "Entity", "kind": "person", "name": "Unhosted", "reason": "fixture"
+                    }),
+                )
+                .await
+                .unwrap();
+            for (system, identifier) in [
+                ("account", "acct:unhosted"),
+                ("native-principal", "native/unhosted"),
+            ] {
+                sqlx::query(
+                    "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+                     VALUES (?, ?, ?, 1)",
+                )
+                .bind(person["id"].as_str().unwrap())
+                .bind(system)
+                .bind(identifier)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+            }
+            for (id, format) in [(1, None), (2, Some("json"))] {
+                let mut arguments = json!({
+                    "type": "Document", "kind": "note", "name": format!("receipt {id}"),
+                    "body": "plain body", "reason": "fixture"
+                });
+                if let Some(format) = format {
+                    arguments["format"] = json!(format);
+                }
+                let call = response(
+                    handle_legacy_message(
+                        registry.clone(),
+                        db.clone(),
+                        caller.clone(),
+                        json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                                "params": { "name": "create_record", "arguments": arguments } }),
+                    )
+                    .await,
+                );
+                let result = &call["result"];
+                assert_eq!(result["isError"], false, "{result}");
+                let text = result["content"][0]["text"].as_str().unwrap();
+                // The text rendering of a write receipt never shows the act;
+                // the JSON rendering is the structured value and must agree
+                // with `structuredContent`.
+                assert!(!text.contains("\"act\"") || owner, "{text}");
+                if format == Some("json") {
+                    let structured = &result["structuredContent"];
+                    let parsed: Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(&parsed, structured);
+                    assert_eq!(structured.get("act").is_some(), owner, "{structured}");
+                }
+                let durable_act: Option<i64> = sqlx::query_scalar(
+                    "SELECT ce.act FROM content_events ce JOIN records r ON r.id = ce.record_id \
+                     WHERE ce.type = 'record.created' AND r.name = ?",
+                )
+                .bind(format!("receipt {id}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert!(durable_act.is_some(), "the act is still allocated durably");
+            }
+            db.close().await;
+        }
     }
 
     #[tokio::test]

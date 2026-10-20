@@ -20,7 +20,7 @@ use crate::events::{
     LinkAddedPayload, LinkRemovedPayload,
 };
 use crate::meta::resolve_vocab_ref;
-#[cfg(test)]
+#[cfg(any(test, feature = "v2-kernel-probe"))]
 use crate::projector::project;
 use crate::schema::ARCHIVED_FACET_KEY;
 
@@ -151,23 +151,37 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
                 }
             };
             causal_envelope.validate_for_event(&event.id)?;
-            for parent_event_id in causal_envelope.frontier().as_slice() {
-                let closes_cycle: bool = sqlx::query_scalar(
-                    "WITH RECURSIVE ancestors(event_id) AS (
-                         SELECT ?
-                         UNION
-                         SELECT frontier.parent_event_id
-                           FROM content_event_causal_frontier frontier
-                           JOIN ancestors ON frontier.event_id = ancestors.event_id
-                     )
-                     SELECT EXISTS(SELECT 1 FROM ancestors WHERE event_id = ?)",
-                )
-                .bind(parent_event_id)
-                .bind(&event.id)
-                .fetch_one(&mut **self.transaction)
-                .await?;
-                if closes_cycle {
-                    return Err(Error::engine("causal frontier would create a cycle"));
+            // An ancestor path can reach the new ID only if an existing edge
+            // already names it as a parent. Most local IDs have no such edge;
+            // avoid walking the entire history for an impossible cycle. Keep
+            // the full check for unresolved forward references, including IDs
+            // not yet present in content_events. Self-parenting was checked by
+            // validate_for_event above. The frontier itself is unchanged.
+            let referenced: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id=?)",
+            )
+            .bind(&event.id)
+            .fetch_one(&mut **self.transaction)
+            .await?;
+            if referenced {
+                for parent_event_id in causal_envelope.frontier().as_slice() {
+                    let closes_cycle: bool = sqlx::query_scalar(
+                        "WITH RECURSIVE ancestors(event_id) AS (
+                             SELECT ?
+                             UNION
+                             SELECT frontier.parent_event_id
+                               FROM content_event_causal_frontier frontier
+                               JOIN ancestors ON frontier.event_id = ancestors.event_id
+                         )
+                         SELECT EXISTS(SELECT 1 FROM ancestors WHERE event_id = ?)",
+                    )
+                    .bind(parent_event_id)
+                    .bind(&event.id)
+                    .fetch_one(&mut **self.transaction)
+                    .await?;
+                    if closes_cycle {
+                        return Err(Error::engine("causal frontier would create a cycle"));
+                    }
                 }
             }
             event.causal_envelope = causal_envelope;
@@ -295,12 +309,124 @@ pub(crate) async fn append_in(
     spec: AppendSpec,
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if matches!(
+        spec.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine(
+            "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::kernel::slots::is_slot_event(&spec.event_type) {
+        return Err(Error::engine(
+            "slot events require the sealed kernel slot route",
+        ));
+    }
     if spec.event_type == "record.type_corrected.v1" {
         return Err(Error::engine(
             "record.type_corrected.v1 is correction-operation-owned and cannot be appended through the generic content seam",
         ));
     }
     append_with_event_id_in(db, tx, Uuid::new_v4().to_string(), spec, act_alloc).await
+}
+
+/// Internal host-only run ledger event route. Public append/import cannot acquire it.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_run_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !matches!(
+        spec.event_type.as_str(),
+        "kernel.run_opened.v1" | "kernel.run_closed.v1" | "kernel.run_intent_set.v1"
+    ) {
+        return Err(Error::engine("invalid run ledger admission"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
+}
+
+/// Sealed catalogue/control import; never ordinary runtime authority.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_v1_state_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if spec.event_type != crate::kernel::v1_state::EVENT {
+        return Err(Error::engine("invalid state import admission"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
+}
+
+/// Sealed host instruction-binding import; generic append/import refuses it.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_instruction_binding_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !matches!(
+        spec.event_type.as_str(),
+        crate::kernel::instruction_bindings::EVENT | crate::kernel::instruction_bindings::UPDATE
+    ) {
+        return Err(Error::engine("invalid instruction binding admission"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
+}
+
+/// Sealed W1 outcome admission; generic append and imports cannot acquire this route.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_provider_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if spec.event_type != "kernel.provider_outcome.v1" {
+        return Err(Error::engine(
+            "kernel provider admission requires a provider outcome",
+        ));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(
+        db,
+        tx,
+        prepared,
+        PreparedAdmission::KernelProvider,
+        act_alloc,
+    )
+    .await
+}
+
+/// Sealed slot-map registration; generic append, public append and imports
+/// cannot acquire this route. Only `kernel::slots` calls it.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_slot_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !crate::kernel::slots::is_slot_event(&spec.event_type) {
+        return Err(Error::engine("kernel slot admission requires a slot event"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelSlot, act_alloc).await
 }
 
 /// Governed-only append capability for the prepared record-type correction
@@ -392,6 +518,12 @@ pub(crate) async fn append_with_event_id_in(
             "preallocated content event id must be a canonical lowercase UUIDv4",
         ));
     }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type == "kernel.legacy_recorded.v1" {
+        return Err(Error::engine(
+            "legacy events require the sealed host import port",
+        ));
+    }
     let prepared = prepare_sealed_local_event(event_id, spec)?;
     append_prepared_in(db, tx, prepared, act_alloc).await
 }
@@ -429,6 +561,93 @@ pub(crate) async fn append_derived_body_with_event_id_in(
         .await
 }
 
+/// Kernel-owned legacy recording seam. No native causal pins are synthesized.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_legacy_in(
+    conn: &mut sqlx::SqliteConnection,
+    event: &mut EventRow,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    crate::db::enrolled::require_content_connection(conn, None).await?;
+    if event.event_type != "kernel.legacy_recorded.v1" {
+        return Err(Error::engine(
+            "legacy append requires kernel legacy envelope",
+        ));
+    }
+    let act = acts.get_or_allocate(conn).await?;
+    event.local_seq = sqlx::query_scalar(
+        "INSERT INTO content_events (id,record_id,type,payload,actor,run_key,created_at,causal_envelope_version,causal_status,act)
+         VALUES(?,?,?,?,?,?,?,1,'legacy_unknown',?) RETURNING seq")
+        .bind(&event.id).bind(&event.record_id).bind(&event.event_type).bind(&event.payload)
+        .bind(&event.actor).bind(&event.run_key).bind(&event.created_at).bind(act)
+        .fetch_one(&mut *conn).await?;
+    event.act = Some(act);
+    project(conn, event).await
+}
+
+/// Host-import receipts are appended together, before their legacy rows. The
+/// first ordinary append consumes every existing causal head. Until this
+/// function returns, only receipts follow, so each subsequent complete native
+/// frontier is exactly the previous receipt. This avoids rediscovering and
+/// walking the whole log for every row without weakening native causality.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_import_receipts_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    principal: &str,
+    subjects: &[(&str, &str)],
+    acts: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    let mut previous = None;
+    for (record, legacy_id) in subjects {
+        let spec = AppendSpec {
+            record_id: (*record).into(),
+            event_type: "kernel.import_receipt.v1".into(),
+            payload: serde_json::json!({"legacy_event_id":legacy_id}),
+            actor: Some(principal.into()),
+        };
+        let Some(parent) = previous else {
+            previous = Some(append_in(db, tx, spec, acts).await?.id);
+            continue;
+        };
+        let mut event = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?.event;
+        // A dangling reference to the fresh UUID would invalidate the acyclic
+        // fast path. Refuse even that improbable collision, rather than assume.
+        let referenced: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id=?)",
+        )
+        .bind(&event.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if referenced {
+            return Err(Error::conflict(
+                "fresh import receipt id is already referenced",
+            ));
+        }
+        event.causal_envelope =
+            CausalEnvelopeV1::complete(CausalFrontierV1::new([parent.clone()])?);
+        let act = acts.get_or_allocate(tx).await?;
+        event.act = Some(act);
+        event.local_seq = sqlx::query_scalar(
+            "INSERT INTO content_events(id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,causal_envelope_version,causal_status,act)
+             VALUES(?,?,?,?,?,?,?,?,?,1,'complete',?) RETURNING seq",
+        ).bind(&event.id).bind(&event.record_id).bind(&event.event_type).bind(&event.payload)
+            .bind(&event.actor).bind(&event.run_key).bind(&event.parent_key).bind(&event.intent)
+            .bind(&event.created_at).bind(act).fetch_one(&mut **tx).await?;
+        sqlx::query(
+            "INSERT INTO content_event_causal_frontier(event_id,parent_event_id) VALUES(?,?)",
+        )
+        .bind(&event.id)
+        .bind(parent)
+        .execute(&mut **tx)
+        .await?;
+        project(tx, &event).await?;
+        crate::provenance::note_appended_event(&event.id);
+        previous = Some(event.id);
+    }
+    Ok(())
+}
+
 /// Migration-only content append on the migration runner's existing
 /// connection. Migration steps already own one `BEGIN IMMEDIATE` transaction;
 /// opening a `Db` here would take a second connection and deadlock. Fixed
@@ -441,6 +660,27 @@ pub(crate) async fn append_migration_on(
     spec: AppendSpec,
     created_at: &str,
 ) -> Result<EventRow> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if matches!(
+        spec.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine(
+            "provider outcomes cannot be imported through the generic event seam",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::kernel::slots::is_slot_event(&spec.event_type) {
+        return Err(Error::engine(
+            "slot events cannot be imported through the generic event seam",
+        ));
+    }
     crate::db::enrolled::require_content_connection(conn, None).await?;
     let payload = normalize_payload(&spec.record_id, &spec.event_type, spec.payload);
     let mut event = EventRow {
@@ -457,6 +697,11 @@ pub(crate) async fn append_migration_on(
         causal_envelope: CausalEnvelopeV1::legacy_unknown(),
         act: None,
     };
+    // This path inserts and projects without passing `append_prepared_admitted`,
+    // so it runs the shared home admission itself, before the insert (design
+    // 681a449 N3).
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    crate::kernel::admit_home_event(&mut *conn, &event).await?;
     let act = crate::act::ActAllocation::new()
         .get_or_allocate(conn)
         .await?;
@@ -550,10 +795,31 @@ async fn append_prepared_engine_seed_in(
 
 #[derive(Clone, Copy)]
 enum PreparedAdmission {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    KernelProvider,
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    KernelSlot,
     Ordinary,
     EngineSeed,
     EngineProvisioning,
     EngineDerived,
+}
+
+/// The record's stored kind for the live-session backstop, built in its own
+/// never-inlined frame: the append path is deeply nested (seeding, sign-up)
+/// and runs on 2 MiB server workers, so it must not carry the query future.
+#[inline(never)]
+fn boxed_stored_kind<'a>(
+    tx: &'a mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    record_id: &'a str,
+) -> futures::future::BoxFuture<'a, Result<Option<String>>> {
+    Box::pin(async move {
+        Ok(sqlx::query_scalar("SELECT kind FROM records WHERE id = ?")
+            .bind(record_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten())
+    })
 }
 
 async fn append_prepared_admitted(
@@ -564,6 +830,55 @@ async fn append_prepared_admitted(
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     crate::db::enrolled::require_content_connection(tx, Some(db)).await?;
+    // The hosted image also compiles kernel intents. Refuse an ordinary v1
+    // destination explicitly before allocating an act or appending anything,
+    // including events admitted through import/replication's shared seam.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if prepared.event.event_type.starts_with("kernel.") {
+        let kernel_schema: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='kernel_records')",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        if !kernel_schema {
+            return Err(Error::engine(
+                "kernel.* events require a kernel database; refusing a v1 database destination",
+            ));
+        }
+    }
+    // Single-writer rule backstop: while a live session is open on the
+    // record, only the session's own versions may write its body, and an
+    // event that takes the record out of live-editable scope closes it.
+    // Only databases with live sessions in this process pay for the
+    // backstop at all (a cheap map lookup gates it).
+    if crate::coedit::live::has_sessions(db) {
+        let stored_kind: Option<String> = if crate::coedit::live::needs_stored_kind(
+            db,
+            &prepared.event.record_id,
+            &prepared.event.event_type,
+            &prepared.payload,
+        ) {
+            boxed_stored_kind(tx, &prepared.event.record_id).await?
+        } else {
+            None
+        };
+        crate::coedit::live::admit_event(
+            db,
+            &prepared.event.record_id,
+            &prepared.event.event_type,
+            &prepared.payload,
+            prepared.event.actor.as_deref(),
+            stored_kind.as_deref(),
+        )?;
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    crate::kernel::admit_link_event(tx, &prepared.event).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    crate::kernel::admit_provider_event(tx, &prepared.event).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    crate::kernel::admit_home_event(tx, &prepared.event).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    crate::kernel::slots::admit(tx, &prepared.event).await?;
     if prepared.event.event_type == "record.deleted" {
         let active_binding: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -699,6 +1014,32 @@ async fn append_prepared_admitted(
     };
     let control = crate::portable_sql::ExecutionControl::default();
     match admission {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        PreparedAdmission::KernelProvider => {
+            if !matches!(causal_admission, CausalAdmission::LocalComputed) {
+                return Err(Error::engine(
+                    "provider outcomes cannot carry imported causality",
+                ));
+            }
+            crate::domain_transaction::append_and_project_kernel_provider(
+                &mut ports,
+                &mut prepared.event,
+                &control,
+            )
+            .await?;
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        PreparedAdmission::KernelSlot => {
+            if !matches!(causal_admission, CausalAdmission::LocalComputed) {
+                return Err(Error::engine("slot events cannot carry imported causality"));
+            }
+            crate::domain_transaction::append_and_project_kernel_slot(
+                &mut ports,
+                &mut prepared.event,
+                &control,
+            )
+            .await?;
+        }
         PreparedAdmission::Ordinary => {
             if matches!(causal_admission, CausalAdmission::GovernedImport(_)) {
                 crate::domain_transaction::append_and_project_governed_import(
@@ -764,8 +1105,8 @@ async fn append_prepared_admitted(
     // content rebuild intentionally has an empty meta tier.
     // v2 kernel events project into kernel tables only; the v1 definition
     // slot check reads `records`, which a v2 database does not have. This
-    // gate is unreachable in production: kernel types fail intent parsing
-    // there before this line (the test-only arm in `from_event`).
+    // gate is active when the hosted kernel feature is built. The shared
+    // admission above refuses kernel events on ordinary v1 destinations.
     if !(cfg!(any(test, feature = "v2-kernel-probe"))
         && prepared.event.event_type.starts_with("kernel."))
     {
@@ -978,6 +1319,67 @@ async fn reject_public_governed_attribution_in(
 }
 
 fn reject_public_runtime_event(spec: &AppendSpec) -> Result<()> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type == crate::kernel::HOST_TRANSFORM_CREATED_EVENT
+        || spec.event_type == "kernel.app_installs_activated.v1"
+        || spec.event_type == "kernel.app_install_removed.v1"
+        || spec.event_type == "kernel.app_install_recorded.v1"
+        || spec.event_type == "kernel.app_install_adopted.v1"
+        || spec.event_type == "kernel.app_action_started.v1"
+        || spec.event_type == "kernel.app_action_recorded.v1"
+        || spec.event_type == crate::kernel::v1_state::EVENT
+        || spec.event_type == "kernel.hosted_offboarding.v1"
+        || spec.event_type == "kernel.hosted_membership.v1"
+        || spec.event_type == "kernel.import_member_policy.v1"
+        || spec.event_type == "kernel.import_hosted_accounts.v1"
+        || spec.event_type == "kernel.host_import_created.v1"
+        || spec.event_type == "kernel.legacy_recorded.v1"
+        || spec.event_type == "kernel.import_receipt.v1"
+        || spec.event_type == "kernel.import_state.v1"
+        || spec.event_type == "kernel.import_state_delta.v1"
+        || spec.event_type == "kernel.import_removed.v1"
+        || spec.event_type == "kernel.import_source_head.v1"
+        || spec.event_type == "kernel.generic_link_removal_imported.v1"
+        || spec.event_type == "kernel.import_home.v1"
+        || spec.event_type == "kernel.import_home_delta.v1"
+        || spec.event_type == "kernel.import_home_policy.v1"
+        || spec.event_type == "kernel.import_members_roster.v1"
+        || spec.event_type == "kernel.import_record_created.v1"
+        || spec.event_type == "kernel.generic_link_imported.v1"
+        || spec.event_type == "kernel.generic_link_note_imported.v1"
+        || (spec.event_type == crate::kernel::KERNEL_PRINCIPAL_CREATED_EVENT
+            && spec
+                .payload
+                .get("auth_binding")
+                .and_then(Value::as_str)
+                .is_some_and(|b| b.starts_with("host:")))
+    {
+        return Err(Error::engine(
+            "host: auth bindings are reserved for kernel-owned principals",
+        ));
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if matches!(
+        spec.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine("provider outcomes are kernel commit-port-owned and cannot be appended through the public event seam"));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::kernel::slots::is_slot_event(&spec.event_type) {
+        return Err(Error::engine("slot events are kernel slot-route-owned and cannot be appended through the public event seam"));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if spec.event_type == "kernel.record_rebound.v1" {
+        return Err(Error::engine("rebind events are test-support-only"));
+    }
     if spec.event_type == "record.type_corrected.v1" {
         return Err(Error::engine(
             "record.type_corrected.v1 is correction-operation-owned and cannot be appended through the public event seam",
@@ -1436,6 +1838,112 @@ mod causal_admission_tests {
         assert!(!stored);
         tx.rollback().await.unwrap();
     }
+    #[tokio::test]
+    async fn cycle_shortcut_preserves_forward_references_and_exact_frontiers() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let seed: String =
+            sqlx::query_scalar("SELECT id FROM content_events ORDER BY seq DESC LIMIT 1")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        let ids: Vec<String> = (0..7).map(|_| Uuid::new_v4().to_string()).collect();
+        let mut acts = crate::act::ActAllocation::new();
+        let act = acts.get_or_allocate(&mut tx).await.unwrap();
+        let control = crate::portable_sql::ExecutionControl::default();
+        let mut ports = SqliteContentPorts {
+            transaction: &mut tx,
+            native_source: None,
+            act,
+        };
+        // A consumes a known event. B references C before C exists. C can then
+        // arrive referencing A: incoming references do not by themselves imply
+        // a cycle, so the original ancestry check must still decide the result.
+        for (position, parents) in [
+            vec![seed.clone()],
+            vec![ids[2].clone()],
+            vec![ids[0].clone()],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ports.native_source = Some(source(100 + position as i64));
+            ports
+                .append_event(
+                    &mut imported_event(ids[position].clone()),
+                    &CausalAdmission::GovernedImport(CausalEnvelopeV1::complete(
+                        CausalFrontierV1::new(parents).unwrap(),
+                    )),
+                    &control,
+                )
+                .await
+                .unwrap();
+        }
+        // D -> missing E; F -> D. E -> F must refuse the indirect cycle,
+        // including when E is not yet present in content_events.
+        for (position, parents) in [(3, vec![ids[4].clone()]), (5, vec![ids[3].clone()])] {
+            ports.native_source = Some(source(100 + position as i64));
+            ports
+                .append_event(
+                    &mut imported_event(ids[position].clone()),
+                    &CausalAdmission::GovernedImport(CausalEnvelopeV1::complete(
+                        CausalFrontierV1::new(parents).unwrap(),
+                    )),
+                    &control,
+                )
+                .await
+                .unwrap();
+        }
+        ports.native_source = Some(source(106));
+        let error = ports
+            .append_event(
+                &mut imported_event(ids[4].clone()),
+                &CausalAdmission::GovernedImport(CausalEnvelopeV1::complete(
+                    CausalFrontierV1::new([ids[5].clone(), ids[0].clone()]).unwrap(),
+                )),
+                &control,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "causal frontier would create a cycle");
+        // A completely unreferenced ID must still reject a direct self-parent.
+        let error = ports
+            .append_event(
+                &mut imported_event(ids[6].clone()),
+                &CausalAdmission::GovernedImport(CausalEnvelopeV1::complete(
+                    CausalFrontierV1::new([ids[6].clone()]).unwrap(),
+                )),
+                &control,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "causal frontier cannot contain the event itself"
+        );
+        drop(ports);
+        for (position, parents) in [
+            (0, vec![seed]),
+            (1, vec![ids[2].clone()]),
+            (2, vec![ids[0].clone()]),
+            (3, vec![ids[4].clone()]),
+            (5, vec![ids[3].clone()]),
+        ] {
+            let recorded: Vec<String> = sqlx::query_scalar("SELECT parent_event_id FROM content_event_causal_frontier WHERE event_id=? ORDER BY parent_event_id")
+                .bind(&ids[position]).fetch_all(&mut *tx).await.unwrap();
+            assert_eq!(recorded, parents);
+        }
+        for position in [4, 6] {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE id=?)")
+                    .bind(&ids[position])
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert!(!exists);
+        }
+        tx.rollback().await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1729,11 +2237,15 @@ mod version_metadata_tests {
         let contributors = [AcknowledgedContributor {
             principal: "acct:human".into(),
             executor_kind: "human".into(),
+            run_key: None,
+            app: None,
+            channel: None,
         }];
         let metadata = VersionMetadata {
             contributors: &contributors,
             session_ref: "sess-1",
             merged_offline: true,
+            span_map: None,
         };
         let base = json!({"summary": "carried"}).as_object().unwrap().clone();
         let payload = record_updated_payload(base, Some(&metadata)).unwrap();
@@ -1760,4 +2272,126 @@ mod version_metadata_tests {
         assert_eq!(stored["merged_offline"], json!(true));
         db.close().await;
     }
+}
+
+/// Design fixtures 49 and 79, governed-import route (Foci v2 G6 increment 3b).
+/// Only this module can build a prepared event carrying authenticated source
+/// facts, which is what makes `append_prepared_admitted` choose the governed
+/// import admission. The verified replication ingest builds only
+/// `record.created` events, so it cannot carry a kernel home event at all; this
+/// drives the same `append_prepared_in` it calls, with a kernel event, to show
+/// that the shared home hook sits ahead of the governed-import branch.
+#[cfg(test)]
+mod home_admission_route_tests {
+    use super::*;
+    use crate::events::KERNEL_ROOT_ID;
+
+    fn prepared(event_type: &str, record_id: &str, actor: &str, payload: Value) -> PreparedEvent {
+        PreparedEvent {
+            event: EventRow {
+                local_seq: -1,
+                id: Uuid::new_v4().to_string(),
+                record_id: record_id.into(),
+                event_type: event_type.into(),
+                payload: Some(payload.to_string()),
+                actor: Some(actor.into()),
+                run_key: None,
+                parent_key: None,
+                intent: None,
+                created_at: "2026-10-15T00:00:00.000Z".into(),
+                causal_envelope: CausalEnvelopeV1::default(),
+                act: None,
+            },
+            payload,
+            native_source: Some(NativeEventSource {
+                origin_database_id: "ndb_test_source".into(),
+                source_seq: 1,
+                source_record_id: Uuid::new_v4().to_string(),
+                source_principal: "native:principal:test-source".into(),
+                fingerprint: [9; 32],
+            }),
+            governed_causal_envelope: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn governed_import_meets_the_shared_home_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", dir.path().join("governed.db").display());
+        let (db, admin) = crate::kernel::create_v2_database(&url, "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+        let other = crate::kernel::create_principal(&db, "account", "Other", "acct:other", &admin)
+            .await
+            .unwrap();
+        let home = crate::kernel::create_home(&db, KERNEL_ROOT_ID, Some(&[]), &admin)
+            .await
+            .unwrap();
+        let record = crate::kernel::create_record_as(&db, &admin, &home)
+            .await
+            .unwrap();
+        let home_payload =
+            |owner: &str| json!({"parent_id": KERNEL_ROOT_ID, "owner_id": owner, "entries": []});
+        let record_payload = json!({"home_id": KERNEL_ROOT_ID, "owner_id": null,
+            "primary_type": null, "kind": null, "accession": null, "pin": null, "interpreter": null});
+
+        let cases = [
+            (
+                prepared(
+                    "kernel.home_created.v1",
+                    &Uuid::new_v4().to_string(),
+                    &admin,
+                    home_payload(&other),
+                ),
+                "a home can be created for another owner only through the sealed home_created_for route",
+            ),
+            (
+                prepared("kernel.record_created.v1", &home, &admin, record_payload),
+                "record id is already a home",
+            ),
+            (
+                prepared("kernel.home_created.v1", &record, &admin, home_payload(&admin)),
+                "home id is not fresh",
+            ),
+        ];
+        for (event, expected) in cases {
+            let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            let mut acts = crate::act::ActAllocation::new();
+            match append_prepared_in(&db, &mut tx, event, &mut acts).await {
+                Err(Error::Engine(got)) => assert_eq!(got, expected),
+                other => panic!("expected Engine({expected}), got {other:?}"),
+            }
+            tx.rollback().await.unwrap();
+            let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(before, after);
+        }
+        db.close().await;
+    }
+}
+
+/// Test the physical ProjectorPort without first appending the caller's envelope.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn exercise_provider_projector_port(db: &Db, event: &EventRow) -> Result<()> {
+    use crate::domain_transaction::ProjectorPort;
+    let mut tx = db.write_pool().begin().await?;
+    let intent = crate::domain_transaction::ProjectorIntent::from_event(event)?;
+    let mut ports = SqliteContentPorts {
+        transaction: &mut tx,
+        native_source: None,
+        act: 0,
+    };
+    ports
+        .apply_projector(
+            &intent,
+            event,
+            &crate::portable_sql::ExecutionControl::default(),
+        )
+        .await
 }

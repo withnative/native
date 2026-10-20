@@ -1,0 +1,164 @@
+# Native core app kit 1.1.0
+
+Major 1 now defaults to 1.1.0 on the next launch; 1.0.0 is retained for host
+rollback. The host installs frozen `window.native.kit` synchronously before the
+first author script. No imports, npm, JSX compiler or build are required.
+An unavailable requested major refuses `kit_major_unavailable`.
+
+## Prepare an install from Native MCP alone
+
+Create the complete HTML as a `Document/artifact` with runtime `native.html.v1`.
+Use its write receipt's `body_digest` (or body-carrying `source_event_id`) to call
+`artifacts_read.manage_alpha_tabs.prepare_install` through `call_executor`:
+
+```json
+{"executor":"artifacts_read","operation":"manage_alpha_tabs.prepare_install","arguments":{"artifact_id":"<source id>","expected_body_digest":"<body_digest>","package":"agent.my-app","version":"1.0.0","declaration":{"needs":[],"effects":[]},"reason":"Install my authored app"}}
+```
+
+Include your actual consent declaration, including each SQL snapshot need.
+When `ready` is true, pass the returned `next_call` to `call_executor`, adding
+your `run_key`. It contains the server-computed digests, source revision and
+install/update event precondition; no shell, hash computation or build is needed.
+When false, read the bounded findings, fix the source/declaration and prepare again.
+Malformed package/version/reason/request/guard arguments and authority failures
+are normal API errors, rather than `ready:false` findings. Preparation caps the
+echoed declaration at 65,536 serialized JSON bytes; `require_declaration` has
+entry limits but no total byte cap. An optional `request` is validated and passed
+through, including a reinstall over a removed tab; updates must preserve it.
+Kit availability is advisory against the packaged default; delivery checks its
+own selection. Preparation grants nothing, installs nothing and locks nothing.
+The returned revision pins historical bytes; later source edits do not silently
+replace them. Re-prepare after edits. Current update CAS and consent rules still
+apply. `ready:true` means prepared, not usable. Read `adoption`: when it is
+`requires_person_preview_adopt`, tell the signed-in person to Preview/Adopt after
+install/update; MCP cannot mint that authority. `carried` means the update can
+carry proven adoption for an unchanged canonical declaration. An unadopted
+predecessor still requires Preview/Adopt even when the declaration is unchanged.
+
+Alpha tabs pin a package/version/digest, a viewable live `Document/artifact`, its
+source revision and consented needs/effects. Updates check exact bytes/digest and
+event CAS, preserving status/request. Keyed retries return the original receipt
+and current install without reapplying. Disable/restore/remove use event CAS;
+disabled or removed tabs stop reads/actions. Target resolution fails closed;
+inspect `target_resolves`. List before reorder: reorder replaces the strip order,
+appends omitted installs, and refuses unknown/removed/duplicate entries. Without
+a saved order, the strip uses agents/folders/tasks/graph/installs.
+
+Preview checks exact source/digest and returns sample HTML with an expiring
+account/pin/session receipt; it writes nothing. Preview/adopt/adopt_authored
+require a hosted cookie and trusted Origin, never Bearer credentials. Adopt
+checks the receipt, pin, event and attestation. Launch checks adoption, event,
+View and source; its one-use URL delivers sample input only, without live rows.
+`live_read` returns only the caller's authorized consented inputs:
+`attention.query.v1` at `input.records`, up to eight `sql.snapshot.v1` SELECT/WITH
+needs with 200 rows each at `input.sql[key]`. `params[0]` binds `?1`; omitted
+optional parameters bind NULL. Use `live_read.need` to request a consented `records.search.v1` with
+`params:{query,limit}` (`limit` at most 30), `records.resolve_reference.v1` with
+`params:{reference}`, or a SQL need by key with its declared parameter schema.
+Omit `need` for the snapshot. Subscriptions are connection-bound; use the stream-frame token;
+subscriptions and `if_revision` apply only to snapshot reads. An `if_revision`
+equal to `revision_digest` returns `unchanged:true` with pins/revision and no rows.
+Use `if_revision` to resynchronize. Revision information includes `id` and
+`time_dependent`; `now_ms()` uses `as_of_ms`. `subscribe_refused` includes the
+read. `live_unsubscribe` is idempotent and connection-scoped.
+`admit_reveal_target` checks consented `surface.reveal.v1` and one visible
+canonical target/pin; delivery is push-only, never via `live_read`.
+Supply the full record id or a reserved id such as `native:root`; prefixes refuse.
+
+## A source-only feed app
+
+This complete source-only app displays a declared `records.recent` param-less
+`sql.snapshot.v1` feed. Declare that need in the install declaration; the kit
+policy below adds no data permission. Use this exact declaration:
+
+```json
+{
+  "needs": [
+    {
+      "need": "sql.snapshot.v1",
+      "key": "records.recent",
+      "label": "Up to 200 visible records, newest first",
+      "sql": "SELECT id, substr(name, 1, 160) AS name, type, kind, updated_at FROM records WHERE deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM facet_values fv WHERE fv.record_id = records.id AND fv.key = 'archived') ORDER BY updated_at_ms DESC, id ASC LIMIT 200"
+    }
+  ],
+  "effects": []
+}
+```
+
+The SQL selects `id` and `name`, the columns the example renders. Apps own
+CSS; the components use simple `kit-*` classes and add no reset.
+
+```html
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Recent notes</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem}.kit-record-link{cursor:pointer}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact) root.textContent = 'Open in a Native host with core kit 1.1.0.';
+else {
+  const { html, render, useFeed, Loading, Empty, ErrorState, RecordLink } = kit.preact;
+  function App() {
+    const feed = useFeed('records.recent');
+    if (feed.status === 'loading') return html`<${Loading} what="notes" />`;
+    const result = feed.status === 'ready' ? feed.result : feed.last;
+    return html`<section><h1>Recent notes</h1>
+      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} />`}
+      ${feed.status === 'error' && result && html`<p>Last good rows; may be out of date.</p>`}
+      ${result && html`<p>${kit.countLabel(result)} notes</p>`}
+      ${result?.rows.length ? html`<ul>${result.rows.map(row => html`<li key=${row.id}>
+        <${RecordLink} id=${row.id}>${row.name || row.id}<//></li>`)}</ul>`
+        : html`<${Empty}>No notes delivered.<//>`}
+    </section>`;
+  }
+  try { await kit.ready; render(html`<${App} />`, root); }
+  catch (error) { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>
+```
+
+`kit.preact` supplies one Preact instance: `h`, `render`, `Fragment`,
+`createContext`, standard hooks, and `html = htm.bind(h)`. Use its hooks for its
+components. `useFeed(key)` uses core snapshots; `useQueryFeed(query)` waits for
+ready and uses the optional negotiated app-v2 `window.native.subscribe`.
+Equivalent JSON query values keep the subscription; changed queries and
+unmounts unsubscribe and suppress late deliveries. Errors retain last-good
+rows and delivery time. Inside a v2 component, pass `feed.retry`
+to the retry button:
+
+```js
+const feed = kit.preact.useQueryFeed({ sql: 'SELECT id, name FROM records LIMIT 20' });
+if (feed.status === 'error')
+  return html`<${ErrorState} error=${feed.error} onRetry=${feed.retry} />`;
+```
+
+`retry()` resubscribes to the same query; a terminal error closes the old
+subscription. Hooks mounted after kit disposal return a `closed` error.
+Query answers have `truncated`, not a total count.
+
+A ready result is `{ rows, columns, truncated, cached? }`. Rows of a `{ sql }`
+query, like snapshot rows, are objects keyed by column name: read `row.id`, not
+`row[0]`. `columns` names them in select order. Rows of a structured `{ steps }`
+query are arrays aligned with `columns` (`id`, `type`, `kind`, `name`,
+`summary`, `home_id`, `lifecycle`, `maturity`, `updated_at`,
+`last_activity_at`). To accept either shape, use
+`Array.isArray(row) ? Object.fromEntries(columns.map((c, i) => [c, row[i]])) : row`.
+A host without subscriptions returns `status: 'unsupported'` with an explicit
+message. Core major 1 never grants app-v2 authority to an app-v1 install.
+
+For an app-v2 install, negotiated `query`, `subscribe` and `call` may also be
+used directly after `kit.ready`. Check each optional method. A write is saved
+only when `call(operation, args).confirmed` resolves; dispatch is not a receipt.
+Initial Preview/Adopt still requires the person's browser gesture.
+
+`Loading`, `Empty`, `ErrorState` (optional retry), `PreviewBanner`, `Markdown`
+(`source`), `Avatar` (initials), `IconSvg` (app-owned children), and `RecordLink`
+(`id`) are supplied. Mount `PreviewBanner` only for known sample/preview mode.
+Markdown reuses the kit parser: raw HTML stays text, images show alt text,
+entities decode through an inert browser resolver, and navigation uses core
+attributes and trusted user activation. No editor, comments or CSS are supplied.
+Prepared documents retain their selected release. Kit bytes are exempt from
+author size/digest accounting; source and declaration still define the app pin.

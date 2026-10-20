@@ -39,6 +39,8 @@ mod attribution;
 mod bears_shape;
 #[path = "records/body_blocks.rs"]
 mod body_blocks;
+#[path = "records/body_json_nodes.rs"]
+mod body_json_nodes;
 #[path = "records/citations.rs"]
 mod citations;
 #[path = "records/comments.rs"]

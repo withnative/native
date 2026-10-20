@@ -73,7 +73,7 @@ pub enum LifecycleInterpretation {
     Unclassified(UnclassifiedLifecycleInterpretation),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct VocabularyValueState {
     id: String,
     vocabulary_id: String,
@@ -234,6 +234,94 @@ pub struct LifecycleInterpreter {
 }
 
 impl LifecycleInterpreter {
+    /// Already-authorized declarations for read-time facet interpretation.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    #[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+    pub(crate) fn schema_rows(&self) -> &[SchemaConfigRow] {
+        &self.schema_rows
+    }
+
+    /// Pure constructor for sealed v1 catalogue snapshots in probe databases.
+    /// Shares precisely the live interpreter's alias/terminality rules.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn from_imported_rows(
+        mut schema_rows: Vec<SchemaConfigRow>,
+        vocabularies: Vec<serde_json::Value>,
+        values: Vec<serde_json::Value>,
+    ) -> Result<Self> {
+        schema_rows.sort_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)));
+        let mut index = VocabularyIndex::default();
+        for row in vocabularies {
+            let id = row["id"]
+                .as_str()
+                .ok_or_else(|| Error::engine("vocabulary id missing"))?
+                .to_owned();
+            let name = row["name"]
+                .as_str()
+                .ok_or_else(|| Error::engine("vocabulary name missing"))?
+                .to_owned();
+            index.refs.insert(id.clone(), id.clone());
+            index.refs.insert(name.clone(), id.clone());
+            index.names_by_id.insert(id, name);
+        }
+        for row in values {
+            let value: VocabularyValueState = serde_json::from_value(row)?;
+            index.values_by_vocab_and_value.insert(
+                (value.vocabulary_id.clone(), value.value.clone()),
+                value.id.clone(),
+            );
+            index.values_by_id.insert(value.id.clone(), value);
+        }
+        Ok(Self {
+            schema_rows,
+            vocabularies: index,
+        })
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn canonical_imported_kind(&self, typ: &str, kind: &str) -> String {
+        self.vocabularies
+            .refs
+            .get(&format!("kind:{typ}"))
+            .and_then(|vocab| self.vocabularies.canonical_value(vocab, kind))
+            .map(|v| v.value.clone())
+            .unwrap_or_else(|| kind.into())
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn validate_imported_write(
+        &self,
+        typ: &str,
+        kind: &str,
+        bearer: Option<&str>,
+        lifecycle: Option<&str>,
+    ) -> Result<()> {
+        let facets = cascade::facets_for_record_context(&self.schema_rows, typ, Some(kind), bearer);
+        if lifecycle.is_none()
+            && facets
+                .get("lifecycle")
+                .and_then(|v| v.get("required"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        {
+            return Err(Error::engine(
+                "lifecycle is required by the governing schema",
+            ));
+        }
+        if lifecycle.is_some()
+            && facets
+                .get("lifecycle")
+                .is_some_and(|s| s.get("vocab").or_else(|| s.get("vocab_ref")).is_some())
+            && !matches!(
+                self.interpret(typ, Some(kind), bearer, lifecycle),
+                LifecycleInterpretation::Governed(_)
+            )
+        {
+            return Err(Error::engine(
+                "lifecycle is unknown, inactive or has an uninterpretable governing vocabulary",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn load(db: &Db, principal: Option<Principal<'_>>) -> Result<Self> {
         Self::load_in_pool(db.write_pool(), principal).await
     }

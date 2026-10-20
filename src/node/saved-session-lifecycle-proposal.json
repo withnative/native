@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "vocabulary": {
+    "name": "saved-session-lifecycle",
+    "values": [
+      {
+        "value": "open",
+        "terminality": "open",
+        "gloss": "The saved conversation remains open for saving or resumption."
+      },
+      {
+        "value": "closed",
+        "terminality": "terminal_positive",
+        "gloss": "The execution-host session ended; saved conversation history remains available."
+      }
+    ]
+  },
+  "shape_patch": {
+    "shapes": {
+      "Document:agent-session": {
+        "facets": {
+          "lifecycle": {
+            "required": false,
+            "vocab": "rec:voc:saved-session-lifecycle",
+            "axis": {
+              "key": "saved_session_status",
+              "label": "Saved session status"
+            }
+          }
+        }
+      }
+    }
+  },
+  "kind": {
+    "vocabulary": "kind:Document",
+    "value": "agent-session",
+    "gloss": "Saved curated conversation and persistence state for one bound execution-host agent.",
+    "metadata": {
+      "schema_version": 1,
+      "provenance_ref": "rec:f38936b4-830e-4c04-9e9e-0e281cac75c5",
+      "definition": "A saved agent conversation descriptor. Immutable curated steps are separate child records in its session folder; this descriptor carries host binding, progress and saving state.",
+      "identity": {
+        "criterion": "One descriptor for an execution-host server identity and agent within its owner-private account/database binding; writer position and identity keys provide admission.",
+        "dedup": {
+          "mode": "manual",
+          "keys": []
+        }
+      },
+      "declared_capabilities": []
+    }
+  }
+}

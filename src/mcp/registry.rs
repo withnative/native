@@ -88,7 +88,19 @@ use crate::domain_transaction::request::{
 /// discretionary widening, and it is deliberately the smallest whole-KiB step
 /// that clears both the ordinary and the federated-lens Focused projections.
 /// It does not answer `cc34ddc`; it records that this feature needed the room.
-pub const FOCUSED_PROFILE_MAX_BYTES: usize = 71_680;
+///
+/// Raised from 70 KiB to 71 KiB on 7 Oct 2026 for universal idempotency
+/// (task `8bef361`, slice A0, design `515067b`). Keyed writes must advertise
+/// `idempotency_key`, and A0 adds the shared fragment to four Focused
+/// branches — singular and multi-target `update_record`, and
+/// `manage_links.add`/`remove` — at 66 bytes each. That took the federated-lens
+/// Focused projection from 71,579 to 71,843, past the old ceiling; the
+/// ordinary Focused projection still fits. Same shape as the raises above: a
+/// required contract, approved by the task driver, and the smallest whole-KiB
+/// step that clears both projections. Later slices wire more Focused writes
+/// and will need room of their own; that is the `cc34ddc` question again, not
+/// a standing allowance.
+pub const FOCUSED_PROFILE_MAX_BYTES: usize = 72_704;
 /// Raised from 192 KiB to 224 KiB on 3 Sep 2026, deliberately and as a stopgap.
 ///
 /// The federated-lens Complete projection reached 196,637 bytes against the
@@ -129,7 +141,46 @@ pub const FOCUSED_PROFILE_MAX_BYTES: usize = 71_680;
 /// ceiling. Same shape as the raises above: a required contract, not a
 /// discretionary widening, and the smallest whole-KiB step that clears it,
 /// leaving ~183 bytes. The broader surface decision is still open.
-pub const COMPLETE_PROFILE_MAX_BYTES: usize = 239_616;
+/// Raised from 234 KiB to 237 KiB for persona participants S1/S2 (5001e34).
+/// Persona management stays Complete-only. Its discriminated schema and the
+/// speaker claim still put the hosted opt-in lens over 234 KiB after tightening
+/// persona descriptions; removing every remaining persona description would
+/// not recover that gap. 237 KiB remains the smallest whole-KiB limit admitting
+/// the required contracts. Focused remains at 70 KiB. Current measured costs
+/// are recorded in the generated tool inventory.
+/// This required contract does not settle the broader surface-cost decision
+/// cc34ddc; the generated inventory records the added cost.
+///
+/// Raised from 237 KiB to 238 KiB on 8 Oct 2026 for universal idempotency
+/// (task `8bef361`, slice A1, design `515067b`). A1 adds the shared
+/// `idempotency_key` fragment (66 bytes) to nine more write schemas. That
+/// took the experimental opt-in federated-lens Complete projection to 242,771
+/// bytes, 83 over the old ceiling; the Focused profile still fits. Same shape
+/// as the raises above: a required contract, and the smallest whole-KiB step
+/// that clears it. It does not answer `cc34ddc`; A2 wires a few more writes and
+/// the remaining headroom is about 940 bytes.
+///
+/// Raised from 238 KiB to 239 KiB on 8 Oct 2026 for universal idempotency
+/// slices A1b and A2 combined (task `8bef361`). A1b keys four artifact tools
+/// and three message actions; A2 adds the fragment to `create_many`,
+/// `instantiate_artifact` and `attach_from_url`, plus `create_many`'s resume
+/// contract (one sentence, 136 bytes). Together they took the experimental
+/// opt-in federated-lens Complete projection to 243,843 bytes, 131 over the old
+/// ceiling; Focused still fits (72,267 of 72,704 on the lens). A1b and A2 alone
+/// would have landed at 243,547, 165 under the old ceiling: what crossed it was
+/// a 296-byte description addition across twelve tools that reached `main`
+/// between the slices and the merge, so this raise is owed to that as much as
+/// to them. The smallest whole-KiB step that clears it, leaving about 890
+/// bytes. It does not answer `cc34ddc`.
+///
+/// Raised from 239 KiB to 240 KiB on 14 Oct 2026 for Option B5 (task
+/// `626a1e9`): `manage_alpha_tabs.launch` gains optional `delivery`. Main had
+/// already filled the 239 KiB ceiling to within about 8 bytes, so any new
+/// argument crossed it. The property was trimmed to its minimum (no
+/// `minLength`, a 61-byte description), leaving the lens Complete projection
+/// at 244,887 bytes, 151 over the old ceiling. The smallest whole-KiB step
+/// that clears it, leaving about 870 bytes. It does not answer `cc34ddc`.
+pub const COMPLETE_PROFILE_MAX_BYTES: usize = 245_760;
 
 /// Trusted workspace audience classification supplied by the transport.
 /// Agent-authored tool arguments cannot influence this value.
@@ -185,12 +236,22 @@ pub struct Caller {
     /// Unforgeable compatibility boundary for trusted in-process callers.
     /// Public credential construction must never be able to enable it.
     trusted_local: bool,
+    /// The operator of a local database file or of their own standby copy.
+    /// Grants exactly one thing: [`CounterFooting::Owner`] when no hosting
+    /// route is attached. It is not `trusted_local` and bypasses nothing.
+    /// Set only by [`Caller::local_owner`].
+    local_owner: bool,
     /// Member-copy serving mode: the caller holds only the admitted E(m)
     /// slice, so per-id visibility is "present in the slice", never the
     /// engine policy/Unit fold (which reads tables a member file does not
     /// contain). Set only by [`Caller::member_copy`].
     member_copy: bool,
     suppress_request_persistence: bool,
+    /// Outage-bootstrap mode for the local node (design 200dc2d §6).
+    /// Only internal composition may set it; tool arguments have no
+    /// representation for it. It changes neither authorisation nor
+    /// persistence suppression.
+    outage_bootstrap: bool,
     /// §3.3 rule 6 schema markers of the admitted generation, threaded from the
     /// dispatch's member gate so a member handler can refine the global vs
     /// collection-scoped applicability of a schema surface. Empty online and
@@ -203,6 +264,8 @@ pub struct Caller {
     /// principal so hosting capabilities can authorize the user and act on the
     /// database without changing portable event attribution.
     hosting_database: Option<String>,
+    /// Issuing cookie session, attached only by trusted hosted ingress.
+    hosting_session_id: Option<String>,
     /// Current hosted roster established by the catalog at request ingress.
     /// Routing context alone never populates this capability.
     hosted_activity_roster: Option<Vec<crate::query::principal::ActivityRosterMember>>,
@@ -223,6 +286,7 @@ pub struct Caller {
     run_key: Option<String>,
     parent_key: Option<String>,
     intent: Option<String>,
+    deferred_run_context: Option<(String, Option<String>, Option<String>)>,
     /// Self-asserted MCP client identity from this call's
     /// `params._meta["io.modelcontextprotocol/clientInfo"]`, attached by the
     /// protocol layer before dispatch. This is a CLIENT-ASSERTED FACT, not a
@@ -233,6 +297,12 @@ pub struct Caller {
     /// stays distinguishable from an empty string the client did send.
     reported_mcp_client_name: Option<String>,
     reported_mcp_client_version: Option<String>,
+    /// OAuth client id (`azp` / `client_id`) read off a signature-verified
+    /// bearer token by hosted ingress. ATTRIBUTION ONLY: it names which
+    /// connected application acted for the person and must never influence
+    /// authorization, routing, or any attested identity. `None` when the
+    /// credential carries no such claim (opaque sessions, local callers).
+    oauth_client_id: Option<String>,
     /// Present only after a trusted host/UI ingress verifies an unforgeable
     /// human interaction token. Tool arguments can never populate it.
     verified_human_interaction: Option<crate::awareness::VerifiedHumanInteraction>,
@@ -292,18 +362,53 @@ pub struct Caller {
     /// layer. Same pin shape as the other proofs, separate field so a
     /// preview or adopt attestation is never an authored-adopt authority.
     verified_alpha_tab_adopt_authored: Option<VerifiedAlphaTabPreview>,
+    /// The v2 app the hosted shell vouched for on this call (task
+    /// `50f5aca`). Only the hosted plain-JSON adapter attaches it, after
+    /// cookie-session plus same-host Origin checks; the MCP router, Bearer
+    /// callers, and tool arguments have no representation for it. It grants
+    /// nothing: the call keeps exactly the user's authority. The engine
+    /// re-verifies the install before dispatch and records the app beside
+    /// every action attestation the call issues. Held behind an `Arc` so
+    /// the unattributed path pays one pointer per `Caller` copy: callers are
+    /// moved by value through deeply nested dispatch futures.
+    host_asserted_app: Option<Arc<crate::mcp::app_attribution::AppAttribution>>,
     /// Trusted policy evaluator authority. Ordinary authenticated agent calls
     /// never receive this bit and therefore cannot reroute obligations.
     policy_authority: bool,
     /// Trusted, request-local write-plan claim. Only the in-process executor
     /// can populate this; source tool arguments cannot manufacture it.
     write_plan_execution: Option<WritePlanExecution>,
+    /// Trusted, request-local serving catalogue for `catalog_operations`.
+    /// Only the in-process executor projects this from its effective
+    /// (advertised) contracts, and only for the ad-hoc online SQLite
+    /// `query_sql` dispatch; source tool arguments have no representation
+    /// for it. Every other path carries `None` and refuses the relation.
+    catalog_operations: Option<crate::query::principal::CatalogOperationsSnapshot>,
     /// Trusted, request-local hosted executor claim. Only the signed plan
     /// runtime can populate this; source tool arguments have no representation
     /// for it. Membership handlers consume it to couple their catalogue
     /// mutation to the durable plan claim in one transaction.
     #[cfg(feature = "mcp-executor-prototype")]
     hosted_plan_execution: Option<HostedMembershipPlanExecution>,
+}
+
+/// Counter-visibility footing for a [`Caller`]. Owners keep workspace-wide
+/// counters; every other caller is a non-owner and must never be handed a
+/// count of activity it cannot see (design 08b4c21 §3).
+///
+/// The check is positive-proof and deny-by-default: an authenticated caller
+/// that carries no hosting context is a non-owner, and a member copy is always
+/// a non-owner regardless of any host fields it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterFooting {
+    Owner,
+    NonOwner,
+}
+
+impl CounterFooting {
+    pub fn is_owner(self) -> bool {
+        matches!(self, CounterFooting::Owner)
+    }
 }
 
 #[cfg(feature = "mcp-executor-prototype")]
@@ -451,11 +556,14 @@ impl Caller {
             credential: identity.into(),
             channel: Channel::Unknown,
             trusted_local: false,
+            local_owner: false,
             member_copy: false,
             suppress_request_persistence: false,
+            outage_bootstrap: false,
             member_schema_incomplete_for: Vec::new(),
             hosting_principal: None,
             hosting_database: None,
+            hosting_session_id: None,
             hosted_activity_roster: None,
             hosting_owner: false,
             hosting_is_member: None,
@@ -464,8 +572,10 @@ impl Caller {
             run_key: None,
             parent_key: None,
             intent: None,
+            deferred_run_context: None,
             reported_mcp_client_name: None,
             reported_mcp_client_version: None,
+            oauth_client_id: None,
             verified_human_interaction: None,
             verified_provenance_interaction: None,
             effect_gesture: None,
@@ -477,8 +587,10 @@ impl Caller {
             verified_alpha_tab_preview: None,
             verified_alpha_tab_adopt: None,
             verified_alpha_tab_adopt_authored: None,
+            host_asserted_app: None,
             policy_authority: false,
             write_plan_execution: None,
+            catalog_operations: None,
             #[cfg(feature = "mcp-executor-prototype")]
             hosted_plan_execution: None,
         }
@@ -493,10 +605,42 @@ impl Caller {
         self
     }
 
+    /// Whether this request must perform no lifecycle persistence. This is
+    /// host/dispatch state, never authority supplied through tool arguments.
+    #[doc(hidden)]
+    pub fn request_persistence_suppressed(&self) -> bool {
+        self.suppress_request_persistence
+    }
+
+    /// Internal outage-bootstrap mode (design 200dc2d §6). Only internal
+    /// composition may set it; tool arguments have no representation for it.
+    /// It changes neither authorisation nor persistence suppression.
+    #[doc(hidden)]
+    pub fn with_outage_bootstrap(mut self) -> Self {
+        self.outage_bootstrap = true;
+        self
+    }
+
+    pub fn is_outage_bootstrap(&self) -> bool {
+        self.outage_bootstrap
+    }
+
     pub fn local() -> Self {
         let mut caller = Caller::authenticated("local");
         caller.trusted_local = true;
         caller.channel = Channel::Local;
+        caller
+    }
+
+    /// The operator of a local database file (SQLite stdio), or of the owner's
+    /// own standby copy, which sits inside the owner's trust boundary (design
+    /// 1e5d802). The account credential is kept. The only authority this adds
+    /// is owner counter footing: it deliberately does **not** set
+    /// `trusted_local`, which bypasses authorization. Not for member copies
+    /// (use [`Caller::member_copy`]) or hosted routes.
+    pub fn local_owner(identity: impl Into<String>) -> Self {
+        let mut caller = Caller::authenticated(identity);
+        caller.local_owner = true;
         caller
     }
 
@@ -563,6 +707,38 @@ impl Caller {
         self
     }
 
+    /// Pin an attested deferred call's original run and resolved intent.
+    ///
+    /// # Safety
+    /// Only the hosted deferred verifier may call this, after verifying the
+    /// attestation and current authority. Never derive these values from public
+    /// dispatch arguments. A pinned absence must remain distinct from no pin.
+    #[doc(hidden)]
+    pub unsafe fn with_pinned_deferred_intent(
+        mut self,
+        run: String,
+        parent: Option<String>,
+        intent: Option<String>,
+    ) -> Result<Self> {
+        if !matches!(
+            crate::runkey::validate_run_key_value(Some(&serde_json::json!(run))),
+            crate::runkey::KeyOutcome::Valid(_)
+        ) || parent.as_ref().is_some_and(|key| {
+            !matches!(
+                crate::runkey::validate_parent_key_value(Some(&serde_json::json!(key))),
+                crate::runkey::KeyOutcome::Valid(_)
+            )
+        }) {
+            return Err(Error::auth("deferred calls require resolved run keys"));
+        }
+        self.deferred_run_context = Some((run, parent, intent));
+        Ok(self)
+    }
+
+    pub(crate) fn deferred_run_context(&self) -> Option<&(String, Option<String>, Option<String>)> {
+        self.deferred_run_context.as_ref()
+    }
+
     pub(crate) fn with_intent(mut self, intent: Option<String>) -> Self {
         self.intent = intent;
         self
@@ -584,11 +760,30 @@ impl Caller {
         principal: impl Into<String>,
         database: impl Into<String>,
     ) -> Self {
+        self.hosting_session_id = None;
         self.hosting_principal = Some(principal.into());
         self.hosting_database = Some(database.into());
         self.hosting_is_member = Some(true);
         self.trusted_audience = TrustedAudience::Unknown;
         self
+    }
+
+    /// Attach the catalog id of the authenticated cookie session.
+    ///
+    /// # Safety
+    ///
+    /// Trusted ingress must have authenticated this session for the same
+    /// hosted principal and database already attached to this caller.
+    /// Tool arguments and bearer credentials must never reach this seam.
+    #[doc(hidden)]
+    pub unsafe fn with_verified_hosting_session(mut self, session_id: impl Into<String>) -> Self {
+        self.hosting_session_id = Some(session_id.into());
+        self
+    }
+
+    /// Catalog session id carried by trusted cookie ingress.
+    pub fn hosting_session_id(&self) -> Option<&str> {
+        self.hosting_session_id.as_deref()
     }
 
     /// Attach current hosted membership authority and its portable roster.
@@ -625,12 +820,42 @@ impl Caller {
                 "verified hosted activity roster does not contain the caller",
             ));
         }
+        self.hosting_session_id = None;
         self.hosting_principal = Some(principal);
         self.hosting_database = Some(database);
         self.hosted_activity_roster = Some(roster);
         self.hosting_is_member = Some(is_member);
         self.trusted_audience = TrustedAudience::Unknown;
         Ok(self)
+    }
+
+    /// Attach hosted v2 routing and role after kernel membership admission.
+    /// V2 uses its live kernel membership projection, so this carries no v1
+    /// activity roster or Person identities.
+    ///
+    /// # Safety
+    ///
+    /// Trusted ingress must have authenticated `principal`, reconciled this
+    /// caller's credential through the sealed hosted v2 admission for the
+    /// exact routed `database`, and verified its active owner/member role in
+    /// that admission's catalogue snapshot. Tool arguments must never reach
+    /// this seam. Invoke on every request; do not cache admitted callers.
+    #[cfg(feature = "v2-kernel-probe")]
+    #[doc(hidden)]
+    pub unsafe fn with_verified_hosted_v2_identity(
+        mut self,
+        principal: impl Into<String>,
+        database: impl Into<String>,
+        is_owner: bool,
+    ) -> Self {
+        self.hosting_session_id = None;
+        self.hosting_principal = Some(principal.into());
+        self.hosting_database = Some(database.into());
+        self.hosted_activity_roster = None;
+        self.hosting_is_member = Some(true);
+        self.hosting_owner = is_owner;
+        self.trusted_audience = TrustedAudience::Unknown;
+        self
     }
 
     #[doc(hidden)]
@@ -701,6 +926,28 @@ impl Caller {
         self.hosting_database.is_none() || self.hosting_owner
     }
 
+    /// Whether this caller may see workspace-wide counters. Positive proof,
+    /// deny by default: an owner is a trusted local caller or a marked local
+    /// owner ([`Caller::local_owner`]: the operator of a local database file or
+    /// of their own standby copy), in either case with no hosting database
+    /// route, or a hosted caller with an owner catalog role. A member copy is
+    /// never an owner, and an authenticated caller with no owner marker and no
+    /// hosting context is never an owner. Unlike [`Self::is_host_owner`], this
+    /// predicate is safe to reuse for non-owner gating because it does not
+    /// treat a hosted caller that forgot its hosting context as an owner.
+    pub fn counter_footing(&self) -> CounterFooting {
+        let local_owner = (self.is_trusted_local() || self.local_owner)
+            && self.hosting_database.is_none()
+            && !self.is_member_copy();
+        let hosted_owner =
+            self.hosting_database.is_some() && self.hosting_owner && !self.is_member_copy();
+        if local_owner || hosted_owner {
+            CounterFooting::Owner
+        } else {
+            CounterFooting::NonOwner
+        }
+    }
+
     /// The authenticated identity stamped on every event, independent of any
     /// asserted run context. The full validated run key is stored separately on
     /// the same row and its first word remains the display handle.
@@ -724,6 +971,24 @@ impl Caller {
 
     pub(crate) fn write_plan_execution(&self) -> Option<&WritePlanExecution> {
         self.write_plan_execution.as_ref()
+    }
+
+    /// Attach the serving executor's projected `catalog_operations`
+    /// snapshot. Trusted seam only: the in-process executor calls this
+    /// immediately before delegation for the ad-hoc online SQLite
+    /// `query_sql` dispatch. Tool arguments have no representation for it.
+    pub(crate) fn with_catalog_operations_snapshot(
+        mut self,
+        snapshot: crate::query::principal::CatalogOperationsSnapshot,
+    ) -> Self {
+        self.catalog_operations = Some(snapshot);
+        self
+    }
+
+    pub(crate) fn catalog_operations(
+        &self,
+    ) -> Option<&crate::query::principal::CatalogOperationsSnapshot> {
+        self.catalog_operations.as_ref()
     }
 
     /// Authenticated hosted principal selected by trusted ingress, when this
@@ -790,6 +1055,20 @@ impl Caller {
         self
     }
 
+    /// Attach the OAuth client id hosted ingress read off the verified bearer
+    /// token. Attribution only: no authorization decision may read it.
+    #[doc(hidden)]
+    pub fn with_oauth_client_id(mut self, client_id: Option<String>) -> Self {
+        self.oauth_client_id = client_id.filter(|id| !id.trim().is_empty());
+        self
+    }
+
+    /// The OAuth client id of the connected application, when the bearer
+    /// token named one. Attribution only; never an authorization input.
+    pub fn oauth_client_id(&self) -> Option<&str> {
+        self.oauth_client_id.as_deref()
+    }
+
     /// The self-asserted identity to stamp if this call admits a run. The
     /// model slot stays `None` here by construction: the model is the agent's
     /// own declaration, carried by the `set_intent` `model` argument rather
@@ -850,6 +1129,55 @@ impl Caller {
     #[doc(hidden)]
     pub fn with_verified_alpha_tab_preview(mut self, preview: VerifiedAlphaTabPreview) -> Self {
         self.verified_alpha_tab_preview = Some(preview);
+        self
+    }
+
+    pub(crate) fn host_asserted_app(&self) -> Option<&crate::mcp::app_attribution::AppAttribution> {
+        self.host_asserted_app.as_deref()
+    }
+
+    /// The same claim as a shared pointer, so provenance copies it without
+    /// re-allocating its strings.
+    pub(crate) fn host_asserted_app_shared(
+        &self,
+    ) -> Option<Arc<crate::mcp::app_attribution::AppAttribution>> {
+        self.host_asserted_app.clone()
+    }
+
+    /// This caller without its host-asserted app: the same principal and
+    /// authority, attributed to nobody's app. Live sessions use it when an
+    /// install was removed mid-session, so a version still cuts instead of
+    /// failing the app attribution re-check forever.
+    pub(crate) fn without_host_asserted_app(mut self) -> Self {
+        self.host_asserted_app = None;
+        self
+    }
+
+    /// In-place form of [`Caller::with_host_asserted_app`] for the hosted
+    /// ingress, whose poll frame sits close to the worker-stack budget: it
+    /// sets the slot through `&mut` and out of line instead of moving the
+    /// whole `Caller` by value. The read-only owner standby also uses this
+    /// seam for desktop main's `native/app` metadata, under its selected
+    /// account and with the same engine install admission.
+    #[doc(hidden)]
+    #[inline(never)]
+    pub fn set_host_asserted_app(&mut self, app: crate::mcp::app_attribution::AppAttribution) {
+        self.host_asserted_app = Some(Arc::new(app));
+    }
+
+    /// Host ingress seam for app contract v2 attribution (task `50f5aca`).
+    ///
+    /// Call only after the hosted adapter has verified a cookie-authenticated
+    /// session plus a same-host Origin, and parsed the host-set
+    /// `X-Native-App` header. There is deliberately no MCP argument for it,
+    /// and Bearer callers never receive it. Attaching it grants no authority;
+    /// it makes the engine verify the named install and record the app.
+    #[doc(hidden)]
+    pub fn with_host_asserted_app(
+        mut self,
+        app: crate::mcp::app_attribution::AppAttribution,
+    ) -> Self {
+        self.host_asserted_app = Some(Arc::new(app));
         self
     }
 
@@ -1104,7 +1432,7 @@ impl Caller {
 /// roster for this request; routing fields alone confer no query authority.
 impl From<&Caller> for crate::query::QueryPrincipal {
     fn from(caller: &Caller) -> Self {
-        if caller.is_trusted_local() && caller.hosting_database().is_none() {
+        let mut principal = if caller.is_trusted_local() && caller.hosting_database().is_none() {
             // SAFETY: this is the sole production crossing into the bypass.
             // The predicate above proves both invariants required by the
             // extracted contract's privileged constructor.
@@ -1127,7 +1455,11 @@ impl From<&Caller> for crate::query::QueryPrincipal {
                 caller.credential(),
                 caller.is_host_member(),
             )
+        };
+        if let Some(snapshot) = caller.catalog_operations() {
+            principal = principal.with_catalog_operations_snapshot(snapshot.clone());
         }
+        principal
     }
 }
 
@@ -1147,6 +1479,38 @@ mod query_principal_conversion_tests {
         let principal = QueryPrincipal::from(&Caller::local());
         assert_eq!(principal.credential(), "local");
         assert!(principal.trusted_local_bypass());
+    }
+
+    #[test]
+    fn catalog_operations_snapshot_is_absent_by_default_and_carries() {
+        use crate::query::principal::CatalogOperationRow;
+        assert!(QueryPrincipal::from(&Caller::local())
+            .catalog_operations()
+            .is_none());
+        let snapshot: crate::query::principal::CatalogOperationsSnapshot =
+            std::sync::Arc::new(vec![CatalogOperationRow {
+                executor: "sql_read".to_string(),
+                operation: "query_sql".to_string(),
+                surface: "ordinary".to_string(),
+                access: "read".to_string(),
+                plan_required: false,
+                direct_execution_enabled: true,
+                contract_version: "native.operation-contract.v1".to_string(),
+                contract_digest: "abc".to_string(),
+                source_tool: "query_sql".to_string(),
+                selector_field: None,
+                selector_value: None,
+                advertised_directly: true,
+            }]);
+        let caller = Caller::local().with_catalog_operations_snapshot(snapshot);
+        let principal = QueryPrincipal::from(&caller);
+        assert_eq!(
+            principal
+                .catalog_operations()
+                .expect("snapshot carries")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1248,11 +1612,277 @@ mod query_principal_conversion_tests {
     }
 }
 
+#[cfg(test)]
+mod counter_footing_tests {
+    use super::{Caller, CounterFooting};
+
+    fn roster_member(account: &str) -> crate::query::principal::ActivityRosterMember {
+        // SAFETY: this is a unit test constructing the one admission
+        // capability the accessor reads; no query or storage runs.
+        unsafe {
+            crate::query::principal::ActivityRosterMember::verified_unchecked(
+                account,
+                format!("native:workspace-member:{account}"),
+            )
+        }
+    }
+
+    fn hosted(account: &str, is_member: bool) -> Caller {
+        unsafe {
+            Caller::authenticated(account).with_verified_hosted_activity(
+                format!("catalog-{account}"),
+                "db-1",
+                vec![roster_member(account)],
+                is_member,
+            )
+        }
+        .expect("the roster contains its own caller")
+    }
+
+    #[test]
+    fn trusted_local_is_an_owner() {
+        assert_eq!(Caller::local().counter_footing(), CounterFooting::Owner);
+        assert!(Caller::local().counter_footing().is_owner());
+    }
+
+    #[test]
+    fn trusted_local_with_a_hosting_route_is_not_an_owner() {
+        // m-b: the local branch requires the absence of a hosting database, so
+        // a `Caller::local()` that later gains hosting context is not an owner
+        // by that route.
+        let caller = Caller::local().with_hosting_context("catalog-local", "db-1");
+        assert_eq!(caller.counter_footing(), CounterFooting::NonOwner);
+    }
+
+    #[test]
+    fn hosted_owner_is_an_owner() {
+        let caller = hosted("acct:owner", true).with_hosting_owner(true);
+        assert_eq!(caller.counter_footing(), CounterFooting::Owner);
+    }
+
+    #[test]
+    fn hosted_member_is_not_an_owner() {
+        let caller = hosted("acct:member", true).with_hosting_owner(false);
+        assert_eq!(caller.counter_footing(), CounterFooting::NonOwner);
+    }
+
+    #[test]
+    fn local_owner_is_an_owner_without_being_trusted_local() {
+        let caller = Caller::local_owner("acct:operator");
+        assert_eq!(caller.counter_footing(), CounterFooting::Owner);
+        assert!(!caller.is_trusted_local());
+    }
+
+    #[test]
+    fn local_owner_with_a_hosting_route_or_member_copy_flag_is_not_an_owner() {
+        let routed = Caller::local_owner("acct:operator").with_hosting_context("c", "db-1");
+        assert_eq!(routed.counter_footing(), CounterFooting::NonOwner);
+        let mut copy = Caller::local_owner("acct:operator");
+        copy.set_member_copy(true);
+        assert_eq!(copy.counter_footing(), CounterFooting::NonOwner);
+    }
+
+    #[test]
+    fn authenticated_without_hosting_context_is_not_an_owner() {
+        assert_eq!(
+            Caller::authenticated("acct:unhosted").counter_footing(),
+            CounterFooting::NonOwner
+        );
+    }
+
+    #[test]
+    fn member_copy_is_never_an_owner() {
+        assert_eq!(
+            Caller::member_copy("acct:member-copy").counter_footing(),
+            CounterFooting::NonOwner
+        );
+        // Even with owner host fields attached, a member copy stays a
+        // non-owner: both branches of the rule exclude it.
+        let disguised = Caller::member_copy("acct:member-copy")
+            .with_hosting_context("catalog-member-copy", "db-1")
+            .with_hosting_owner(true);
+        assert_eq!(disguised.counter_footing(), CounterFooting::NonOwner);
+    }
+}
+
+#[cfg(test)]
+mod outward_receipt_tests {
+    //! The registry's one outward `act` / `acts` decision (design 08b4c21 §4
+    //! S2a), driven through real dispatch with a synthetic receipt-shaped
+    //! tool so the footing × position matrix is pinned independently of any
+    //! one engine tool.
+    use super::*;
+    use crate::mcp::TransientEvidence;
+    use serde_json::{json, Value};
+
+    fn hosted(account: &str, owner: bool) -> Caller {
+        let member = unsafe {
+            crate::query::principal::ActivityRosterMember::verified_unchecked(
+                account,
+                format!("native:workspace-member:{account}"),
+            )
+        };
+        unsafe {
+            Caller::authenticated(account).with_verified_hosted_activity(
+                format!("catalog-{account}"),
+                "db-1",
+                vec![member],
+                true,
+            )
+        }
+        .expect("the roster contains its own caller")
+        .with_hosting_owner(owner)
+    }
+
+    /// Engine receipt metadata at every position S2a names, beside authored
+    /// JSON that happens to use the same key names.
+    fn receipt() -> Value {
+        json!({
+            "id": "r1",
+            "previous_seq": 7,
+            "act": 9,
+            "acts": [{ "index": 0, "act": 9 }],
+            "body": { "act": 1, "acts": [2], "seq": 3, "frontier": ["x"] },
+            "results": [{
+                "index": 0,
+                "status": "created",
+                "record": { "id": "c1", "act": 4, "metadata": { "act": 5 } },
+            }],
+            "refresh": { "record": { "id": "c2", "act": 6, "body": { "act": 8 } } },
+        })
+    }
+
+    fn expected_outward_receipt() -> Value {
+        let mut expected = receipt();
+        // S3a echoes null because the synthetic predecessor has no stored event.
+        expected["previous_event_id"] = Value::Null;
+        expected
+    }
+
+    async fn dispatch(tool: &str, caller: Caller) -> ToolCallOutcome {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        // The same synthetic receipt under each tool name the positional
+        // rules key on, plus a neutral one.
+        for name in [
+            "receipt_probe",
+            "create_many",
+            "invoke_artifact_interaction",
+        ] {
+            registry
+                .register_custom(
+                    name,
+                    CustomInteractionPolicy::NoRecordInteractions,
+                    ToolExposure::extension(true),
+                    "receipt probe",
+                    json!({"type": "object", "properties": {}}),
+                    |_db, _caller, _arguments| async move {
+                        Ok(ToolResult::rich(
+                            receipt(),
+                            vec![TransientEvidence::image("proof", "image/png", b"pixels")?],
+                        ))
+                    },
+                )
+                .unwrap();
+        }
+        let outcome = registry
+            .call_detailed(
+                db.clone(),
+                caller,
+                tool,
+                json!({"run_key": "scout-chair-a748b2"}),
+            )
+            .await
+            .unwrap();
+        db.close().await;
+        outcome
+    }
+
+    fn structured(outcome: ToolCallOutcome) -> (Value, ToolCallOutcome) {
+        let mut outcome = outcome;
+        let result = outcome.outcome.as_mut().expect("probe succeeds");
+        let value = result.structured.clone();
+        (value, outcome)
+    }
+
+    #[tokio::test]
+    async fn owners_keep_the_exact_receipt() {
+        for caller in [
+            Caller::local(),
+            Caller::local_owner("acct:operator"),
+            hosted("acct:owner", true),
+        ] {
+            for tool in [
+                "receipt_probe",
+                "create_many",
+                "invoke_artifact_interaction",
+            ] {
+                let (value, _) = structured(dispatch(tool, caller.clone()).await);
+                assert_eq!(value, expected_outward_receipt(), "{tool}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_non_owner_footing_loses_the_engine_act_positions_only() {
+        for caller in [
+            hosted("acct:member", false),
+            Caller::authenticated("acct:unhosted"),
+            Caller::member_copy("acct:copy"),
+            Caller::local().with_hosting_context("catalog-local", "db-1"),
+        ] {
+            assert_eq!(caller.counter_footing(), CounterFooting::NonOwner);
+            // Top-level act/acts only: the neutral tool name has no nested
+            // positions.
+            let (value, outcome) = structured(dispatch("receipt_probe", caller.clone()).await);
+            let mut expected = expected_outward_receipt();
+            let object = expected.as_object_mut().unwrap();
+            object.remove("act");
+            object.remove("acts");
+            assert_eq!(value, expected);
+            // The projection touches the structured value only.
+            let result = outcome.outcome.unwrap();
+            assert_eq!(result.evidence.len(), 1);
+            assert_eq!(outcome.run_context["run_key"], "scout-chair-a748b2");
+            assert_eq!(outcome.original_arguments["run_key"], "scout-chair-a748b2");
+
+            let (value, _) = structured(dispatch("create_many", caller.clone()).await);
+            let mut expected = expected_outward_receipt();
+            let object = expected.as_object_mut().unwrap();
+            object.remove("act");
+            object.remove("acts");
+            expected["results"][0]["record"]
+                .as_object_mut()
+                .unwrap()
+                .remove("act");
+            assert_eq!(value, expected);
+
+            let (value, _) =
+                structured(dispatch("invoke_artifact_interaction", caller.clone()).await);
+            let mut expected = expected_outward_receipt();
+            let object = expected.as_object_mut().unwrap();
+            object.remove("act");
+            object.remove("acts");
+            expected["refresh"]["record"]
+                .as_object_mut()
+                .unwrap()
+                .remove("act");
+            assert_eq!(value, expected);
+            // Authored JSON that reuses the key names is never touched.
+            assert_eq!(value["body"], receipt()["body"]);
+            assert_eq!(value["results"][0]["record"]["metadata"], json!({"act": 5}));
+            assert_eq!(value["refresh"]["record"]["body"], json!({"act": 8}));
+        }
+    }
+}
+
 /// Physical implementation selected before dispatch. This is deliberately a
 /// small closed routing key, not a generic SQL or storage API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EngineKind {
     Sqlite,
+    #[cfg(feature = "v2-kernel-probe")]
+    KernelV2,
     #[cfg(feature = "postgres")]
     Postgres,
     #[cfg(feature = "turso-local")]
@@ -1301,11 +1931,14 @@ mod governed_pipeline_tests {
             })
         }
 
-        fn intent_at<'a>(&'a self, _run_key: Option<&'a str>) -> BoxFuture<'a, Option<String>> {
+        fn intent_at<'a>(
+            &'a self,
+            _run_key: Option<&'a str>,
+        ) -> BoxFuture<'a, Result<Option<String>>> {
             let events = Arc::clone(&self.events);
             Box::pin(async move {
                 events.lock().unwrap().push("intent");
-                None
+                Ok(None)
             })
         }
 
@@ -1317,7 +1950,11 @@ mod governed_pipeline_tests {
             _reported: crate::control::ReportedRunIdentity,
             _channel: Channel,
         ) -> BoxFuture<'a, Result<()>> {
-            Box::pin(async { Ok(()) })
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("persist");
+                Ok(())
+            })
         }
 
         fn displaced_key_note<'a>(&'a self, _caller: &'a Caller) -> BoxFuture<'a, Option<String>> {
@@ -1335,7 +1972,13 @@ mod governed_pipeline_tests {
             future: BoxFuture<'a, Result<ToolResult>>,
         ) -> BoxFuture<'a, Result<ToolResult>> {
             assert_eq!(operation, "portable_parity");
-            assert_eq!(capability, Some("native.extension.unclassified"));
+            // Custom/no-storage tools carry the extension capability; declared
+            // kinds like SetIntent resolve no storage capability (None) and
+            // exercise the same admission seam without one.
+            assert!(
+                capability == Some("native.extension.unclassified") || capability.is_none(),
+                "unexpected capability: {capability:?}"
+            );
             let events = Arc::clone(&self.events);
             Box::pin(async move {
                 events.lock().unwrap().push("admission.enter");
@@ -1576,12 +2219,43 @@ mod governed_pipeline_tests {
         assert!(!handler_called.load(Ordering::SeqCst));
         assert!(fake.events.lock().unwrap().is_empty());
     }
+
+    /// Projection-less Applied backends (turso/postgres adapters hold no
+    /// `agent_runs` and keep the default `admit_or_enrich_run`) must still
+    /// persist a validated set_intent through the legacy port: an `Ok(None)`
+    /// enrichment answer is "no projection here", never "nothing to persist".
+    #[tokio::test]
+    async fn projection_less_port_still_persists_validated_set_intent() {
+        let fake = FakePortableRequestPort::default();
+        let outcome = crate::domain_transaction::request::execute_request(
+            &fake,
+            Caller::local(),
+            "portable_parity",
+            Some(crate::mcp::interactions::ToolKind::SetIntent),
+            Extractor::Custom(CustomInteractionPolicy::NoRecordInteractions),
+            serde_json::json!({"intent": "declare on a projection-less backend", "model": "m1", "run_key": "scout-chair-a748b2"}),
+            true,
+            None,
+            None,
+            move |_, _| async { Ok(ToolResult::from(serde_json::json!({"ok": true}))) },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.outcome.is_ok());
+        assert!(
+            fake.events.lock().unwrap().contains(&"persist"),
+            "legacy persistence must run on Ok(None): {:?}",
+            fake.events.lock().unwrap()
+        );
+    }
 }
 
 impl EngineKind {
     fn label(self) -> &'static str {
         match self {
             Self::Sqlite => "sqlite",
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::KernelV2 => "kernel-v2",
             #[cfg(feature = "postgres")]
             Self::Postgres => "postgres",
             #[cfg(feature = "turso-local")]
@@ -1594,6 +2268,8 @@ impl EngineKind {
 #[derive(Clone)]
 pub enum EngineHandle {
     Sqlite(Db),
+    #[cfg(feature = "v2-kernel-probe")]
+    KernelV2(Db),
     #[cfg(feature = "postgres")]
     Postgres(crate::postgres::PostgresDb),
     #[cfg(feature = "turso-local")]
@@ -1604,6 +2280,8 @@ impl EngineHandle {
     pub fn kind(&self) -> EngineKind {
         match self {
             Self::Sqlite(_) => EngineKind::Sqlite,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::KernelV2(_) => EngineKind::KernelV2,
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => EngineKind::Postgres,
             #[cfg(feature = "turso-local")]
@@ -1611,9 +2289,11 @@ impl EngineHandle {
         }
     }
 
-    fn sqlite(&self) -> Option<&Db> {
+    pub(crate) fn sqlite(&self) -> Option<&Db> {
         match self {
             Self::Sqlite(db) => Some(db),
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::KernelV2(_) => None,
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => None,
             #[cfg(feature = "turso-local")]
@@ -1624,6 +2304,8 @@ impl EngineHandle {
     fn into_sqlite(self) -> Db {
         match self {
             Self::Sqlite(db) => db,
+            #[cfg(feature = "v2-kernel-probe")]
+            Self::KernelV2(_) => unreachable!("SQLite handler selected for KernelV2"),
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => {
                 unreachable!("registry selected the SQLite handler for Postgres")
@@ -1668,8 +2350,8 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
         })
     }
 
-    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Option<String>> {
-        Box::pin(crate::runkey::intent_at(self.db, run_key))
+    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move { Ok(crate::runkey::intent_at(self.db, run_key).await) })
     }
 
     fn persist_intent<'a>(
@@ -1690,6 +2372,53 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SqliteRequestL
             )
             .await
             .map(|_| ())
+        })
+    }
+
+    fn read_run_binding<'a>(
+        &'a self,
+        run_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::control::RunBinding>>> {
+        Box::pin(async move {
+            if Db::is_enrolled(self.db) {
+                return Ok(None);
+            }
+            crate::control::read_run_binding(self.db, run_key).await
+        })
+    }
+
+    fn read_stored_identity<'a>(
+        &'a self,
+        run_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::control::ReportedRunIdentity>>> {
+        Box::pin(async move {
+            if Db::is_enrolled(self.db) {
+                return Ok(None);
+            }
+            crate::control::read_stored_identity(self.db, run_key).await
+        })
+    }
+
+    fn admit_or_enrich_run<'a>(
+        &'a self,
+        run_key: &'a str,
+        authenticated_account: &'a str,
+        reported: crate::control::ReportedRunIdentity,
+        channel: Channel,
+    ) -> BoxFuture<'a, Result<Option<crate::control::FirstCallOutcome>>> {
+        Box::pin(async move {
+            if Db::is_enrolled(self.db) {
+                return Ok(None);
+            }
+            crate::control::admit_or_enrich_run(
+                self.db,
+                run_key,
+                authenticated_account,
+                reported,
+                channel,
+            )
+            .await
+            .map(Some)
         })
     }
 
@@ -1801,8 +2530,8 @@ impl crate::domain_transaction::request::RequestLifecyclePort for PostgresReques
         Box::pin(self.db.mint_run_key(agent_key))
     }
 
-    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Option<String>> {
-        Box::pin(self.db.intent_at(run_key))
+    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move { Ok(self.db.intent_at(run_key).await) })
     }
 
     fn persist_intent<'a>(
@@ -1877,8 +2606,8 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SuppressedRequ
         Box::pin(async { Err(Error::engine("run-key persistence is suppressed")) })
     }
 
-    fn intent_at<'a>(&'a self, _run_key: Option<&'a str>) -> BoxFuture<'a, Option<String>> {
-        Box::pin(async { None })
+    fn intent_at<'a>(&'a self, _run_key: Option<&'a str>) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async { Ok(None) })
     }
 
     fn persist_intent<'a>(
@@ -1890,6 +2619,99 @@ impl crate::domain_transaction::request::RequestLifecyclePort for SuppressedRequ
         _channel: Channel,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async { Err(Error::engine("run-context persistence is suppressed")) })
+    }
+
+    fn displaced_key_note<'a>(&'a self, _caller: &'a Caller) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    fn with_operation_admission<'a>(
+        &'a self,
+        _operation: &'a str,
+        _capability: Option<&'a str>,
+        future: BoxFuture<'a, Result<ToolResult>>,
+    ) -> BoxFuture<'a, Result<ToolResult>> {
+        future
+    }
+
+    fn with_realtime_completion<'a>(
+        &'a self,
+        future: BoxFuture<'a, Result<ToolResult>>,
+    ) -> BoxFuture<'a, Result<ToolResult>> {
+        future
+    }
+
+    fn capture_interaction<'a>(
+        &'a self,
+        _capture: crate::domain_transaction::request::InteractionCapture<'a>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+struct KernelV2RequestLifecycle<'a> {
+    db: &'a Db,
+    caller: &'a Caller,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl crate::domain_transaction::request::RequestLifecyclePort for KernelV2RequestLifecycle<'_> {
+    fn backend_label(&self) -> &'static str {
+        "kernel-v2"
+    }
+
+    fn capability(
+        &self,
+        operation: GovernedRequestOperation,
+    ) -> crate::domain_transaction::request::RequestStageCapability {
+        use crate::domain_transaction::request::RequestStageCapability::{Applied, Suppressed};
+        match operation {
+            GovernedRequestOperation::StrictPortability
+            | GovernedRequestOperation::RealtimeWakeup
+            | GovernedRequestOperation::InteractionCapture => Suppressed,
+            GovernedRequestOperation::RunContext
+            | GovernedRequestOperation::Authorization
+            | GovernedRequestOperation::TransientEvidence
+            | GovernedRequestOperation::StableErrors => Applied,
+        }
+    }
+
+    fn mint_run_key<'a>(&'a self, agent_key: Option<&'a str>) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let actor = super::kernel_v2::principal(self.db, self.caller).await?;
+            crate::kernel::mint_run_as(self.db, &actor, agent_key).await
+        })
+    }
+
+    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Result<Option<String>>> {
+        Box::pin(async move {
+            let Some(key) = run_key else {
+                return Ok(None);
+            };
+            let actor = super::kernel_v2::principal(self.db, self.caller).await?;
+            let Some(run) =
+                super::kernel_v2::coordination::existing_run(self.db, &actor, key).await?
+            else {
+                return Ok(None);
+            };
+            crate::kernel::run_intent_as(self.db, &run).await
+        })
+    }
+
+    fn persist_intent<'a>(
+        &'a self,
+        run_key: &'a str,
+        intent: &'a str,
+        _authenticated_account: &'a str,
+        _reported: crate::control::ReportedRunIdentity,
+        _channel: Channel,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let actor = super::kernel_v2::principal(self.db, self.caller).await?;
+            let run = crate::kernel::open_run_as(self.db, &actor, run_key).await?;
+            crate::kernel::set_run_intent_as(self.db, &run, intent).await
+        })
     }
 
     fn displaced_key_note<'a>(&'a self, _caller: &'a Caller) -> BoxFuture<'a, Option<String>> {
@@ -1977,6 +2799,11 @@ async fn dispatch_with_request_port<
             let arguments =
                 crate::mcp::record_ref::resolve_record_ids(&engine, &caller, name, arguments)
                     .await?;
+            // Boxed: this dispatch future is already large.
+            let arguments = Box::pin(crate::position::admit_event_id_preconditions(
+                &engine, &caller, name, arguments,
+            ))
+            .await?;
             crate::mcp::request_timing::pre_handler_complete();
             // Handler-body write-pool acquisition count for the readonly-pool
             // migration (stage 1: instrument only). Test-only scope around the
@@ -2046,6 +2873,11 @@ pub struct ToolSpec {
     /// are registry authority, but deliberately do not enlarge the compact
     /// direct-tool descriptor advertised by [`descriptor`](Self::descriptor).
     operation_schemas: HashMap<String, Value>,
+    engine_input_schemas: HashMap<EngineKind, Value>,
+    /// A custom tool its registrant has declared read-only (see
+    /// [`ToolRegistry::declare_read_only`]). Always false for shipped kinds,
+    /// whose access comes from their authoritative disposition.
+    server_read_only: bool,
     extractor: Extractor,
     handlers: HashMap<EngineKind, EngineHandler>,
 }
@@ -2053,6 +2885,12 @@ pub struct ToolSpec {
 impl ToolSpec {
     pub(crate) fn operation_schema(&self, selector_value: &str) -> Option<&Value> {
         self.operation_schemas.get(selector_value)
+    }
+
+    pub(crate) fn input_schema_for_engine(&self, engine: EngineKind) -> &Value {
+        self.engine_input_schemas
+            .get(&engine)
+            .unwrap_or(&self.input_schema)
     }
 
     /// The authored MCP descriptor before surface-specific runtime projection.
@@ -2185,6 +3023,7 @@ pub struct ToolRegistry {
     /// default: local, stdio, and self-hosted registries must never cause an
     /// agent to guess that the hosted short domain applies to their records.
     share_origin: Option<String>,
+    app_bundle_delivery: Option<crate::mcp::tools::alpha_tabs::AppBundleDelivery>,
 }
 
 /// Attach deployment-authoritative absolute addresses anywhere a read
@@ -2320,6 +3159,52 @@ impl ToolRegistry {
     /// Set the already-validated short-link origin used on record projections.
     pub fn set_share_origin(&mut self, origin: Option<String>) {
         self.share_origin = origin;
+    }
+
+    /// Preserve deployment URL annotations and exposure without copying handlers
+    /// or authority gates into an isolated registry.
+    pub fn copy_presentation_from(&mut self, source: &Self) {
+        self.public_origin = source.public_origin.clone();
+        self.share_origin = source.share_origin.clone();
+        self.exposure_profile = source.exposure_profile;
+    }
+
+    /// Take only the deployment's absolute-link origins from `source`, for a
+    /// registry that serves its own tool family (`/hcp`) but must link records
+    /// the way the main registry does. Unlike [`Self::copy_presentation_from`]
+    /// it leaves the exposure profile alone.
+    pub fn copy_link_origins_from(&mut self, source: &Self) {
+        self.public_origin = source.public_origin.clone();
+        self.share_origin = source.share_origin.clone();
+    }
+
+    /// The absolute address of a record whose relative path is `path` (for
+    /// example `/ab12cd3`): the short-link origin when the deployment has one,
+    /// else the public origin, else `None` (the local, relative shape).
+    pub fn absolute_record_url(&self, path: &str) -> Option<String> {
+        let origin = self.share_origin().or_else(|| self.public_origin())?;
+        Some(format!("{origin}{path}"))
+    }
+
+    /// Configure installed-app delivery before registering surface tools.
+    pub fn set_app_bundle_delivery(
+        &mut self,
+        delivery: Option<crate::mcp::tools::alpha_tabs::AppBundleDelivery>,
+    ) {
+        debug_assert!(
+            self.tools.iter().all(|tool| matches!(
+                tool.kind,
+                None | Some(ToolKind::Ping | ToolKind::EngineInfo | ToolKind::StandbyStatus)
+            )),
+            "app bundle delivery must be configured before registering surface tools"
+        );
+        self.app_bundle_delivery = delivery;
+    }
+
+    pub(crate) fn app_bundle_delivery(
+        &self,
+    ) -> Option<crate::mcp::tools::alpha_tabs::AppBundleDelivery> {
+        self.app_bundle_delivery.clone()
     }
 
     pub fn set_exposure_profile(&mut self, profile: ExposureProfile) {
@@ -2567,9 +3452,31 @@ impl ToolRegistry {
             exposure,
             ui,
             operation_schemas: HashMap::new(),
+            engine_input_schemas: HashMap::new(),
+            server_read_only: false,
             extractor,
             handlers,
         });
+        Ok(())
+    }
+
+    /// Declare a custom tool read-only: deployment admission then treats every
+    /// call to it as a read (it stays available, with persistence suppressed,
+    /// while a deployment is frozen). The registrant vouches that the handler
+    /// never writes; shipped kinds are classified by their own disposition and
+    /// cannot be declared here.
+    pub fn declare_read_only(&mut self, name: &str) -> Result<()> {
+        let tool = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| Error::engine(format!("unknown tool: {name}")))?;
+        if tool.kind.is_some() {
+            return Err(Error::engine(format!(
+                "tool {name} is a shipped kind; its access is not declarable"
+            )));
+        }
+        tool.server_read_only = true;
         Ok(())
     }
 
@@ -2706,6 +3613,45 @@ impl ToolRegistry {
             ))
         })?;
         handler.operations = EngineOperationSupport::None;
+        Ok(())
+    }
+
+    /// Probe-only discovery additions; the default registry is unchanged.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn extend_kernel_v2_arguments(
+        &mut self,
+        name: &str,
+        properties: Value,
+    ) -> Result<()> {
+        let tool = self
+            .tools
+            .iter_mut()
+            .find(|t| t.name == name)
+            .ok_or_else(|| Error::engine("missing KernelV2 tool descriptor"))?;
+        let target = tool
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::engine("missing tool argument properties"))?;
+        target.extend(
+            properties
+                .as_object()
+                .expect("probe argument schema object")
+                .clone(),
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn isolate_kernel_v2_schema(&mut self, name: &str, original: Value) -> Result<()> {
+        let tool = self
+            .tools
+            .iter_mut()
+            .find(|tool| tool.name == name)
+            .ok_or_else(|| Error::engine("missing KernelV2 tool descriptor"))?;
+        let v2_schema = std::mem::replace(&mut tool.input_schema, original);
+        tool.engine_input_schemas
+            .insert(EngineKind::KernelV2, v2_schema);
         Ok(())
     }
 
@@ -2852,6 +3798,12 @@ impl ToolRegistry {
         if !self.standby_read_only {
             return Ok(());
         }
+        if name == "manage_account_config" {
+            return Err(Error::unavailable_offline(
+                name,
+                "canonical online account-config authority",
+            ));
+        }
         let admitted = self
             .get(name)
             .and_then(|tool| tool.kind)
@@ -2875,6 +3827,10 @@ impl ToolRegistry {
             Some(kind) if kind.authoritative_disposition().admits(arguments) => {
                 OperationAccess::Read
             }
+            // A custom tool is a mutation unless its registrant declared it
+            // read-only. The declaration is registry state fixed at startup;
+            // nothing in the call, its arguments or its caller can change it.
+            None if tool.server_read_only => OperationAccess::Read,
             Some(_) | None => OperationAccess::Mutation,
         };
         let operation = DeploymentReadOnlyOperation::registered(
@@ -2942,13 +3898,18 @@ impl ToolRegistry {
     pub(crate) fn reuse_deployment_admission(
         &self,
         lease: &DeploymentPersistenceLease,
+        name: &str,
+        arguments: &Value,
     ) -> Result<Option<DeploymentAdmission>> {
         let Some(barrier) = &self.deployment_mutation_barrier else {
             return Err(Error::engine(
                 "deployment persistence lease supplied without a mutation barrier",
             ));
         };
-        barrier.reuse(lease).map(Some)
+        let (operation, access) = self.classify_registered_operation(name, arguments)?;
+        barrier
+            .reuse_for_operation(lease, &operation, access)
+            .map(Some)
     }
 
     pub fn descriptor_array_bytes_for_policy(&self, policy: &ResolvedToolExposure) -> usize {
@@ -3097,7 +4058,9 @@ impl ToolRegistry {
             .await
     }
 
-    pub(crate) async fn call_engine_detailed_with_persistence(
+    /// Hosted engine dispatch under the exact lease admitted before identity
+    /// reconciliation. Reusing it lets an admitted request drain during freeze.
+    pub async fn call_engine_detailed_with_persistence(
         &self,
         engine: EngineHandle,
         caller: Caller,
@@ -3173,6 +4136,48 @@ impl ToolRegistry {
         capture: bool,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> BoxFuture<'a, Result<ToolCallOutcome>> {
+        let database_id = caller.hosting_database().map(str::to_owned);
+        let call = self.call_detailed_with_capture_inner(
+            engine,
+            caller,
+            name,
+            arguments,
+            capture,
+            persistence_lease,
+        );
+        let call = async move {
+            match database_id {
+                Some(id) => {
+                    if let Some(barrier) = &self.deployment_mutation_barrier {
+                        if !barrier.for_fleet().is_read_only() {
+                            barrier.register_database(&id)?;
+                        }
+                    }
+                    super::scope_database_persistence(id, call).await
+                }
+                None => call.await,
+            }
+        }
+        .boxed();
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        {
+            crate::kernel::hosted_identity::scope_request(call).boxed()
+        }
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        {
+            call
+        }
+    }
+
+    fn call_detailed_with_capture_inner<'a>(
+        &'a self,
+        engine: EngineHandle,
+        caller: Caller,
+        name: &'a str,
+        arguments: Value,
+        capture: bool,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> BoxFuture<'a, Result<ToolCallOutcome>> {
         async move {
             let mut caller = caller;
             // One source of truth for member serving: the engine open mode.
@@ -3183,6 +4188,10 @@ impl ToolRegistry {
                 .sqlite()
                 .is_some_and(|db| db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly);
             caller.set_member_copy(member_copy);
+            // Counter footing is decided here, after the open-mode
+            // normalisation above, so a member copy can never read as an
+            // owner. It is consumed once, at the outward return below.
+            let counter_footing = caller.counter_footing();
             // A member-copy `Db` with no validated, active gate is a raw
             // SQLite path: refuse rather than serve under member lenses with
             // no admitted coordinates. The lease is held for the whole
@@ -3210,12 +4219,39 @@ impl ToolRegistry {
             let Some(tool) = self.get(name) else {
                 return Err(Error::engine(format!("unknown tool: {name}")));
             };
+            // App contract v2 (task `50f5aca`): an app-attributed call keeps
+            // the user's authority, but only for a current adopted v2 install
+            // of this account, and never for the provisional refusal list.
+            // `name` is always the source tool here, executor calls included.
+            if let Some(app) = caller.host_asserted_app() {
+                // `admit` returns a future boxed in its own frame, so the
+                // install read never enlarges this dispatch frame.
+                match &engine {
+                    #[cfg(feature = "v2-kernel-probe")]
+                    EngineHandle::KernelV2(db) => {
+                        crate::mcp::app_attribution::admit_kernel_v2(
+                            db, caller.credential(), name, &arguments, app,
+                        ).await?;
+                    }
+                    _ => {
+                        crate::mcp::app_attribution::admit(
+                            engine.sqlite(), caller.credential(), name, &arguments, app,
+                        ).await?;
+                    }
+                }
+            }
             // Whole-body writes may arrive base64/gzip-encoded. Decode at the
             // single entry point, before provenance digests the action, the
             // idempotency lookups run or any handler reads the body, so an
             // encoded and a raw submission of the same body are one action.
             let mut arguments = arguments;
             crate::mcp::tools::body_encoding::decode_for_tool(name, &mut arguments)?;
+            #[cfg(feature = "v2-kernel-probe")]
+            if matches!(&engine, EngineHandle::KernelV2(db) if db.has_enrolled_execution())
+                && self.registered_operation_access(name, &arguments)? == OperationAccess::Mutation
+            {
+                return Err(Error::engine("managed-custody v2 writes not yet supported"));
+            }
             if engine.sqlite().is_some_and(Db::is_enrolled) {
                 if tool.kind.is_some_and(ToolKind::issues_run_key) || arguments.get("run_key").and_then(Value::as_str).is_some_and(|raw| raw == crate::runkey::SENTINEL || raw.starts_with(crate::runkey::AGENT_KEY_SENTINEL_PREFIX)) {
                     return Err(Error::engine("enrolled storage does not mint run context"));
@@ -3233,7 +4269,7 @@ impl ToolRegistry {
             let deployment_admission = if self.standby_read_only {
                 None
             } else if let Some(lease) = &persistence_lease {
-                self.reuse_deployment_admission(lease)?
+                self.reuse_deployment_admission(lease, name, &arguments)?
             } else {
                 self.admit_deployment_call(name, &arguments)?
             };
@@ -3247,7 +4283,25 @@ impl ToolRegistry {
                 || self.standby_read_only
                 || member_copy
                 || matches!(&deployment_admission, Some(DeploymentAdmission::FrozenRead));
+            #[cfg(feature = "v2-kernel-probe")]
+            if suppress_persistence && matches!(&engine, EngineHandle::KernelV2(_)) {
+                caller = caller.with_suppressed_request_persistence();
+            }
             let engine_kind = engine.kind();
+            // Probe writes own atomic adapter receipts rather than the v1
+            // provenance seam. Other backends/tools retain the refusal.
+            #[cfg(feature = "v2-kernel-probe")]
+            let adapter_keyed_write = matches!(engine_kind, EngineKind::KernelV2)
+                && matches!(name, "create_record" | "update_record" | "manage_links" | "archive_record" | "attach_text" | "manage_messages" | "manage_participants" | "resolve_suggestions");
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            let adapter_keyed_write = false;
+            if engine.sqlite().is_none() && !adapter_keyed_write {
+                crate::mcp::tools::keyed_replay::refuse_on_engine(
+                    name,
+                    &mut arguments,
+                    engine_kind.label(),
+                )?;
+            }
             let handler = tool.handlers.get(&engine_kind).ok_or_else(|| {
                 crate::domain_transaction::request::unsupported_backend_tool(
                     name,
@@ -3259,6 +4313,16 @@ impl ToolRegistry {
             } else {
                 None
             };
+            // Every backend branch composes its result (capture, receipt
+            // disposition, standby status, record URLs, member decoration)
+            // inside this labelled block, including the early exit of the
+            // Postgres branch. The one outward receipt projection below
+            // therefore sees the final structured result whichever engine
+            // produced it. A labelled block (not a nested future) keeps the
+            // dispatch frame the size it was.
+            // Only the Postgres arm needs the early success exit below.
+            #[cfg_attr(not(feature = "postgres"), allow(unused_labels))]
+            let dispatched: Result<ToolCallOutcome> = 'dispatch: {
             match engine.sqlite() {
                 Some(db) => {
                     let sqlite_port = SqliteRequestLifecycle {
@@ -3358,9 +4422,53 @@ impl ToolRegistry {
                     }
                     Box::pin(self.annotate_standby_status(name, &mut dispatched)).await;
                     self.annotate_record_urls(name, &mut dispatched);
+                    // Every write receipt names the pre-write state by event id
+                    // beside `previous_seq` (design 08b4c21 S3a), at this one
+                    // point so no receipt site can miss it.
+                    if matches!(
+                        self.registered_operation_access(name, &lookup_arguments),
+                        Ok(OperationAccess::Mutation)
+                    ) {
+                        if let Ok(result) = &mut dispatched.outcome {
+                            // Best effort: the write has already committed, so
+                            // a failed lookup must not turn it into an error.
+                            // Boxed to keep this dispatch future small.
+                            if let Err(error) = Box::pin(crate::position::echo_previous_event_ids_in(
+                                db,
+                                &mut result.structured,
+                            ))
+                            .await
+                            {
+                                tracing::warn!(
+                                    tool = name,
+                                    %error,
+                                    "write receipt committed without previous_event_id"
+                                );
+                            }
+                        }
+                    }
                     if let Some(gate) = &self.member_copy {
                         gate.decorate(name, &lookup_arguments, &mut dispatched);
                     }
+                    Ok(dispatched)
+                }
+                #[cfg(feature = "v2-kernel-probe")]
+                None if matches!(&engine, EngineHandle::KernelV2(_)) => {
+                    let EngineHandle::KernelV2(db) = &engine else { unreachable!() };
+                    let port_caller = caller.clone();
+                    let actor = super::kernel_v2::principal(db, &caller).await?;
+                    if let Some(key) = arguments.get("run_key").and_then(Value::as_str) {
+                        super::kernel_v2::coordination::existing_run(db, &actor, key).await?;
+                    }
+                    let port = KernelV2RequestLifecycle { db, caller: &port_caller };
+                    let suppressed = SuppressedRequestLifecycle { backend: "kernel-v2-deployment-read-only" };
+                    let lifecycle: &dyn crate::domain_transaction::request::RequestLifecyclePort =
+                        if suppress_persistence { &suppressed } else { &port };
+                    let dispatched = dispatch_with_request_port(
+                        lifecycle, engine.clone(), caller, name, tool.kind,
+                        tool.extractor, arguments, false, self.public_origin(),
+                        bootstrap_exposure, &handler.call,
+                    ).await?;
                     Ok(dispatched)
                 }
                 #[cfg(feature = "turso-local")]
@@ -3424,7 +4532,7 @@ impl ToolRegistry {
                         .await?;
                         Box::pin(self.annotate_standby_status(name, &mut dispatched)).await;
                         self.annotate_record_urls(name, &mut dispatched);
-                        return Ok(dispatched);
+                        break 'dispatch Ok(dispatched);
                     }
                     let port = SuppressedRequestLifecycle {
                         backend: engine_kind.label(),
@@ -3448,6 +4556,22 @@ impl ToolRegistry {
                     Ok(dispatched)
                 }
             }
+            };
+            let mut dispatched = dispatched?;
+            // Outward receipt projection (design 08b4c21 §4 S2a). Owners keep
+            // the engine's `act` / `acts` receipt counters; everyone else,
+            // including an unhosted authenticated caller and a member copy,
+            // gets the receipt without them. Only the typed `ToolResult`
+            // structured value changes: the durable act, provenance and
+            // idempotency state, `interaction_context`, `evidence`,
+            // `original_arguments` and `run_context` are untouched, and the
+            // text renderer reads the projected value.
+            if counter_footing == CounterFooting::NonOwner {
+                if let Ok(result) = &mut dispatched.outcome {
+                    crate::mcp::counter_fence::withhold_receipt_acts(name, &mut result.structured);
+                }
+            }
+            Ok(dispatched)
         }
         .boxed()
     }
@@ -3458,14 +4582,6 @@ impl ToolRegistry {
         caller: Caller,
         arguments: &Value,
     ) -> Value {
-        let deployment_admission = self.deployment_mutation_barrier.as_ref().map(|barrier| {
-            barrier
-                .admit(
-                    &DeploymentReadOnlyOperation::server("request_lifecycle"),
-                    OperationAccess::Read,
-                )
-                .expect("read-only lifecycle admission cannot reject")
-        });
         // The metadata-error echo must suppress for a member engine too: its
         // slice excludes the run-context/history/read-log/provenance tables.
         // Derive from the engine's open mode, never a caller flag, so
@@ -3473,11 +4589,7 @@ impl ToolRegistry {
         let member_copy = engine
             .sqlite()
             .is_some_and(|db| db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly);
-        if caller.suppress_request_persistence
-            || self.standby_read_only
-            || member_copy
-            || matches!(&deployment_admission, Some(DeploymentAdmission::FrozenRead))
-        {
+        if caller.suppress_request_persistence || self.standby_read_only || member_copy {
             let port = SuppressedRequestLifecycle {
                 backend: if member_copy {
                     "sqlite-member"
@@ -3493,7 +4605,14 @@ impl ToolRegistry {
             )
             .await;
         }
-        run_context_for_engine(engine, caller, arguments, self.public_origin()).await
+        run_context_for_engine(
+            engine,
+            caller,
+            arguments,
+            self.public_origin(),
+            self.deployment_mutation_barrier(),
+        )
+        .await
     }
 }
 
@@ -3561,10 +4680,36 @@ pub(crate) async fn run_context_for(
     caller: Caller,
     arguments: &Value,
     public_origin: Option<&str>,
+    barrier: Option<&DeploymentMutationBarrier>,
 ) -> Value {
-    if caller.suppress_request_persistence {
+    let admission = barrier
+        .map(|barrier| {
+            let barrier = caller
+                .hosting_database()
+                .map(|id| barrier.for_database(id))
+                .unwrap_or_else(|| barrier.clone());
+            let operation = DeploymentReadOnlyOperation::server("request_lifecycle");
+            match super::deployment_read_only::current_job_lease() {
+                Some(lease) => {
+                    barrier.reuse_for_operation(&lease, &operation, OperationAccess::Read)
+                }
+                None => barrier.admit(&operation, OperationAccess::Read),
+            }
+        })
+        .transpose();
+    let admission = match admission {
+        Ok(admission) => admission,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    if caller.suppress_request_persistence
+        || matches!(admission, Some(DeploymentAdmission::FrozenRead))
+    {
         let port = SuppressedRequestLifecycle {
-            backend: "sqlite-demo",
+            backend: if matches!(admission, Some(DeploymentAdmission::FrozenRead)) {
+                "sqlite-frozen"
+            } else {
+                "sqlite-demo"
+            },
         };
         return crate::domain_transaction::request::run_context_for(
             &port,
@@ -3576,10 +4721,21 @@ pub(crate) async fn run_context_for(
     }
     let port = SqliteRequestLifecycle {
         db,
-        persistence_lease: None,
+        persistence_lease: match admission {
+            Some(DeploymentAdmission::Writable(lease)) => Some(lease),
+            _ => None,
+        },
     };
-    crate::domain_transaction::request::run_context_for(&port, caller, arguments, public_origin)
-        .await
+    super::deployment_read_only::scope_deployment_persistence(
+        port.persistence_lease.clone(),
+        crate::domain_transaction::request::run_context_for(
+            &port,
+            caller,
+            arguments,
+            public_origin,
+        ),
+    )
+    .await
 }
 
 pub(crate) async fn run_context_for_engine(
@@ -3587,9 +4743,10 @@ pub(crate) async fn run_context_for_engine(
     caller: Caller,
     arguments: &Value,
     public_origin: Option<&str>,
+    barrier: Option<&DeploymentMutationBarrier>,
 ) -> Value {
     match engine.sqlite() {
-        Some(db) => run_context_for(db, caller, arguments, public_origin).await,
+        Some(db) => run_context_for(db, caller, arguments, public_origin, barrier).await,
         None => {
             #[cfg(feature = "postgres")]
             if let EngineHandle::Postgres(db) = engine {
@@ -4349,6 +5506,134 @@ mod hosting_context_tests {
     }
 
     #[tokio::test]
+    async fn database_freeze_run_context_reuses_same_database_and_binds_fleet_lease() {
+        use crate::mcp::{DeploymentAdmission, DeploymentMutationBarrier, OperationAccess};
+        use crate::DeploymentReadOnlyOperation;
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = DeploymentMutationBarrier::default().with_database_freezes(dir.path());
+        let operation = DeploymentReadOnlyOperation::server("request_lifecycle");
+        for admitted in [barrier.for_database("db-a"), barrier.for_fleet()] {
+            let DeploymentAdmission::Writable(lease) =
+                admitted.admit(&operation, OperationAccess::Read).unwrap()
+            else {
+                panic!()
+            };
+            let context = super::super::deployment_read_only::scope_deployment_persistence(
+                Some(lease),
+                super::run_context_for(
+                    &db,
+                    Caller::local().with_hosting_context("user", "db-a"),
+                    &json!({"run_key":"new"}),
+                    None,
+                    Some(&barrier),
+                ),
+            )
+            .await;
+            assert!(context.get("error").is_none(), "{context}");
+            assert!(context["run_key"].is_string(), "{context}");
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_freeze_run_context_suppresses_unbound_lease_filesystem_failure() {
+        use crate::mcp::{DeploymentAdmission, DeploymentMutationBarrier, OperationAccess};
+        use crate::DeploymentReadOnlyOperation;
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = DeploymentMutationBarrier::default().with_database_freezes(dir.path());
+        let operation = DeploymentReadOnlyOperation::server("request_lifecycle");
+        let DeploymentAdmission::Writable(lease) = barrier
+            .for_fleet()
+            .admit(&operation, OperationAccess::Read)
+            .unwrap()
+        else {
+            panic!()
+        };
+        // A non-directory forces a real I/O error when the unbound lease is
+        // enrolled in this database; it must never grant persistence authority.
+        std::fs::write(dir.path().join("database-freezes"), b"not a directory").unwrap();
+        let scoped = barrier.for_database("db-a");
+        assert!(matches!(
+            scoped.admit(&operation, OperationAccess::Read).unwrap(),
+            DeploymentAdmission::FrozenRead
+        ));
+        assert!(matches!(
+            scoped.reuse_for_operation(&lease, &operation, OperationAccess::Mutation),
+            Err(crate::Error::Io(_))
+        ));
+        let context = super::super::deployment_read_only::scope_deployment_persistence(
+            Some(lease),
+            super::run_context_for(
+                &db,
+                Caller::local().with_hosting_context("user", "db-a"),
+                &json!({"run_key":"new"}),
+                None,
+                Some(&barrier),
+            ),
+        )
+        .await;
+        assert!(context.get("error").is_none(), "{context}");
+        assert!(context["run_key"].is_null(), "{context}");
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_freeze_run_context_refuses_a_foreign_database_lease() {
+        use crate::mcp::{DeploymentAdmission, DeploymentMutationBarrier, OperationAccess};
+        use crate::DeploymentReadOnlyOperation;
+
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = DeploymentMutationBarrier::default().with_database_freezes(dir.path());
+        let operation = DeploymentReadOnlyOperation::server("request_lifecycle");
+        let DeploymentAdmission::Writable(lease) = barrier
+            .for_database("db-a")
+            .admit(&operation, OperationAccess::Read)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let result = super::super::deployment_read_only::scope_deployment_persistence(
+            Some(lease),
+            super::run_context_for(
+                &db,
+                Caller::local().with_hosting_context("user", "db-b"),
+                &json!({"run_key":"new"}),
+                None,
+                Some(&barrier),
+            ),
+        )
+        .await;
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("belongs to another database"),
+            "{result}"
+        );
+        assert!(result.get("run_key").is_none());
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn deployment_freeze_drains_capture_after_transport_cancellation() {
         let db = crate::db::create_database(":memory:").await.unwrap();
         let barrier = crate::mcp::DeploymentMutationBarrier::default();
@@ -4550,6 +5835,7 @@ mod hosting_context_tests {
         crate::mcp::register_surface_tools(&mut registry).unwrap();
         let run_key = "scout-chair-a748b2";
         let caller = Caller::authenticated("acct:alice")
+            .with_channel(crate::provenance::Channel::Mcp)
             .with_reported_mcp_client(Some("hazel".into()), Some("2.1.0".into()));
         assert_eq!(
             caller.reported_run_identity().client_name.as_deref(),
@@ -4685,8 +5971,11 @@ mod hosting_context_tests {
         let mut registry = ToolRegistry::new();
         crate::mcp::register_builtin_tools(&mut registry).unwrap();
         crate::mcp::register_surface_tools(&mut registry).unwrap();
-        let named =
-            || Caller::local().with_reported_mcp_client(Some("hazel".into()), Some("2.1.0".into()));
+        let named = || {
+            Caller::local()
+                .with_channel(crate::provenance::Channel::Mcp)
+                .with_reported_mcp_client(Some("hazel".into()), Some("2.1.0".into()))
+        };
 
         let run_key = "scout-chair-c748b2";
         let record_id = "c0de0000-0000-4000-8000-000000000001";
@@ -6132,5 +7421,795 @@ mod receipt_disposition_tests {
         note_invoke_domain_owned();
         let (_, fresh) = with_fresh_receipt_scope(async {}).await;
         assert_eq!(fresh, ReceiptDisposition::Legacy);
+    }
+}
+
+#[cfg(test)]
+mod first_call_harness_tests {
+    use serde_json::json;
+
+    use super::{Caller, ToolRegistry};
+    use crate::provenance::Channel;
+
+    fn test_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+    }
+
+    fn mcp_caller(account: &str, name: Option<&str>, version: Option<&str>) -> Caller {
+        Caller::authenticated(account)
+            .with_channel(Channel::Mcp)
+            .with_reported_mcp_client(name.map(str::to_string), version.map(str::to_string))
+    }
+
+    async fn control_event_count(db: &crate::Db) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM control_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    /// Portable account footing for authenticated test callers: writers and
+    /// readers require a bindings row, which bare in-memory databases lack.
+    async fn bind_account(db: &crate::Db, account: &str, person: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO records
+                (id, type, kind, name, home_id, policy_anchor_id, persistence)
+             VALUES (?, 'Entity', 'person', 'Test account', ?, ?, 'enduring')",
+        )
+        .bind(person)
+        .bind(crate::schema::UNFILED_RECORD_ID)
+        .bind(crate::schema::ROOT_RECORD_ID)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR IGNORE INTO bindings
+                (record_id, system, identifier, is_canonical)
+             VALUES (?, 'account', ?, 1)",
+        )
+        .bind(person)
+        .bind(account)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    async fn stored_identity(
+        db: &crate::Db,
+        run_key: &str,
+    ) -> Option<crate::control::ReportedRunIdentity> {
+        crate::control::read_agent_run_reported_identity(db, run_key)
+            .await
+            .unwrap()
+    }
+
+    /// A direct MCP write without any prior bootstrap/set_intent admits its
+    /// own run with the call's harness, visible in the contribution block.
+    #[tokio::test]
+    async fn direct_write_first_admits_harness_without_set_intent() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-f748b2";
+        let record_id = "c0de0000-0000-4000-8000-000000000011";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("2.1.0")),
+                "create_record",
+                json!({
+                    "id": record_id, "type": "Document", "kind": "note",
+                    "name": "first-call write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        let stored = stored_identity(&db, run_key).await.expect("run admitted");
+        assert_eq!(stored.client_name.as_deref(), Some("hazel"));
+        assert_eq!(stored.client_version.as_deref(), Some("2.1.0"));
+        let fetched = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("2.1.0")),
+                "get_record",
+                json!({"ids": [record_id], "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        let run = &fetched["records"][0]["contribution"]["run"];
+        assert_eq!(run["reported_mcp_client"]["name"], "hazel");
+        assert_eq!(run["reported_mcp_client"]["version"], "2.1.0");
+        assert_eq!(run["reported_mcp_client"]["assurance"], "client_asserted");
+        db.close().await;
+    }
+
+    /// Bootstrap-first: the issued key has a durable row immediately, and a
+    /// later call without clientInfo preserves the first identity.
+    #[tokio::test]
+    async fn bootstrap_first_row_immediate_then_call_without_clientinfo_preserves() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let boot = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("2.1.0")),
+                "bootstrap",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let run_key = boot["run"]["run_key"].as_str().unwrap().to_string();
+        let stored = stored_identity(&db, &run_key)
+            .await
+            .expect("bootstrap row durable");
+        assert_eq!(stored.client_name.as_deref(), Some("hazel"));
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", None, None),
+                "get_record",
+                json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        let kept = stored_identity(&db, &run_key)
+            .await
+            .expect("run reads back");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        assert_eq!(kept.client_version.as_deref(), Some("2.1.0"));
+        db.close().await;
+    }
+
+    /// Missing->present enrichment fills, then a conflicting report leaves the
+    /// row unchanged and says so honestly in the run-context notes.
+    #[tokio::test]
+    async fn missing_to_present_then_conflict_unchanged_with_note() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-g748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", None, None),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000012", "type": "Document",
+                    "kind": "note", "name": "silent first write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_identity(&db, run_key).await.expect("run admitted"),
+            crate::control::ReportedRunIdentity::default()
+        );
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("2.1.0")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000013", "type": "Document",
+                    "kind": "note", "name": "filling write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        let filled = stored_identity(&db, run_key).await.expect("run reads back");
+        assert_eq!(filled.client_name.as_deref(), Some("hazel"));
+        let conflicted = registry
+            .call_detailed(
+                db.clone(),
+                mcp_caller("acct:alice", Some("other"), Some("9.9")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000014", "type": "Document",
+                    "kind": "note", "name": "conflicting write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(conflicted.outcome.is_ok());
+        let notes = conflicted.run_context["notes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .unwrap_or_default()
+                .contains("recorded values are unchanged")),
+            "conflict surfaces honestly: {notes:?}"
+        );
+        let kept = stored_identity(&db, run_key).await.expect("run reads back");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        assert_eq!(kept.client_version.as_deref(), Some("2.1.0"));
+        db.close().await;
+    }
+
+    /// Cross-account use of a bound key refuses before any content mutation:
+    /// no new record lands.
+    #[tokio::test]
+    async fn cross_account_refused_before_mutation() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-h748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000015", "type": "Document",
+                    "kind": "note", "name": "alice write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        let failed = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:bob", Some("hazel"), Some("1")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000016", "type": "Document",
+                    "kind": "note", "name": "bob write", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await;
+        assert!(failed.is_err());
+        let stray: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE id=?")
+            .bind("c0de0000-0000-4000-8000-000000000016")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(stray, 0, "refused call mutated nothing");
+        db.close().await;
+    }
+
+    /// Closed runs keep existing behavior — repeated close and reads succeed —
+    /// while identity enrichment of the closed run is refused.
+    #[tokio::test]
+    async fn closed_run_read_and_close_preserved_enrichment_refused() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-t748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "set_intent",
+                json!({"intent": "close me", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "close_run",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "close_run",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "get_record",
+                json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        // A present->different report on the closed run enriches nothing, so
+        // the read succeeds with an honest note instead of gating the operation.
+        let baseline = control_event_count(&db).await;
+        let conflicting = registry
+            .call_detailed(
+                db.clone(),
+                mcp_caller("acct:alice", Some("other"), Some("2")),
+                "get_record",
+                json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            conflicting.outcome.is_ok(),
+            "conflict never gates the operation"
+        );
+        let notes = conflicting.run_context["notes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .unwrap_or_default()
+                .contains("recorded values are unchanged")),
+            "conflict surfaces honestly: {notes:?}"
+        );
+        let kept = stored_identity(&db, run_key).await.expect("run reads back");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        assert_eq!(
+            control_event_count(&db).await,
+            baseline,
+            "conflict writes nothing"
+        );
+        // A missing->present fill targeting the closed row stays refused.
+        let silent_key = "scout-chair-r748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", None, None),
+                "set_intent",
+                json!({"intent": "silent then closed", "run_key": silent_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", None, None),
+                "close_run",
+                json!({"run_key": silent_key}),
+            )
+            .await
+            .unwrap();
+        let filling = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "get_record",
+                json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": silent_key}),
+            )
+            .await;
+        assert!(filling.is_err(), "closed identity is final");
+        db.close().await;
+    }
+
+    /// An unchanged repeat writes no new canonical control events.
+    #[tokio::test]
+    async fn unchanged_identity_writes_no_new_control_events() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-j748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000017", "type": "Document",
+                    "kind": "note", "name": "first", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        let baseline = control_event_count(&db).await;
+        for index in 0..3 {
+            registry
+                .call(
+                    db.clone(),
+                    mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                    "get_record",
+                    json!({"ids": [crate::schema::ROOT_RECORD_ID], "run_key": run_key}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                control_event_count(&db).await,
+                baseline,
+                "repeat {index} wrote"
+            );
+        }
+        db.close().await;
+    }
+
+    /// Non-MCP callers and uncaptured reads never gain canonical run rows from
+    /// this seam, even with a run key in hand.
+    #[tokio::test]
+    async fn non_mcp_and_uncaptured_calls_leave_no_run_row() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000018", "type": "Document",
+                    "kind": "note", "name": "local write", "body": "body",
+                    "reason": "first-call harness test", "run_key": "scout-chair-k748b2",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(stored_identity(&db, "scout-chair-k748b2").await.is_none());
+        registry
+            .call_detailed_uncaptured(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000019", "type": "Document",
+                    "kind": "note", "name": "uncaptured write", "body": "body",
+                    "reason": "first-call harness test", "run_key": "scout-chair-m748b2",
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(stored_identity(&db, "scout-chair-m748b2").await.is_none());
+        db.close().await;
+    }
+
+    /// A qualified non-MCP set_intent still fills a later model declaration
+    /// (harness stays absent), with a truthful committed confirmation.
+    #[tokio::test]
+    async fn local_set_intent_later_model_fill() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-n748b2";
+        let admitted = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "start without model", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted["declared_model"]["refused"], false);
+        assert_eq!(
+            stored_identity(&db, run_key).await.expect("row").model,
+            None
+        );
+        let later = registry
+            .call(
+                db.clone(),
+                Caller::authenticated("acct:alice"),
+                "set_intent",
+                json!({"intent": "still going", "model": "late-model", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(later["declared_model"]["recorded"], "late-model");
+        assert_eq!(later["declared_model"]["refused"], false);
+        assert_eq!(
+            stored_identity(&db, run_key)
+                .await
+                .expect("row")
+                .model
+                .as_deref(),
+            Some("late-model")
+        );
+        db.close().await;
+    }
+
+    /// Over-long names, versions and models clamp on a UTF-8 boundary instead
+    /// of rejecting admission; an accepted long model repeats honestly.
+    #[tokio::test]
+    async fn overlong_identity_clamps_and_long_model_repeats() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-s748b2";
+        let long_name = format!("{}é", "n".repeat(300));
+        let long_model = format!("{}é", "m".repeat(300));
+        let admitted = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some(&long_name), Some("v")),
+                "set_intent",
+                json!({"intent": "long harness", "model": long_model, "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted["declared_model"]["refused"], false);
+        let stored = stored_identity(&db, run_key).await.expect("row");
+        assert!(stored.client_name.as_deref().unwrap().len() <= 256);
+        assert!(stored.model.as_deref().unwrap().len() <= 256);
+        let repeat = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some(&long_name), Some("v")),
+                "set_intent",
+                json!({"intent": "again", "model": long_model, "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repeat["declared_model"]["refused"], false,
+            "clamped repeat must not falsely refuse"
+        );
+        db.close().await;
+    }
+
+    /// A repeated bootstrap echoing an admitted key with divergent clientInfo
+    /// reports the conflict read-only; another account's key is refused.
+    #[tokio::test]
+    async fn bootstrap_echo_conflict_note_and_cross_account_refusal() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let boot = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "bootstrap",
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let run_key = boot["run"]["run_key"].as_str().unwrap().to_string();
+        let before = control_event_count(&db).await;
+        let echo = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("other"), Some("9")),
+                "bootstrap",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            echo["run"].get("harness_note").is_some(),
+            "divergent echo reports honestly: {echo}"
+        );
+        assert_eq!(
+            control_event_count(&db).await,
+            before,
+            "conflict writes nothing"
+        );
+        let kept = stored_identity(&db, &run_key).await.expect("row");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        let stranger = registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:bob", Some("hazel"), Some("1")),
+                "bootstrap",
+                json!({"run_key": run_key}),
+            )
+            .await;
+        assert!(stranger.is_err(), "other-account echo is refused");
+        db.close().await;
+    }
+
+    /// An explicitly sent empty name is present, not absent: it pins and a
+    /// later non-empty name is refused rather than overwriting it.
+    #[tokio::test]
+    async fn empty_string_name_pins_against_later_name() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-p748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some(""), None),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000020", "type": "Document",
+                    "kind": "note", "name": "empty first", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        let stored = stored_identity(&db, run_key).await.expect("row");
+        assert_eq!(stored.client_name.as_deref(), Some(""));
+        let diverged = registry
+            .call_detailed(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), None),
+                "create_record",
+                json!({
+                    "id": "c0de0000-0000-4000-8000-000000000021", "type": "Document",
+                    "kind": "note", "name": "later name", "body": "body",
+                    "reason": "first-call harness test", "run_key": run_key,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(diverged.outcome.is_ok());
+        let kept = stored_identity(&db, run_key).await.expect("row");
+        assert_eq!(kept.client_name.as_deref(), Some(""));
+        db.close().await;
+    }
+
+    /// A present->different harness report on a closed run is a response-level
+    /// note, never a gating error: idempotent close succeeds, the row is
+    /// unchanged, and nothing canonical is written.
+    #[tokio::test]
+    async fn closed_conflict_reports_note_without_gating_close() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-q748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "set_intent",
+                json!({"intent": "close me", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "close_run",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        let baseline = control_event_count(&db).await;
+        let repeated = registry
+            .call_detailed(
+                db.clone(),
+                mcp_caller("acct:alice", Some("other"), Some("9")),
+                "close_run",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            repeated.outcome.is_ok(),
+            "conflict never gates the operation"
+        );
+        let notes = repeated.run_context["notes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .unwrap_or_default()
+                .contains("recorded values are unchanged")),
+            "conflict surfaces honestly: {notes:?}"
+        );
+        let kept = stored_identity(&db, run_key).await.expect("row");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        assert_eq!(kept.client_version.as_deref(), Some("1"));
+        assert_eq!(
+            control_event_count(&db).await,
+            baseline,
+            "conflict writes nothing"
+        );
+        db.close().await;
+    }
+
+    /// A closed bootstrap echo preserves key-echo inspection with no writer,
+    /// yet reports a divergent harness honestly — and the whole wrapper takes
+    /// no write-pool connection doing it.
+    #[tokio::test]
+    async fn closed_bootstrap_echo_reports_conflict_read_only() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let run_key = "scout-chair-w748b2";
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "set_intent",
+                json!({"intent": "close me", "run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        registry
+            .call(
+                db.clone(),
+                mcp_caller("acct:alice", Some("hazel"), Some("1")),
+                "close_run",
+                json!({"run_key": run_key}),
+            )
+            .await
+            .unwrap();
+        let baseline = control_event_count(&db).await;
+        let (echo, writes) = crate::db::with_write_pool_acquisition_counter(registry.call(
+            db.clone(),
+            mcp_caller("acct:alice", Some("other"), Some("9")),
+            "bootstrap",
+            json!({"run_key": run_key}),
+        ))
+        .await;
+        let echo = echo.unwrap();
+        assert_eq!(echo["run"]["run_key"], run_key, "key echo preserved");
+        assert!(
+            echo["run"].get("harness_note").is_some(),
+            "divergence reported honestly: {echo}"
+        );
+        assert_eq!(writes, 0, "read-only echo takes no write-pool connection");
+        assert_eq!(
+            control_event_count(&db).await,
+            baseline,
+            "echo writes nothing"
+        );
+        let kept = stored_identity(&db, run_key).await.expect("row");
+        assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+        assert_eq!(kept.client_version.as_deref(), Some("1"));
+        db.close().await;
+    }
+
+    /// Whole-wrapper pool accounting for bootstrap: the first call durably
+    /// admits (takes write-pool connections), while an unchanged echo takes
+    /// none — a no-op BEGIN IMMEDIATE regression would trip the zero.
+    #[tokio::test]
+    async fn bootstrap_first_writes_then_unchanged_echo_takes_no_write_pool() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let registry = test_registry();
+        bind_account(&db, "acct:alice", "test:alice-person").await;
+        bind_account(&db, "acct:bob", "test:bob-person").await;
+        let caller = || mcp_caller("acct:alice", Some("hazel"), Some("1"));
+        let (first, first_writes) = crate::db::with_write_pool_acquisition_counter(registry.call(
+            db.clone(),
+            caller(),
+            "bootstrap",
+            json!({}),
+        ))
+        .await;
+        let first = first.unwrap();
+        let run_key = first["run"]["run_key"].as_str().unwrap().to_string();
+        assert!(first_writes > 0, "first call durably admits");
+        assert!(stored_identity(&db, &run_key).await.is_some());
+        let baseline = control_event_count(&db).await;
+        let (echo, echo_writes) = crate::db::with_write_pool_acquisition_counter(registry.call(
+            db.clone(),
+            caller(),
+            "bootstrap",
+            json!({"run_key": run_key}),
+        ))
+        .await;
+        echo.unwrap();
+        assert_eq!(
+            echo_writes, 0,
+            "unchanged echo takes no write-pool connection"
+        );
+        assert_eq!(
+            control_event_count(&db).await,
+            baseline,
+            "echo writes nothing"
+        );
+        db.close().await;
     }
 }

@@ -3125,7 +3125,7 @@ async fn current_stamp_config_node_carrier_corruption_refuses_health_and_reopen(
         // Corruption keeps the current stamp and all advertised runtime tables.
         corrupt_turso_file(&path, &[corruption]).await;
         let before = state(&path).await;
-        assert_eq!(before.0, 82);
+        assert_eq!(before.0, native_ce::CURRENT_ENGINE_SCHEMA_VERSION);
         let health = runtime.health().await.unwrap();
         assert!(!health.ready && !health.write_ready);
         drop(runtime);
@@ -3187,13 +3187,76 @@ async fn current_stamp_facet_value_carrier_corruption_refuses_health_and_reopen(
         let path = runtime.path().to_path_buf();
         corrupt_turso_file(&path, &[corruption]).await;
         let before = state(&path).await;
-        assert_eq!(before.0, 82);
+        assert_eq!(before.0, native_ce::CURRENT_ENGINE_SCHEMA_VERSION);
         let health = runtime.health().await.unwrap();
         assert!(!health.ready && !health.write_ready);
         drop(runtime);
         assert_eq!(
             runtime_config.open().await.unwrap_err().to_string(),
             "Turso-local shared facet-value node carrier is incomplete"
+        );
+        assert_eq!(state(&path).await, before);
+    }
+}
+
+#[tokio::test]
+async fn current_stamp_facet_observation_carrier_corruption_refuses_health_and_reopen() {
+    async fn state(path: &std::path::Path) -> (i64, String, i64) {
+        let raw = turso::Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = raw.connect().unwrap();
+        let mut versions = connection.query("PRAGMA user_version", ()).await.unwrap();
+        let version = versions
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        drop(versions);
+        let mut rows = connection
+            .query(
+                "SELECT COALESCE((SELECT sql FROM sqlite_schema WHERE name='facet_observation_json_nodes'),''),
+                    (SELECT count(*) FROM meta_events)",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            version,
+            row.get::<String>(0).unwrap(),
+            row.get::<i64>(1).unwrap(),
+        )
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    for (name, corruption) in [
+        (
+            "missing-facet-observation-nodes",
+            "DROP TABLE facet_observation_json_nodes",
+        ),
+        (
+            "altered-facet-observation-nodes",
+            "ALTER TABLE facet_observation_json_nodes ADD COLUMN unreviewed TEXT",
+        ),
+    ] {
+        let runtime_config = config(directory.path(), name);
+        let runtime = runtime_config.open().await.unwrap();
+        assert!(runtime.health().await.unwrap().ready);
+        let path = runtime.path().to_path_buf();
+        corrupt_turso_file(&path, &[corruption]).await;
+        let before = state(&path).await;
+        assert_eq!(before.0, native_ce::CURRENT_ENGINE_SCHEMA_VERSION);
+        let health = runtime.health().await.unwrap();
+        assert!(!health.ready && !health.write_ready);
+        drop(runtime);
+        assert_eq!(
+            runtime_config.open().await.unwrap_err().to_string(),
+            "Turso-local shared facet-observation node carrier is incomplete"
         );
         assert_eq!(state(&path).await, before);
     }
@@ -3255,7 +3318,7 @@ async fn current_stamp_workspace_carrier_corruption_refuses_health_and_reopen() 
         let path = runtime.path().to_path_buf();
         corrupt_turso_file(&path, &[corruption]).await;
         let before = state(&path).await;
-        assert_eq!(before.0, 82);
+        assert_eq!(before.0, native_ce::CURRENT_ENGINE_SCHEMA_VERSION);
         let health = runtime.health().await.unwrap();
         assert!(!health.ready && !health.write_ready);
         drop(runtime);

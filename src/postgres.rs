@@ -54,12 +54,12 @@ pub use substrate::{
     PostgresMetaEvent, PostgresPolicyEvent,
 };
 
-const SCHEMA_VERSION: i32 = 9;
+const SCHEMA_VERSION: i32 = 10;
 const DATABASE_PROVISION_LOCK: &str = "native-ce:postgres-database-provision:v1";
 const SEEDED_RECORD_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 const POSTGRES_DESCRIBE_SCHEMA_DDL_COUNT: usize = 58;
 const POSTGRES_DESCRIBE_SCHEMA_DDL_FINGERPRINT: &str =
-    "73ef84e9fcdf81de2fe48dc5304314590516907fcf3ed907146a87b43c46d6a7";
+    "9acc0431ed95dbb73850eb5def6f00d032578a445adc989dd511c85dd7fe1cc8";
 const POSTGRES_V4_DDL_COUNT: usize = 49;
 const POSTGRES_V4_DDL_FINGERPRINT: &str =
     "9a65675dd0d396a6437fe25d98051303b9a6128fc6686fbb28bdfaff0a5eb553";
@@ -871,6 +871,13 @@ impl PostgresRuntimeConfig {
             if observed == Some(8) {
                 db.migrate_v8_to_v9().await?;
             }
+            let observed: Option<i32> =
+                sqlx::query_scalar(&format!("SELECT MAX(version) FROM {migrations}"))
+                    .fetch_one(&db.pool)
+                    .await?;
+            if observed == Some(9) {
+                db.migrate_v9_to_v10().await?;
+            }
             let health = db.health().await?;
             if !health.ready || !health.write_ready {
                 db.close().await;
@@ -1537,7 +1544,62 @@ fn postgres_v9_schema(schema: &str) -> Vec<String> {
     ]
 }
 
+/// `Configuration` becomes the eleventh spine type (task 6ec81db), so the
+/// closed `records.record_type` CHECK widens. Postgres can alter a constraint
+/// in place: no table rebuild, no row touched, and every existing type is a
+/// strict subset of the widened set. The constraint keeps the name Postgres
+/// gave the inline column CHECK at creation, so fresh and migrated schemas
+/// are identical.
+fn postgres_v10_schema(schema: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {schema}.records DROP CONSTRAINT records_record_type_check"),
+        format!(
+            "ALTER TABLE {schema}.records ADD CONSTRAINT records_record_type_check \
+             CHECK(record_type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation','Configuration'))"
+        ),
+    ]
+}
+
 impl PostgresDb {
+    /// Present a schema-v10 database as the v9 database it would have been:
+    /// restore the ten-type CHECK and stamp 9. The `kind:Configuration`
+    /// vocabulary is the caller's to remove (natively created databases hold a
+    /// projection row, imported ones an event), because how it is removed is
+    /// the thing the v9→v10 edge must cope with.
+    #[cfg(feature = "postgres-tests")]
+    #[doc(hidden)]
+    pub async fn contract_rewind_schema_v10_to_v9_for_test(&self) -> Result<()> {
+        let schema = quote_identifier(&self.schema)?;
+        let migrations = self.qualified_table("schema_migrations")?;
+        let mut tx = self.pool.begin().await?;
+        tx.execute(postgres_v10_schema(&schema).remove(0).as_str())
+            .await?;
+        tx.execute(
+            format!(
+                "ALTER TABLE {schema}.records ADD CONSTRAINT records_record_type_check \
+                 CHECK(record_type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation'))"
+            )
+            .as_str(),
+        )
+        .await?;
+        sqlx::query(&format!("DELETE FROM {migrations} WHERE version=10"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(&format!(
+            "INSERT INTO {migrations}(version) VALUES(9) ON CONFLICT DO NOTHING"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[doc(hidden)]
+    pub async fn contract_migrate_v9_to_v10_for_test(&self) -> Result<()> {
+        self.migrate_v9_to_v10().await
+    }
+
     #[cfg(feature = "postgres-tests")]
     #[doc(hidden)]
     pub async fn contract_rewind_schema_v5_to_v4_for_test(&self) -> Result<()> {
@@ -1643,8 +1705,27 @@ impl PostgresDb {
             .as_str(),
         )
         .await?;
+        // Rewind the `Configuration` edge: restore the ten-type CHECK. This
+        // fails, as the older constraint would, if a Configuration record exists.
+        let schema_name = quote_identifier(&self.schema)?;
+        tx.execute(postgres_v10_schema(&schema_name).remove(0).as_str())
+            .await?;
+        tx.execute(
+            format!(
+                "ALTER TABLE {schema_name}.records ADD CONSTRAINT records_record_type_check \
+                 CHECK(record_type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation'))"
+            )
+            .as_str(),
+        )
+        .await?;
+        // A released v9 database has no `kind:Configuration` vocabulary.
         sqlx::query(&format!(
-            "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9)"
+            "DELETE FROM {schema_name}.vocabularies WHERE id='voc:kind:Configuration'"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&format!(
+            "DELETE FROM {migrations} WHERE version IN (5,6,7,8,9,10)"
         ))
         .execute(&mut *tx)
         .await?;
@@ -2154,7 +2235,7 @@ impl PostgresDb {
             ),
             format!(
                 "CREATE TABLE {schema}.records (\
-                 id TEXT PRIMARY KEY, record_type TEXT NOT NULL CHECK(record_type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation')), kind TEXT NOT NULL CHECK (kind <> ''),\
+                 id TEXT PRIMARY KEY, record_type TEXT NOT NULL CHECK(record_type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation','Configuration')), kind TEXT NOT NULL CHECK (kind <> ''),\
                  name TEXT, body TEXT, home_id TEXT REFERENCES {schema}.records(id) ON DELETE SET NULL, summary TEXT, lifecycle TEXT, owner_id TEXT REFERENCES {schema}.records(id),\
                  policy_anchor_id TEXT REFERENCES {schema}.records(id),\
                  persistence TEXT NOT NULL DEFAULT 'enduring' CHECK(persistence IN ('enduring','occurrent')), maturity TEXT,\
@@ -2441,6 +2522,90 @@ impl PostgresDb {
             tx.execute(statement.as_str()).await?;
         }
         sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(8)"))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(())
+    }
+
+    async fn migrate_v9_to_v10(&self) -> Result<()> {
+        let schema = quote_identifier(&self.schema)?;
+        let migrations = self.qualified_table("schema_migrations")?;
+        let mut tx = self.pool.begin().await?;
+        let observed: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT version FROM {migrations} ORDER BY version DESC LIMIT 1 FOR UPDATE"
+        ))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if observed != Some(9) {
+            return Err(Error::engine(
+                "Postgres schema v9-to-v10 migration requires exact source version 9",
+            ));
+        }
+        for statement in postgres_v10_schema(&schema) {
+            tx.execute(statement.as_str()).await?;
+        }
+        // A v9 database predates the `Configuration` spine type and so lacks its
+        // `kind:Configuration` vocabulary, which v10 genesis (and a v10 replay)
+        // seeds. This edge touches that one vocabulary and no other: a seeded
+        // vocabulary that a v9 history deleted stays deleted, because replay
+        // replays that deletion.
+        let vocabularies = self.qualified_table("vocabularies")?;
+        let content_events = self.qualified_table("content_events")?;
+        let configuration_id = crate::meta::kind::kind_vocabulary_id("Configuration");
+        let configuration_name = crate::meta::kind::kind_vocabulary_name("Configuration");
+        let imported: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {content_events} WHERE record_id=$1 AND type='record.created')"
+        ))
+        .bind(ROOT_RECORD_ID)
+        .fetch_one(&mut *tx)
+        .await?;
+        let present: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {vocabularies} WHERE id=$1)"
+        ))
+        .bind(&configuration_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !present && !imported {
+            // Native: projection-only, matching what a v10 replay seeds
+            // (`migrate(true)`).
+            sqlx::query(&format!(
+                "INSERT INTO {vocabularies}(id,name,created_at) VALUES($1,$2,$3::timestamptz)"
+            ))
+            .bind(&configuration_id)
+            .bind(&configuration_name)
+            .bind(SEEDED_RECORD_TIMESTAMP)
+            .execute(&mut *tx)
+            .await?;
+        } else if !present {
+            // Imported: replay seeds nothing, and the importer materializes no
+            // vocabularies, so an imported database with none gets none. One
+            // that holds kind vocabularies (as events) gets this one as exactly
+            // one event, under one explicitly allocated act.
+            let holds_kind_vocabularies: bool = sqlx::query_scalar(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {vocabularies} WHERE name LIKE 'kind:%')"
+            ))
+            .fetch_one(&mut *tx)
+            .await?;
+            if holds_kind_vocabularies {
+                let act = allocate_act_in(self, &mut tx).await?;
+                self.append_meta_event_in(
+                    &mut tx,
+                    PostgresMetaEvent {
+                        id: Uuid::new_v4().to_string(),
+                        subject_id: configuration_id,
+                        event_type: "vocabulary.created".into(),
+                        payload: json!({ "name": configuration_name }),
+                        actor: Some("engine:seed".into()),
+                        created_at: Utc::now().to_rfc3339(),
+                        act: Some(act),
+                    },
+                )
+                .await?;
+            }
+        }
+        sqlx::query(&format!("INSERT INTO {migrations}(version) VALUES(10)"))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;

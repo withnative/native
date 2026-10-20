@@ -399,6 +399,42 @@ async fn current_record_version_in(
         .ok_or_else(|| Error::engine(format!("record {record_id} has no content version")))
 }
 
+/// The governed-HTML receipt for a record's projected state in `conn`: the
+/// inputs `prospective_body_in` validates before a write, read back after it.
+/// Keyed `update_record` replays rebuild `html_body_write` with this, from
+/// the live projection or from a pinned scratch one.
+async fn html_body_write_in(
+    conn: &mut sqlx::SqliteConnection,
+    tool: &str,
+    record_id: &str,
+) -> Result<Option<Value>> {
+    let Some(row) = sqlx::query(
+        "SELECT r.type, r.kind, r.body, f.value AS runtime, p.value AS package_marker
+           FROM records r
+           LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
+           LEFT JOIN facet_values p ON p.record_id = r.id AND p.key = ?
+          WHERE r.id = ?",
+    )
+    .bind(crate::artifact_html::PACKAGE_FACET_KEY)
+    .bind(record_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let body: Option<String> = row.try_get("body")?;
+    let manifest = super::artifacts::validate_prospective_html(
+        tool,
+        &row.try_get::<String, _>("type")?,
+        row.try_get::<Option<String>, _>("kind")?.as_deref(),
+        row.try_get::<Option<String>, _>("runtime")?.as_deref(),
+        row.try_get::<Option<String>, _>("package_marker")?
+            .as_deref(),
+        body.as_deref(),
+    )?;
+    Ok(manifest.map(|manifest| html_body_write_result(&manifest, body.as_deref().unwrap_or(""))))
+}
+
 fn html_body_write_result(manifest: &crate::artifact_html::Manifest, source: &str) -> Value {
     let mut receipt = json!({
         "algorithm": "sha256",
@@ -611,6 +647,7 @@ async fn correction_snapshot_in(
 ) -> Result<crate::record_type_correction::CorrectionPlan> {
     const TOOL: &str = "correct_record_type";
     require_record_in(tx, caller, TOOL, &args.record_id, required).await?;
+    crate::persona::require_unregistered(tx, &args.record_id, TOOL).await?;
     require_nonblank_reason(TOOL, &args.reason)?;
     if !SPINE_TYPES.contains(&args.target_type.as_str()) || args.target_kind.trim().is_empty() {
         return Err(Error::engine(format!(
@@ -1050,6 +1087,11 @@ pub(crate) async fn correct_record_type(db: Db, caller: Caller, arguments: Value
                     .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         })
         .ok_or_else(|| Error::engine("correct_record_type: executor effect_digest is required"))?;
+    // Single-writer rule: a live session on the record versions its unsaved
+    // edits first and is closed once the correction has committed.
+    let mut live_write =
+        crate::coedit::live::begin_body_write(&db, &args.record_id, &caller).await?;
+    live_write.begin_scope_change(&db, &caller).await?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     let plan = correction_snapshot_in(
@@ -1092,6 +1134,7 @@ pub(crate) async fn correct_record_type(db: Db, caller: Caller, arguments: Value
     )
     .await?;
     db.commit_content(tx).await?;
+    live_write.finish_scope_change(&db).await;
     echo_act(
         json!({
         "record_id": args.record_id,
@@ -1930,6 +1973,11 @@ async fn compact_record_source_in(
         record.lifecycle.as_deref(),
     );
     let mut value = serde_json::to_value(record)?;
+    if value["type"] == "Message" {
+        if let Some(speaker) = crate::persona::message_speaker(tx, id).await? {
+            value["speaker"] = speaker;
+        }
+    }
     annotate_body_digest(&mut value);
     Ok(value)
 }
@@ -1956,7 +2004,14 @@ pub(super) async fn enriched_or_none(db: &Db, caller: &Caller, id: &str) -> Resu
     match record {
         Some(mut record) => {
             filter_enriched_record(db, caller, &mut record, read::EnrichOptions::default()).await?;
-            Ok(Some(serde_json::to_value(record)?))
+            let mut value = serde_json::to_value(record)?;
+            if value["type"] == "Message" {
+                let mut conn = db.write_pool().acquire().await?;
+                if let Some(speaker) = crate::persona::message_speaker(&mut conn, id).await? {
+                    value["speaker"] = speaker;
+                }
+            }
+            Ok(Some(value))
         }
         None => Ok(None),
     }
@@ -1974,7 +2029,8 @@ pub(crate) const SOURCE_BASIS_FORMAT: &str = "native.source-basis.v1";
 /// One caller-declared source on an ordinary write: either the object form
 /// `{record_id, reason, role?, revision_event_id?}`, or a bare record id as
 /// shorthand for `{record_id}` with no reason.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
 pub(crate) enum SourceBasisInput {
     /// The object form.
     Object(SourceBasisObject),
@@ -1992,14 +2048,14 @@ pub(crate) enum SourceBasisInput {
 /// head. A supplied revision must be a real body revision of the cited record
 /// but need not be the head — the honest stale-but-real case. `reason` is
 /// required and validated non-blank; only the bare-string form may omit it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceBasisObject {
     pub record_id: String,
     pub reason: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision_event_id: Option<String>,
 }
 
@@ -2176,7 +2232,7 @@ fn reject_null_sources(tool: &str, arguments: &Value) -> Result<()> {
 /// Every refusal is a whole-call error naming the ordinal, never the cited
 /// record: a write that could report *which* unseen id was denied would be an
 /// existence oracle.
-pub(super) async fn resolve_source_basis_in(
+pub(crate) async fn resolve_source_basis_in(
     tx: &mut Transaction<'static, Sqlite>,
     caller: &Caller,
     tool: &str,
@@ -2325,6 +2381,14 @@ struct CreateRecordArgs {
     /// delivered-Message routes keep their own narrower replay paths and never
     /// set this field.
     idempotency_key: Option<String>,
+    /// Optional privacy boundary for the ordinary create path. Absent retains
+    /// existing behavior (the record inherits its home's policy). The single
+    /// literal `"account_only"` installs an explicit caller-account-only
+    /// Manage policy in the same transaction as creation, before first
+    /// commit. The account is always the authenticated caller — never a
+    /// payload field — so this cannot name another principal. Any other value
+    /// is refused.
+    access_policy: Option<String>,
     #[serde(default)]
     response_mode: ResponseMode,
 }
@@ -2468,6 +2532,7 @@ pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> R
         CreateRecordResponse {
             mode: None,
             similar_notice: Some(&[]),
+            keyed_item: None,
         },
     )
     .await
@@ -2486,6 +2551,7 @@ pub(super) async fn create_record_verbose_excluding(
     caller: Caller,
     arguments: Value,
     similar_exclusion: &[String],
+    keyed_item: Option<KeyedCreateItem<'_>>,
 ) -> Result<Value> {
     create_record_inner(
         db,
@@ -2497,6 +2563,7 @@ pub(super) async fn create_record_verbose_excluding(
         CreateRecordResponse {
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(similar_exclusion),
+            keyed_item,
         },
     )
     .await
@@ -2504,6 +2571,7 @@ pub(super) async fn create_record_verbose_excluding(
 
 #[derive(Debug, Clone)]
 pub(crate) struct SendMessagePlan {
+    pub speaker: Option<Value>,
     pub idempotency_key: String,
     pub intent_digest: String,
     pub disclosure_preview: Option<String>,
@@ -2571,6 +2639,7 @@ pub(crate) async fn create_record_from_artifact(
         CreateRecordResponse {
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(&[]),
+            keyed_item: None,
         },
     )
     .await
@@ -2639,6 +2708,10 @@ pub(crate) struct ArtifactCommentPlan {
     /// Exact body from the declared values input. Retained byte-for-byte;
     /// capped by `min(manifest, consent)` in-transaction.
     pub body: String,
+    /// Normalized passage anchor for a root (`source_slot`, `purpose`,
+    /// `selectors`); the bearer is always `target_id`. Present only when the
+    /// manifest declares an anchor input and the invocation filled it.
+    pub anchor: Option<Value>,
     pub manifest_max_bytes: usize,
     /// Candidate binding scope from the entry's explicit bound-input port:
     /// exactly one (port, collection, kind) triple, re-proved
@@ -2728,7 +2801,7 @@ pub(crate) async fn create_comment_from_artifact(
             message: "comment body must be nonblank".to_string(),
         });
     }
-    let arguments = json!({
+    let mut arguments = json!({
         "type": "Annotation",
         "kind": "comment",
         "name": "Comment",
@@ -2739,6 +2812,13 @@ pub(crate) async fn create_comment_from_artifact(
         ),
         "links": [{ "target_id": plan.target_id, "relationship": "part_of" }],
     });
+    if let Some(anchor) = &plan.anchor {
+        // The bearer is never frame-supplied: the anchor always targets the
+        // comment's own part_of record.
+        let mut target = anchor.clone();
+        target["target_record_id"] = json!(plan.target_id);
+        arguments["target"] = target;
+    }
     let outcome = create_record_inner(
         db,
         caller,
@@ -2749,6 +2829,7 @@ pub(crate) async fn create_comment_from_artifact(
         CreateRecordResponse {
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(&[]),
+            keyed_item: None,
         },
     )
     .await?;
@@ -3535,12 +3616,25 @@ pub(crate) async fn rename_record_from_artifact(
             ),
         ));
     };
-    let Some(expected) = native_artifact_runtime::artifact_intents::FacetVersion::parse(token)
-        .and_then(|version| match version {
-            native_artifact_runtime::artifact_intents::FacetVersion::Record { .. } => Some(version),
-            _ => None,
-        })
-    else {
+    // `rec:N` or `rev:<event id>`; an event id resolves to the sequence it
+    // names, and an unresolvable one is refused like an invalid token.
+    // Only the unknown-position refusal becomes `invalid_precondition`; a busy
+    // or timed-out store propagates as itself.
+    let parsed = match crate::position::parse_facet_version(
+        &mut tx,
+        caller.counter_footing(),
+        token,
+    )
+    .await
+    {
+        Ok(parsed) => parsed,
+        Err(error) if crate::position::is_unknown_position(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let Some(expected) = parsed.and_then(|version| match version {
+        native_artifact_runtime::artifact_intents::FacetVersion::Record { .. } => Some(version),
+        _ => None,
+    }) else {
         tx.rollback().await?;
         return Ok(refused(
             "invalid_precondition",
@@ -3685,6 +3779,11 @@ fn comment_command_digest(caller_actor: &str, plan: &ArtifactCommentPlan) -> Res
         "idempotency_key": plan.idempotency_key,
         "actor": caller_actor,
     });
+    // Unanchored commands keep their exact historical digest.
+    let mut envelope = envelope;
+    if let Some(anchor) = &plan.anchor {
+        envelope["anchor"] = anchor.clone();
+    }
     serde_jcs::to_vec(&envelope)
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
         .map_err(|error| Error::engine(format!("comment command digest failed: {error}")))
@@ -3806,6 +3905,7 @@ pub(crate) async fn send_message_record(
             // type-blind, so a Message could match unrelated Documents, and this
             // response has no curated rendering for it. Suppress it here.
             similar_notice: None,
+            keyed_item: None,
         },
     )
     .await
@@ -3814,9 +3914,50 @@ pub(crate) async fn send_message_record(
 struct CreateRecordResponse<'a> {
     mode: Option<ResponseMode>,
     similar_notice: Option<&'a [String]>,
+    keyed_item: Option<KeyedCreateItem<'a>>,
 }
 
+/// One item of a keyed multi-record call (`create_many`), created through
+/// this handler under the item's own command identity. The call's dispatch
+/// already carries that identity for the attestation this create issues; the
+/// lookup needs it too, with the whole call's arguments for the action and
+/// intent comparison, since the item's own arguments contain ids the server
+/// minted for this attempt.
+pub(super) struct KeyedCreateItem<'a> {
+    pub(super) operation: &'static str,
+    pub(super) command_identity_digest: String,
+    pub(super) action_arguments: &'a Value,
+    /// Replay the receipt fields only (id, act, body digest, warnings),
+    /// folded from the record's own events rather than rebuilt through the
+    /// workspace history when the caller needs no record view.
+    pub(super) receipt_only: bool,
+}
+
+// This kernel carries ordinary, message and artifact creation branches. Keep
+// its future off every entry point's stack: first sign-in also reaches it through
+// FULL conformance's read-log corpus, under the HTTP and registry poll frames.
 async fn create_record_inner(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+    send_plan: Option<SendMessagePlan>,
+    artifact_plan: Option<ArtifactCreatePlan>,
+    comment_plan: Option<ArtifactCommentPlan>,
+    response: CreateRecordResponse<'_>,
+) -> Result<Value> {
+    Box::pin(create_record_inner_impl(
+        db,
+        caller,
+        arguments,
+        send_plan,
+        artifact_plan,
+        comment_plan,
+        response,
+    ))
+    .await
+}
+
+async fn create_record_inner_impl(
     db: Db,
     caller: Caller,
     arguments: Value,
@@ -3861,13 +4002,15 @@ async fn create_record_inner(
     // narrower replay paths (SendMessagePlan / ArtifactCreatePlan) and never
     // set the ordinary key; the provenance mechanism stays out of their way.
     // The comment route keeps its own post-gate replay the same way.
+    let keyed_item = response.keyed_item;
     let idempotent_create = send_plan.is_none()
         && artifact_plan.is_none()
         && comment_plan.is_none()
-        && args
-            .idempotency_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty());
+        && (keyed_item.is_some()
+            || args
+                .idempotency_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()));
     require_nonblank_reason(TOOL, &args.reason)?;
     let lifecycle = args.lifecycle.take();
     let source_inputs = args.sources.take();
@@ -3909,6 +4052,38 @@ async fn create_record_inner(
         return Err(Error::engine(
             "manage_messages.send may create only a Message",
         ));
+    }
+    // Optional atomic privacy boundary (task 5b5bfa5). Absent means exactly
+    // today's behavior. The account is always the authenticated caller, never
+    // a payload field, so this cannot name another principal.
+    let account_only = match args.access_policy.as_deref() {
+        None => false,
+        Some("account_only") => true,
+        Some(other) => {
+            return Err(Error::engine(format!(
+                "{TOOL}: 'access_policy' must be the single literal \"account_only\", got {other:?}"
+            )));
+        }
+    };
+    if account_only {
+        // Narrow routes keep their own policy semantics: delivered Messages
+        // install audience policy below, and the send/artifact/comment plans
+        // never carry this field. Refuse rather than silently ignore.
+        if send_plan.is_some() || artifact_plan.is_some() || comment_plan.is_some() {
+            return Err(Error::engine(
+                "create_record: 'access_policy' is valid only for the ordinary create path",
+            ));
+        }
+        if record_type == "Message" {
+            return Err(Error::engine(
+                "create_record: 'access_policy' is not supported for Message creation; audience policy governs delivery",
+            ));
+        }
+        if super::is_legacy_local(&caller) {
+            return Err(Error::engine(
+                "create_record: 'access_policy' requires a portable account caller",
+            ));
+        }
     }
     let mut record_kind = args.kind.clone();
     let requested_owner = args.owner_id.clone();
@@ -4140,11 +4315,6 @@ async fn create_record_inner(
     let mut audience_recipients = Vec::new();
     let mut audience_seen = BTreeSet::new();
     for recipient_id in args.addressed_to.iter().flatten() {
-        if fields.get("owner_id").and_then(Value::as_str) == Some(recipient_id.as_str()) {
-            return Err(Error::engine(
-                "create_record: addressed_to must exclude the Message sender",
-            ));
-        }
         if !audience_seen.insert(recipient_id.as_str()) {
             return Err(Error::engine(format!(
                 "create_record: duplicate addressed_to recipient {recipient_id}"
@@ -4192,16 +4362,7 @@ async fn create_record_inner(
                 "create_record: mention ids must be non-empty and unique",
             ));
         }
-        if mention.span_start >= mention.span_end
-            || mention.span_end > body_for_mentions.len()
-            || !body_for_mentions.is_char_boundary(mention.span_start)
-            || !body_for_mentions.is_char_boundary(mention.span_end)
-            || body_for_mentions[mention.span_start..mention.span_end] != mention.authored_label
-        {
-            return Err(Error::engine(
-                "create_record: mention span must exactly match immutable Message prose",
-            ));
-        }
+        crate::awareness::validate_mention_span(body_for_mentions, mention)?;
         require_record_in(&mut tx, &caller, TOOL, &mention.target_id, Capability::View).await?;
         let (target_binding, recipient_account) = match mention.target_kind.as_str() {
             "principal" => {
@@ -4374,7 +4535,13 @@ async fn create_record_inner(
         }
     } else if is_comment {
         if let Some(target) = args.target.as_ref() {
-            if comment_position != Some(crate::comments::Position::Root) {
+            // A comment plan's root position is manifest-fixed; a deferred
+            // shape refuses after CAS on its own, so it is not judged here.
+            let deferred_plan_root = comment_plan
+                .as_ref()
+                .is_some_and(|plan| plan.position == "root")
+                && deferred_comment_shape;
+            if comment_position != Some(crate::comments::Position::Root) && !deferred_plan_root {
                 return Err(Error::engine(
                     "create_record: comment replies must be targetless; quoted context belongs to the root",
                 ));
@@ -4715,12 +4882,14 @@ async fn create_record_inner(
         .find(|facet| facet.key == "runtime")
         .map(FacetWrite::stored_value);
     validate_prospective_program(TOOL, &record_type, Some(&record_kind), runtime.as_deref())?;
+    let package_marker = super::artifacts::package_marker_of_writes(&facets);
     let body = fields.get("body").and_then(Value::as_str);
     let html_manifest = super::artifacts::validate_prospective_html(
         TOOL,
         &record_type,
         Some(&record_kind),
         runtime.as_deref(),
+        package_marker.as_deref(),
         body,
     )?;
     let html_body_write = html_manifest.map(|manifest| {
@@ -4731,7 +4900,22 @@ async fn create_record_inner(
     });
     let before = required_violations_in(&mut tx, &schema_rows, &[&id]).await?;
     let captured_target = match args.target {
-        Some(target) => Some(crate::citations::capture_target_in(&mut tx, target).await?),
+        Some(target) => match crate::citations::capture_target_in(&mut tx, target).await {
+            Ok(captured) => Some(captured),
+            // A comment plan's anchor that does not hold against the stored
+            // body is a definite refusal (nothing was written), not an
+            // uncertain outcome. Infrastructure errors still propagate.
+            // The fixed message never echoes selector detail (match counts,
+            // offsets) back to the frame.
+            Err(Error::Engine(_)) if comment_plan.is_some() => {
+                tx.rollback().await?;
+                return Ok(comment_refused_value(
+                    "comment_anchor_invalid",
+                    "the passage anchor does not match the stored body".to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        },
         None => None,
     };
     let message_sender = if record_type == "Message" {
@@ -4867,6 +5051,22 @@ async fn create_record_inner(
             }
         }
     }
+    let speaker = if let Some((sender_id, sender_principal)) = &message_sender {
+        crate::persona::resolve_claim(
+            &mut tx,
+            send_plan.as_ref().and_then(|plan| plan.speaker.as_ref()),
+            sender_id,
+            sender_principal,
+        )
+        .await?
+    } else {
+        None
+    };
+    let self_addressed = message_sender.as_ref().is_some_and(|(sender, _)| {
+        audience_recipients
+            .iter()
+            .any(|recipient| &recipient.recipient_id == sender)
+    });
     let mut send_evaluation = None;
     let mut intervention_id = None;
     let mut delivered = record_type != "Message";
@@ -4962,7 +5162,22 @@ async fn create_record_inner(
                     "idempotent_retry":true,
                 }),
             );
+            if self_addressed && existing.get("speaker").is_none() {
+                return Err(Error::engine(
+                    "Message sender cannot be an addressed_to recipient without a valid speaker",
+                ));
+            }
+            existing["speaker_claim_status"] = json!(if existing.get("speaker").is_some() {
+                "recorded"
+            } else {
+                "absent"
+            });
             return echo_previous_seq(existing, None);
+        }
+        if self_addressed && speaker.is_none() {
+            return Err(Error::engine(
+                "Message sender cannot be an addressed_to recipient without a valid speaker",
+            ));
         }
         let correspondents = intended_recipients
             .iter()
@@ -5024,14 +5239,28 @@ async fn create_record_inner(
         }
         send_evaluation = Some((plan.clone(), sender_principal.clone(), evaluation));
     }
-    let artifact_attestation = super::artifacts::validate_prospective_artifact(
-        &id,
-        &record_type,
-        Some(&record_kind),
-        fields.get("body").and_then(Value::as_str),
-        runtime.as_deref(),
-    )
-    .await?;
+    if self_addressed && speaker.is_none() {
+        return Err(Error::engine(
+            "Message sender cannot be an addressed_to recipient without a valid speaker",
+        ));
+    }
+    // The compiler check is load- and state-dependent (a compile slot, the
+    // source's validity), and a replay needs neither: a keyed call therefore
+    // runs it only after its replay lookup misses, so a retry of a committed
+    // create is never refused because the compiler happens to be busy.
+    let mut artifact_attestation = if idempotent_create {
+        None
+    } else {
+        super::artifacts::validate_prospective_artifact(
+            &id,
+            &record_type,
+            Some(&record_kind),
+            fields.get("body").and_then(Value::as_str),
+            runtime.as_deref(),
+            package_marker.as_deref(),
+        )
+        .await?
+    };
     let source = fields
         .get("body")
         .and_then(Value::as_str)
@@ -5109,15 +5338,31 @@ async fn create_record_inner(
     // Summary reconstruction has a command-specific dependency closure;
     // verbose/unsupported requests rebuild a bounded historical projection.
     if idempotent_create {
-        if let Some(attestation_id) = crate::provenance::lookup_authorized_command_attestation_in(
-            &mut tx,
-            caller.credential(),
-            "create_record",
-            &provenance_arguments,
-            caller.intent(),
-        )
-        .await?
-        {
+        let found = match &keyed_item {
+            Some(item) => {
+                crate::provenance::lookup_authorized_command_identity_in(
+                    &mut tx,
+                    caller.credential(),
+                    item.operation,
+                    &item.command_identity_digest,
+                    item.action_arguments,
+                    caller.intent(),
+                )
+                .await?
+            }
+            None => {
+                crate::provenance::lookup_authorized_command_attestation_in(
+                    &mut tx,
+                    caller.credential(),
+                    "create_record",
+                    &provenance_arguments,
+                    caller.intent(),
+                )
+                .await?
+            }
+        };
+        let receipt_only = keyed_item.as_ref().is_some_and(|item| item.receipt_only);
+        if let Some(attestation_id) = found {
             let attested = attested_create_horizons_in(&mut tx, &attestation_id).await?;
             // Non-disclosure for the output: the receipt discloses the created
             // record, so the replaying caller must still view it. A caller
@@ -5130,32 +5375,56 @@ async fn create_record_inner(
                 Capability::View,
             )
             .await?;
-            // Compact receipts have no enrichment dependencies. Reconstruct
-            // their pinned fields while the live authorization snapshot is held.
-            let compact = if response_mode == ResponseMode::Summary {
-                tokio::time::timeout(
-                    ATTESTED_REBUILD_EXECUTION,
-                    compact_attested_create_in(
-                        &mut tx,
-                        &caller,
-                        &attested,
-                        html_body_write.clone(),
-                    ),
+            // Neither reconstruction holds the writer transaction. The View
+            // check above is the authorization; everything below reads
+            // history pinned at the command's horizon.
+            tx.rollback().await?;
+            crate::provenance::note_replayed_action_attestation(attestation_id);
+            // Compact receipts have no enrichment dependencies: their pinned
+            // fields fold from the record's own events on a read transaction,
+            // under the replay deadline.
+            let compact = if response_mode == ResponseMode::Summary || receipt_only {
+                compact_attested_create_bounded(
+                    &db,
+                    &caller,
+                    TOOL,
+                    attested_rebuild_execution(),
+                    &attested,
+                    html_body_write.clone(),
                 )
-                .await
-                .map_err(|_| Error::engine("create_record: compact replay deadline exceeded"))??
+                .await?
             } else {
                 None
             };
-            // Historical reconstruction does not hold the writer transaction.
-            tx.rollback().await?;
-            crate::provenance::note_replayed_action_attestation(attestation_id);
-            let mut receipt = match compact {
+            let receipt = match compact {
                 Some(receipt) => receipt,
                 None => {
-                    read_attested_create_receipt(&db, &caller, &attested, html_body_write).await?
+                    match read_attested_create_receipt(
+                        &db,
+                        &caller,
+                        &attested,
+                        html_body_write.clone(),
+                    )
+                    .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(refusal) if is_rebuild_capacity_refusal(&refusal) => {
+                            pinned_create_summary(&db, &caller, TOOL, &attested, html_body_write)
+                                .await?
+                                .ok_or(refusal)?
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             };
+            // Same key order as the first call, which echoes `act` before it
+            // names the source event and before basis and warnings.
+            let mut receipt = echo_act(receipt, attested.act)?;
+            if let Some(object) = receipt.as_object_mut() {
+                if let Some(source_event_id) = object.shift_remove("source_event_id") {
+                    object.insert("source_event_id".into(), source_event_id);
+                }
+            }
             attach_basis_feedback(
                 &db,
                 &caller,
@@ -5165,14 +5434,24 @@ async fn create_record_inner(
             )
             .await;
             crate::domain_transaction::push_receipt_warnings(&mut receipt, alias_warnings.clone())?;
+            if receipt_only {
+                return Ok(receipt);
+            }
             return response_mode
-                .render(
-                    &db,
-                    echo_act(receipt, attested.act)?,
-                    attested.content_horizon,
-                )
+                .render(&db, receipt, attested.content_horizon)
                 .await;
         }
+    }
+    if idempotent_create {
+        artifact_attestation = super::artifacts::validate_prospective_artifact(
+            &id,
+            &record_type,
+            Some(&record_kind),
+            fields.get("body").and_then(Value::as_str),
+            runtime.as_deref(),
+            package_marker.as_deref(),
+        )
+        .await?;
     }
     // The basis rides beside `reason` on the record.created event ALONE, for
     // the same reason `reason` does: it is one authoring act, and copying it
@@ -5273,6 +5552,14 @@ async fn create_record_inner(
                 actor: Some(caller.actor().into()),
             });
         }
+    }
+    if let Some(speaker) = speaker {
+        specs.push(AppendSpec {
+            record_id: id.clone(),
+            event_type: "message.speaker.declared.v1".into(),
+            payload: serde_json::to_value(speaker)?,
+            actor: Some(caller.actor().into()),
+        });
     }
     if let Some((sender_id, sender_principal)) = message_sender {
         specs.push(AppendSpec {
@@ -5456,6 +5743,16 @@ async fn create_record_inner(
             }
         }
     }
+    if account_only {
+        super::private_create::install_account_only_policy_in(
+            &mut tx,
+            &caller,
+            TOOL,
+            &id,
+            &mut act_alloc,
+        )
+        .await?;
+    }
     let after = required_violations_in(&mut tx, &schema_rows, &[&id]).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
     if let Some(draft) = action_draft {
@@ -5520,6 +5817,14 @@ async fn create_record_inner(
     // substrates uniform — Postgres and Turso mint it from their shared read
     // shape — so the corpus can pin it on creation instead of looking away.
     let mut receipt = finish_create_receipt(result, html_body_write)?;
+    if send_plan.is_some() {
+        receipt["speaker_claim_status"] = json!(if receipt.get("speaker").is_some() {
+            "recorded"
+        } else {
+            "absent"
+        });
+    }
+
     // The act this write allocated, on the fresh-create path only: every
     // idempotent replay returns above through its own receipt without
     // reaching here, so replays keep byte-identical receipts with no act.
@@ -5633,7 +5938,7 @@ async fn create_record_inner(
 /// Both logs are append-only, so rows at or below a committed horizon are
 /// immutable — replaying exactly those prefixes reproduces the receipt the
 /// first call returned, regardless of later writes.
-struct AttestedCreate {
+struct AttestedWrite {
     attestation_id: String,
     record_id: String,
     content_horizon: i64,
@@ -5644,85 +5949,191 @@ struct AttestedCreate {
     act: Option<i64>,
 }
 
+/// Test seam for the replay fold: a gate the fold waits at, so a test can act
+/// while it is in flight (the deadline is [`AttestedRebuildEnvelope`]'s). Per thread, like the
+/// rebuild limits: the current-thread test runtime keeps every read on the
+/// test's own thread.
+#[cfg(test)]
+pub(crate) struct ReplayFoldGate {
+    entered: tokio::sync::Notify,
+    open: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+    /// Folds that pass the gate untouched before it starts holding them.
+    pass: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ReplayFoldGate {
+    pub(crate) fn closed() -> std::sync::Arc<Self> {
+        Self::closed_after(0)
+    }
+
+    /// A gate that lets the first `pass` folds through, then holds the rest.
+    pub(crate) fn closed_after(pass: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            entered: tokio::sync::Notify::new(),
+            open: std::sync::atomic::AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            pass: std::sync::atomic::AtomicUsize::new(pass),
+        })
+    }
+
+    /// Resolves once a fold is waiting at the gate.
+    pub(crate) async fn fold_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    /// Lets every fold, waiting or future, proceed.
+    pub(crate) fn open(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.notify_waiters();
+        self.wake.notify_one();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAY_FOLD_GATE: std::cell::RefCell<Option<std::sync::Arc<ReplayFoldGate>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `gate` for the current test thread until dropped.
+#[cfg(test)]
+pub(crate) struct ReplayFoldGateGuard;
+
+#[cfg(test)]
+impl ReplayFoldGateGuard {
+    pub(crate) fn install(gate: std::sync::Arc<ReplayFoldGate>) -> Self {
+        REPLAY_FOLD_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReplayFoldGateGuard {
+    fn drop(&mut self) {
+        REPLAY_FOLD_GATE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Run a replay's fold of one record's own events under the replay deadline.
+/// The fold is linear in that record's history bytes and has no row budget, so
+/// the deadline is its bound. Missing it is [`Error::ReplayBounded`]: the
+/// write committed, only its receipt is late, and hosted transports answer it
+/// 503 rather than as a refusal.
+///
+/// Callers fold on a read transaction after the writer transaction has rolled
+/// back, so even a record with hundreds of large body versions holds neither
+/// the single writer nor a pooled writer connection while it is scanned.
+async fn bounded_replay_fold<T>(
+    tool: &'static str,
+    deadline: std::time::Duration,
+    fold: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    #[cfg(test)]
+    let fold = {
+        let gate = REPLAY_FOLD_GATE.with(|slot| slot.borrow().clone());
+        async move {
+            if let Some(gate) = gate {
+                use std::sync::atomic::Ordering::SeqCst;
+                let passes = gate
+                    .pass
+                    .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+                    .is_ok();
+                if !passes {
+                    gate.entered.notify_one();
+                    while !gate.open.load(SeqCst) {
+                        gate.wake.notified().await;
+                    }
+                }
+            }
+            fold.await
+        }
+    };
+    tokio::time::timeout(deadline, fold)
+        .await
+        .map_err(|_| Error::replay_bounded(tool, crate::ReplayBound::Deadline))?
+}
+
+/// [`compact_attested_create_in`] on its own read transaction, under the
+/// replay deadline. The caller has already authorized the replay and rolled
+/// its writer transaction back.
+async fn compact_attested_create_bounded(
+    db: &Db,
+    caller: &Caller,
+    tool: &'static str,
+    deadline: std::time::Duration,
+    attested: &AttestedWrite,
+    html_body_write: Option<Value>,
+) -> Result<Option<Value>> {
+    let mut read = db.pool().begin().await?;
+    let folded = bounded_replay_fold(
+        tool,
+        deadline,
+        compact_attested_create_in(&mut read, caller, attested, html_body_write),
+    )
+    .await;
+    read.rollback().await?;
+    folded
+}
+
+/// [`compact_attested_update_in`] on its own read transaction, under the
+/// replay deadline.
+async fn compact_attested_update_bounded(
+    db: &Db,
+    caller: &Caller,
+    record_id: &str,
+    horizon: i64,
+    deadline: std::time::Duration,
+) -> Result<Option<(Value, Option<Value>)>> {
+    let mut read = db.pool().begin().await?;
+    let folded = bounded_replay_fold(
+        "update_record",
+        deadline,
+        compact_attested_update_in(&mut read, caller, record_id, horizon),
+    )
+    .await;
+    read.rollback().await?;
+    folded
+}
+
 /// Summary's dependency closure is exactly the pinned spine fields plus live
 /// schema/vocabulary interpretation. Never use this for verbose enrichment.
-/// Only ordinary types and known non-spine-mutating outputs are supported;
-/// unknown output semantics require the full historical projection.
+/// Folded from the created record's own events ([`fold_pinned_spine_in`]),
+/// so it holds at any workspace size and any body size.
 async fn compact_attested_create_in(
     tx: &mut Transaction<'static, Sqlite>,
     caller: &Caller,
-    attested: &AttestedCreate,
+    attested: &AttestedWrite,
     html_body_write: Option<Value>,
 ) -> Result<Option<Value>> {
-    let sizes: Vec<i64> = sqlx::query_scalar(
-        "SELECT 512 + 6 * (COALESCE(length(CAST(id AS BLOB)),0) + COALESCE(length(CAST(type AS BLOB)),0) + COALESCE(length(CAST(payload AS BLOB)),0)) FROM content_events
-         WHERE record_id=? AND seq<=? ORDER BY seq LIMIT 257",
+    // The command created this record, so every event it has at or below the
+    // horizon must be one of the command's own outputs.
+    let foreign: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM content_events e
+                        WHERE e.record_id=?1 AND e.seq<=?2
+                          AND NOT EXISTS(SELECT 1 FROM provenance_action_outputs o
+                                          WHERE o.action_attestation_id=?3
+                                            AND o.output_domain='content'
+                                            AND o.output_event_id=e.id))",
     )
     .bind(&attested.record_id)
     .bind(attested.content_horizon)
-    .fetch_all(&mut **tx)
-    .await?;
-    if sizes.len() > 256
-        || sizes.iter().sum::<i64>() > ATTESTED_REBUILD_MAX_BYTES
-        || sizes
-            .iter()
-            .any(|size| *size > ATTESTED_REBUILD_MAX_EVENT_BYTES)
-    {
-        return Ok(None);
-    }
-    let mut budget = AttestedReplayBudget::new();
-    budget.charge(&sizes)?;
-    charge_live_interpretation_in(tx, &mut budget).await?;
-    let rows = sqlx::query(
-        "SELECT e.id, e.type, e.payload,
-                EXISTS(SELECT 1 FROM provenance_action_outputs o
-                       WHERE o.action_attestation_id=? AND o.output_domain='content'
-                         AND o.output_event_id=e.id) AS covered
-           FROM content_events e WHERE e.record_id=? AND e.seq<=?
-           ORDER BY e.seq LIMIT 257",
-    )
     .bind(&attested.attestation_id)
-    .bind(&attested.record_id)
-    .bind(attested.content_horizon)
-    .fetch_all(&mut **tx)
+    .fetch_one(&mut **tx)
     .await?;
-    if rows.is_empty() || rows.len() > 256 {
+    if foreign {
         return Ok(None);
     }
-    let mut fields = None;
-    let mut source_event = None;
-    for row in rows {
-        if !row.try_get::<bool, _>("covered")? {
-            return Ok(None);
-        }
-        let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
-        match row.try_get::<String, _>("type")?.as_str() {
-            "record.created" if fields.is_none() => {
-                if !matches!(
-                    payload["type"].as_str(),
-                    Some("Document" | "WorkItem" | "Entity" | "Collection")
-                ) {
-                    return Ok(None);
-                }
-                if payload["body"].is_string() {
-                    source_event = Some(row.try_get::<String, _>("id")?);
-                }
-                fields = Some(payload);
-            }
-            "facet.set" if fields.is_some() => {
-                let key = payload["key"].as_str().unwrap_or_default();
-                // Spine facets project into records, rather than facet_values.
-                if let Some(column) = spine_facet_column(key) {
-                    fields.as_mut().unwrap()[column] = payload["value"].clone();
-                }
-            }
-            "link.added" | "artifact.source_attested" if fields.is_some() => {}
-            _ => return Ok(None),
-        }
-    }
-    let Some(mut fields) = fields else {
+    let Some(spine) =
+        fold_pinned_spine_in(tx, &attested.record_id, attested.content_horizon).await?
+    else {
         return Ok(None);
     };
+    let source_event = spine
+        .created_body_is_text
+        .then_some(spine.created_event_id.clone());
+    let mut fields = Value::Object(spine.fields);
     fields["id"] = json!(attested.record_id);
     // Same defaults as the record.created projector.
     if fields["name"].is_null() {
@@ -5751,6 +6162,162 @@ async fn compact_attested_create_in(
     Ok(Some(receipt))
 }
 
+/// Content event types whose projection writes a summary column of
+/// `records` (type, kind, name, body, home, lifecycle and the other spine
+/// fields). Every other event type a record can carry only touches
+/// timestamps, `archived`, `deleted_at` or `successor_count`, or other
+/// tables, so a summary fold can skip it.
+const PINNED_SPINE_EVENT_TYPES: &str =
+    "'record.created','record.updated','record.type_corrected.v1',\
+     'facet.set','facet.unset','receipt.committed.v1','unit.revision.recorded.v1'";
+
+/// One record's spine as of `horizon`, folded from that record's own events.
+struct PinnedSpine {
+    /// The `record.created` payload with every later spine change applied,
+    /// and `body` set to the body the projector would hold.
+    fields: Map<String, Value>,
+    /// String-valued open facets (the governed runtime and package among them).
+    facets: BTreeMap<String, String>,
+    created_event_id: String,
+    /// The `record.created` itself carried a text body: its event is then the
+    /// create's exact-source identity.
+    created_body_is_text: bool,
+}
+
+/// Fold one record's spine at `horizon` from its OWN content events, for the
+/// keyed replays that pin a summary: `create_record` (and `create_many`'s
+/// items), `update_record`, and the summary fallback of the full-view
+/// replays.
+///
+/// Nothing here depends on the size of the workspace or of any body. Rows
+/// are streamed, not collected. Each body-writing event replaces the whole
+/// body, so every body but the latest at the horizon is stripped in SQL
+/// before it is read, and the latest is read exactly once. There is no row
+/// or byte budget: memory is one payload plus that body, and the work is
+/// linear in this record's own history.
+async fn fold_pinned_spine_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    record_id: &str,
+    horizon: i64,
+) -> Result<Option<PinnedSpine>> {
+    use futures::TryStreamExt;
+
+    let latest_body_seq = crate::record_body::latest_body_revision_on(
+        tx,
+        record_id,
+        Some(horizon),
+        crate::record_body::BodyRevisionSelection::PayloadCarrying,
+    )
+    .await?
+    .map(|revision| revision.seq);
+    let sql = format!(
+        "SELECT id, type,
+                type = 'record.created' AND json_type(payload,'$.body') = 'text' AS body_is_text,
+                CASE WHEN seq = ?3 THEN payload
+                     ELSE json_remove(payload,'$.body','$.content.content') END AS payload
+           FROM content_events
+          WHERE record_id=?1 AND seq<=?2 AND type IN ({PINNED_SPINE_EVENT_TYPES})
+          ORDER BY seq"
+    );
+    let mut rows = sqlx::query(&sql)
+        .bind(record_id)
+        .bind(horizon)
+        .bind(latest_body_seq.unwrap_or(-1))
+        .fetch(&mut **tx);
+    let mut fields: Option<Map<String, Value>> = None;
+    let mut facets: BTreeMap<String, String> = BTreeMap::new();
+    let mut created: Option<(String, bool)> = None;
+    let mut body: Option<String> = None;
+    while let Some(row) = rows.try_next().await? {
+        let event_type: String = row.try_get("type")?;
+        let payload: Value = serde_json::from_str(&row.try_get::<String, _>("payload")?)?;
+        if let Some(next) = crate::record_body::projected_body(&event_type, &payload) {
+            body = next;
+        }
+        match (event_type.as_str(), fields.as_mut()) {
+            ("record.created", None) => {
+                let Some(object) = payload.as_object() else {
+                    return Ok(None);
+                };
+                created = Some((row.try_get("id")?, row.try_get("body_is_text")?));
+                fields = Some(object.clone());
+            }
+            ("record.updated", Some(fields)) => {
+                for key in [
+                    "name",
+                    "kind",
+                    "home_id",
+                    "summary",
+                    "lifecycle",
+                    "owner_id",
+                    "persistence",
+                    "maturity",
+                ] {
+                    if let Some(value) = payload.get(key) {
+                        fields.insert(key.into(), value.clone());
+                    }
+                }
+            }
+            ("record.type_corrected.v1", Some(fields)) => {
+                let (Some(record_type), Some(kind)) =
+                    (payload["to"].get("type"), payload["to"].get("kind"))
+                else {
+                    return Ok(None);
+                };
+                fields.insert("type".into(), record_type.clone());
+                fields.insert("kind".into(), kind.clone());
+            }
+            ("facet.set", Some(fields)) => {
+                let Some(key) = payload["key"].as_str() else {
+                    return Ok(None);
+                };
+                // Spine facets project into records, rather than facet_values.
+                match spine_facet_column(key) {
+                    Some(column) => {
+                        fields.insert(column.into(), payload["value"].clone());
+                    }
+                    None => match payload["value"].as_str() {
+                        Some(value) => {
+                            facets.insert(key.into(), value.to_owned());
+                        }
+                        None => {
+                            facets.remove(key);
+                        }
+                    },
+                }
+            }
+            ("facet.unset", Some(fields)) => {
+                let Some(key) = payload["key"].as_str() else {
+                    return Ok(None);
+                };
+                match spine_facet_column(key) {
+                    Some(column) => {
+                        fields.insert(column.into(), Value::Null);
+                    }
+                    None => {
+                        facets.remove(key);
+                    }
+                }
+            }
+            ("receipt.committed.v1" | "unit.revision.recorded.v1", Some(_)) => {}
+            // A spine event before the record exists, or a second create.
+            _ => return Ok(None),
+        }
+    }
+    drop(rows);
+    let (Some(mut fields), Some((created_event_id, created_body_is_text))) = (fields, created)
+    else {
+        return Ok(None);
+    };
+    fields.insert("body".into(), json!(body));
+    Ok(Some(PinnedSpine {
+        fields,
+        facets,
+        created_event_id,
+        created_body_is_text,
+    }))
+}
+
 /// Shared receipt assembly for every create response shape: the previous-seq
 /// echo (always null on creation), the governed-HTML receipt when the body
 /// validated as HTML, and the whole-body CAS token. Identical on the first
@@ -5765,14 +6332,76 @@ fn finish_create_receipt(result: Value, html_body_write: Option<Value>) -> Resul
 /// bounded prefix fold in a scratch database. Compact ordinary replay never
 /// touches this. Acquired after rollback, with bounded admission, so waiting
 /// serializes only historical rebuilds, never writers.
-/// Admission, setup, fold, enrichment and graceful close share the existing
-/// 10-second execution envelope: queueing consumes time available to rebuild.
-/// Physical cleanup may outlive cancellation, retaining capacity until drained.
-/// This bounds the historical stage, not the entire tool or cleanup latency.
-const ATTESTED_REBUILD_EXECUTION: std::time::Duration = std::time::Duration::from_secs(10);
+/// Admission, setup, fold, enrichment and graceful close share the
+/// [`KEYED_REPLAY_DEADLINE`] execution envelope: queueing consumes time
+/// available to rebuild. Physical cleanup may outlive cancellation, retaining
+/// capacity until drained. This bounds the historical stage, not the entire
+/// tool or cleanup latency.
+///
+/// Every keyed replay stage runs under this one deadline: the verbose rebuild,
+/// and the fold of a record's own events behind a summary replay. It is
+/// 5 s, not the 10 s the rebuild used to have, because the host retries a
+/// keyed write on its own and gives each attempt 10 s (appHost's per-attempt
+/// timeout, Phase 2, #2131). A replay that is going to hit its bound has to
+/// say so with the typed 503 [`Error::ReplayBounded`] before the host's
+/// attempt times out; at 10 s the host abandons the attempt first and the app
+/// never sees `applied: true`. Keep this comfortably under that timeout, with
+/// room for the network and for the fallback stage below.
+const KEYED_REPLAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// The summary fold a refused full-view rebuild falls back to. It runs after
+/// the rebuild has spent up to [`KEYED_REPLAY_DEADLINE`], so it gets a smaller
+/// bound of its own: the worst case for one replay request is
+/// `KEYED_REPLAY_DEADLINE + KEYED_REPLAY_FALLBACK_DEADLINE` = 7 s, still inside
+/// one host attempt. (The fold reads one record's own events; it is not the
+/// workspace-wide stage that queues.)
+const KEYED_REPLAY_FALLBACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 const ATTESTED_REBUILD_MAX_EVENTS: usize = 10_000;
 const ATTESTED_REBUILD_MAX_BYTES: i64 = 16 * 1024 * 1024;
-const ATTESTED_REBUILD_MAX_EVENT_BYTES: i64 = 1024 * 1024;
+// There is deliberately no per-event cap. One used to sit here (1 MiB of the
+// 6x charge, so about 174 KB of stored payload), and it refused to replay a
+// committed write for the size of what it had written: a keyed body write over
+// that size could not be retried after any later write. The cumulative byte
+// budget above bounds the full-view rebuild only. Summary replays fold the
+// record's own events with no budget (`fold_pinned_spine_in`), and a full-view
+// replay this budget refuses degrades to that fold's summary, marked.
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of the rebuild's row and byte budgets, so a test can
+    /// exceed them with a handful of events. Per thread: the current-thread
+    /// test runtime keeps every budget read on the test's own thread.
+    static ATTESTED_REBUILD_LIMIT_OVERRIDE: std::cell::Cell<Option<(usize, i64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Lowers the rebuild's budgets for the current test thread until dropped, so
+/// a test can put a handful of events over the workspace-prefix cliff.
+#[cfg(test)]
+pub(crate) struct AttestedRebuildLimits;
+
+#[cfg(test)]
+impl AttestedRebuildLimits {
+    pub(crate) fn lowered(rows: usize, bytes: i64) -> Self {
+        ATTESTED_REBUILD_LIMIT_OVERRIDE.with(|limits| limits.set(Some((rows, bytes))));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for AttestedRebuildLimits {
+    fn drop(&mut self) {
+        ATTESTED_REBUILD_LIMIT_OVERRIDE.with(|limits| limits.set(None));
+    }
+}
+
+/// The `(rows, bytes)` budget a historical replay may consume.
+fn attested_rebuild_limits() -> (usize, i64) {
+    #[cfg(test)]
+    if let Some(limits) = ATTESTED_REBUILD_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limits;
+    }
+    (ATTESTED_REBUILD_MAX_EVENTS, ATTESTED_REBUILD_MAX_BYTES)
+}
 
 /// One request budget, consumed cumulatively across content, relationships,
 /// immutable provenance, binding seeds and live interpretation metadata.
@@ -5781,25 +6410,25 @@ const ATTESTED_REBUILD_MAX_EVENT_BYTES: i64 = 1024 * 1024;
 struct AttestedReplayBudget {
     rows: usize,
     bytes: i64,
+    /// The keyed write whose replay this budget bounds, named in refusals.
+    tool: &'static str,
 }
 impl AttestedReplayBudget {
+    #[cfg(test)]
     fn new() -> Self {
-        Self {
-            rows: ATTESTED_REBUILD_MAX_EVENTS,
-            bytes: ATTESTED_REBUILD_MAX_BYTES,
-        }
+        Self::for_tool("create_record")
+    }
+    fn for_tool(tool: &'static str) -> Self {
+        let (rows, bytes) = attested_rebuild_limits();
+        Self { rows, bytes, tool }
+    }
+    fn exceeded(&self) -> Error {
+        Error::replay_bounded(self.tool, crate::ReplayBound::Budget)
     }
     fn charge(&mut self, sizes: &[i64]) -> Result<()> {
         let bytes = sizes.iter().sum::<i64>();
-        if sizes.len() > self.rows
-            || bytes > self.bytes
-            || sizes
-                .iter()
-                .any(|size| *size > ATTESTED_REBUILD_MAX_EVENT_BYTES)
-        {
-            return Err(Error::engine(
-                "create_record: historical replay budget exceeded",
-            ));
+        if sizes.len() > self.rows || bytes > self.bytes {
+            return Err(self.exceeded());
         }
         self.rows -= sizes.len();
         self.bytes -= bytes;
@@ -5831,17 +6460,88 @@ async fn charge_live_interpretation_in(
 static ATTESTED_REBUILD_PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
     std::sync::OnceLock::new();
 
-fn attested_rebuild_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
-    ATTESTED_REBUILD_PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+fn attested_rebuild_permits() -> std::sync::Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    if let Some((permits, _)) = ATTESTED_REBUILD_ENVELOPE.with(|slot| slot.borrow().clone()) {
+        return permits;
+    }
+    ATTESTED_REBUILD_PERMITS
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)))
+        .clone()
 }
 
+/// The execution envelope a historical rebuild or replay fold runs under.
+fn attested_rebuild_execution() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some((_, deadline)) = ATTESTED_REBUILD_ENVELOPE.with(|slot| slot.borrow().clone()) {
+        return deadline;
+    }
+    KEYED_REPLAY_DEADLINE
+}
+
+/// The bound of the summary fold a refused rebuild falls back to. A test that
+/// installed an envelope (to time out the rebuild quickly) keeps the fallback
+/// generous, so the fallback itself is never what a test is racing.
+fn attested_fallback_execution() -> std::time::Duration {
+    #[cfg(test)]
+    if ATTESTED_REBUILD_ENVELOPE.with(|slot| slot.borrow().is_some()) {
+        return std::time::Duration::from_secs(30);
+    }
+    KEYED_REPLAY_FALLBACK_DEADLINE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of the rebuild's admission permits and execution
+    /// deadline, per thread like [`ATTESTED_REBUILD_LIMIT_OVERRIDE`]: a test
+    /// can exhaust admission or time out a rebuild without touching the
+    /// process-wide permits other tests share, or waiting out ten seconds.
+    static ATTESTED_REBUILD_ENVELOPE: std::cell::RefCell<
+        Option<(std::sync::Arc<tokio::sync::Semaphore>, std::time::Duration)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a private permit pool and deadline for the current test thread
+/// until dropped.
+#[cfg(test)]
+pub(crate) struct AttestedRebuildEnvelope;
+
+#[cfg(test)]
+impl AttestedRebuildEnvelope {
+    pub(crate) fn install(permits: usize, deadline: std::time::Duration) -> Self {
+        ATTESTED_REBUILD_ENVELOPE.with(|slot| {
+            *slot.borrow_mut() = Some((
+                std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
+                deadline,
+            ));
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for AttestedRebuildEnvelope {
+    fn drop(&mut self) {
+        ATTESTED_REBUILD_ENVELOPE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
 async fn admit_attested_rebuild(
+    semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: tokio::time::Instant,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    admit_attested_rebuild_for("create_record", semaphore, deadline).await
+}
+
+async fn admit_attested_rebuild_for(
+    tool: &str,
     semaphore: &std::sync::Arc<tokio::sync::Semaphore>,
     deadline: tokio::time::Instant,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     // timeout_at can accept a ready future even after expiry. Fail closed at
     // the hard boundary, including when capacity becomes ready on a late poll.
-    let exhausted = || Error::engine("create_record: historical replay admission exhausted");
+    let exhausted = || Error::replay_bounded(tool, crate::ReplayBound::Admission);
     if tokio::time::Instant::now() >= deadline {
         return Err(exhausted());
     }
@@ -5855,27 +6555,37 @@ async fn admit_attested_rebuild(
     Ok(permit)
 }
 
-async fn with_attested_rebuild_deadline<F, Fut>(
+#[cfg(test)]
+async fn with_attested_rebuild_deadline<F, Fut, T>(
     permits: &std::sync::Arc<tokio::sync::Semaphore>,
     deadline: tokio::time::Instant,
     rebuild: F,
-) -> Result<Value>
+) -> Result<T>
 where
     F: FnOnce(tokio::sync::OwnedSemaphorePermit) -> Fut,
-    Fut: std::future::Future<Output = Result<Value>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
-    let permit = admit_attested_rebuild(permits, deadline).await?;
+    with_attested_rebuild_deadline_for("create_record", permits, deadline, rebuild).await
+}
+
+/// Shared historical-rebuild envelope; `tool` names the refusing write.
+async fn with_attested_rebuild_deadline_for<F, Fut, T>(
+    tool: &str,
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    deadline: tokio::time::Instant,
+    rebuild: F,
+) -> Result<T>
+where
+    F: FnOnce(tokio::sync::OwnedSemaphorePermit) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let permit = admit_attested_rebuild_for(tool, permits, deadline).await?;
     let result = tokio::time::timeout_at(deadline, rebuild(permit)).await;
+    let exceeded = || Error::replay_bounded(tool, crate::ReplayBound::Deadline);
     if tokio::time::Instant::now() >= deadline {
-        return Err(Error::engine(
-            "create_record: historical replay deadline exceeded",
-        ));
+        return Err(exceeded());
     }
-    result.unwrap_or_else(|_| {
-        Err(Error::engine(
-            "create_record: historical replay deadline exceeded",
-        ))
-    })
+    result.unwrap_or_else(|_| Err(exceeded()))
 }
 
 /// Resolve which record an ordinary keyed `create_record` first created and
@@ -5884,7 +6594,7 @@ where
 async fn attested_create_horizons_in(
     tx: &mut Transaction<'static, Sqlite>,
     attestation_id: &str,
-) -> Result<AttestedCreate> {
+) -> Result<AttestedWrite> {
     let created: Option<String> = sqlx::query_scalar(
         "SELECT e.record_id FROM provenance_action_outputs o
            JOIN content_events e ON e.id=o.output_event_id
@@ -5938,7 +6648,7 @@ async fn attested_create_horizons_in(
     .fetch_optional(&mut **tx)
     .await?
     .flatten();
-    Ok(AttestedCreate {
+    Ok(AttestedWrite {
         attestation_id: attestation_id.to_string(),
         record_id,
         content_horizon,
@@ -5958,10 +6668,56 @@ async fn attested_create_horizons_in(
 /// A rebuilt record that is no longer visible maps to the opaque denial,
 /// never to a "not readable after write" diagnostic: from the caller's side
 /// that outcome is indistinguishable from the record never having existed.
+/// The full-view rebuild refused for capacity (its workspace-wide budget,
+/// admission or deadline), not because the record cannot be rebuilt. The
+/// bounds are a typed error ([`Error::ReplayBounded`]), so a message change
+/// cannot silently turn a fallback into a refusal.
+fn is_rebuild_capacity_refusal(error: &Error) -> bool {
+    error.is_replay_bounded()
+}
+
+/// The marker a full-view replay carries when it fell back to the pinned
+/// summary: `replay_view: "summary"`. Every summary field is still the
+/// command's own; only the full record view (links, children, enrichment)
+/// could not be rebuilt at this workspace's size. Read the record for its
+/// current view.
+pub(super) fn mark_summary_replay(receipt: &mut Value) {
+    if let Some(object) = receipt.as_object_mut() {
+        object.insert("replay_view".into(), json!("summary"));
+    }
+}
+
+/// A full-view create replay's fallback: the created record's summary folded
+/// from its own events at the command's horizon, marked. `None` only for a
+/// malformed history, in which case the caller keeps the rebuild's refusal.
+async fn pinned_create_summary(
+    db: &Db,
+    caller: &Caller,
+    tool: &'static str,
+    attested: &AttestedWrite,
+    html_body_write: Option<Value>,
+) -> Result<Option<Value>> {
+    let Some(compact) = compact_attested_create_bounded(
+        db,
+        caller,
+        tool,
+        attested_fallback_execution(),
+        attested,
+        html_body_write,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let mut summary = summarize_write_receipt(db, compact, attested.content_horizon).await?;
+    mark_summary_replay(&mut summary);
+    Ok(Some(summary))
+}
+
 async fn read_attested_create_receipt(
     db: &Db,
     caller: &Caller,
-    attested: &AttestedCreate,
+    attested: &AttestedWrite,
     html_body_write: Option<Value>,
 ) -> Result<Value> {
     read_attested_create_receipt_with_limits(
@@ -5969,8 +6725,8 @@ async fn read_attested_create_receipt(
         caller,
         attested,
         html_body_write,
-        attested_rebuild_permits(),
-        ATTESTED_REBUILD_EXECUTION,
+        &attested_rebuild_permits(),
+        attested_rebuild_execution(),
     )
     .await
 }
@@ -5995,9 +6751,23 @@ impl Drop for AttestedScratch {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Scratch databases opened for historical rebuilds on this test thread.
+    static ATTESTED_SCRATCH_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Scratch databases opened on this test thread so far.
+#[cfg(test)]
+pub(crate) fn attested_scratch_opens() -> usize {
+    ATTESTED_SCRATCH_OPENS.with(std::cell::Cell::get)
+}
+
 async fn open_attested_scratch(
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<AttestedScratch> {
+    #[cfg(test)]
+    ATTESTED_SCRATCH_OPENS.with(|opens| opens.set(opens.get() + 1));
     // Opening may already have created SQLite workers when the deadline fires.
     // The setup task owns the permit until it hands off a complete guard or
     // closes it after the receiver disappears. It never runs reconstruction.
@@ -6032,19 +6802,110 @@ async fn open_attested_scratch(
 async fn read_attested_create_receipt_with_limits(
     db: &Db,
     caller: &Caller,
-    attested: &AttestedCreate,
+    attested: &AttestedWrite,
     html_body_write: Option<Value>,
     permits: &std::sync::Arc<tokio::sync::Semaphore>,
     budget: std::time::Duration,
 ) -> Result<Value> {
-    const TOOL: &str = "create_record";
+    let rebuilt = read_attested_record_with_limits(
+        db,
+        caller,
+        attested,
+        "create_record",
+        false,
+        permits,
+        budget,
+    )
+    .await?;
+    let mut receipt = finish_create_receipt(rebuilt.record, html_body_write)?;
+    annotate_source_event_id(&mut receipt, rebuilt.latest_source_event_id.as_deref());
+    Ok(receipt)
+}
+
+/// One record as of an attested write's pinned horizons, before any
+/// tool-specific receipt assembly.
+struct AttestedRecordRebuild {
+    /// The filtered enriched record, with its pinned contribution byline.
+    record: Value,
+    /// Governed-HTML receipt computed from the pinned record, when asked for.
+    html_body_write: Option<Value>,
+    /// Latest body-bearing event at or below the content horizon.
+    latest_source_event_id: Option<String>,
+}
+
+/// One record as a keyed write that created it left it, for a replay
+/// renderer whose record has been written since: rebuilt at the command's
+/// horizons through the same bounded historical reconstruction keyed
+/// `create_record` uses. Where that rebuild refuses for capacity, the record's
+/// pinned summary, marked ([`mark_summary_replay`]), so a committed write
+/// still replays at any workspace size.
+pub(super) async fn read_record_as_attested(
+    db: &Db,
+    caller: &Caller,
+    replay: &super::keyed_replay::KeyedReplay,
+    record_id: &str,
+    tool: &'static str,
+) -> Result<Value> {
+    let content_horizon = replay
+        .content_horizon()
+        .ok_or_else(|| Error::engine(format!("{tool}: attested write has no content output")))?;
+    let attested = AttestedWrite {
+        attestation_id: replay.attestation_id().to_string(),
+        record_id: record_id.to_string(),
+        content_horizon,
+        relationship_horizon: replay.relationship_horizon(),
+        act: replay.act(),
+    };
+    match read_attested_record_with_limits(
+        db,
+        caller,
+        &attested,
+        tool,
+        false,
+        &attested_rebuild_permits(),
+        attested_rebuild_execution(),
+    )
+    .await
+    {
+        Ok(rebuilt) => Ok(rebuilt.record),
+        Err(refusal) if is_rebuild_capacity_refusal(&refusal) => {
+            pinned_create_summary(db, caller, tool, &attested, None)
+                .await?
+                .ok_or(refusal)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Rebuild one record exactly as the attested write left it: the bounded
+/// content and relationship prefixes replayed into a scratch projection and
+/// read through the historical lens. Shared by keyed `create_record` and
+/// keyed `update_record` replays.
+async fn read_attested_record_with_limits(
+    db: &Db,
+    caller: &Caller,
+    attested: &AttestedWrite,
+    tool: &'static str,
+    with_html_body_write: bool,
+    permits: &std::sync::Arc<tokio::sync::Semaphore>,
+    budget: std::time::Duration,
+) -> Result<AttestedRecordRebuild> {
+    // An over-cap workspace (every real one) refuses here, in one bounded
+    // COUNT, before a permit, a scratch database or its schema are spent on
+    // a rebuild that cannot fit. The refusal degrades to the pinned summary.
+    probe_attested_prefix(
+        db,
+        attested.content_horizon,
+        &AttestedReplayBudget::for_tool(tool),
+    )
+    .await?;
     let deadline = tokio::time::Instant::now() + budget;
     // Admission, opening, schema, replay, enrichment AND close share a deadline.
     // On cancellation the guard retires scratch pools without an unbounded wait.
-    with_attested_rebuild_deadline(permits, deadline, |permit| async {
+    with_attested_rebuild_deadline_for(tool, permits, deadline, |permit| async {
         let guard = open_attested_scratch(permit).await?;
         let scratch = &guard.db;
-        let mut budget = AttestedReplayBudget::new();
+        let mut budget = AttestedReplayBudget::for_tool(tool);
         apply_schema(scratch).await?;
         // A projector failure on an old prefix propagates as an engine
         // error rather than falling back to a live read: a live read would
@@ -6094,7 +6955,7 @@ async fn read_attested_create_receipt_with_limits(
             Some(record) => record,
             None => {
                 return Err(Error::engine(format!(
-                    "{TOOL}: record {} does not exist",
+                    "{tool}: record {} does not exist",
                     attested.record_id
                 )));
             }
@@ -6113,28 +6974,57 @@ async fn read_attested_create_receipt_with_limits(
         // live disclosure, mirroring `contribution_for_record_in` exactly.
         record.contribution =
             attested_contribution_for_record(scratch, db, caller, &record.record.id).await?;
-        let mut receipt = finish_create_receipt(serde_json::to_value(record)?, html_body_write)?;
+        let html_body_write = if with_html_body_write {
+            let mut pinned = scratch.write_pool().begin().await?;
+            let html = html_body_write_in(&mut pinned, tool, &attested.record_id).await?;
+            pinned.rollback().await?;
+            html
+        } else {
+            None
+        };
         // The pinned horizon bounds the read: later writers may have moved the
         // live source since, but the attested receipt names its own event.
-        let attested_source =
+        let latest_source_event_id =
             latest_body_event_id(db, &attested.record_id, Some(attested.content_horizon)).await?;
-        annotate_source_event_id(&mut receipt, attested_source.as_deref());
         live_snapshot.rollback().await?;
         scratch.close().await;
-        Ok(receipt)
+        Ok(AttestedRecordRebuild {
+            record: serde_json::to_value(record)?,
+            html_body_write,
+            latest_source_event_id,
+        })
     })
     .await
 }
 
 #[cfg(test)]
-struct AttestedReplayPause {
-    reached: tokio::sync::Notify,
-    scratch: std::sync::Mutex<Option<Db>>,
-    projected: std::sync::atomic::AtomicUsize,
+pub(crate) struct AttestedReplayPause {
+    pub(crate) reached: tokio::sync::Notify,
+    /// Lets the parked rebuild continue.
+    pub(crate) release: tokio::sync::Notify,
+    pub(crate) scratch: std::sync::Mutex<Option<Db>>,
+    pub(crate) projected: std::sync::atomic::AtomicUsize,
 }
 #[cfg(test)]
 tokio::task_local! {
-    static ATTESTED_REPLAY_PAUSE: std::sync::Arc<AttestedReplayPause>;
+    pub(crate) static ATTESTED_REPLAY_PAUSE: std::sync::Arc<AttestedReplayPause>;
+}
+
+/// Reject a row-overflow prefix before any rebuild resource is spent on it.
+/// LIMIT bounds even this cardinality probe, including sparse seq logs. The
+/// prefix is immutable, so it reads on the pool a writer does not block.
+async fn probe_attested_prefix(db: &Db, horizon: i64, budget: &AttestedReplayBudget) -> Result<()> {
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (SELECT seq FROM content_events WHERE seq<=? ORDER BY seq LIMIT ?)",
+    )
+    .bind(horizon)
+    .bind(budget.rows as i64 + 1)
+    .fetch_one(db.pool())
+    .await?;
+    if rows as usize > budget.rows {
+        return Err(budget.exceeded());
+    }
+    Ok(())
 }
 
 /// Read keyset pages with explicit row/byte budgets before decoding payloads.
@@ -6146,21 +7036,10 @@ async fn replay_bounded_attested_content(
     horizon: i64,
     budget: &mut AttestedReplayBudget,
 ) -> Result<()> {
-    // Reject a row-overflow prefix before spending its budget on a fold.
-    // LIMIT bounds even this cardinality probe, including sparse seq logs.
-    let rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM (SELECT seq FROM content_events WHERE seq<=? ORDER BY seq LIMIT ?)",
-    )
-    .bind(horizon)
-    .bind(budget.rows as i64 + 1)
-    .fetch_one(db.write_pool())
-    .await?;
-    if rows as usize > budget.rows {
-        return Err(Error::engine(
-            "create_record: historical replay budget exceeded",
-        ));
-    }
     let mut after = 0;
+    // Whether this rebuild has already parked at the test pause (below).
+    #[cfg(test)]
+    let mut parked = false;
     loop {
         let sizes: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT seq,
@@ -6207,7 +7086,16 @@ async fn replay_bounded_attested_content(
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 *pause.scratch.lock().unwrap() = Some(scratch.clone());
                 pause.reached.notify_one();
-                std::future::pending::<()>().await;
+                // Every rebuild parks after ITS first event until the test
+                // releases it; one that is never released stays parked until
+                // its deadline cancels it. (Per rebuild, not per pause: a call
+                // that rebuilds several records, like a verbose create_many,
+                // must park each of them, or whether a later one finishes
+                // inside the deadline would depend on how fast the host is.)
+                if !parked {
+                    parked = true;
+                    pause.release.notified().await;
+                }
             }
         }
         tx.commit().await?;
@@ -7227,6 +8115,16 @@ enum RecordSupplementSource<'a, 'db> {
 }
 
 impl RecordSupplementSource<'_, '_> {
+    async fn speaker(&mut self, message_id: &str) -> Result<Option<Value>> {
+        match self {
+            Self::Lens(lens) => {
+                let mut conn = lens.projection().snapshot_pool().acquire().await?;
+                crate::persona::message_speaker(&mut conn, message_id).await
+            }
+            Self::Live(tx) => crate::persona::message_speaker(tx, message_id).await,
+        }
+    }
+
     async fn record_version(&mut self, record_id: &str) -> Result<String> {
         let event_seq: Option<i64> = match self {
             Self::Lens(lens) => {
@@ -7448,6 +8346,14 @@ async fn supplement_get_record_items(
             item.as_object_mut()
                 .expect("found batch item serializes as an object")
                 .insert("message_expectation_state".into(), value);
+            if !caller.is_member_copy() {
+                let message_id = item["id"].as_str().expect("found Message id").to_owned();
+                if let Some(speaker) = source.speaker(&message_id).await? {
+                    item.as_object_mut()
+                        .expect("Message object")
+                        .insert("speaker".into(), speaker);
+                }
+            }
         }
         if !resolve {
             continue;
@@ -7548,14 +8454,14 @@ pub(crate) async fn get_record(db: Db, caller: Caller, mut arguments: Value) -> 
     let Some(selector) = as_of else {
         return get_record_from_lens(&ReadLens::live(&db), &caller, args, Some(&db)).await;
     };
-    let resolved = lens::resolve_as_of(&db, selector).await?;
+    let resolved = lens::resolve_as_of_for(&db, caller.counter_footing(), selector).await?;
     let scratch = open_database(":memory:").await?;
     let result = async {
         apply_schema(&scratch).await?;
         lens::replay_projection(&db, &scratch, resolved.resolved_content_seq).await?;
         let read_lens = ReadLens::historical(&scratch, &db, &resolved);
         let mut output = get_record_from_lens(&read_lens, &caller, args, None).await?;
-        lens::echo_temporal(&mut output, &resolved);
+        lens::echo_temporal(&mut output, &resolved, caller.counter_footing());
         Ok(output)
     }
     .await;
@@ -7810,6 +8716,11 @@ async fn get_record_from_lens(
         .expect("batch get serializes as an array")
     {
         annotate_body_digest(item);
+        // D-3: during a live session, the live body with a matched digest
+        // (live reads only; `as_of` reads have no index handle).
+        if let Some(db) = index_db {
+            crate::coedit::live::overlay_live_body(db, item);
+        }
     }
     // The windows are echoed back for the same reason `get_structure` echoes
     // its caps: a caller reading `child_count: 1501` next to 200 children needs
@@ -8440,10 +9351,14 @@ struct UpdateRecordArgs {
     body_replace: Option<Vec<BodyReplace>>,
     if_body_digest: Option<String>,
     if_unmodified_since: Option<String>,
+    /// Opaque revision returned by manage_record_policy list. Checked in the
+    /// same transaction as the content write, independently of updated_at.
+    if_policy_revision: Option<String>,
     facets: Option<Map<String, Value>>,
     links: Option<Vec<NewLink>>,
     #[serde(default)]
     response_mode: ResponseMode,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -8454,11 +9369,14 @@ struct MultiUpdateRecordArgs {
     facets: Option<Map<String, Value>>,
     #[serde(default, deserialize_with = "present")]
     maturity: Option<Value>,
+    #[serde(default, deserialize_with = "present")]
+    lifecycle: Option<Value>,
     home_id: Option<String>,
     if_facets: Option<Map<String, Value>>,
     #[serde(default, deserialize_with = "present")]
     if_maturity: Option<Value>,
     if_home_id: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -8485,7 +9403,7 @@ struct MultiUpdateIssue {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BodyReplace {
+pub(crate) struct BodyReplace {
     old: String,
     new: String,
     expected_count: Option<usize>,
@@ -8754,6 +9672,19 @@ pub fn unguarded_body_write_error(tool: &str, target: &BodyGuardTarget) -> Error
     ))
 }
 
+/// A whole-body write on a record with an open live editing session named
+/// no `if_body_digest`, or one that does not match the LIVE body (code
+/// `live_session_changed`).
+pub fn live_session_changed_error(tool: &str, target: &BodyGuardTarget) -> Error {
+    Error::engine(format!(
+        "{tool}: live_session_changed — a live session is editing the body of {}; re-read it \
+         (get_record returns the live text) and retry with if_body_digest, or use \
+         body_replace/body_append. Nothing was written. {}",
+        target.described(),
+        target.state()
+    ))
+}
+
 /// The supplied `if_body_digest` no longer describes the stored body.
 pub fn stale_body_digest_error(tool: &str, target: &BodyGuardTarget) -> Error {
     Error::engine(format!(
@@ -8951,7 +9882,11 @@ fn match_contexts(body: &str, old: &str, count: usize) -> String {
     contexts
 }
 
-fn apply_body_replacements(tool: &str, body: &str, ops: &[BodyReplace]) -> Result<String> {
+pub(crate) fn apply_body_replacements(
+    tool: &str,
+    body: &str,
+    ops: &[BodyReplace],
+) -> Result<String> {
     if ops.is_empty() {
         return Err(Error::engine(format!(
             "{tool}: 'body_replace' must not be empty"
@@ -9120,6 +10055,58 @@ pub(super) async fn facet_state_in(
         .transpose()
 }
 
+/// Replay renderer for a keyed multi-target `update_record`. A target is
+/// `changed` exactly when the original command appended an event on it; a
+/// command that changed nothing left only an anchor and replays as all
+/// unchanged with no act. Alias warnings are recomputed from the request and
+/// each target's type and kind, which this form never changes.
+async fn replay_update_record_multi(
+    mut tx: Transaction<'static, Sqlite>,
+    ids: &[String],
+    facet_sets: &[FacetWrite],
+    replay: super::keyed_replay::KeyedReplay,
+) -> Result<Value> {
+    let mut results = Vec::with_capacity(ids.len());
+    let mut warnings = Vec::new();
+    let mut changed = 0usize;
+    for (index, id) in ids.iter().enumerate() {
+        let target_changed = !replay.is_noop() && replay.content_for(id).next().is_some();
+        changed += usize::from(target_changed);
+        results.push(json!({
+            "index": index,
+            "id": id,
+            "status": if target_changed { "changed" } else { "unchanged" },
+        }));
+        let row = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let record_type: String = row.try_get("type")?;
+        let kind: Option<String> = row.try_get("kind")?;
+        for warning in crate::domain_transaction::governed_alias_warnings_for_sets(
+            facet_sets,
+            &record_type,
+            kind.as_deref(),
+        ) {
+            warnings.push(crate::domain_transaction::index_warning_for_batch(
+                index, id, warning,
+            ));
+        }
+    }
+    tx.rollback().await?;
+    let mut response = json!({
+        "requested": ids.len(),
+        "changed": changed,
+        "unchanged": ids.len() - changed,
+        "results": results,
+    });
+    if !warnings.is_empty() {
+        response["warnings"] = Value::Array(warnings);
+    }
+    replay.settle();
+    echo_act(response, replay.act())
+}
+
 async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
     // `sources` is unsupported on the batch form in every shape. The parsed
@@ -9133,8 +10120,12 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             "{TOOL}: 'sources' is not supported on the batch form; call update_record once per record to declare a basis"
         )));
     }
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: MultiUpdateRecordArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
     if args.ids.is_empty() {
         return Err(Error::engine(format!(
             "{TOOL}: 'ids' must contain at least one record id"
@@ -9159,12 +10150,17 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
         }
     }
     validate_multi_maturity(TOOL, "maturity", &args.maturity)?;
+    validate_multi_maturity(TOOL, "lifecycle", &args.lifecycle)?;
     validate_multi_maturity(TOOL, "if_maturity", &args.if_maturity)?;
 
     let facet_inputs = args.facets.as_ref().cloned().unwrap_or_default();
-    if facet_inputs.is_empty() && args.maturity.is_none() && args.home_id.is_none() {
+    if facet_inputs.is_empty()
+        && args.maturity.is_none()
+        && args.lifecycle.is_none()
+        && args.home_id.is_none()
+    {
         return Err(Error::engine(format!(
-            "{TOOL}: multi-target mode requires at least one non-empty facets patch, maturity, or home_id"
+            "{TOOL}: multi-target mode requires at least one non-empty facets patch, maturity, lifecycle, or home_id"
         )));
     }
     let mut facet_sets = Vec::new();
@@ -9235,6 +10231,18 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
         }
     }
 
+    // Keyed replay once the whole cohort is authorized, before the per-target
+    // CAS (`if_*`) and change detection that the first call's own effect
+    // would now fail or turn into "unchanged". A cohort that is not fully
+    // authorized falls through to the ordinary opaque rejection.
+    if keyed && issues.is_empty() {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            return replay_update_record_multi(tx, &args.ids, &facet_sets, replay).await;
+        }
+    }
     let schema_rows = cascade::schema_config_rows_in(&mut tx).await?;
     let touches_message_expectation =
         facet_inputs.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY);
@@ -9250,7 +10258,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             continue;
         }
         let row = sqlx::query(
-            "SELECT type, kind, maturity, home_id FROM records WHERE id = ? AND deleted_at IS NULL",
+            "SELECT type, kind, maturity, lifecycle, home_id FROM records WHERE id = ? AND deleted_at IS NULL",
         )
         .bind(id)
         .fetch_optional(&mut *tx)
@@ -9268,6 +10276,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
         let kind: Option<String> = row.try_get("kind")?;
         let current_maturity: Option<String> = row.try_get("maturity")?;
         let current_home: Option<String> = row.try_get("home_id")?;
+        let current_lifecycle: Option<String> = row.try_get("lifecycle")?;
 
         if touches_message_expectation && record_type == "Message" {
             issues.push(MultiUpdateIssue {
@@ -9451,6 +10460,16 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
                 fields.insert("home_id".into(), json!(desired));
             }
         }
+        if let Some(desired) = args.lifecycle.as_ref() {
+            let changed = match desired {
+                Value::String(desired) => current_lifecycle.as_deref() != Some(desired),
+                Value::Null => current_lifecycle.is_some(),
+                _ => unreachable!("multi lifecycle validation ran before the transaction"),
+            };
+            if changed {
+                fields.insert("lifecycle".into(), desired.clone());
+            }
+        }
         let target = PreparedMultiUpdate {
             index,
             id: id.clone(),
@@ -9488,6 +10507,45 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
             target
                 .fields
                 .insert("reason".into(), json!(args.reason.clone()));
+            if target.fields.contains_key("lifecycle") {
+                let unsets: BTreeSet<String> = target.facet_unsets.iter().cloned().collect();
+                let mut specs: Vec<AppendSpec> = target
+                    .facet_sets
+                    .iter()
+                    .map(|facet| facet_set_spec(&target.id, facet, caller.actor()))
+                    .collect();
+                specs.extend(target.facet_unsets.iter().map(|key| AppendSpec {
+                    record_id: target.id.clone(),
+                    event_type: "facet.unset".into(),
+                    payload: json!({"key":key}),
+                    actor: Some(caller.actor().into()),
+                }));
+                // Keep suggestion/comment lifecycle rules and every ordinary
+                // prospective/post-write validator. A later target failure
+                // rolls this same transaction back with the entire cohort.
+                record_update_in(RecordUpdateInput {
+                    db: &db,
+                    tx: &mut tx,
+                    act_alloc: &mut act_alloc,
+                    caller: &caller,
+                    tool: TOOL,
+                    record_id: &target.id,
+                    fields: target.fields,
+                    version_metadata: None,
+                    has_kind: false,
+                    has_lifecycle: true,
+                    has_summary: false,
+                    facet_specs: specs,
+                    facet_writes: &target.facet_sets,
+                    facet_unsets: &unsets,
+                    schema_rows: &schema_rows,
+                    links: &[],
+                    relationship_link_indexes: &BTreeSet::new(),
+                    before: &before,
+                })
+                .await?;
+                continue;
+            }
             append_in(
                 &db,
                 &mut tx,
@@ -9541,6 +10599,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     }
     let after = required_violations_in(&mut tx, &schema_rows, &id_refs).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
 
     let results = prepared
@@ -9568,7 +10627,7 @@ async fn update_record_multi(db: Db, caller: Caller, arguments: Value) -> Result
     echo_act(batch_response, act_alloc.get())
 }
 
-async fn update_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
+pub(super) async fn update_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Value> {
     // Whole-body replacement only (`body_set`, and its deprecated `body`
     // alias); decoded before any other reader, including enrolled admission.
     super::body_encoding::decode_for_tool("update_record", &mut arguments)?;
@@ -9614,7 +10673,7 @@ pub(crate) async fn prepare_session_version(
         let mut act_alloc = crate::act::ActAllocation::new();
         let metadata = crate::coedit::version_metadata::VersionMetadata {
             contributors: snapshot.contributors(), session_ref: &snapshot.session_id().0,
-            merged_offline: false,
+            merged_offline: false, span_map: Some(snapshot.span_map()),
         };
         let fields = json!({"body": snapshot.body(), "reason": reason}).as_object().expect("object").clone();
         let outcome = record_update_in(RecordUpdateInput {
@@ -9643,6 +10702,76 @@ pub(crate) async fn prepare_session_version(
             Err(error)
         }
     }
+}
+
+/// One committed live-session version (see `coedit::live`).
+pub(crate) struct LiveVersionReceipt {
+    pub(crate) event_id: String,
+    pub(crate) version: i64,
+}
+
+/// Write one live-session version as an ordinary `record.updated` carrying
+/// the live body, `contributors[]` and `session`, inside `tx` (the caller
+/// commits). `caller` is the version's actor and must hold Edit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_live_version_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    caller: &Caller,
+    record: &str,
+    body: &str,
+    contributors: &[crate::coedit::AcknowledgedContributor],
+    session_ref: &str,
+    reason: &str,
+    span_map: Option<&crate::coedit::span_map::SpanMap>,
+) -> Result<LiveVersionReceipt> {
+    const PURPOSE: &str = "session.version";
+    require_record_in(tx, caller, PURPOSE, record, Capability::Edit).await?;
+    require_nonblank_reason(PURPOSE, reason)?;
+    let schema_rows = cascade::schema_config_rows_in(tx).await?;
+    let before = required_violations_in(tx, &schema_rows, &[record]).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    let metadata = crate::coedit::version_metadata::VersionMetadata {
+        contributors,
+        session_ref,
+        merged_offline: false,
+        span_map,
+    };
+    let fields = json!({"body": body, "reason": reason})
+        .as_object()
+        .expect("object")
+        .clone();
+    let outcome = record_update_in(RecordUpdateInput {
+        db,
+        tx,
+        act_alloc: &mut act_alloc,
+        caller,
+        tool: PURPOSE,
+        record_id: record,
+        fields,
+        version_metadata: Some(&metadata),
+        has_kind: false,
+        has_lifecycle: false,
+        has_summary: false,
+        facet_specs: Vec::new(),
+        facet_writes: &[],
+        facet_unsets: &BTreeSet::new(),
+        schema_rows: &schema_rows,
+        links: &[],
+        relationship_link_indexes: &BTreeSet::new(),
+        before: &before,
+    })
+    .await?;
+    let after = required_violations_in(tx, &schema_rows, &[record]).await?;
+    assert_required_not_worsened(PURPOSE, &before, &after)?;
+    let event = outcome
+        .record_event
+        .ok_or_else(|| Error::engine("session version did not append"))?;
+    let version = current_record_version_in(tx, record).await?;
+    Ok(LiveVersionReceipt {
+        event_id: event.id,
+        version,
+    })
 }
 
 /// Input context for [`prospective_body_in`]: primitives only, so the helper
@@ -9692,11 +10821,14 @@ async fn prospective_body_in(
 ) -> Result<ProspectiveBody> {
     let tool = input.tool;
     let current = sqlx::query(
-        "SELECT r.type, r.kind, r.body, r.lifecycle, r.summary, f.value AS runtime
+        "SELECT r.type, r.kind, r.body, r.lifecycle, r.summary, f.value AS runtime,
+                p.value AS package_marker
            FROM records r
            LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
+           LEFT JOIN facet_values p ON p.record_id = r.id AND p.key = ?
           WHERE r.id = ?",
     )
+    .bind(crate::artifact_html::PACKAGE_FACET_KEY)
     .bind(input.record_id)
     .fetch_optional(&mut **tx)
     .await?
@@ -9707,6 +10839,7 @@ async fn prospective_body_in(
     let current_lifecycle: Option<String> = current.try_get("lifecycle")?;
     let current_summary: Option<String> = current.try_get("summary")?;
     let current_runtime: Option<String> = current.try_get("runtime")?;
+    let current_package_marker: Option<String> = current.try_get("package_marker")?;
     let resulting_kind = input
         .fields
         .get("kind")
@@ -9811,6 +10944,14 @@ async fn prospective_body_in(
             .map(FacetWrite::stored_value)
             .or(current_runtime.clone())
     };
+    let resulting_package_marker = if input
+        .facet_unsets
+        .contains(crate::artifact_html::PACKAGE_FACET_KEY)
+    {
+        None
+    } else {
+        super::artifacts::package_marker_of_writes(input.facet_writes).or(current_package_marker)
+    };
     validate_prospective_program(
         tool,
         &record_type,
@@ -9858,6 +10999,7 @@ async fn prospective_body_in(
         &record_type,
         resulting_kind.as_deref(),
         resulting_runtime.as_deref(),
+        resulting_package_marker.as_deref(),
         resulting_body.as_deref(),
     )?;
     let html_body_write = html_manifest
@@ -9869,6 +11011,7 @@ async fn prospective_body_in(
         resulting_kind.as_deref(),
         resulting_body.as_deref(),
         resulting_runtime.as_deref(),
+        resulting_package_marker.as_deref(),
     )
     .await?;
     let source_changed = input.fields.get("body").is_some();
@@ -9896,6 +11039,7 @@ async fn prospective_body_in(
                 current_kind.as_deref(),
                 current_body.as_deref(),
                 current_runtime.as_deref(),
+                resulting_package_marker.as_deref(),
             )
             .await?
             .ok_or_else(|| Error::engine("current v2 artifact attestation is missing"))?;
@@ -10023,29 +11167,11 @@ mod body_effect_preparation {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct EventRef {
-        event_id: String,
-        seq: i64,
-        event_type: String,
-    }
+    use crate::record_body::budgeted::{BodyEventRef as EventRef, UniqueJson};
 
     impl EventRef {
         fn validate(&self) -> Result<()> {
-            identity(&self.event_id)?;
-            if self.seq <= 0
-                || !matches!(
-                    self.event_type.as_str(),
-                    "record.created"
-                        | "record.updated"
-                        | "receipt.committed.v1"
-                        | "unit.revision.recorded.v1"
-                )
-            {
-                return Err(refuse("invalid_history_reference"));
-            }
-            Ok(())
+            self.validate_for(TOOL)
         }
     }
 
@@ -10390,90 +11516,6 @@ mod body_effect_preparation {
         }
     }
 
-    // serde_json::Value erases duplicates. Reject them recursively BEFORE
-    // typed deserialization, including nested admission pins and summaries.
-    struct UniqueJson(Value);
-
-    impl<'de> Deserialize<'de> for UniqueJson {
-        fn deserialize<D: serde::Deserializer<'de>>(
-            deserializer: D,
-        ) -> std::result::Result<Self, D::Error> {
-            struct Visitor;
-            impl<'de> serde::de::Visitor<'de> for Visitor {
-                type Value = UniqueJson;
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("unique-key JSON")
-                }
-                fn visit_bool<E: serde::de::Error>(
-                    self,
-                    v: bool,
-                ) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(json!(v)))
-                }
-                fn visit_i64<E: serde::de::Error>(
-                    self,
-                    v: i64,
-                ) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(json!(v)))
-                }
-                fn visit_u64<E: serde::de::Error>(
-                    self,
-                    v: u64,
-                ) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(json!(v)))
-                }
-                fn visit_f64<E: serde::de::Error>(
-                    self,
-                    v: f64,
-                ) -> std::result::Result<UniqueJson, E> {
-                    serde_json::Number::from_f64(v)
-                        .map(|n| UniqueJson(Value::Number(n)))
-                        .ok_or_else(|| E::custom("nonfinite JSON"))
-                }
-                fn visit_str<E: serde::de::Error>(
-                    self,
-                    v: &str,
-                ) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(json!(v)))
-                }
-                fn visit_string<E: serde::de::Error>(
-                    self,
-                    v: String,
-                ) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(Value::String(v)))
-                }
-                fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<UniqueJson, E> {
-                    Ok(UniqueJson(Value::Null))
-                }
-                fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                    self,
-                    mut seq: A,
-                ) -> std::result::Result<UniqueJson, A::Error> {
-                    let mut values = Vec::new();
-                    while let Some(UniqueJson(v)) = seq.next_element()? {
-                        values.push(v);
-                    }
-                    Ok(UniqueJson(Value::Array(values)))
-                }
-                fn visit_map<A: serde::de::MapAccess<'de>>(
-                    self,
-                    mut map: A,
-                ) -> std::result::Result<UniqueJson, A::Error> {
-                    let mut values = Map::new();
-                    while let Some(key) = map.next_key::<String>()? {
-                        if values.contains_key(&key) {
-                            return Err(serde::de::Error::custom("duplicate JSON key"));
-                        }
-                        let UniqueJson(value) = map.next_value()?;
-                        values.insert(key, value);
-                    }
-                    Ok(UniqueJson(Value::Object(values)))
-                }
-            }
-            deserializer.deserialize_any(Visitor)
-        }
-    }
-
     fn parse_origin(text: &str) -> Result<BodyOrigin> {
         if text.len() > 262_144 {
             return Err(refuse("origin_oversize"));
@@ -10580,135 +11622,25 @@ mod body_effect_preparation {
         Ok(BodyValue::from_nullable(row.try_get("body")?))
     }
 
-    // No raw payload crosses the SQL cell boundary. BLOB lengths count UTF8
-    // bytes even across NUL; SQLite text length would truncate that proof.
-    // Malformed candidate families participate in selection and then refuse.
+    // Authorization and the write transaction stay with lifecycle. This reader
+    // preserves NULL separately from empty text for summaries and undo binding.
     async fn history_in(
         tx: &mut Transaction<'static, Sqlite>,
         target: &str,
         through: i64,
     ) -> Result<(EventRef, EventRef, BodyValue)> {
-        let creations: i64 = sqlx::query_scalar("SELECT count(*) FROM
-            (SELECT seq FROM content_events WHERE record_id=? AND type='record.created' AND seq<=? LIMIT 2)")
-            .bind(target).bind(through).fetch_one(&mut **tx).await?;
-        if creations != 1 {
-            return Err(refuse("creation_missing_or_ambiguous"));
-        }
-        let creation_row = sqlx::query("SELECT id,seq,type,
-            CASE WHEN json_valid(payload) THEN json_type(payload) ELSE 'invalid' END AS root_type,
-            CASE WHEN json_valid(payload) THEN (SELECT count(*) FROM json_each(payload) WHERE key='body') ELSE 0 END AS body_keys
-            FROM content_events WHERE record_id=? AND type='record.created' AND seq<=? LIMIT 1")
-            .bind(target).bind(through).fetch_one(&mut **tx).await?;
-        if creation_row.try_get::<String, _>("root_type")? != "object"
-            || creation_row.try_get::<i64, _>("body_keys")? > 1
-        {
-            return Err(refuse("malformed_creation"));
-        }
-        let creation = EventRef {
-            event_id: creation_row.try_get("id")?,
-            seq: creation_row.try_get("seq")?,
-            event_type: creation_row.try_get("type")?,
-        };
-        let row = sqlx::query("WITH candidate AS (
-            SELECT id,seq,type,payload FROM content_events WHERE record_id=? AND seq<=?
-            AND type IN ('record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1')
-            AND CASE WHEN json_valid(payload) THEN
-                CASE WHEN json_type(payload)='object' THEN
-                    type IN ('record.created','unit.revision.recorded.v1') OR json_type(payload,'$.body') IS NOT NULL
-                ELSE 1 END ELSE 1 END
-            ORDER BY seq DESC LIMIT 1
-        ), classified AS (
-            SELECT id,seq,type,payload,
-            CASE WHEN json_valid(payload) THEN json_type(payload) ELSE 'invalid' END AS root_type,
-            CASE WHEN json_valid(payload) THEN
-                CASE WHEN type='unit.revision.recorded.v1' THEN json_type(payload,'$.content.content') ELSE json_type(payload,'$.body') END
-            ELSE 'invalid' END AS body_type
-            FROM candidate
-        ), fragments AS (
-            SELECT *, CASE WHEN body_type='text' THEN
-                CASE WHEN type='unit.revision.recorded.v1' THEN json_extract(payload,'$.content.content') ELSE json_extract(payload,'$.body') END
-            END AS fragment FROM classified
-        ) SELECT id,seq,type,root_type,body_type,
-            CASE WHEN body_type='text' THEN length(CAST(fragment AS BLOB)) END AS body_bytes,
-            CASE WHEN body_type='text' AND length(CAST(fragment AS BLOB))<=? THEN fragment END AS body,
-            CASE WHEN root_type='object' THEN
-                (SELECT count(*) FROM json_each(payload) WHERE key=CASE WHEN f.type='unit.revision.recorded.v1' THEN 'content' ELSE 'body' END)
-            ELSE 0 END AS key_count,
-            CASE WHEN root_type='object' AND type='unit.revision.recorded.v1' AND json_type(payload,'$.content')='object' THEN
-                (SELECT count(*) FROM json_each(payload,'$.content') WHERE key='content')
-            ELSE 0 END AS nested_count,
-            CASE WHEN type='unit.revision.recorded.v1' AND root_type='object' AND body_type='text'
-                AND length(CAST(fragment AS BLOB))<=?
-                AND length(CAST(payload -> '$.content' AS BLOB))<=? THEN payload -> '$.content' END AS unit_content,
-            CASE WHEN type='unit.revision.recorded.v1' AND root_type='object' AND json_type(payload,'$.format')='text'
-                AND length(CAST(json_extract(payload,'$.format') AS BLOB))<=256 THEN
-                json_extract(payload,'$.format') END AS unit_format,
-            CASE WHEN type='unit.revision.recorded.v1' AND root_type='object' AND json_type(payload,'$.semantic_contract_version')='text'
-                AND length(CAST(json_extract(payload,'$.semantic_contract_version') AS BLOB))<=256 THEN
-                json_extract(payload,'$.semantic_contract_version') END AS unit_semantic,
-            CASE WHEN type='unit.revision.recorded.v1' AND root_type='object' AND json_type(payload,'$.content_sha256')='text'
-                AND length(CAST(json_extract(payload,'$.content_sha256') AS BLOB))=64 THEN
-                json_extract(payload,'$.content_sha256') END AS unit_sha256,
-            CASE WHEN type='unit.revision.recorded.v1' AND root_type='object' THEN
-                (SELECT count(*)=3 AND count(DISTINCT key)=3 FROM json_each(payload)
-                    WHERE key IN ('format','semantic_contract_version','content_sha256'))
-            ELSE 0 END AS unit_headers_valid
-            FROM fragments AS f")
-            .bind(target).bind(through).bind(BODY_BYTES as i64).bind(BODY_BYTES as i64).bind(BODY_ENCODED_BYTES as i64).fetch_optional(&mut **tx).await?.ok_or_else(|| refuse("inverse_missing"))?;
-        let reference = EventRef {
-            event_id: row.try_get("id")?,
-            seq: row.try_get("seq")?,
-            event_type: row.try_get("type")?,
-        };
-        creation.validate()?;
-        reference.validate()?;
-        if reference.seq < creation.seq || row.try_get::<String, _>("root_type")? != "object" {
-            return Err(refuse("malformed_history"));
-        }
-        let kind: Option<String> = row.try_get("body_type")?;
-        let keys: i64 = row.try_get("key_count")?;
-        let unit = reference.event_type == "unit.revision.recorded.v1";
-        if keys > 1 || (unit && (keys != 1 || row.try_get::<i64, _>("nested_count")? != 1)) {
-            return Err(refuse("malformed_history"));
-        }
-        let body = match kind.as_deref() {
-            None if reference.event_type == "record.created" && keys == 0 => BodyValue::Null,
-            Some("null") if !unit && keys == 1 => BodyValue::Null,
-            Some("text") if keys == 1 => {
-                let bytes: i64 = row.try_get("body_bytes")?;
-                if bytes > BODY_BYTES as i64 {
-                    return Err(refuse("body_or_inverse_oversize"));
-                }
-                let text: String = row.try_get("body")?;
-                if text.len() as i64 != bytes {
-                    return Err(refuse("history_transport_incomplete"));
-                }
-                BodyValue::Text(text)
-            }
-            _ => return Err(refuse("malformed_history")),
-        };
-        if unit {
-            let content_json: String = row.try_get("unit_content")?;
-            let UniqueJson(value) = serde_json::from_str(&content_json)
-                .map_err(|_| refuse("malformed_unit_content"))?;
-            let content: crate::freshness::UnitContent =
-                serde_json::from_value(value).map_err(|_| refuse("malformed_unit_content"))?;
-            content.validate()?;
-            if body.as_nullable() != Some(content.content.as_str())
-                || !row.try_get::<bool, _>("unit_headers_valid")?
-                || row.try_get::<Option<String>, _>("unit_format")?.as_deref()
-                    != Some(crate::freshness::UNIT_REVISION_FORMAT)
-                || row
-                    .try_get::<Option<String>, _>("unit_semantic")?
-                    .as_deref()
-                    != Some(crate::freshness::SEMANTIC_CONTRACT_VERSION)
-                || row.try_get::<Option<String>, _>("unit_sha256")?.as_deref()
-                    != Some(content.sha256().as_str())
-            {
-                return Err(refuse("malformed_unit_content"));
-            }
-        }
-        Ok((creation, reference, body))
+        let (creation, revision, body) = crate::record_body::budgeted::strict_history_on(
+            tx,
+            target,
+            through,
+            crate::record_body::budgeted::BodyReadLimits {
+                body_bytes: BODY_BYTES,
+                unit_encoded_bytes: BODY_ENCODED_BYTES,
+            },
+            TOOL,
+        )
+        .await?;
+        Ok((creation, revision, BodyValue::from_nullable(body)))
     }
 
     async fn prepare_snapshot_in(
@@ -11291,25 +12223,20 @@ mod body_effect_preparation {
         source_digest: &str,
         entry_id: &str,
     ) -> Result<mdx_v2::InteractionEntry> {
-        let source: String = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT CASE WHEN json_valid(payload)
-            AND json_type(payload,'$.body')='text'
-            AND length(CAST(json_extract(payload,'$.body') AS BLOB))<=524288
-            AND (SELECT count(*) FROM json_each(payload) WHERE key='body')=1
-            THEN json_extract(payload,'$.body') END
-            FROM content_events WHERE id=? AND record_id=?
-            AND type IN ('record.created','record.updated','receipt.committed.v1')",
+        // The pinned bundle may be a package over the ordinary HTML limit.
+        let body_limit = super::super::artifacts::html_body_limit_in(tx, &pins.artifact_id).await?;
+        let source = crate::record_body::budgeted::exact_html_source_on(
+            tx,
+            &pins.artifact_id,
+            &pins.source_revision,
+            body_limit,
         )
-        .bind(&pins.source_revision)
-        .bind(&pins.artifact_id)
-        .fetch_optional(&mut **tx)
         .await?
-        .flatten()
         .ok_or_else(|| refuse("body_source_missing"))?;
         if super::super::alpha_tabs::alpha_tab_bundle_digest(&source) != source_digest {
             return Err(refuse("body_source_digest"));
         }
-        let manifest = crate::artifact_html::validate_cached(&source)
+        let manifest = crate::artifact_html::validate_cached_with_limit(&source, body_limit)
             .map_err(|_| refuse("body_source_not_html"))?
             .interaction_manifest();
         let entry = manifest
@@ -11732,13 +12659,41 @@ mod body_effect_preparation {
         plan: ArtifactBodySavePlan,
     ) -> Result<ArtifactBodyOutcome> {
         refuse_enrolled(db)?; // Before job/transaction/replay.
-        let mut tx = crate::db::enrolled::begin_document_write(db).await?;
+                              // Single-writer rule: flush-and-absorb into a live session on the
+                              // target (its one slot), before the write transaction.
+        let target = match plan.invocation.slots.len() {
+            1 => plan.invocation.slots.values().next().cloned(),
+            _ => None,
+        };
+        let mut live_write =
+            crate::coedit::live::begin_body_write(db, target.as_deref().unwrap_or(""), caller)
+                .await?;
+        live_write.begin_absorb(db, caller).await?;
+        // Failing before the transaction opens cannot have committed
+        // anything: the absorb is cancelled rather than close the session.
+        let mut tx = live_write
+            .open_absorbing(crate::db::enrolled::begin_document_write(db))
+            .await?;
         let result = async {
             structural_in(&mut tx).await?;
             save_in(db, &mut tx, caller, &plan).await
         }
         .await;
-        complete(db, tx, result).await
+        let outcome = complete(db, tx, result).await;
+        match &outcome {
+            Ok(ArtifactBodyOutcome::Committed { .. }) => {
+                live_write
+                    .absorb_committed(db, caller, "explicit artifact body save")
+                    .await;
+            }
+            // A confirmed precommit refusal: nothing was written.
+            Ok(ArtifactBodyOutcome::Refused { .. }) => live_write.cancel_absorb(),
+            // An error may have struck after the commit: leave the absorb
+            // armed, so dropping it closes the session rather than let the
+            // live doc go stale.
+            Err(_) => drop(live_write),
+        }
+        outcome
     }
 
     pub(crate) async fn undo_body_from_artifact(
@@ -11747,13 +12702,53 @@ mod body_effect_preparation {
         invocation: &ArtifactInvocation,
     ) -> Result<ArtifactBodyOutcome> {
         refuse_enrolled(db)?;
-        let mut tx = crate::db::enrolled::begin_document_write(db).await?;
+        // Undo is routed like any body write (flush-and-absorb). Its target
+        // is the original save's record, read ahead of the transaction.
+        let target: Option<String> = match invocation.reverses.as_ref() {
+            Some(reverse) => sqlx::query_scalar(
+                "SELECT record_id FROM content_events WHERE actor=?
+                   AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.origin.artifact_id')=? ELSE 0 END
+                   AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.origin.entry_id')=? ELSE 0 END
+                   AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.origin.idempotency_key')=? ELSE 0 END
+                 ORDER BY seq LIMIT 1",
+            )
+            .bind(caller.actor())
+            .bind(&invocation.artifact_id)
+            .bind(&reverse.entry_id)
+            .bind(&reverse.idempotency_key)
+            .fetch_optional(db.pool())
+            .await?,
+            None => None,
+        };
+        let mut live_write =
+            crate::coedit::live::begin_body_write(db, target.as_deref().unwrap_or(""), caller)
+                .await?;
+        live_write.begin_absorb(db, caller).await?;
+        // Failing before the transaction opens cannot have committed
+        // anything: the absorb is cancelled rather than close the session.
+        let mut tx = live_write
+            .open_absorbing(crate::db::enrolled::begin_document_write(db))
+            .await?;
         let result = async {
             structural_in(&mut tx).await?;
             undo_in(db, &mut tx, caller, invocation).await
         }
         .await;
-        complete(db, tx, result).await
+        let outcome = complete(db, tx, result).await;
+        match &outcome {
+            Ok(ArtifactBodyOutcome::Committed { .. }) => {
+                live_write
+                    .absorb_committed(db, caller, "explicit artifact body undo")
+                    .await;
+            }
+            // A confirmed precommit refusal: nothing was written.
+            Ok(ArtifactBodyOutcome::Refused { .. }) => live_write.cancel_absorb(),
+            // An error may have struck after the commit: leave the absorb
+            // armed, so dropping it closes the session rather than let the
+            // live doc go stale.
+            Err(_) => drop(live_write),
+        }
+        outcome
     }
 
     // Exact production precommit/cleanup boundary, with a test-only error
@@ -13364,9 +14359,6 @@ async fn record_update_in(input: RecordUpdateInput<'_>) -> Result<RecordUpdateOu
             .await?;
         }
     }
-    if let Some(draft) = link_draft {
-        crate::provenance::issue_reserved_pending_action_in(tx, draft).await?;
-    }
     if let Some(compiler_attestation) = artifact_attestation {
         let (source_event_id, source) = if source_changed {
             (
@@ -13381,14 +14373,11 @@ async fn record_update_in(input: RecordUpdateInput<'_>) -> Result<RecordUpdateOu
                     .to_owned(),
             )
         } else {
-            let row = sqlx::query(
-                "SELECT id,json_extract(payload,'$.body') AS body FROM content_events
-                  WHERE record_id=? AND type IN ('record.created','record.updated','receipt.committed.v1')
-                    AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+            let row = crate::record_body::live_artifact::latest_present_source_on(
+                &mut **tx, record_id, None,
             )
-            .bind(record_id)
-            .fetch_one(&mut **tx)
-            .await?;
+            .await?
+            .ok_or(sqlx::Error::RowNotFound)?;
             (row.try_get("id")?, row.try_get("body")?)
         };
         let already_attested: bool = sqlx::query_scalar(
@@ -13684,6 +14673,14 @@ async fn record_update_in(input: RecordUpdateInput<'_>) -> Result<RecordUpdateOu
         )
         .await?;
     }
+    // Finalize the reserved identity only after every output this call
+    // appends, the artifact source attestation included, so one attestation
+    // covers the whole command. Issuing it before that left the later events
+    // to a second attestation at commit, which a keyed call cannot have: both
+    // would carry the key digest and the second would hit the authority index.
+    if let Some(draft) = link_draft {
+        crate::provenance::issue_reserved_pending_action_in(tx, draft).await?;
+    }
     let after = required_violations_in(tx, schema_rows, &[record_id]).await?;
     assert_required_not_worsened(tool, before, &after)?;
     Ok(RecordUpdateOutcome {
@@ -13698,6 +14695,688 @@ async fn record_update_in(input: RecordUpdateInput<'_>) -> Result<RecordUpdateOu
     })
 }
 
+/// The spine view a summary replay of a keyed `update_record` needs, folded
+/// from the record's OWN content events at or below the command's horizon:
+/// the `update_record` counterpart of `compact_attested_create_in`, on the
+/// same [`fold_pinned_spine_in`]. It reads this record's history only, never
+/// the workspace log, and loads only the latest body, so a record that has
+/// been written since the command replays at any workspace or body size.
+///
+/// Returns the compact record (the summary's dependency closure: spine
+/// fields, body digest, live lifecycle interpretation) and the governed-HTML
+/// receipt, or `None` only for a malformed history (a spine event before the
+/// record's creation).
+async fn compact_attested_update_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    caller: &Caller,
+    record_id: &str,
+    horizon: i64,
+) -> Result<Option<(Value, Option<Value>)>> {
+    const TOOL: &str = "update_record";
+    let Some(spine) = fold_pinned_spine_in(tx, record_id, horizon).await? else {
+        return Ok(None);
+    };
+    let (mut fields, facets) = (spine.fields, spine.facets);
+    let body = fields
+        .get("body")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let record_type = fields
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let kind = fields
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let html_body_write = super::artifacts::validate_prospective_html(
+        TOOL,
+        &record_type,
+        kind.as_deref(),
+        facets.get("runtime").map(String::as_str),
+        facets
+            .get(crate::artifact_html::PACKAGE_FACET_KEY)
+            .map(String::as_str),
+        body.as_deref(),
+    )?
+    .map(|manifest| html_body_write_result(&manifest, body.as_deref().unwrap_or("")));
+    let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
+    let schema = cascade::schema_config_rows_for_principal_on(tx, principal).await?;
+    let interpreter =
+        crate::query::lifecycle::LifecycleInterpreter::load_from_connection(tx, schema).await?;
+    let interpretation = interpreter.interpret(
+        &record_type,
+        kind.as_deref(),
+        fields.get("home_id").and_then(Value::as_str),
+        fields.get("lifecycle").and_then(Value::as_str),
+    );
+    fields.insert("id".into(), json!(record_id));
+    fields.insert("kind".into(), json!(kind));
+    if fields.get("name").is_none_or(Value::is_null) {
+        fields.insert("name".into(), json!(""));
+    }
+    fields.insert(
+        "lifecycle_interpretation".into(),
+        serde_json::to_value(interpretation)?,
+    );
+    Ok(Some((Value::Object(fields), html_body_write)))
+}
+
+#[cfg(test)]
+mod final_latest_body_reader_tests {
+    use super::*;
+
+    const SOURCE: &str = r#"export const nativeArtifact = { schema: "native.mdx.artifact.v2", inputs: {}, module_inputs: {}, capability_requests: [] }
+
+<Callout>café🦮</Callout>
+"#;
+
+    async fn registry() -> (Db, ToolRegistry) {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        (db, registry)
+    }
+
+    async fn insert_event(db: &Db, id: &str, family: &str, payload: Value) -> String {
+        let event_id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,?,?,1,'legacy_unknown')")
+            .bind(&event_id).bind(id).bind(family).bind(payload.to_string()).execute(db.write_pool()).await.unwrap();
+        event_id
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn metadata_only_artifact_update_attests_latest_three_family_source() {
+        let _guard = native_artifact_runtime::mdx::test_guard();
+        let (db, registry) = registry().await;
+        let created = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "type":"Document", "kind":"artifact", "name":"source fixture", "body":SOURCE,
+                    "facets":{"runtime":"native.mdx.v2"}, "reason":"fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        // Equal bytes, new identity: metadata update must attest this receipt,
+        // not reuse the create attestation merely because its digest matches.
+        let latest = insert_event(&db, id, "receipt.committed.v1", json!({"body":SOURCE})).await;
+        for (family, payload) in [
+            ("record.updated", json!({"name":"metadata only"})),
+            (
+                "unit.revision.recorded.v1",
+                json!({"body":"excluded", "content":{"content":"excluded"}}),
+            ),
+            ("other.family", json!({"body":"excluded"})),
+        ] {
+            insert_event(&db, id, family, payload).await;
+        }
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":id, "name":"new metadata", "reason":"compile unchanged source"
+                }),
+            )
+            .await
+            .unwrap();
+        let (event_id, digest): (String, String) = sqlx::query_as(
+            "SELECT source_event_id,source_sha256 FROM artifact_source_attestations WHERE artifact_id=? ORDER BY event_seq DESC LIMIT 1"
+        ).bind(id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(event_id, latest);
+        assert_eq!(
+            digest,
+            native_artifact_runtime::mdx::sha256_hex(SOURCE.as_bytes())
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_source_attestations WHERE artifact_id=?",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 2);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":id, "name":"more metadata", "reason":"retain existing source attestation"
+                }),
+            )
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifact_source_attestations WHERE artifact_id=?",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(after, count);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unchanged_artifact_missing_source_keeps_sqlx_row_not_found() {
+        let _guard = native_artifact_runtime::mdx::test_guard();
+        let (db, registry) = registry().await;
+        let id = Uuid::new_v4().to_string();
+        // A bodyless legacy event and a surviving projection body establish
+        // the missing-source fallback without mutating immutable history.
+        let payload = json!({"type":"Document", "kind":"artifact", "name":"legacy",
+            "home_id":crate::schema::UNFILED_RECORD_ID});
+        let event_id = insert_event(&db, &id, "record.created", payload.clone()).await;
+        let (local_seq, created_at): (i64, String) =
+            sqlx::query_as("SELECT seq,created_at FROM content_events WHERE id=?")
+                .bind(&event_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let event = crate::events::EventRow {
+            local_seq,
+            id: event_id,
+            record_id: id.clone(),
+            event_type: "record.created".into(),
+            payload: Some(payload.to_string()),
+            actor: None,
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            created_at,
+            causal_envelope: crate::events::CausalEnvelopeV1::legacy_unknown(),
+            act: None,
+        };
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        crate::projector::project(&mut conn, &event).await.unwrap();
+        sqlx::query("UPDATE records SET body=? WHERE id=?")
+            .bind(SOURCE)
+            .bind(&id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO facet_values(id,record_id,key,value) VALUES (? ,?,'runtime','native.mdx.v2')")
+            .bind(Uuid::new_v4().to_string()).bind(&id).execute(&mut *conn).await.unwrap();
+        drop(conn);
+        let error = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":id, "name":"metadata", "reason":"missing legacy source"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Sqlx(sqlx::Error::RowNotFound)),
+            "{error:?}"
+        );
+        let name: String = sqlx::query_scalar("SELECT name FROM records WHERE id=?")
+            .bind(&id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(name, "legacy", "the failed update rolls back");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_receipt_retry_includes_exact_previous_sequence_and_unicode() {
+        let (db, registry) = registry().await;
+        let created = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "type":"Document", "kind":"note", "name":"retry", "body":"x", "reason":"fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap();
+        // The previous content sequence itself carries the body (not an
+        // intervening metadata event), so an exclusive query loses these chars.
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":id, "body_append":"é🦮", "reason":"previous body"
+                }),
+            )
+            .await
+            .unwrap();
+        let keyed = json!({"id":id, "body_append":"🌍", "reason":"keyed", "idempotency_key":"inclusive-receipt"});
+        let first = registry
+            .call(db.clone(), Caller::local(), "update_record", keyed.clone())
+            .await
+            .unwrap();
+        assert_eq!(first["body_receipt"]["before_chars"], 3);
+        assert_eq!(first["body_receipt"]["after_chars"], 4);
+        let replay = registry
+            .call(db.clone(), Caller::local(), "update_record", keyed.clone())
+            .await
+            .unwrap();
+        assert_eq!(replay["body_receipt"], first["body_receipt"]);
+        registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "update_record",
+                json!({
+                    "id":id, "body_append":"later", "reason":"move past replay horizon"
+                }),
+            )
+            .await
+            .unwrap();
+        let replay = registry
+            .call(db.clone(), Caller::local(), "update_record", keyed)
+            .await
+            .unwrap();
+        assert_eq!(replay["body_receipt"], first["body_receipt"]);
+        assert_eq!(replay["version"], first["version"]);
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod compact_update_replay_tests {
+    use super::*;
+
+    /// Review S1: a summary replay of a keyed update whose record has been
+    /// written since folds that record's own events, not the workspace log
+    /// prefix the global rebuild replays (bounded at 10,000 events).
+    #[tokio::test]
+    async fn the_compact_fold_pins_the_record_as_the_keyed_update_left_it() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let call = |args: Value| {
+            let registry = &registry;
+            let db = db.clone();
+            async move {
+                registry
+                    .call(db, Caller::local(), "update_record", args)
+                    .await
+                    .unwrap()
+            }
+        };
+        let id = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({"type": "Document", "kind": "note", "name": "pinned", "body": "one",
+                       "reason": "fixture"}),
+            )
+            .await
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let keyed = json!({"id": id, "body_append": " two", "facets": {"colour": "blue"},
+                           "reason": "keyed", "idempotency_key": "compact-1"});
+        let first = call(keyed.clone()).await;
+        let horizon: i64 = first["version"].as_str().unwrap()["rec:".len()..]
+            .parse()
+            .unwrap();
+        call(json!({"id": id, "body_append": " later", "name": "renamed",
+                    "reason": "a later writer"}))
+        .await;
+
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let (record, html) = compact_attested_update_in(&mut tx, &Caller::local(), &id, horizon)
+            .await
+            .unwrap()
+            .expect("an ordinary history folds compactly");
+        tx.rollback().await.unwrap();
+        assert_eq!(record["body"], "one two");
+        assert_eq!(record["name"], "pinned");
+        assert!(html.is_none());
+
+        let replay = call(keyed).await;
+        assert_eq!(replay, first);
+        assert_eq!(replay.to_string(), first.to_string());
+        db.close().await;
+    }
+
+    /// Review S1 residue: neither the workspace-wide 10,000-event prefix nor a
+    /// byte budget charged for every historical body version may refuse a
+    /// summary replay. The budgets are lowered so a few dozen events cross
+    /// them; the verbose replay, which still uses the historical rebuild, is
+    /// the control that proves the lowered budgets bite.
+    #[tokio::test]
+    async fn summary_replay_of_a_long_edited_record_in_a_busy_workspace_still_replays() {
+        struct LimitGuard;
+        impl Drop for LimitGuard {
+            fn drop(&mut self) {
+                ATTESTED_REBUILD_LIMIT_OVERRIDE.with(|limits| limits.set(None));
+            }
+        }
+
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let call = |tool: &'static str, args: Value| {
+            let registry = &registry;
+            let db = db.clone();
+            async move { registry.call(db, Caller::local(), tool, args).await }
+        };
+        let id = call(
+            "create_record",
+            json!({"type": "Document", "kind": "note", "name": "long edited",
+                   "body": "v0", "reason": "fixture"}),
+        )
+        .await
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Many body versions, each storing the whole body: the old fold
+        // charged every one of them against the byte budget.
+        for version in 1..=8 {
+            call(
+                "update_record",
+                json!({"id": id, "body_append": format!("\nv{version} {}", "x".repeat(4 * 1024)),
+                       "reason": "edit"}),
+            )
+            .await
+            .unwrap();
+        }
+        // Unrelated workspace history, to push the whole-log prefix past the row cap.
+        for n in 0..30 {
+            call(
+                "create_record",
+                json!({"type": "Document", "kind": "note", "name": format!("other {n}"),
+                       "body": "filler", "reason": "fixture"}),
+            )
+            .await
+            .unwrap();
+        }
+        let keyed = json!({"id": id, "body_append": format!("\nkeyed {}", "y".repeat(4 * 1024)),
+                           "reason": "keyed", "idempotency_key": "long-edit-1"});
+        let first = call("update_record", keyed.clone()).await.unwrap();
+        call(
+            "update_record",
+            json!({"id": id, "body_append": " later", "reason": "a later writer"}),
+        )
+        .await
+        .unwrap();
+
+        // 20 rows is far below the workspace log. 400 KiB is below the six-fold
+        // charge for the record's ten growing body versions (about 1.1 MiB) but
+        // above the fold of the latest body plus the stripped events (about 240 KiB).
+        ATTESTED_REBUILD_LIMIT_OVERRIDE.with(|limits| limits.set(Some((20, 400 * 1024))));
+        let _reset = LimitGuard;
+        let replay = call("update_record", keyed.clone()).await.unwrap();
+        assert_eq!(replay.to_string(), first.to_string());
+
+        // The verbose control: its full-view rebuild refuses under the same
+        // lowered budget, which proves the override reaches the handler, and
+        // the replay degrades to the marked summary rather than refusing.
+        let mut verbose = keyed;
+        verbose["response_mode"] = json!("verbose");
+        let degraded = call("update_record", verbose).await.unwrap();
+        assert_eq!(degraded["replay_view"], json!("summary"), "{degraded}");
+        assert_eq!(degraded["body_digest"], first["body_digest"]);
+        assert_eq!(degraded["act"], first["act"]);
+        db.close().await;
+    }
+}
+
+/// What the singular `update_record` replay renderer needs from the request:
+/// only facts that are a pure function of the arguments.
+struct UpdateReplayRequest<'a> {
+    id: &'a str,
+    response_mode: ResponseMode,
+    /// `(operation, requested_as)` of the body receipt, when a body op ran.
+    body_op: Option<(&'static str, &'static str)>,
+    legacy_body_alias: bool,
+    facet_writes: &'a [FacetWrite],
+    declared_sources: Option<usize>,
+}
+
+/// Replay renderer for a keyed singular `update_record` (keyed-replay
+/// contract, `keyed_replay`). Assembles the same receipt the first call
+/// returned, in the same order.
+///
+/// Pinned from the attestation: `previous_seq`, `act`, `source_event_id`,
+/// `body_receipt` (both lengths read from the logged bodies), `version`, and
+/// the action attestation id. The record view is the record as this command
+/// left it. While nothing has written the record since, that is its current
+/// projection, read in this transaction (summary) or through the live lens
+/// (verbose); verbose enrichment drawn from other records (links in,
+/// children) is then current rather than pinned. Once the record has been
+/// written again, the view is rebuilt at the command's horizons through the
+/// same bounded historical reconstruction keyed `create_record` uses, so a
+/// replay never hands back a later body digest as this write's token.
+async fn replay_update_record(
+    db: &Db,
+    mut tx: Transaction<'static, Sqlite>,
+    caller: &Caller,
+    request: UpdateReplayRequest<'_>,
+    replay: super::keyed_replay::KeyedReplay,
+) -> Result<Value> {
+    const TOOL: &str = "update_record";
+    let id = request.id;
+    let previous_seq = replay.previous_seq_in(&mut tx, id).await?;
+    let record_event = replay
+        .content_for(id)
+        .find(|event| event.event_type == "record.updated");
+    let source_event_id = record_event
+        .filter(|event| event.payload.get("body").is_some())
+        .map(|event| event.event_id.clone());
+    let body_receipt = match request.body_op {
+        Some((operation, requested_as)) => {
+            let after = record_event
+                .and_then(|event| event.payload.get("body"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .count() as u64;
+            let before: Option<String> = match previous_seq {
+                Some(seq) => {
+                    crate::record_body::live_artifact::latest_present_body_through_on(
+                        &mut *tx, id, seq,
+                    )
+                    .await?
+                }
+                None => None,
+            };
+            let before = before.as_deref().unwrap_or("").chars().count() as u64;
+            Some(json!({
+                "operation": operation,
+                "requested_as": requested_as,
+                "before_chars": before,
+                "after_chars": after,
+                "delta_chars": after as i64 - before as i64,
+                "unit": "unicode_scalars",
+            }))
+        }
+        None => None,
+    };
+    let horizon = replay.content_horizon_for(id);
+    let version_seq = match horizon {
+        Some(horizon) => horizon,
+        None => current_record_version_in(&mut tx, id).await?,
+    };
+    let moved_on: bool = match horizon {
+        Some(horizon) => {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND seq>?)",
+            )
+            .bind(id)
+            .bind(horizon)
+            .fetch_one(&mut *tx)
+            .await?
+        }
+        None => false,
+    };
+    let mut summary_fallback = false;
+    let (record, html_body_write, record_type, kind) = if moved_on {
+        // A record written since is answered from its pinned history, so
+        // neither the fold nor the rebuild holds the writer transaction. A
+        // summary replay folds the record's own events on a read transaction
+        // under the replay deadline: a retry burst on a record with hundreds
+        // of body versions must not serialize the single writer behind scans.
+        tx.rollback().await?;
+        let compact_pinned = if request.response_mode == ResponseMode::Summary {
+            compact_attested_update_bounded(
+                db,
+                caller,
+                id,
+                version_seq,
+                attested_rebuild_execution(),
+            )
+            .await?
+        } else {
+            None
+        };
+        if let Some((record, html)) = compact_pinned {
+            let record_type = record["type"].as_str().unwrap_or_default().to_owned();
+            let kind = record["kind"].as_str().map(str::to_owned);
+            (record, html, record_type, kind)
+        } else {
+            let attested = AttestedWrite {
+                attestation_id: replay.attestation_id().to_string(),
+                record_id: id.to_string(),
+                content_horizon: replay.content_horizon().unwrap_or(version_seq),
+                relationship_horizon: replay.relationship_horizon(),
+                act: replay.act(),
+            };
+            let rebuilt = match read_attested_record_with_limits(
+                db,
+                caller,
+                &attested,
+                TOOL,
+                true,
+                &attested_rebuild_permits(),
+                attested_rebuild_execution(),
+            )
+            .await
+            {
+                Ok(rebuilt) => (rebuilt.record, rebuilt.html_body_write),
+                // The full view cannot be rebuilt at this workspace's size: the
+                // pinned summary, marked, rather than refusing a committed write.
+                Err(refusal) if is_rebuild_capacity_refusal(&refusal) => {
+                    let folded = compact_attested_update_bounded(
+                        db,
+                        caller,
+                        id,
+                        version_seq,
+                        attested_fallback_execution(),
+                    )
+                    .await;
+                    summary_fallback = true;
+                    folded?.ok_or(refusal)?
+                }
+                Err(error) => return Err(error),
+            };
+            let record_type = rebuilt.0["type"].as_str().unwrap_or_default().to_owned();
+            let kind = rebuilt.0["kind"].as_str().map(str::to_owned);
+            (rebuilt.0, rebuilt.1, record_type, kind)
+        }
+    } else {
+        let html_body_write = html_body_write_in(&mut tx, TOOL, id).await?;
+        let row = sqlx::query("SELECT type, kind FROM records WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let record_type: String = row.try_get("type")?;
+        let kind: Option<String> = row.try_get("kind")?;
+        let compact = if request.response_mode == ResponseMode::Summary {
+            Some(compact_record_source_in(&mut tx, caller, TOOL, id).await?)
+        } else {
+            None
+        };
+        tx.rollback().await?;
+        let record = match compact {
+            Some(record) => record,
+            None => enriched_or_none(db, caller, id)
+                .await?
+                .ok_or_else(|| Error::engine(format!("{TOOL}: record {id} does not exist")))?,
+        };
+        (record, html_body_write, record_type, kind)
+    };
+    // The resulting effective kind, as the first call judged alias shadows.
+    let alias_kind = match kind.as_deref() {
+        Some(kind) => {
+            let mut conn = db.pool().acquire().await?;
+            let resolution = crate::meta::kind::resolve_on(&mut conn, &record_type, kind).await?;
+            Some(
+                resolution
+                    .canonical_kind_for_write()
+                    .unwrap_or(kind)
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
+    let mut updated =
+        attach_html_body_write(echo_previous_seq(record, previous_seq)?, html_body_write)?;
+    updated = echo_act(updated, replay.act())?;
+    annotate_body_digest(&mut updated);
+    annotate_source_event_id(&mut updated, source_event_id.as_deref());
+    if let Some(receipt) = body_receipt {
+        updated
+            .as_object_mut()
+            .expect("enriched record object")
+            .insert("body_receipt".into(), receipt);
+    }
+    if request.legacy_body_alias {
+        let warning = json!({
+            "code": "deprecated_body_alias",
+            "message": "update_record 'body' is a deprecated alias for full replacement; use 'body_set' for new calls.",
+        });
+        match updated.get_mut("warnings") {
+            Some(Value::Array(warnings)) => warnings.push(warning),
+            Some(existing) => {
+                *existing = Value::Array(vec![existing.clone(), warning]);
+            }
+            None => {
+                updated
+                    .as_object_mut()
+                    .expect("enriched record object")
+                    .insert("warnings".into(), Value::Array(vec![warning]));
+            }
+        }
+    }
+    crate::domain_transaction::push_receipt_warnings(
+        &mut updated,
+        crate::domain_transaction::governed_alias_warnings_for_sets(
+            request.facet_writes,
+            &record_type,
+            alias_kind.as_deref(),
+        ),
+    )?;
+    attach_basis_feedback(db, caller, &mut updated, request.declared_sources, true).await;
+    replay.settle();
+    if summary_fallback {
+        let mut summary = summarize_write_receipt(db, updated, version_seq).await?;
+        mark_summary_replay(&mut summary);
+        return Ok(summary);
+    }
+    request.response_mode.render(db, updated, version_seq).await
+}
+
+/// A0 limit: refused before any flush when a live session would route the
+/// body of a keyed `update_record`.
+const KEYED_LIVE_REFUSAL: &str = "update_record: idempotency_key is not supported while a live editing session is routing this record's body; retry without a key";
+
 async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "update_record";
     reject_null_sources(TOOL, &arguments)?;
@@ -13709,9 +15388,13 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             "{TOOL}: 'body_replace' must be an array of {{old, new}} edits, got null"
         )));
     }
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let mut args: UpdateRecordArgs = parse_args(TOOL, arguments)?;
     let response_mode = args.response_mode;
     require_nonblank_reason(TOOL, &args.reason)?;
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
     let source_inputs = args.sources.take();
     let touches_message_expectation = args.facets.as_ref().is_some_and(|facets| {
         facets.contains_key(crate::message_expectation::EXPECTATION_FACET_KEY)
@@ -13900,6 +15583,102 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // the cycle check) run inside the transaction: `BEGIN IMMEDIATE`
     // serializes writers, so a concurrent cross-rehome cannot slip a cycle
     // past a check that already committed.
+    // Single-writer rule: while a live session has peers on this record, a
+    // body write is routed into it as a diff (see `coedit::live`). Entered
+    // before the write transaction, per the live-session lock order.
+    let body_op = args.body.is_some()
+        || args.body_set.is_some()
+        || args.body_append.is_some()
+        || args.body_replace.is_some();
+    // A kind change or a `runtime` facet can take the record out of live
+    // editing: the session is closed once this write has committed.
+    // Only an actual change counts (an unchanged kind is not a scope change);
+    // and even then the session closes after commit only if the record is no
+    // longer live-editable.
+    let wants_runtime = args
+        .facets
+        .as_ref()
+        .and_then(|facets| facets.get("runtime"))
+        .cloned();
+    let scope_op = if (args.kind.is_some() || wants_runtime.is_some()) && !db.is_enrolled() {
+        let current = sqlx::query(
+            "SELECT kind, (SELECT value FROM facet_values
+                            WHERE record_id = records.id AND key = 'runtime') AS runtime
+               FROM records WHERE id = ?",
+        )
+        .bind(&args.id)
+        .fetch_optional(db.pool())
+        .await?;
+        match current {
+            None => false,
+            Some(row) => {
+                let kind: Option<String> = row.try_get("kind")?;
+                let runtime: Option<String> = row.try_get("runtime")?;
+                let kind_changes = args
+                    .kind
+                    .as_ref()
+                    .is_some_and(|wanted| wanted.as_str() != kind.as_deref());
+                let runtime_changes = wants_runtime.as_ref().is_some_and(|wanted| {
+                    let stored = runtime.as_deref();
+                    match wanted {
+                        Value::Null => stored.is_some(),
+                        Value::String(value) => {
+                            stored != Some(value.as_str())
+                                && stored != Some(Value::String(value.clone()).to_string().as_str())
+                        }
+                        other => stored != Some(other.to_string().as_str()),
+                    }
+                });
+                kind_changes || runtime_changes
+            }
+        }
+    } else {
+        false
+    };
+    // A keyed call must not flush a live session unless it will write.
+    // A replay writes nothing, and a keyed call that would be routed is
+    // refused (A0 limit: a body routed into a live co-editing session
+    // becomes the session's merged version, so its receipt cannot be
+    // rebuilt). Versioning the people's unsaved text first would make a
+    // replay a non-no-op, and a refusal would move `updated_at` under the
+    // caller's `if_unmodified_since`, so the unkeyed resend would be refused
+    // as stale. The early lookup below only skips that flush; the
+    // authoritative lookup (and the race between concurrent duplicates) is
+    // the in-transaction one further down.
+    // A read error fails the call here, before any gate: the gate flushes,
+    // and the lookup may have found a replay. Accepted residual: a concurrent
+    // duplicate committing between this lookup and the gate, with a dirty
+    // grace session, flushes once more before it replays: one extra,
+    // correctly attributed version of the people's text, and no lost edit.
+    // The flush does move `updated_at`; the duplicate replays without
+    // re-evaluating its `if_unmodified_since`, so nothing is judged against
+    // the moved value.
+    let may_replay = keyed
+        && (body_op || scope_op)
+        && !db.is_enrolled()
+        && super::keyed_replay::replay_may_exist(&db, &caller, TOOL, &provenance_arguments).await?;
+    let mut live_write = if (body_op || scope_op) && !db.is_enrolled() && !may_replay {
+        let mut write = if keyed {
+            crate::coedit::live::begin_unrouted_body_write(
+                &db,
+                &args.id,
+                &caller,
+                KEYED_LIVE_REFUSAL,
+            )
+            .await?
+        } else {
+            crate::coedit::live::begin_body_write(&db, &args.id, &caller).await?
+        };
+        if scope_op {
+            write.begin_scope_change(&db, &caller).await?;
+        }
+        Some(write)
+    } else {
+        None
+    };
+    let routed = live_write
+        .as_ref()
+        .is_some_and(|write| write.live_body().is_some());
     let mut tx = crate::db::enrolled::begin_document_write(&db).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     let structural = args.home_id.is_some();
@@ -13971,6 +15750,68 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
             relationship_link_indexes.insert(index);
         }
     }
+    // Keyed replay, inside this BEGIN IMMEDIATE transaction and after every
+    // authorization check, but before the state checks below (owner,
+    // Collection origin, if_unmodified_since, body guards): those judge the
+    // world the first call already changed. A rehome's destination Edit is
+    // authorization, so it is checked here first rather than after them.
+    if keyed {
+        if let Some(Value::String(new_home)) = &args.home_id {
+            require_record_in(&mut tx, &caller, TOOL, new_home, Capability::Edit).await?;
+        }
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            let request = UpdateReplayRequest {
+                id: &args.id,
+                response_mode,
+                body_op: if args.body_append.is_some() {
+                    Some(("body_append", "body_append"))
+                } else if args.body_replace.is_some() {
+                    Some(("body_replace", "body_replace"))
+                } else if args.body.is_some() {
+                    Some(("body_set", "body"))
+                } else if args.body_set.is_some() {
+                    Some(("body_set", "body_set"))
+                } else {
+                    None
+                },
+                legacy_body_alias: args.body.is_some(),
+                facet_writes: &facet_writes,
+                declared_sources: source_inputs.as_ref().map(Vec::len),
+            };
+            // Enrolled custody refuses a key at admission, so this is SQLite.
+            return Box::pin(replay_update_record(&db, tx, &caller, request, replay)).await;
+        }
+        // The early lookup said "replay" and skipped the live-session gate,
+        // but this authoritative one found none. Writing now would bypass the
+        // gate (no single-writer lock, flush or refusal), so write nothing
+        // and have the caller retry, which takes the gated path. Simpler
+        // than re-entering the gate with the write transaction open, which
+        // the live-session lock order forbids.
+        if may_replay {
+            tx.rollback().await?;
+            return Err(Error::engine(format!(
+                "{TOOL}: could not confirm the earlier command for this idempotency_key; retry shortly"
+            )));
+        }
+        // A0 limit, kept as a backstop. `begin_unrouted_body_write` already
+        // refused a keyed call a live session would take, before flushing
+        // it, and its open gate stops a session opening before this write
+        // commits, so this should not be reachable. It stays so a future
+        // change to that entry cannot turn into a silent keyed routed write.
+        if routed {
+            return Err(Error::engine(KEYED_LIVE_REFUSAL));
+        }
+    }
+    super::policy::assert_write_policy_revision_in(
+        &mut tx,
+        &args.id,
+        args.if_policy_revision.as_deref(),
+        TOOL,
+    )
+    .await?;
     if let Some(Value::String(new_home)) = &args.home_id {
         let origin = sqlx::query(
             "SELECT status,origin_type,collection_id
@@ -14062,7 +15903,15 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         .await?
         .ok_or_else(|| Error::engine(format!("{TOOL}: record {} does not exist", args.id)))?;
         let current_raw: String = row.try_get("updated_at")?;
-        let current = chrono::DateTime::parse_from_rfc3339(&current_raw).map_err(|_| {
+        // A live session's unsaved edits were versioned just before this
+        // transaction (the routed write's own flush), which moved
+        // `updated_at`. The caller's timestamp is judged against what it was
+        // before that, so a correct guard still passes, unless something else
+        // committed after the flush (`guard_updated_at`).
+        let guarded_raw = live_write.as_ref().map_or(current_raw.as_str(), |write| {
+            write.guard_updated_at(&current_raw)
+        });
+        let current = chrono::DateTime::parse_from_rfc3339(guarded_raw).map_err(|_| {
             Error::engine(format!(
                 "{TOOL}: record {} has an invalid stored updated_at timestamp",
                 args.id
@@ -14328,7 +16177,12 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                 args.id
             )));
         }
-        let current_body: Option<String> = row.try_get("body")?;
+        // With a live session, every body computation and digest guard runs
+        // against the live text.
+        let current_body: Option<String> = match live_write.as_ref().and_then(|w| w.live_body()) {
+            Some(live) => Some(live.to_owned()),
+            None => row.try_get("body")?,
+        };
 
         if let Some(expected) = &args.if_body_digest {
             if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -14352,12 +16206,22 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
                 .unwrap_or_default(),
         };
 
-        if whole_body_write_needs_guard(
-            args.body.is_some() || args.body_set.is_some(),
-            current_body.as_deref(),
-            args.if_body_digest.as_deref(),
-            args.if_unmodified_since.as_deref(),
-        ) {
+        // Live: a whole-body write must name the live text it replaces, so a
+        // stale `body_set` cannot silently erase what people just typed.
+        // `body_replace`/`body_append` need no digest.
+        if routed
+            && (args.body.is_some() || args.body_set.is_some())
+            && args.if_body_digest.is_none()
+        {
+            guard_failure = Some((false, target()));
+        } else if !routed
+            && whole_body_write_needs_guard(
+                args.body.is_some() || args.body_set.is_some(),
+                current_body.as_deref(),
+                args.if_body_digest.as_deref(),
+                args.if_unmodified_since.as_deref(),
+            )
+        {
             guard_failure = Some((true, target()));
         } else if let Some(expected) = &args.if_body_digest {
             // A record that has never carried a body stores NULL, which is the
@@ -14452,6 +16316,8 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         target.display_reference = crate::mcp::record_ref::display_reference(&db, &args.id).await?;
         return Err(if missing {
             unguarded_body_write_error(TOOL, &target)
+        } else if routed {
+            live_session_changed_error(TOOL, &target)
         } else {
             stale_body_digest_error(TOOL, &target)
         });
@@ -14461,9 +16327,28 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         assert_home_target_in(&mut tx, TOOL, new_home).await?;
         assert_no_containment_cycle_in(&mut tx, TOOL, &args.id, new_home).await?;
     }
-    // Evaluate HTML and MDX policy over the complete prospective tuple under
-    // the same write transaction. This catches body-only, runtime-only and
-    // kind-changing updates before any event is appended.
+    // A routed write becomes the session's version: the live result of the
+    // diff, plus `contributors[]` (live editors and this caller) and
+    // `session`. Non-body fields ride the same ordinary event.
+    let routed_version = match (live_write.as_mut(), fields.get("body")) {
+        (Some(write), Some(body)) if routed => {
+            let new_body = body.as_str().unwrap_or("").to_owned();
+            write.prepare(&caller, &new_body, &args.reason).await?
+        }
+        _ => None,
+    };
+    if let Some(version) = &routed_version {
+        fields.insert("body".into(), Value::String(version.body.clone()));
+    }
+    let routed_metadata =
+        routed_version
+            .as_ref()
+            .map(|version| crate::coedit::version_metadata::VersionMetadata {
+                contributors: &version.contributors,
+                session_ref: &version.session_ref,
+                merged_offline: false,
+                span_map: Some(&version.span_map),
+            });
     // Evaluate HTML and MDX policy over the complete prospective tuple under
     // the same write transaction. This catches body-only, runtime-only and
     // kind-changing updates before any event is appended.
@@ -14484,7 +16369,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         tool: TOOL,
         record_id: &args.id,
         fields,
-        version_metadata: None,
+        version_metadata: routed_metadata.as_ref(),
         has_kind: args.kind.is_some(),
         has_lifecycle: args.lifecycle.is_some(),
         has_summary: args.summary.is_some(),
@@ -14497,6 +16382,13 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
         before: &before,
     })
     .await?;
+    // A0 limit: artifact-input continuity is computed from the inputs the
+    // write dropped or carried, which a replay cannot see again.
+    if keyed && artifact_input_continuity.is_some() {
+        return Err(Error::engine(format!(
+            "{TOOL}: idempotency_key is not supported for an artifact source change that carries artifact-input continuity; retry without a key"
+        )));
+    }
     // Alias shadows warn on success, silent on unsets and on kinds the
     // governed relationship does not admit. Uses the resulting kind so a
     // kind-changing update judges the record it leaves behind.
@@ -14516,7 +16408,14 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // Capture the version from the same transaction and snapshot.
     let version_seq = current_record_version_in(&mut tx, &args.id).await?;
     crate::db::enrolled::phase(crate::db::enrolled::Phase::AfterAppend).await;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
+    if let Some(write) = live_write {
+        match (routed_version.is_some(), record_event.as_ref()) {
+            (true, Some(event)) => write.finish(&event.id, version_seq).await,
+            _ => write.finish_scope_change(&db).await,
+        }
+    }
 
     // The success response reports the digest of the body it just wrote, so a
     // caller continuing guarded work does not need a second read to obtain the
@@ -14576,17 +16475,19 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // The long task-body nudge moved to the post-commit advisor hook
     // (`crate::mcp::advisors::long_record`, installed by default): it rides
     // `advisories` below, not `warnings` here.
+    // A keyed write is replayable, so it carries nothing derived from live
+    // run history: the undeclared-basis pointer and advisories are omitted
+    // on the first call exactly as on a replay (`replay_update_record`).
     attach_basis_feedback(
         &db,
         &caller,
         &mut updated,
         source_inputs.as_ref().map(Vec::len),
-        false,
+        keyed,
     )
     .await;
-    // The post-commit advisor hook (S1). The singular update has no keyed
-    // replay path, so reaching here means a fresh, successful write; the key
-    // is omitted entirely when no advisor fires, keeping other receipts
+    // The post-commit advisor hook (S1), on fresh unkeyed writes only; the
+    // key is omitted entirely when no advisor fires, keeping other receipts
     // byte-identical. Fail-silent: the hook never errors. The pre-write body
     // length is reused from the write path's own body receipt (same Unicode
     // scalar unit) rather than re-queried; facet-only updates carry no body
@@ -14596,8 +16497,9 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
     // appended nothing. The second half covers what the engine still
     // appends: a content-identical body write changes nothing observable,
     // so advisors stay silent even though the receipt carries an act.
-    let write_changed =
-        act_alloc.get().is_some() && (non_body_changed || body_content_changed.unwrap_or(false));
+    let write_changed = !keyed
+        && act_alloc.get().is_some()
+        && (non_body_changed || body_content_changed.unwrap_or(false));
     if write_changed {
         // The watches gate judges the record left behind, like the alias
         // shadows above: the resulting (effective) kind, with the raw kind
@@ -14641,6 +16543,7 @@ async fn update_record_singular(db: Db, caller: Caller, arguments: Value) -> Res
 struct ClaimUnownedRecordArgs {
     record_id: String,
     reason: String,
+    idempotency_key: Option<String>,
 }
 
 fn claim_unowned_record_ineligible() -> Error {
@@ -14649,6 +16552,8 @@ fn claim_unowned_record_ineligible() -> Error {
 
 async fn claim_unowned_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "claim_unowned_record";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     // Host authority is checked before any target-dependent read, so a hosted
     // non-owner cannot use this exceptional recovery surface as an oracle.
     if !caller.is_host_owner() {
@@ -14663,10 +16568,41 @@ async fn claim_unowned_record(db: Db, caller: Caller, arguments: Value) -> Resul
         ));
     }
     require_nonblank_reason(TOOL, &args.reason)?;
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
 
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.record_id, Capability::View).await?;
+    // Keyed replay: after host-owner and View authorization, before the
+    // eligibility checks that the first claim's own effect (an owner now set)
+    // would fail.
+    if keyed {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            let [event] = replay.content() else {
+                return Err(Error::engine(format!(
+                    "{TOOL}: idempotent receipt is incomplete"
+                )));
+            };
+            let previous_seq = replay.previous_seq_in(&mut tx, &args.record_id).await?;
+            let receipt = echo_act(
+                json!({
+                "id": args.record_id,
+                "owner_id": event.payload["owner_id"],
+                "event_id": event.event_id,
+                "event_seq": event.seq,
+                "previous_seq": previous_seq,
+                }),
+                replay.act(),
+            )?;
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
+    }
 
     let claimant_ids = sqlx::query_scalar::<_, String>(
         "SELECT b.record_id
@@ -14731,6 +16667,7 @@ async fn claim_unowned_record(db: Db, caller: Caller, arguments: Value) -> Resul
         &mut act_alloc,
     )
     .await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     echo_act(
         json!({
@@ -14902,6 +16839,11 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
     // Appended here rather than through `store::delete_record_as` only so the
     // event can carry the reason payload; the event type, guard and projection
     // are identical.
+    //
+    // Single-writer rule: a live session on the record versions its unsaved
+    // edits first and is closed once the deletion has committed.
+    let mut live_write = crate::coedit::live::begin_body_write(&db, &args.id, &caller).await?;
+    live_write.begin_scope_change(&db, &caller).await?;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.id, Capability::Manage).await?;
@@ -14942,6 +16884,7 @@ async fn delete_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
         .await?;
     }
     db.commit_content(tx).await?;
+    live_write.finish_scope_change(&db).await;
     let deleted_at = sqlx::query("SELECT deleted_at FROM records WHERE id = ?")
         .bind(&args.id)
         .fetch_one(db.write_pool())
@@ -14972,13 +16915,18 @@ struct ArchiveRecordArgs {
     /// for the same reason as delete: it is consequential and the reasoning is
     /// hard to recover once the record has dropped out of default queries.
     reason: String,
+    idempotency_key: Option<String>,
 }
 
-async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(super) async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "archive_record";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ArchiveRecordArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
     let want_archived = args.archived.unwrap_or(true);
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
 
     // State check and event share one write transaction, so the no-op answer
     // cannot race the write it declined: an already-archived archive (or an
@@ -14987,6 +16935,36 @@ async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Valu
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     require_record_in(&mut tx, &caller, TOOL, &args.id, Capability::Manage).await?;
+    // Keyed replay: after authorization, before the state checks below. The
+    // first call's own effect would make a retry look like an already-archived
+    // no-op or, for a restore, a deleted record.
+    if keyed {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            // A keyed no-op echoes no `previous_seq`: it pinned no position, so
+            // the live one would differ from the first call's after any later
+            // write. Keyed receipts carry no live fields.
+            let receipt = if replay.is_noop() {
+                json!({"id": args.id, "archived": want_archived, "changed": false})
+            } else {
+                let previous_seq = replay.previous_seq_in(&mut tx, &args.id).await?;
+                echo_act(
+                    json!({
+                    "id": args.id,
+                    "archived": want_archived,
+                    "changed": true,
+                    "previous_seq": previous_seq,
+                    }),
+                    replay.act(),
+                )?
+            };
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
+    }
     let previous_seq = previous_record_seq_in(&mut tx, &args.id).await?;
     let row = sqlx::query(
         "SELECT r.deleted_at,
@@ -15012,6 +16990,12 @@ async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Valu
     }
     let is_archived = row.try_get::<i64, _>("archived")? != 0;
     if is_archived == want_archived {
+        if keyed {
+            // Leave the anchor a retry finds and replays as this same no-op.
+            super::keyed_replay::anchor_noop_in(&mut tx).await?;
+            db.commit_content(tx).await?;
+            return Ok(json!({"id": args.id, "archived": want_archived, "changed": false}));
+        }
         return Ok(json!({
             "id": args.id,
             "archived": want_archived,
@@ -15046,6 +17030,7 @@ async fn archive_record(db: Db, caller: Caller, arguments: Value) -> Result<Valu
         }
     };
     append_in(&db, &mut tx, spec, &mut act_alloc).await?;
+    super::keyed_replay::anchor_noop_in(&mut tx).await?;
     db.commit_content(tx).await?;
     echo_act(
         json!({
@@ -15539,11 +17524,27 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
         (record, names, None)
     };
     let mut out = render_enriched_record_markdown(&record, &names);
+    let speaker = if record.record.record_type == "Message" && !caller.is_member_copy() {
+        let mut conn = db.write_pool().acquire().await?;
+        crate::persona::message_speaker(&mut conn, &args.id).await?
+    } else {
+        None
+    };
+    if let Some(speaker) = &speaker {
+        out.push_str(&format!(
+            "\nSpeaker: {} ({})\n",
+            speaker["display_name"].as_str().unwrap_or("Persona"),
+            speaker["assurance"].as_str().unwrap_or("client_asserted")
+        ));
+    }
 
     if let Some(interpretation) = &interpretation {
         push_interpretation_markdown(&mut out, interpretation)?;
     }
     let mut output = json!({ "id": args.id, "markdown": out });
+    if let Some(speaker) = speaker {
+        output["speaker"] = speaker;
+    }
     if let Some(interpretation) = interpretation {
         output
             .as_object_mut()
@@ -15597,7 +17598,9 @@ fn update_record_input_schema() -> Value {
             },
             "if_body_digest": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
             "if_unmodified_since": { "type": "string", "format": "date-time" },
+            "if_policy_revision": { "type": "string", "minLength": 1, "description": "Opaque policy list revision, checked in the write transaction." },
             "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" },
+            "idempotency_key": super::keyed_replay::idempotency_key_schema(),
             "kind": { "type": "string", "minLength": 1 },
             "home_id": { "type": "string", "description": "Move to a canonical browse home. Only the engine root may have null." },
             "summary": { "type": ["string", "null"] },
@@ -15660,6 +17663,7 @@ fn update_record_input_schema() -> Value {
                 "additionalProperties": true
             },
             "maturity": { "type": ["string", "null"] },
+            "lifecycle": { "type": ["string", "null"] },
             "home_id": { "type": "string" },
             "if_facets": {
                 "type": "object",
@@ -15667,7 +17671,8 @@ fn update_record_input_schema() -> Value {
                 "additionalProperties": true
             },
             "if_maturity": { "type": ["string", "null"] },
-            "if_home_id": { "type": "string" }
+            "if_home_id": { "type": "string" },
+            "idempotency_key": super::keyed_replay::idempotency_key_schema()
         },
         "required": ["ids", "reason"],
         "additionalProperties": false
@@ -15676,6 +17681,7 @@ fn update_record_input_schema() -> Value {
         "anyOf": [
             { "required": ["facets"] },
             { "required": ["maturity"] },
+            { "required": ["lifecycle"] },
             { "required": ["home_id"] }
         ]
     });
@@ -15757,6 +17763,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                 },
                 "target": crate::mcp::tools::citations::target_schema(),
                 "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure retry with the SAME key, never a fresh one. An identical retry returns the record already created; the same key with different content is rejected. No key: every call creates a new record." },
+                "access_policy": { "type": "string", "enum": ["account_only"], "description": "Optional privacy boundary: the single literal account_only installs an explicit caller-account-only Manage policy atomically with creation. Absent inherits the home policy as today." },
                 "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" }
             },
             "required": ["type", "kind", "reason"],
@@ -15766,9 +17773,10 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::GetRecord,
-        "Batch get by full ids or short record references: partial success, visible totals, paged enrichments. \
-         Comments expose comment_count; include_comments pages direct roots from comments_offset \
-         with each exact anchored passage. resolve:false skips saved queries. \
+        "Get full ids or short record references: partial success, visible totals, paged enrichments. \
+         Comments: comment_count; include_comments pages direct roots from comments_offset with exact anchored passage. \
+         Reply via create_record type Annotation, kind comment: exactly one part_of link to root; \
+         omit target/lifecycle/summary. resolve:false skips saved queries. \
          as_of pins content; authorization/schema stay live. Interpretation overflow returns \
          unavailable without count. Only this read returns body_digest: SHA-256 of stored body \
          (empty/null -> sha256(\"\")); use update_record.if_body_digest for safe whole-body replacement.",
@@ -15864,9 +17872,13 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
     )?;
     registry.register(
         ToolKind::UpdateRecord,
-        "Summary default; verbose full. body_set replaces (write finished documents once), body_append small additions only, body_replace edits spans. Guard: if_body_digest. Batch 1–100 ids; skips no-ops. facets=current; observations=evidence. Use manage_relationships.assert; assigned_to: WorkItem/task -> Entity/person. Resolve comments: lifecycle:\"resolved\", nonblank summary (open -> resolved). Tombstones reject. previous_seq -> get_record as_of.content_seq; compensation: record fields only, non-destructive and not atomic; do not create a v2 copy. Declare sources; [] means none.",
+        "Summary default; verbose full. body_set replaces (write finished documents once), body_append small additions only, body_replace edits spans. Guard: if_body_digest; singular if_policy_revision fences audience changes. Batch 1–100 ids; skips no-ops. facets=current; observations=evidence. Use manage_relationships.assert; assigned_to: WorkItem/task -> Entity/person. Resolve comments: lifecycle:\"resolved\", nonblank summary (open -> resolved). Tombstones reject. previous_seq/previous_event_id -> get_record as_of.content_seq/as_of.event_id; compensation: record fields only, non-destructive and not atomic; do not create a v2 copy. Declare sources; [] means none.",
         update_record_input_schema(),
-        update_record,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(update_record(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     registry.register(
         ToolKind::ClaimUnownedRecord,
@@ -15879,12 +17891,17 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
                     "description": "Exact full canonical lowercase UUIDv4 or UUIDv7; abbreviations are deliberately not resolved on this high-risk surface."
                 },
-                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["record_id", "reason"],
             "additionalProperties": false
         })),
-        claim_unowned_record,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(claim_unowned_record(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     registry.register(
         ToolKind::CorrectRecordType,
@@ -15925,18 +17942,23 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         &format!("Archive (archived: true, the default) or restore (archived: false) a \
          record via the engine-reserved archived facet. Archived records drop \
          out of default queries but stay mutable; lifecycle is preserved \
-         across the round trip. {PREVIOUS_SEQ_DESCRIPTION}"),
+         across the round trip. {PREVIOUS_SEQ_DESCRIPTION} Absent on a keyed no-op replay."),
         crate::mcp::record_ref::with_record_selector_aliases("archive_record", json!({
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
                 "archived": { "type": "boolean", "description": "true archives (default), false restores." },
-                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION }
+                "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["id", "reason"],
             "additionalProperties": false
         })),
-        archive_record,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(archive_record(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     registry.register(
         ToolKind::RenderRecord,
@@ -16165,7 +18187,7 @@ mod create_idempotency_tests {
     async fn historical_admission_accepts_release_after_former_cutoff() {
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
         let occupied = permits.clone().acquire_many_owned(2).await.unwrap();
-        let deadline = tokio::time::Instant::now() + ATTESTED_REBUILD_EXECUTION;
+        let deadline = tokio::time::Instant::now() + KEYED_REPLAY_DEADLINE;
         let queued = permits.clone();
         let admission =
             tokio::spawn(async move { admit_attested_rebuild(&queued, deadline).await });
@@ -16186,12 +18208,12 @@ mod create_idempotency_tests {
     async fn historical_admission_fails_closed_at_shared_deadline() {
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
         let occupied = permits.clone().acquire_many_owned(2).await.unwrap();
-        let deadline = tokio::time::Instant::now() + ATTESTED_REBUILD_EXECUTION;
+        let deadline = tokio::time::Instant::now() + KEYED_REPLAY_DEADLINE;
         let queued = permits.clone();
         let admission =
             tokio::spawn(async move { admit_attested_rebuild(&queued, deadline).await });
         tokio::task::yield_now().await;
-        tokio::time::advance(ATTESTED_REBUILD_EXECUTION).await;
+        tokio::time::advance(KEYED_REPLAY_DEADLINE).await;
         let error = admission.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("admission exhausted"), "{error}");
         assert_eq!(permits.available_permits(), 0);
@@ -16210,7 +18232,7 @@ mod create_idempotency_tests {
     async fn historical_admission_cancellation_removes_waiter_without_leaking() {
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
         let occupied = permits.clone().acquire_many_owned(2).await.unwrap();
-        let deadline = tokio::time::Instant::now() + ATTESTED_REBUILD_EXECUTION;
+        let deadline = tokio::time::Instant::now() + KEYED_REPLAY_DEADLINE;
         let queued = permits.clone();
         let admission =
             tokio::spawn(async move { admit_attested_rebuild(&queued, deadline).await });
@@ -16230,7 +18252,7 @@ mod create_idempotency_tests {
     async fn historical_admission_wait_consumes_execution_budget() {
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
         let occupied = permits.clone().acquire_many_owned(2).await.unwrap();
-        let deadline = tokio::time::Instant::now() + ATTESTED_REBUILD_EXECUTION;
+        let deadline = tokio::time::Instant::now() + KEYED_REPLAY_DEADLINE;
         let queued = permits.clone();
         let reached = Arc::new(tokio::sync::Notify::new());
         let started = reached.clone();
@@ -16244,11 +18266,12 @@ mod create_idempotency_tests {
             .await
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(9)).await;
+        let last_second = std::time::Duration::from_secs(1);
+        tokio::time::advance(KEYED_REPLAY_DEADLINE - last_second).await;
         drop(occupied);
         reached.notified().await;
         assert_eq!(permits.available_permits(), 1);
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(last_second).await;
         let error = replay.await.unwrap().unwrap_err().to_string();
         assert!(error.contains("deadline exceeded"), "{error}");
         assert_eq!(tokio::time::Instant::now(), deadline);
@@ -16258,7 +18281,7 @@ mod create_idempotency_tests {
     #[tokio::test(start_paused = true)]
     async fn historical_deadline_rejects_ready_result_at_expiry() {
         let permits = Arc::new(tokio::sync::Semaphore::new(2));
-        let deadline = tokio::time::Instant::now() + ATTESTED_REBUILD_EXECUTION;
+        let deadline = tokio::time::Instant::now() + KEYED_REPLAY_DEADLINE;
         let (release, wait) = tokio::sync::oneshot::channel();
         let mut replay = Box::pin(with_attested_rebuild_deadline(
             &permits,
@@ -16277,7 +18300,7 @@ mod create_idempotency_tests {
         assert_eq!(permits.available_permits(), 1);
         // Make the work ready, but only poll it after expiry. Tokio polls
         // work before its timer, so the explicit completion check is needed.
-        tokio::time::advance(ATTESTED_REBUILD_EXECUTION).await;
+        tokio::time::advance(KEYED_REPLAY_DEADLINE).await;
         release.send(()).unwrap();
         let error = replay.await.unwrap_err().to_string();
         assert!(error.contains("deadline exceeded"), "{error}");
@@ -16363,7 +18386,7 @@ mod create_idempotency_tests {
         (db, registry)
     }
 
-    async fn attested(db: &Db, receipt: &Value) -> AttestedCreate {
+    async fn attested(db: &Db, receipt: &Value) -> AttestedWrite {
         let mut tx = db.write_pool().begin().await.unwrap();
         let result = attested_create_horizons_in(
             &mut tx,
@@ -16477,7 +18500,11 @@ mod create_idempotency_tests {
         .await
         .unwrap_err()
         .to_string();
-        assert!(error.contains("admission exhausted"), "{error}");
+        // The row-count probe runs before admission (slice C0, R2): this log is
+        // over the cap, so the rebuild refuses on budget without waiting for a
+        // permit it could never use. Admission exhaustion on a log within the
+        // cap is covered by the capacity-class tests in `keyed_replay_bound_tests`.
+        assert!(error.contains("budget exceeded"), "{error}");
         // Same pinned receipt's compact path has no dependency on admission.
         let mut tx = db.write_pool().begin().await.unwrap();
         let compact = compact_attested_create_in(&mut tx, &Caller::local(), &pin, None)
@@ -16500,7 +18527,7 @@ mod create_idempotency_tests {
             &pin,
             None,
             &permits,
-            ATTESTED_REBUILD_EXECUTION,
+            KEYED_REPLAY_DEADLINE,
         )
         .await
         .unwrap_err()
@@ -16703,6 +18730,7 @@ mod create_idempotency_tests {
         let permits = Arc::new(tokio::sync::Semaphore::new(1));
         let pause = Arc::new(AttestedReplayPause {
             reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
             scratch: std::sync::Mutex::new(None),
             projected: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -16798,7 +18826,7 @@ mod create_idempotency_tests {
             &pin,
             None,
             &permits,
-            ATTESTED_REBUILD_EXECUTION,
+            KEYED_REPLAY_DEADLINE,
         )
         .await
         .unwrap();
@@ -17586,6 +19614,7 @@ mod comment_kernel_tests {
                     input: "text".into(),
                     max_bytes: 500,
                 },
+                anchor: None,
             }),
             react: None,
             title: None,
@@ -18049,7 +20078,17 @@ mod comment_kernel_tests {
         package: &str,
         initial: Option<&str>,
     ) -> KernelFixture {
-        let source = body_kernel_source();
+        body_kernel_fixture_with_source(declaration, package, initial, body_kernel_source()).await
+    }
+
+    /// As [`body_kernel_fixture`] with an explicit bundle. A bundle over the
+    /// ordinary HTML limit is created with the package marker facet.
+    async fn body_kernel_fixture_with_source(
+        declaration: Value,
+        package: &str,
+        initial: Option<&str>,
+        source: String,
+    ) -> KernelFixture {
         let adopt = true;
         configure_preview_launch();
         let db = crate::create_database(":memory:").await.unwrap();
@@ -18124,9 +20163,14 @@ mod comment_kernel_tests {
                 args.as_object_mut()
                     .unwrap()
                     .insert("body".into(), json!(&source));
-                args.as_object_mut()
-                    .unwrap()
-                    .insert("facets".into(), json!({ "runtime": "native.html.v1" }));
+                args.as_object_mut().unwrap().insert("facets".into(), {
+                    let mut facets = json!({ "runtime": "native.html.v1" });
+                    if source.len() > crate::artifact_html::BODY_LIMIT {
+                        facets[crate::artifact_html::PACKAGE_FACET_KEY] =
+                            json!(crate::artifact_html::PACKAGE_FACET_VALUE);
+                    }
+                    facets
+                });
             }
             if id == KERNEL_COLLECTION {
                 args.as_object_mut()
@@ -18460,6 +20504,225 @@ mod comment_kernel_tests {
         }
     }
 
+    /// Rebinds the fixture's port to the production Docs `pages` shape — a
+    /// saved query over every Document, archived included, with explicit
+    /// `all_matching` membership — and files `extra` more Documents beside
+    /// the target, so the bound collection holds `extra + 1` members.
+    async fn body_large_pages_collection(f: &KernelFixture, extra: usize) {
+        let local = crate::mcp::Caller::local();
+        let query = json!({"v": "0.2", "query": {
+            "steps": [{"step": "filter", "types": ["Document"], "include_archived": true}],
+            "order": "name_asc",
+        }});
+        f.registry
+            .call(
+                f.db.clone(),
+                local.clone(),
+                "update_record",
+                json!({
+                    "id": KERNEL_QUERY,
+                    "facets": {"query": query.to_string(), "input_membership": "all_matching"},
+                    "reason": "Bind the port the way Docs binds pages.",
+                }),
+            )
+            .await
+            .unwrap();
+        for i in 0..extra {
+            f.registry
+                .call(
+                    f.db.clone(),
+                    local.clone(),
+                    "create_record",
+                    json!({
+                        "type": "Document", "kind": "note", "name": format!("bulk-{i:05}"),
+                        "home_id": KERNEL_COLLECTION, "reason": "Large pages collection.",
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Body Save asks the bound collection about the target alone (task
+    /// 0062a90). Through the real kernel path, a target inside a
+    /// Docs-shaped `all_matching` query binding commits, and a Document the
+    /// caller can edit but which the binding excludes is refused before any
+    /// write.
+    #[tokio::test]
+    async fn body_save_admits_only_targets_inside_the_bound_query() {
+        const OUTSIDE_DOC: &str = "e0000000-0000-4000-8000-0000000000b1";
+        let f = body_kernel_fixture(body_kernel_declaration(), "agent.body-membership", None).await;
+        let local = crate::mcp::Caller::local();
+        let query = json!({"v": "0.2", "query": {
+            "steps": [{"step": "filter", "types": ["Document"], "home_id": KERNEL_COLLECTION}],
+            "order": "name_asc",
+        }});
+        f.registry
+            .call(
+                f.db.clone(),
+                local.clone(),
+                "update_record",
+                json!({
+                    "id": KERNEL_QUERY,
+                    "facets": {"query": query.to_string(), "input_membership": "all_matching"},
+                    "reason": "Bind the port to every Document in the fixture folder.",
+                }),
+            )
+            .await
+            .unwrap();
+        f.registry
+            .call(
+                f.db.clone(),
+                local,
+                "create_record",
+                json!({"id": OUTSIDE_DOC, "type": "Document", "kind": "note",
+                    "name": "outside the binding", "reason": "Membership fixture."}),
+            )
+            .await
+            .unwrap();
+        crate::authorization::replace_explicit_policy(
+            &f.db,
+            "test:body-outside",
+            OUTSIDE_DOC,
+            vec![
+                AllowEntry::account(KERNEL_ACCOUNT, Capability::View),
+                AllowEntry::account(KERNEL_ACCOUNT, Capability::Edit),
+            ],
+        )
+        .await
+        .unwrap();
+        let caller = Caller::authenticated(KERNEL_ACCOUNT);
+        body_receipt(
+            save_body_from_artifact(
+                &f.db,
+                &caller,
+                body_plan(&f, "inside", None, "membership:inside"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body_durable_state(&f.db).await.3.as_deref(), Some("inside"));
+        let mut outside = body_plan(&f, "outside", None, "membership:outside");
+        outside
+            .invocation
+            .slots
+            .insert("page".into(), OUTSIDE_DOC.into());
+        let before = body_durable_state(&f.db).await;
+        match save_body_from_artifact(&f.db, &caller, outside).await {
+            Ok(ArtifactBodyOutcome::Refused { code, .. }) => {
+                assert_eq!(code, "record_outside_binding")
+            }
+            other => panic!("expected record_outside_binding: {other:?}"),
+        }
+        assert_eq!(body_durable_state(&f.db).await, before);
+    }
+
+    /// Timing evidence for task 0062a90, not a CI gate: wall-clock numbers
+    /// vary by host, so nothing here asserts a duration. Run with
+    /// `cargo test --lib body_save_membership_cost -- --ignored --nocapture`
+    /// and compare the printed per-save cost across collection sizes.
+    #[tokio::test]
+    #[ignore = "timing bench; run explicitly with --ignored --nocapture"]
+    async fn body_save_membership_cost_by_collection_size() {
+        for extra in [0_usize, 1_000, 5_000] {
+            let f = body_kernel_fixture(body_kernel_declaration(), "agent.body-bench", None).await;
+            body_large_pages_collection(&f, extra).await;
+            let probe = body_plan(&f, "", None, "bench:probe").invocation;
+            let caller =
+                body_audit_caller(&probe, crate::awareness::EffectGestureKind::Click, false);
+            let scope = vec![(
+                "orders".to_string(),
+                KERNEL_QUERY.to_string(),
+                "query".to_string(),
+            )];
+            let mut check = Vec::new();
+            for _ in 0..3 {
+                let mut tx = crate::db::begin_write(f.db.write_pool()).await.unwrap();
+                let started = std::time::Instant::now();
+                let refused = crate::mcp::tools::alpha_tabs::check_body_binding_in(
+                    &mut tx,
+                    &caller,
+                    KERNEL_ARTIFACT,
+                    &f.guard.source_revision,
+                    &f.body_digest,
+                    &scope,
+                    KERNEL_BEARER,
+                )
+                .await
+                .unwrap();
+                check.push(started.elapsed());
+                assert_eq!(refused, None, "the target is inside the bound collection");
+                tx.rollback().await.unwrap();
+            }
+            let mut saves = Vec::new();
+            let mut previous: Option<String> = None;
+            for round in 0..3 {
+                let body = format!("bench body {round}");
+                let invocation = body_plan(
+                    &f,
+                    &body,
+                    previous.as_deref(),
+                    &format!("bench:save:{round}"),
+                )
+                .invocation;
+                let caller = body_audit_caller(
+                    &invocation,
+                    crate::awareness::EffectGestureKind::Click,
+                    false,
+                );
+                let started = std::time::Instant::now();
+                let receipt = public_body_call(&f, caller, invocation).await.unwrap();
+                saves.push(started.elapsed());
+                assert_eq!(receipt["status"], "committed", "{receipt:#}");
+                previous = Some(body);
+            }
+            let median = |mut samples: Vec<std::time::Duration>| {
+                samples.sort();
+                samples[samples.len() / 2]
+            };
+            println!(
+                "body-save bench: {} bound documents: check_body_binding_in median {:?}, full public save median {:?}",
+                extra + 1,
+                median(check),
+                median(saves),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn body_public_save_and_undo_work_for_a_package_bundle_over_the_ordinary_limit() {
+        // A v1 package bundle over 512 KiB (marker facet): the pinned entry
+        // and the interaction path re-validate it at the package limit.
+        let source = body_kernel_source().replacen(
+            "</main>",
+            &format!("<!--{}--></main>", "x".repeat(600_000)),
+            1,
+        );
+        assert!(source.len() > crate::artifact_html::BODY_LIMIT);
+        let f = body_kernel_fixture_with_source(
+            body_kernel_declaration(),
+            "agent.body-package",
+            Some("base"),
+            source,
+        )
+        .await;
+        let invocation = body_plan(&f, "next", Some("base"), "package:save").invocation;
+        let caller = body_audit_caller(
+            &invocation,
+            crate::awareness::EffectGestureKind::Click,
+            false,
+        );
+        let receipt = public_body_call(&f, caller, invocation).await.unwrap();
+        assert_eq!(receipt["status"], "committed", "{receipt:#}");
+        assert_eq!(body_durable_state(&f.db).await.3.as_deref(), Some("next"));
+        let undo = body_undo(&f, "package:save", "package:undo");
+        let undo_caller =
+            body_audit_caller(&undo, crate::awareness::EffectGestureKind::Click, true);
+        let inverse = public_body_call(&f, undo_caller, undo).await.unwrap();
+        assert_eq!(inverse["status"], "committed", "{inverse:#}");
+        assert_eq!(body_durable_state(&f.db).await.3.as_deref(), Some("base"));
+    }
+
     #[tokio::test]
     async fn body_public_stale_malformed_oversize_foreign_and_revoked_zero_write() {
         let f = body_kernel_fixture(
@@ -18604,6 +20867,72 @@ mod comment_kernel_tests {
                 "enrolled storage supports only singular Document body updates; mutation not admitted");
             assert_eq!(body_durable_state(&enrolled).await, before);
         }
+    }
+
+    /// Single-writer rule: an app body Save and its Undo on a record with a
+    /// live session are flushed-and-absorbed: they commit through their own
+    /// preconditions, then arrive in the live doc as a server diff with the
+    /// write's event as the version.
+    #[tokio::test]
+    async fn body_kernel_save_and_undo_route_into_a_live_session() {
+        use crate::coedit::live::{self, OpenRequest, SessionEvent};
+        use yrs::updates::decoder::Decode;
+        use yrs::{GetString, Transact};
+        let f =
+            body_kernel_fixture(body_kernel_declaration(), "agent.body-live", Some("base")).await;
+        let caller = Caller::authenticated(KERNEL_ACCOUNT);
+        let (peer, _) = live::open(
+            &f.db,
+            &caller,
+            OpenRequest {
+                record_id: KERNEL_BEARER.into(),
+                mode: crate::coedit::PeerKind::Edit,
+                resume_peer: None,
+            },
+        )
+        .await
+        .unwrap();
+        let mut rx = peer.subscribe();
+        let live_text = |sync: Vec<u8>| {
+            let mut options = yrs::Options::with_client_id(yrs::ClientID::new(1));
+            options.offset_kind = yrs::OffsetKind::Bytes;
+            let doc = yrs::Doc::with_options(options);
+            let text = doc.get_or_insert_text("body");
+            doc.transact_mut()
+                .apply_update(yrs::Update::decode_v1(&sync).unwrap())
+                .unwrap();
+            let txn = doc.transact();
+            text.get_string(&txn)
+        };
+        let reasons = |rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>| {
+            let mut out = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let SessionEvent::Versioned(v) = event {
+                    out.push(v.reason);
+                }
+            }
+            out
+        };
+        body_receipt(
+            save_body_from_artifact(
+                &f.db,
+                &caller,
+                body_plan(&f, "next", Some("base"), "live:save"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(live_text(peer.sync(&[]).await.unwrap()), "next");
+        assert_eq!(reasons(&mut rx), vec!["explicit artifact body save"]);
+        body_receipt(
+            undo_body_from_artifact(&f.db, &caller, &body_undo(&f, "live:save", "live:undo"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(live_text(peer.sync(&[]).await.unwrap()), "base");
+        assert_eq!(reasons(&mut rx), vec!["explicit artifact body undo"]);
+        assert_eq!(body_durable_state(&f.db).await.3.as_deref(), Some("base"));
+        peer.leave().await;
     }
 
     #[tokio::test]
@@ -19876,6 +22205,7 @@ mod comment_kernel_tests {
             target_id: target.to_string(),
             position: position.to_string(),
             body: body.to_string(),
+            anchor: None,
             manifest_max_bytes: 500,
             scope_port: "orders".to_string(),
             scope_collection_id: KERNEL_QUERY.to_string(),
@@ -19977,6 +22307,266 @@ mod comment_kernel_tests {
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0]["id"], comment_id);
         assert_eq!(comments[0]["body"], "hello thread");
+    }
+
+    /// Give the fixture bearer a body to anchor on, as an ordinary write.
+    async fn anchored_bearer(installed: &KernelFixture, body: &str) {
+        installed
+            .registry
+            .call(
+                installed.db.clone(),
+                crate::mcp::Caller::local(),
+                "update_record",
+                json!({ "id": KERNEL_BEARER, "body_set": body, "reason": "Anchor fixture body." }),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn anchored_entry() -> InteractionEntry {
+        let mut entry = kernel_entry("post", CommentPosition::Root);
+        entry.comment.as_mut().unwrap().anchor =
+            Some(native_artifact_runtime::mdx_v2::CommentAnchorDecl {
+                input: "target".into(),
+            });
+        entry
+    }
+
+    fn passage_anchor(exact: &str, start: usize, end: usize) -> Value {
+        crate::mcp::tools::artifact_interactions::comment_anchor_value(&json!({
+            "source_slot": "body",
+            "selectors": [{ "type": "text_quote", "exact": exact }, { "type": "data_position", "start": start, "end": end }],
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn comment_root_anchors_to_a_passage_of_its_bearer() {
+        let mut declaration = kernel_declaration(json!(["root"]));
+        declaration["effects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("comment.passage-anchor.v1"));
+        let installed = kernel_fixture(declaration, "agent.comment-anchor-a", true).await;
+        anchored_bearer(
+            &installed,
+            "Folders expand lazily.\n\nFolders expand lazily, again.",
+        )
+        .await;
+        let caller = Caller::authenticated(KERNEL_ACCOUNT);
+        let token = comment_token_for(
+            &installed.db,
+            KERNEL_BEARER,
+            &installed.guard,
+            &installed.body_digest,
+        )
+        .await;
+        let mut plan = comment_plan(
+            &installed,
+            anchored_entry(),
+            KERNEL_BEARER,
+            "root",
+            "Agreed?",
+            Some(token),
+            "kernel:anchor:one",
+        );
+        // The repeated phrase: data_position names the second occurrence.
+        plan.anchor = Some(passage_anchor("expand lazily", 32, 45));
+        let outcome =
+            create_comment_from_artifact(installed.db.clone(), caller.clone(), plan.clone())
+                .await
+                .unwrap();
+        let ArtifactCommentOutcome::Created(receipt) = outcome else {
+            panic!("anchored root must post: {outcome:?}")
+        };
+        let comment_id = receipt["comment_id"].as_str().unwrap().to_string();
+        let (target, selectors): (String, String) = sqlx::query_as(
+            "SELECT target_record_id, selectors FROM annotation_targets WHERE annotation_id=?",
+        )
+        .bind(&comment_id)
+        .fetch_one(installed.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            target, KERNEL_BEARER,
+            "the anchor always targets the comment's bearer"
+        );
+        let selectors: Value = serde_json::from_str(&selectors).unwrap();
+        assert!(
+            selectors
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["type"] == "data_position" && s["start"] == 32),
+            "{selectors}"
+        );
+        // The ordinary read reports it as a current passage target.
+        let read = installed
+            .registry
+            .call(
+                installed.db.clone(),
+                caller.clone(),
+                "get_record",
+                json!({ "ids": [KERNEL_BEARER], "include_comments": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read["records"][0]["comments"][0]["target"]["validation"]["status"], "current",
+            "{read:#}"
+        );
+        // Same command replays; a different anchor under the same key is a different command.
+        let replay =
+            create_comment_from_artifact(installed.db.clone(), caller.clone(), plan.clone())
+                .await
+                .unwrap();
+        assert!(
+            matches!(replay, ArtifactCommentOutcome::Replayed(_)),
+            "{replay:?}"
+        );
+        let mut moved = plan;
+        moved.anchor = Some(passage_anchor("expand lazily", 8, 21));
+        let changed = create_comment_from_artifact(installed.db.clone(), caller, moved)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                changed,
+                ArtifactCommentOutcome::Created(_) | ArtifactCommentOutcome::Replayed(_)
+            ),
+            "{changed:?}"
+        );
+        assert_eq!(comment_count(&installed.db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn anchored_comment_replay_refuses_once_anchor_consent_is_dropped() {
+        let mut declaration = kernel_declaration(json!(["root"]));
+        declaration["effects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("comment.passage-anchor.v1"));
+        let installed = kernel_fixture(declaration, "agent.comment-anchor-d", true).await;
+        anchored_bearer(&installed, "Folders expand lazily.").await;
+        let caller = Caller::authenticated(KERNEL_ACCOUNT);
+        let token = comment_token_for(
+            &installed.db,
+            KERNEL_BEARER,
+            &installed.guard,
+            &installed.body_digest,
+        )
+        .await;
+        let mut plan = comment_plan(
+            &installed,
+            anchored_entry(),
+            KERNEL_BEARER,
+            "root",
+            "Agreed?",
+            Some(token),
+            "kernel:anchor:replay-after-drop",
+        );
+        plan.anchor = Some(passage_anchor("expand lazily", 8, 21));
+        let first =
+            create_comment_from_artifact(installed.db.clone(), caller.clone(), plan.clone())
+                .await
+                .unwrap();
+        assert!(
+            matches!(first, ArtifactCommentOutcome::Created(_)),
+            "{first:?}"
+        );
+        // The stored consent loses the passage-anchor string; every pin is unchanged.
+        let consent = kernel_declaration(json!(["root"])).to_string();
+        sqlx::query("UPDATE alpha_tab_installs SET consented_declaration = ? WHERE package = ?")
+            .bind(&consent)
+            .bind("agent.comment-anchor-d")
+            .execute(installed.db.write_pool())
+            .await
+            .unwrap();
+        let replay = create_comment_from_artifact(installed.db.clone(), caller, plan)
+            .await
+            .unwrap();
+        assert!(
+            matches!(replay, ArtifactCommentOutcome::Refused { .. }),
+            "a dropped consent refuses before replay: {replay:?}"
+        );
+        assert_eq!(comment_count(&installed.db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn comment_anchor_needs_its_own_consent_and_must_hold_against_the_body() {
+        // The declaration consents to comments but not to passage anchors.
+        let installed = kernel_fixture(
+            kernel_declaration(json!(["root"])),
+            "agent.comment-anchor-b",
+            true,
+        )
+        .await;
+        anchored_bearer(&installed, "Folders expand lazily.").await;
+        let caller = Caller::authenticated(KERNEL_ACCOUNT);
+        let token = comment_token_for(
+            &installed.db,
+            KERNEL_BEARER,
+            &installed.guard,
+            &installed.body_digest,
+        )
+        .await;
+        let mut plan = comment_plan(
+            &installed,
+            anchored_entry(),
+            KERNEL_BEARER,
+            "root",
+            "Hm",
+            Some(token.clone()),
+            "kernel:anchor:unconsented",
+        );
+        plan.anchor = Some(passage_anchor("expand lazily", 8, 21));
+        let outcome = create_comment_from_artifact(installed.db.clone(), caller.clone(), plan)
+            .await
+            .unwrap();
+        let ArtifactCommentOutcome::Refused { code, message } = outcome else {
+            panic!("unconsented anchor must refuse: {outcome:?}")
+        };
+        assert_eq!(code, "alpha_guard_effect_unconsented", "{message}");
+        assert!(message.contains("comment.passage-anchor.v1"), "{message}");
+        assert_eq!(comment_count(&installed.db).await, 0);
+
+        let mut declaration = kernel_declaration(json!(["root"]));
+        declaration["effects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("comment.passage-anchor.v1"));
+        let installed = kernel_fixture(declaration, "agent.comment-anchor-c", true).await;
+        anchored_bearer(&installed, "Folders expand lazily.").await;
+        let token = comment_token_for(
+            &installed.db,
+            KERNEL_BEARER,
+            &installed.guard,
+            &installed.body_digest,
+        )
+        .await;
+        for (key, exact, start, end) in [
+            ("kernel:anchor:absent", "load eagerly", 8, 20),
+            ("kernel:anchor:disagrees", "expand lazily", 0, 13),
+        ] {
+            let mut plan = comment_plan(
+                &installed,
+                anchored_entry(),
+                KERNEL_BEARER,
+                "root",
+                "Hm",
+                Some(token.clone()),
+                key,
+            );
+            plan.anchor = Some(passage_anchor(exact, start, end));
+            let outcome = create_comment_from_artifact(installed.db.clone(), caller.clone(), plan)
+                .await
+                .unwrap();
+            let ArtifactCommentOutcome::Refused { code, .. } = outcome else {
+                panic!("{key}: a stale anchor must refuse, not post: {outcome:?}")
+            };
+            assert_eq!(code, "comment_anchor_invalid", "{key}");
+        }
+        assert_eq!(comment_count(&installed.db).await, 0);
     }
 
     #[tokio::test]
@@ -22189,6 +24779,9 @@ mod session_version_roundtrip_tests {
         AcknowledgedContributor {
             principal: principal.into(),
             executor_kind: executor_kind.into(),
+            run_key: None,
+            app: None,
+            channel: None,
         }
     }
 
@@ -22197,6 +24790,7 @@ mod session_version_roundtrip_tests {
             contributors: snapshot.contributors(),
             session_ref: &snapshot.session_id().0,
             merged_offline: false,
+            span_map: Some(snapshot.span_map()),
         }
     }
 
@@ -22433,6 +25027,7 @@ mod session_version_roundtrip_tests {
             contributors: snapshot.contributors(),
             session_ref: "",
             merged_offline: false,
+            span_map: None,
         };
         let error = prepare_cut(&fixture, &fixture.caller, &snapshot, &invalid)
             .await

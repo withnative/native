@@ -10,4 +10,4 @@ Every content record has one canonical browse home in the containment tree. `nat
 
 Containment is not inferred from links. Links express associations and dependencies; `home_id` expresses canonical placement. Moving a record means updating `home_id`, subject to the same target and cycle guards. A record has one home but may have many links.
 
-Use `get_structure` for a bounded tree outline, `get_record` for ancestors and a window of children, and `query_record` with `home_id` or `ancestor_id` when the result must be filtered, ordered, counted, or paged.
+Use `get_structure` for a bounded tree outline, `get_record` for ancestors and a window of children, and `query_record` with `home_id` or `ancestor_id` when the result must be filtered, ordered, counted, or paged. On a lean MCP surface these `records_read` operations are reached through `call_executor`, for example `call_executor` with `{"executor":"records_read","operation":"get_record","arguments":{"ids":[reference]}}`; `sql_read` `query_sql` over `records.home_id` answers simple placement questions directly.

@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **86 registered tools / 226 operations**.
-- **13 ordinary, 86 high-risk, and 127 specialized operations**.
-- **97 read-only and 129 mutating operations**.
-- **221 operations carry a non-disclosure obligation**.
-- All **129 mutating operations** carry an explicit no-write-on-deny obligation
+- **88 registered tools / 236 operations**.
+- **13 ordinary, 87 high-risk, and 136 specialized operations**.
+- **101 read-only and 135 mutating operations**.
+- **231 operations carry a non-disclosure obligation**.
+- All **135 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and
@@ -79,3 +79,10 @@ property-generated policy trees. Those remain separate proof obligations.
 
 Alpha-tab update retains the shared numeric X.Y.Z version format and imposes
 no version ordering; equal versions and rollback are allowed.
+
+Alpha-tab `prepare_install` requires View on the live artifact and reads current
+install state only for the authenticated caller account. Its positive and
+negative evidence is `prepare_install_authorization_requires_view_and_scopes_install_to_caller`
+in `tests/tools/alpha_tabs_prepare_install.rs`: it proves non-disclosing refusal
+without View and independent current-install pins for two accounts sharing a
+package. Preparation is read-only and grants no installation or adoption.

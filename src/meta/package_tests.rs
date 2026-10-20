@@ -30,6 +30,7 @@ fn entry(family: &str, kinds: &str) -> DefinitionEntry {
 
 fn manifest(namespace: &str, name: &str, entries: Vec<DefinitionEntry>) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: namespace.to_string(),
         name: name.to_string(),
         version: 1,

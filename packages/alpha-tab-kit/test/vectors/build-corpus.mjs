@@ -20,6 +20,7 @@ const sql = [
   { name: "optional param and timestamp", sql: "SELECT id FROM records WHERE (?1 IS NULL OR kind = ?1) AND last_activity_at_ms >= ?2 ORDER BY id LIMIT 5", params: [text("kind", { required: false }), { name: "since", type: "timestamp_ms" }], admitted: true },
   { name: "like with a param", sql: "SELECT id FROM records WHERE name LIKE ?1 ORDER BY id LIMIT 5", params: [text("pattern")], admitted: true },
   { name: "now_ms()", sql: "SELECT id FROM records WHERE last_activity_at_ms > now_ms() - 86400000 ORDER BY id LIMIT 5", admitted: true },
+  { name: "current_principal()", sql: "SELECT record_id FROM content_events WHERE actor = current_principal() ORDER BY record_id LIMIT 5", admitted: true },
   { name: "compound with trailing order", sql: "SELECT id FROM records WHERE kind = 'task' UNION SELECT id FROM records WHERE kind = 'epic' ORDER BY 1 LIMIT 10", admitted: true },
   // Refused.
   { name: "limit without order", sql: "SELECT id FROM records LIMIT 5", admitted: false, rule: "sql.limit-order" },
@@ -57,6 +58,17 @@ const eight = Array.from({ length: 8 }, (_, i) => need(`kit.n${i}`, ok));
 const params = (n) => Array.from({ length: n }, (_, i) => ({ name: `p${i}`, type: "integer" }));
 const paramSql = (n) => `SELECT id FROM records WHERE ${Array.from({ length: n }, (_, i) => `last_activity_at_ms > ?${i + 1}`).join(" AND ")} ORDER BY id LIMIT 1`;
 const declaration = [
+  // App contract v2: the optional `contract` key. Only native.app.v2 is
+  // admitted, and only with nothing else declared (one Adopt is the consent).
+  { name: "app v2 marker, nothing declared", declaration: { contract: "native.app.v2", needs: [], effects: [] }, admitted: true },
+  { name: "unknown contract value", declaration: { contract: "native.app.v3", needs: [], effects: [] }, admitted: false },
+  { name: "contract value in the wrong case", declaration: { contract: "NATIVE.APP.V2", needs: [], effects: [] }, admitted: false },
+  { name: "contract not a string", declaration: { contract: 2, needs: [], effects: [] }, admitted: false },
+  { name: "contract null", declaration: { contract: null, needs: [], effects: [] }, admitted: false },
+  { name: "app v2 marker with a need", declaration: { contract: "native.app.v2", needs: ["attention.query.v1"], effects: [] }, admitted: false },
+  { name: "app v2 marker with an effect", declaration: { contract: "native.app.v2", needs: [], effects: ["task.triage-set.v1"] }, admitted: false },
+  { name: "app v2 marker with an empty sessions array", declaration: { contract: "native.app.v2", needs: [], effects: [], sessions: [] }, admitted: false },
+  { name: "app v2 marker with sessions", declaration: { contract: "native.app.v2", needs: [], effects: [], sessions: [{ session: "session.body.v1", key: "k", scope: { type: "A", kind: "note" }, mode: "edit", presence: true }] }, admitted: false },
   { name: "minimal", declaration: { needs: [need("kit.a", ok)], effects: [] }, admitted: true },
   { name: "label 120 chars (multi-byte)", declaration: { needs: [{ ...need("kit.a", ok), label: "é".repeat(120) }], effects: [] }, admitted: true },
   { name: "label 121 chars", declaration: { needs: [{ ...need("kit.a", ok), label: "é".repeat(121) }], effects: [] }, admitted: false },

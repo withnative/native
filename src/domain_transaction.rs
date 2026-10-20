@@ -69,7 +69,7 @@ pub(crate) use facets::{
     FacetObservationPort,
 };
 #[path = "domain_transaction/attachments.rs"]
-mod attachments;
+pub(crate) mod attachments;
 #[cfg(any(feature = "postgres", feature = "turso-local"))]
 #[path = "domain_transaction/identity_bindings.rs"]
 mod identity_bindings;
@@ -321,6 +321,27 @@ pub(crate) async fn append_and_project<T>(
 where
     T: EventCursorPort + ProjectorPort,
 {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if matches!(
+        event.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine(
+            "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::kernel::slots::is_slot_event(&event.event_type) {
+        return Err(Error::engine(
+            "slot events require the sealed kernel slot route",
+        ));
+    }
     append_and_project_admitted(
         transaction,
         event,
@@ -422,6 +443,27 @@ pub(crate) async fn append_and_project_governed_import<T>(
 where
     T: EventCursorPort + ProjectorPort,
 {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if matches!(
+        event.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine(
+            "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::kernel::slots::is_slot_event(&event.event_type) {
+        return Err(Error::engine(
+            "slot events require the sealed kernel slot route",
+        ));
+    }
     if !matches!(causal_admission, CausalAdmission::GovernedImport(_)) {
         return Err(Error::engine(
             "governed import append requires governed causal admission",
@@ -433,6 +475,63 @@ where
         control,
         RecordIdAuthority::CallerSupplied,
         causal_admission,
+    )
+    .await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_and_project_kernel_provider<T>(
+    transaction: &mut T,
+    event: &mut EventRow,
+    control: &ExecutionControl,
+) -> Result<ProjectorIntent>
+where
+    T: EventCursorPort + ProjectorPort,
+{
+    if !matches!(
+        event.event_type.as_str(),
+        "kernel.provider_outcome.v1"
+            | "kernel.run_opened.v1"
+            | "kernel.run_closed.v1"
+            | "kernel.run_intent_set.v1"
+            | "kernel.v1_state_imported.v1"
+            | "kernel.instruction_binding_imported.v1"
+            | "kernel.instruction_binding_updated.v1"
+    ) {
+        return Err(Error::engine(
+            "kernel provider admission requires a provider outcome",
+        ));
+    }
+    append_and_project_admitted(
+        transaction,
+        event,
+        control,
+        RecordIdAuthority::CallerSupplied,
+        &CausalAdmission::LocalComputed,
+    )
+    .await
+}
+
+/// Sealed slot-map registration admission, the counterpart of the provider
+/// route above. Reached only from `store::append_kernel_slot_in`.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_and_project_kernel_slot<T>(
+    transaction: &mut T,
+    event: &mut EventRow,
+    control: &ExecutionControl,
+) -> Result<ProjectorIntent>
+where
+    T: EventCursorPort + ProjectorPort,
+{
+    if !crate::kernel::slots::is_slot_event(&event.event_type) {
+        return Err(Error::engine("kernel slot admission requires a slot event"));
+    }
+    append_and_project_admitted(
+        transaction,
+        event,
+        control,
+        RecordIdAuthority::CallerSupplied,
+        &CausalAdmission::LocalComputed,
     )
     .await
 }
@@ -564,14 +663,74 @@ impl ProjectorIntent {
                     crate::events::KERNEL_GENESIS_EVENT
                         | "kernel.record_created.v1"
                         | "kernel.link_added.v1"
+                        | "kernel.link_added.v2"
+                        | "kernel.provider_outcome.v1"
+                        | "kernel.run_opened.v1"
+                        | "kernel.run_closed.v1"
+                        | "kernel.run_intent_set.v1"
+                        | "kernel.v1_state_imported.v1"
+                        | "kernel.instruction_binding_imported.v1"
+                        | "kernel.instruction_binding_updated.v1"
                         | "kernel.principal_created.v1"
                         | "kernel.home_created.v1"
                         | "kernel.home_policy_replaced.v1"
                         | "kernel.root_admin_bootstrapped.v1"
                         | "kernel.record_rehomed.v1"
+                        | "kernel.record_rehomed.v2"
                         | "kernel.definition_adopted.v1"
                         | "kernel.package_adopted.v1"
                         | "kernel.record_revised.v1"
+                        | "kernel.record_revised.v2"
+                        | "kernel.host_transform_created.v1"
+                        | "kernel.hosted_offboarding.v1"
+                        | "kernel.hosted_membership.v1"
+                        | "kernel.import_member_policy.v1"
+                        | "kernel.import_hosted_accounts.v1"
+                        | "kernel.host_import_created.v1"
+                        | "kernel.app_state_imported.v1"
+                        | "kernel.app_installs_activated.v1"
+                        | "kernel.app_install_removed.v1"
+                        | "kernel.app_install_recorded.v1"
+                        | "kernel.app_install_adopted.v1"
+                        | "kernel.app_action_started.v1"
+                        | "kernel.app_action_recorded.v1"
+                        | "kernel.workspace_metadata_imported.v1"
+                        | "kernel.import_state.v1"
+                        | "kernel.import_state_delta.v1"
+                        | "kernel.import_removed.v1"
+                        | "kernel.import_source_head.v1"
+                        | "kernel.import_home.v1"
+                        | "kernel.import_home_delta.v1"
+                        | "kernel.import_home_policy.v1"
+                        | "kernel.import_members_roster.v1"
+                        | "kernel.import_record_created.v1"
+                        | "kernel.import_receipt.v1"
+                        | "kernel.legacy_recorded.v1"
+                        | "kernel.attachment_bound.v1"
+                        | "kernel.body_set.v1"
+                        | "kernel.metadata_set.v1"
+                        | "kernel.generic_link_note_updated.v1"
+                        | "kernel.generic_link_note_imported.v1"
+                        | "kernel.generic_link_added.v1"
+                        | "kernel.generic_link_removed.v1"
+                        | "kernel.generic_link_removal_imported.v1"
+                        | "kernel.generic_link_imported.v1"
+                        | "kernel.message_destination_imported.v1"
+                        | "kernel.message_destination_set.v1"
+                        | "kernel.message_created.v1"
+                        | "kernel.message_state.v1"
+                        | "kernel.message_command_committed.v1"
+                        | "kernel.persona_registered.v1"
+                        | "kernel.persona_retired.v1"
+                        | "kernel.comment_anchor_set.v1"
+                        | "kernel.comment_anchor_imported.v1"
+                        | "kernel.facet_observed.v1"
+                        | "kernel.archive_changed.v1"
+                        | "kernel.record_deleted.v1"
+                        | "kernel.link_removed.v1"
+                        | "kernel.slot_provisioned.v1"
+                        | "kernel.slot_replaced.v1"
+                        | "kernel.home_created_for.v1"
                 ) =>
             {
                 Ok(Self::Extended {
@@ -579,6 +738,11 @@ impl ProjectorIntent {
                     payload,
                 })
             }
+            #[cfg(test)]
+            "kernel.record_rebound.v1" => Ok(Self::Extended {
+                event_type: "kernel.record_rebound.v1".to_string(),
+                payload,
+            }),
             event_type if crate::events::EVENT_TYPES.contains(&event_type) => Ok(Self::Extended {
                 event_type: event_type.to_string(),
                 payload,
@@ -1695,6 +1859,19 @@ mod tests {
             })
         ))
         .is_ok());
+        // Contributor rows are forward-tolerant: an unknown field is accepted
+        // and preserved in the payload (so a future field cannot make this
+        // binary refuse replay), while known fields stay validated.
+        let tolerant = json!({
+            "session": "s",
+            "contributors": [{"principal": "a", "executor_kind": "k", "extra": 1}],
+        });
+        match ProjectorIntent::from_event(&event("record.updated", tolerant)) {
+            Ok(ProjectorIntent::RecordUpdated(fields)) => {
+                assert_eq!(fields["contributors"][0]["extra"], json!(1));
+            }
+            other => panic!("expected an admitted record.updated, got {other:?}"),
+        }
         // Reserved-key misuse is refused before any backend SQL runs.
         for bad in [
             json!({"session": "sess-1"}),
@@ -1703,7 +1880,9 @@ mod tests {
             json!({"session": "", "contributors": []}),
             json!({"session": "s", "contributors": [], "merged_offline": false}),
             json!({"session": "s", "contributors": [{"principal": "a"}]}),
-            json!({"session": "s", "contributors": [{"principal": "a", "executor_kind": "k", "extra": 1}]}),
+            // Malformed known fields are still refused.
+            json!({"session": "s", "contributors": [{"principal": "a", "executor_kind": "k", "channel": ""}]}),
+            json!({"session": "s", "contributors": [{"principal": "a", "executor_kind": "k", "app": "docs@1"}]}),
         ] {
             assert!(
                 ProjectorIntent::from_event(&event("record.updated", bad.clone())).is_err(),

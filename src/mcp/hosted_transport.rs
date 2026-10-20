@@ -57,6 +57,63 @@ pub async fn hosted_artifact_stylesheet(
     super::tools::artifacts::artifact_stylesheet(db, caller, artifact_id, digest).await
 }
 
+/// Read the exact installed source through launch's shared admission chain.
+/// The portable account must be the authenticated caller's own credential.
+/// Returns only body bytes and the current validation limit, never private install rows.
+#[cfg(feature = "v2-kernel-probe")]
+pub async fn admit_kernel_app_bundle_source_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    package: &str,
+    install_event: &str,
+    digest: &str,
+    preview_receipt: Option<&str>,
+) -> Result<(String, usize)> {
+    if super::tools::is_legacy_local(caller) || caller.credential().trim().is_empty() {
+        return Err(Error::engine(
+            "bundle source refused [invalid_bundle_caller]",
+        ));
+    }
+    crate::kernel::app_installs::bundle_source_on(
+        tx,
+        caller,
+        package,
+        install_event,
+        digest,
+        preview_receipt,
+    )
+    .await
+}
+
+/// Read an installed v1 source through its existing admission chain.
+#[doc(hidden)]
+pub async fn admit_installed_app_bundle_source_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    account_id: &str,
+    package: &str,
+    install_event: &str,
+    digest: &str,
+) -> Result<(String, usize)> {
+    if super::tools::is_legacy_local(caller)
+        || caller.credential().trim().is_empty()
+        || account_id != caller.credential()
+    {
+        return Err(Error::engine(
+            "bundle source refused [invalid_bundle_caller]",
+        ));
+    }
+    super::tools::alpha_tabs::admitted_bundle_source_in(
+        tx,
+        caller,
+        account_id,
+        package,
+        install_event,
+        digest,
+    )
+    .await
+}
+
 /// Resolve the one lens-local operation implemented by the hosted federation
 /// adapter without exposing its private descriptor or dispatch tables.
 pub fn lens_local_materialization_name(name: &str) -> Option<&'static str> {
@@ -105,7 +162,14 @@ pub async fn resolve_hosted_run_context(
     caller: Caller,
     arguments: &Value,
 ) -> Value {
-    run_context_for(db, caller, arguments, registry.public_origin()).await
+    run_context_for(
+        db,
+        caller,
+        arguments,
+        registry.public_origin(),
+        registry.deployment_mutation_barrier(),
+    )
+    .await
 }
 
 /// Attach the canonical run-context envelope to a federated tool result.

@@ -446,10 +446,14 @@ pub enum PreviewPublicationFailure {
     Deadline,
     Cancelled,
     Ownership,
+    KitMajorUnavailable(u32),
 }
 impl From<PreviewPublicationFailure> for Error {
-    fn from(_: PreviewPublicationFailure) -> Self {
-        refused()
+    fn from(failure: PreviewPublicationFailure) -> Self {
+        match failure {
+            PreviewPublicationFailure::KitMajorUnavailable(major) => Error::engine(format!("Native app kit major {major} is unavailable on this host [kit_major_unavailable]; choose an admitted major before preview")),
+            _ => refused(),
+        }
     }
 }
 fn publication_sample_error(e: crate::artifact_html::SampleFailure) -> PreviewPublicationFailure {
@@ -459,6 +463,9 @@ fn publication_sample_error(e: crate::artifact_html::SampleFailure) -> PreviewPu
         SampleFailure::Closed => PreviewPublicationFailure::Closed,
         SampleFailure::Expired => PreviewPublicationFailure::Deadline,
         SampleFailure::Invalid => PreviewPublicationFailure::Ownership,
+        SampleFailure::KitMajorUnavailable(major) => {
+            PreviewPublicationFailure::KitMajorUnavailable(major)
+        }
     }
 }
 pub struct PreviewBytes(Vec<u8>);
@@ -656,7 +663,9 @@ pub async fn preview<'a>(
         || g.check(),
     )
     .await?;
-    let manifest = crate::artifact_html::validate_cached(&body).map_err(|_| refused())?;
+    let body_limit = super::super::artifacts::html_body_limit_in(&mut tx, &r.artifact_id).await?;
+    let manifest = crate::artifact_html::validate_cached_with_limit(&body, body_limit)
+        .map_err(|_| refused())?;
     g.check()?;
     let last_update_event_id =
         last_alpha_update_in(&mut tx, g.caller.credential(), &r.package).await?;
@@ -675,7 +684,7 @@ pub async fn preview<'a>(
             g.caller.hosting_database(),
             &r.artifact_id,
         )
-        .map_err(|_| refused())?;
+        .map_err(publication_sample_error)?;
     g.check()?;
     #[cfg(test)]
     preview_fault(g, PreviewFault::AfterSample, Some(&launch), None)?;
@@ -744,7 +753,7 @@ pub async fn preview<'a>(
     #[cfg(test)]
     preview_fault(g, PreviewFault::AfterReceipt, Some(&launch), Some(&receipt))?;
     let sample = alpha_tab_sample_input();
-    let output = json!({"package":r.package,"install_event_id":generation,
+    let mut output = json!({"package":r.package,"install_event_id":generation,
         "scope":BODY_READ_SCOPE,"preview":{"sample_only":true,"live_reads":false,"effects_wired":false,
             "artifact_id":r.artifact_id,"source_revision":r.source_revision,"digest":r.digest,
             "declaration_digest":dd,"body_digest":manifest.body_digest,"runtime":"native.html.v1","bundle_sha256":bundle,
@@ -752,6 +761,9 @@ pub async fn preview<'a>(
             "launch":{"url":launch.descriptor().url,"expires_in_ms":launch.descriptor().expires_in_ms,"bridge_version":crate::artifact_html::BRIDGE_VERSION}},
         "receipt":{"receipt_id":receipt.receipt_id,"nonce":receipt.nonce,
             "preview_session":receipt.preview_session,"expires_at_secs":receipt.expires_at_secs}});
+    if let Some(release) = &launch.descriptor().kit_release {
+        output["preview"]["launch"]["kit_release"] = json!(release);
+    }
     let pending = Preview {
         ingress: g,
         sample: launch,

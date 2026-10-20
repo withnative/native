@@ -1,0 +1,121 @@
+{
+  "format": "native.coedit-yjs-interop.v1",
+  "generator": "tests/fixtures/coedit-yjs-interop/generate.mjs",
+  "yjs_version": "13.6.33",
+  "encoding": "Yjs update v1, base64. Relative positions: Y.encodeRelativePosition, base64.",
+  "doc_shape": "One root Y.Text named \"body\".",
+  "apply": "For each case: a fresh doc, apply `updates` in order; the body text must equal expected_text, with expected_utf8_length bytes. full_state_update alone must give the same text.",
+  "cases": [
+    {
+      "name": "seed_then_insert",
+      "description": "The home seeds the body; a peer inserts ASCII in the middle.",
+      "updates": [
+        "AQGBgMD/BwAEAQRib2R5DEhlbGxvIHdvcmxkCgA=",
+        "AQGQIADEgYDA/wcFgYDA/wcGCmJyYXZlIG5ldyAA"
+      ],
+      "expected_text": "Hello brave new world\n",
+      "expected_utf8_length": 22,
+      "expected_utf16_length": 22,
+      "full_state_update": "AgKBgMD/BwAEAQRib2R5BkhlbGxvIISBgMD/BwUGd29ybGQKAZAgAMSBgMD/BwWBgMD/BwYKYnJhdmUgbmV3IAA="
+    },
+    {
+      "name": "unicode_inserts_and_deletes",
+      "description": "Emoji (4 bytes, 2 UTF-16 units), CJK (3 bytes), a combining mark and CRLF, inserted and deleted one update at a time.",
+      "updates": [
+        "AQGBgMD/BwAEAQRib2R5JkNhZsOpIPCfmIAg5Lit5paHIGXMgSBlbmQuDQpsaW5lIHR3bw0KAA==",
+        "AQGQIADEgYDA/wcEgYDA/wcFBfCfjokgAA==",
+        "AAGBgMD/BwEIAg==",
+        "AQGQIAPEgYDA/wcJgYDA/wcKBuaXpeacrAGBgMD/BwEIAg==",
+        "AAGBgMD/BwIIAgwB",
+        "AQGQIAXEgYDA/wcRgYDA/wcSCg0KbmV3IGxpbmUBgYDA/wcCCAIMAQ==",
+        "AAGBgMD/BwMFAggCDAE=",
+        "AAGBgMD/BwQFAggCDAEcAg=="
+      ],
+      "expected_text": "Café 🎉  日本 e end.\r\nnew line\r\nline two",
+      "expected_utf8_length": 45,
+      "expected_utf16_length": 38,
+      "full_state_update": "AgmBgMD/BwAEAQRib2R5BkNhZsOpIIGBgMD/BwQChIGAwP8HBgEggYGAwP8HBwKEgYDA/wcJAiBlgYGAwP8HCwGEgYDA/wcMBSBlbmQuhIGAwP8HEQoNCmxpbmUgdHdvgYGAwP8HGwIDkCAAxIGAwP8HBIGAwP8HBQXwn46JIMSBgMD/BwmBgMD/BwoG5pel5pysxIGAwP8HEYGAwP8HEgoNCm5ldyBsaW5lAYGAwP8HBAUCCAIMARwC"
+    },
+    {
+      "name": "concurrent_two_clients",
+      "description": "Ada and Ben edit the same seed concurrently, including inserts at the same index and overlapping deletes. Applying the last two updates in either order must give expected_text.",
+      "updates": [
+        "AQGBgMD/BwAEAQRib2R5EGJhc2Ug8J+YgCB0ZXh0DQoA",
+        "AQGQIADEgYDA/wcEgYDA/wcFB0FkYeS4rSABgYDA/wcBCAQ=",
+        "AQKgIADEgYDA/wcEgYDA/wcFCEJlbvCfp6oghIGAwP8HDQZ0YWlsDQoBgYDA/wcBBQI="
+      ],
+      "expected_text": "base Ada中 Ben🧪  \r\ntail\r\n",
+      "expected_utf8_length": 29,
+      "expected_utf16_length": 25,
+      "full_state_update": "AwWBgMD/BwAEAQRib2R5BWJhc2UggYGAwP8HBAKEgYDA/wcGASCBgYDA/wcHBISBgMD/BwsCDQoCoCAAxIGAwP8HBIGAwP8HBQhCZW7wn6eqIISBgMD/Bw0GdGFpbA0KAZAgAMSBgMD/BwSBgMD/BwUHQWRh5LitIAGBgMD/BwIFAggE",
+      "order_independent_from": 1
+    },
+    {
+      "name": "relative_positions_around_emoji",
+      "description": "Relative positions encoded against the seed (the first update only), then resolved after all updates. assoc follows Yjs: 0 or more sticks to the item on the right, below 0 to the item on the left. expected_utf8_offset is what yrs with OffsetKind::Bytes must report.",
+      "updates": [
+        "AQGBgMD/BwAEAQRib2R5DGHwn5iAYuS4rWMNCgA=",
+        "AQGQIABEgYDA/wcAA+KGkgA=",
+        "AQGQIAHEgYDA/wcAgYDA/wcBASEA"
+      ],
+      "expected_text": "→a!😀b中c\r\n",
+      "expected_utf8_length": 16,
+      "expected_utf16_length": 10,
+      "full_state_update": "AgKBgMD/BwAEAQRib2R5AWGEgYDA/wcAC/CfmIBi5LitYw0KApAgAESBgMD/BwAD4oaSxIGAwP8HAIGAwP8HAQEhAA==",
+      "relative_positions": [
+        {
+          "name": "before_emoji_assoc_right",
+          "index": 1,
+          "assoc": 0,
+          "note": "Sticks to the emoji: text inserted at this spot lands before the position.",
+          "encoded": "AIGAwP8HAQA=",
+          "encoded_against_update_count": 1,
+          "expected_utf16_index": 3,
+          "expected_utf8_offset": 5,
+          "seed_utf8_offset": 1
+        },
+        {
+          "name": "before_emoji_assoc_left",
+          "index": 1,
+          "assoc": -1,
+          "note": "Sticks to 'a': text inserted at this spot lands after the position.",
+          "encoded": "AIGAwP8HAEE=",
+          "encoded_against_update_count": 1,
+          "expected_utf16_index": 2,
+          "expected_utf8_offset": 4,
+          "seed_utf8_offset": 1
+        },
+        {
+          "name": "after_emoji",
+          "index": 3,
+          "assoc": 0,
+          "encoded": "AIGAwP8HAwA=",
+          "encoded_against_update_count": 1,
+          "expected_utf16_index": 5,
+          "expected_utf8_offset": 9,
+          "seed_utf8_offset": 5
+        },
+        {
+          "name": "after_cjk",
+          "index": 5,
+          "assoc": 0,
+          "encoded": "AIGAwP8HBQA=",
+          "encoded_against_update_count": 1,
+          "expected_utf16_index": 7,
+          "expected_utf8_offset": 13,
+          "seed_utf8_offset": 9
+        },
+        {
+          "name": "after_crlf",
+          "index": 8,
+          "assoc": -1,
+          "encoded": "AIGAwP8HB0E=",
+          "encoded_against_update_count": 1,
+          "expected_utf16_index": 10,
+          "expected_utf8_offset": 16,
+          "seed_utf8_offset": 12
+        }
+      ]
+    }
+  ]
+}

@@ -2074,14 +2074,11 @@ async fn exact_artifact_source_before(
     artifact_id: &str,
     event_seq: i64,
 ) -> Result<(String, String)> {
-    let row = sqlx::query(
-        "SELECT id,json_extract(payload,'$.body') AS body FROM content_events
-          WHERE record_id=? AND seq < ? AND type IN ('record.created','record.updated','receipt.committed.v1')
-            AND json_type(payload,'$.body') IS NOT NULL ORDER BY seq DESC LIMIT 1",
+    let row = crate::record_body::live_artifact::latest_present_source_on(
+        &mut *conn,
+        artifact_id,
+        Some(event_seq),
     )
-    .bind(artifact_id)
-    .bind(event_seq)
-    .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| Error::engine("artifact attestation has no exact source event"))?;
     Ok((row.try_get("id")?, row.try_get("body")?))
@@ -2251,12 +2248,14 @@ pub(crate) async fn verify_artifact_source_for_projection(
                 "native.html.v1 source attestation must not declare module imports",
             ));
         }
-        let manifest = crate::artifact_html::validate_cached(&source).map_err(|failure| {
-            Error::engine(format!(
-                "native.html.v1 source attestation source is invalid: {} [{}]",
-                failure.message, failure.code
-            ))
-        })?;
+        let body_limit = html_body_limit_in(&mut *conn, event_record_id).await?;
+        let manifest = crate::artifact_html::validate_cached_with_limit(&source, body_limit)
+            .map_err(|failure| {
+                Error::engine(format!(
+                    "native.html.v1 source attestation source is invalid: {} [{}]",
+                    failure.message, failure.code
+                ))
+            })?;
         if descriptor["artifact_ports"]
             != Value::Object(manifest.artifact_ports.into_iter().collect())
             || descriptor["capability_requests"] != Value::Array(manifest.capability_requests)
@@ -2947,10 +2946,12 @@ enum ManageRendererBindingArgs {
     Bind {
         artifact_id: String,
         collection_id: String,
+        idempotency_key: Option<String>,
     },
     Unbind {
         artifact_id: String,
         collection_id: Option<String>,
+        idempotency_key: Option<String>,
     },
 }
 
@@ -3068,8 +3069,132 @@ async fn can_record_in(
     )
 }
 
+/// Rebuild a keyed `manage_renderer_binding.bind` receipt. The binding's
+/// `kind`/`valid` describe the target Collection today, as the first call's
+/// did; everything else is the command's own: `previous_seq` is pinned by the
+/// act and `changed_collection_id` is the target the event named.
+async fn replay_renderer_bind_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    replay: &crate::mcp::tools::keyed_replay::KeyedReplay,
+    artifact_id: &str,
+    collection_id: &str,
+) -> Result<Value> {
+    let kind = collection_kind_in(tx, collection_id).await?;
+    let bindings =
+        json!([{ "collection_id": collection_id, "kind": kind, "valid": kind.is_some() }]);
+    if replay.is_noop() {
+        return Ok(json!({
+            "artifact_id": artifact_id,
+            "status": "unchanged",
+            "bindings": bindings,
+        }));
+    }
+    let previous_seq = replay.previous_seq_in(tx, artifact_id).await?;
+    echo_act(
+        json!({
+        "artifact_id": artifact_id,
+        "status": "bound",
+        "bindings": bindings,
+        "changed_collection_id": collection_id,
+        "previous_seq": previous_seq,
+        }),
+        replay.act(),
+    )
+}
+
+/// The artifact's `renders` targets as the log left them at `horizon`: the
+/// bindings that remained right after a keyed unbind, however the artifact
+/// has been rebound since.
+async fn render_targets_at_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    artifact_id: &str,
+    horizon: i64,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT type, json_extract(payload,'$.target_id') AS target_id FROM content_events
+          WHERE record_id=? AND seq<=? AND type IN ('link.added','link.removed')
+            AND json_extract(payload,'$.source_id')=?
+            AND json_extract(payload,'$.relationship')=?
+          ORDER BY seq",
+    )
+    .bind(artifact_id)
+    .bind(horizon)
+    .bind(artifact_id)
+    .bind(RENDERS_RELATIONSHIP)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut targets = BTreeSet::new();
+    for row in rows {
+        let target: Option<String> = row.try_get("target_id")?;
+        let Some(target) = target else { continue };
+        if row.try_get::<String, _>("type")? == "link.added" {
+            targets.insert(target);
+        } else {
+            targets.remove(&target);
+        }
+    }
+    Ok(targets.into_iter().collect())
+}
+
+/// Rebuild a keyed `manage_renderer_binding.unbind` receipt. The remaining
+/// bindings are those the log held right after the command; their `kind` and
+/// `valid` are read today, as in the first call.
+///
+/// An unbind that named no `collection_id` resolved its target from the
+/// artifact's single binding, and the first call needed View on it. If the
+/// caller has since lost View on the Collection it removed, the replay refuses
+/// with the message an unkeyed unbind gives for a binding it cannot resolve,
+/// rather than a receipt that would have to name (or silently omit) a target
+/// the caller can no longer see. A fresh key on the now-empty artifact answers
+/// `unchanged`, so this refusal does tell a keyed caller one bit: the target
+/// it unbound is now hidden from it. That is the deliberate choice: the
+/// alternative discloses the id. An unbind that named its `collection_id` is
+/// refused earlier instead, by the View check on the named target, with the
+/// denial a fresh key gets.
+async fn replay_renderer_unbind_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    replay: &crate::mcp::tools::keyed_replay::KeyedReplay,
+    artifact_id: &str,
+) -> Result<Value> {
+    const TOOL: &str = "manage_renderer_binding";
+    if replay.is_noop() {
+        return Ok(json!({ "artifact_id": artifact_id, "status": "unchanged", "bindings": [] }));
+    }
+    let (Some(event), Some(horizon)) = (replay.content().first(), replay.content_horizon()) else {
+        return Err(Error::engine(format!(
+            "{TOOL}: idempotent receipt is incomplete"
+        )));
+    };
+    let target = event.payload["target_id"]
+        .as_str()
+        .ok_or_else(|| Error::engine(format!("{TOOL}: idempotent receipt is incomplete")))?
+        .to_owned();
+    if !can_record_in(tx, caller, &target, Capability::View).await? {
+        return Err(Error::engine(format!(
+            "{TOOL}: artifact {artifact_id} binding cannot be resolved without collection_id"
+        )));
+    }
+    let remaining = render_targets_at_in(tx, artifact_id, horizon).await?;
+    let bindings = renderer_bindings_in(tx, caller, &remaining).await?;
+    let status = renderer_binding_status(&bindings);
+    let previous_seq = replay.previous_seq_in(tx, artifact_id).await?;
+    echo_act(
+        json!({
+        "artifact_id": artifact_id,
+        "status": status,
+        "bindings": bindings,
+        "changed_collection_id": target,
+        "previous_seq": previous_seq,
+        }),
+        replay.act(),
+    )
+}
+
 async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "manage_renderer_binding";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ManageRendererBindingArgs = parse_args(TOOL, arguments)?;
     match args {
         ManageRendererBindingArgs::Read { artifact_id } => {
@@ -3103,11 +3228,34 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
         ManageRendererBindingArgs::Bind {
             artifact_id,
             collection_id,
+            idempotency_key,
         } => {
+            let keyed =
+                crate::mcp::tools::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?
+                    .is_some();
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
             require_record_in(&mut tx, &caller, TOOL, &collection_id, Capability::View).await?;
+            // Keyed replay: after both authority checks, before the live-artifact
+            // and existing-binding checks the first call's own effect changed.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt =
+                        replay_renderer_bind_in(&mut tx, &replay, &artifact_id, &collection_id)
+                            .await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             assert_live_artifact_in(&mut tx, TOOL, &artifact_id).await?;
             let kind = collection_kind_in(&mut tx, &collection_id)
                 .await?
@@ -3116,7 +3264,13 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
                 )))?;
             let targets = render_targets_in(&mut tx, &artifact_id).await?;
             if targets.as_slice() == [collection_id.as_str()] {
-                tx.rollback().await?;
+                if keyed {
+                    // Leave the anchor a retry finds and replays as this no-op.
+                    crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                    db.commit_content(tx).await?;
+                } else {
+                    tx.rollback().await?;
+                }
                 return Ok(json!({
                     "artifact_id": artifact_id,
                     "status": "unchanged",
@@ -3162,10 +3316,37 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
         ManageRendererBindingArgs::Unbind {
             artifact_id,
             collection_id,
+            idempotency_key,
         } => {
+            let keyed =
+                crate::mcp::tools::keyed_replay::idempotency_key(TOOL, idempotency_key.as_deref())?
+                    .is_some();
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
+            if let Some(target) = &collection_id {
+                // The named target's View is authorization, so it precedes the
+                // replay; it only moves ahead of the live-artifact check.
+                require_record_in(&mut tx, &caller, TOOL, target, Capability::View).await?;
+            }
+            // Keyed replay: after authorization, before the live-artifact and
+            // binding-exists checks the first call's own effect changed.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt =
+                        replay_renderer_unbind_in(&mut tx, &caller, &replay, &artifact_id).await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             assert_live_artifact_in(&mut tx, TOOL, &artifact_id).await?;
             let targets = render_targets_in(&mut tx, &artifact_id).await?;
             let target = match collection_id {
@@ -3195,7 +3376,12 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
                     target
                 }
                 None if targets.is_empty() => {
-                    tx.rollback().await?;
+                    if keyed {
+                        crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                        db.commit_content(tx).await?;
+                    } else {
+                        tx.rollback().await?;
+                    }
                     return Ok(json!({ "artifact_id": artifact_id, "status": "unchanged", "bindings": [] }));
                 }
                 None => {
@@ -3244,6 +3430,7 @@ async fn manage_renderer_binding(db: Db, caller: Caller, arguments: Value) -> Re
 struct InstantiateArtifactArgs {
     source_id: String,
     title: Option<String>,
+    idempotency_key: Option<String>,
 }
 
 /// Copy one artifact and its governed runtime as one authoritative event batch.
@@ -3254,7 +3441,10 @@ struct InstantiateArtifactArgs {
 /// mutated by this operation.
 async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "instantiate_artifact";
+    let provenance_arguments = arguments.clone();
     let args: InstantiateArtifactArgs = parse_args(TOOL, arguments)?;
+    let keyed =
+        super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?.is_some();
     let id = Uuid::new_v4().to_string();
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
@@ -3267,6 +3457,16 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
         Capability::Edit,
     )
     .await?;
+    // Keyed replay, after authorization and before the source's liveness and
+    // the caller's binding, which judge the world the first call changed.
+    if keyed {
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            return replay_instantiate_artifact(&db, tx, &caller, &args.source_id, replay).await;
+        }
+    }
     assert_live_artifact_in(&mut tx, TOOL, &args.source_id).await?;
 
     let caller_owner: Option<String> = sqlx::query_scalar(
@@ -3337,8 +3537,15 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
     };
     let body: Option<String> = source.try_get("body")?;
     let artifact_attestation = if supports_named_input_runtime(&runtime) {
-        validate_prospective_artifact(&id, "Document", Some(kind), body.as_deref(), Some(&runtime))
-            .await?
+        validate_prospective_artifact(
+            &id,
+            "Document",
+            Some(kind),
+            body.as_deref(),
+            Some(&runtime),
+            None,
+        )
+        .await?
     } else {
         None
     };
@@ -3417,33 +3624,84 @@ async fn instantiate_artifact(db: Db, caller: Caller, arguments: Value) -> Resul
 
     let after = super::lifecycle::required_violations_in(&mut tx, &schema_rows, &[&id]).await?;
     super::lifecycle::assert_required_not_worsened(TOOL, &before, &after)?;
+    // Always appends, so a keyed call never needs a no-op anchor.
     db.commit_content(tx).await?;
 
+    let record = read_instantiated_copy(&db, &caller, &id).await?;
+    instantiate_receipt(record, args.source_id, act_alloc.get())
+}
+
+/// The copy as the caller may read it now, enriched like any created record.
+async fn read_instantiated_copy(db: &Db, caller: &Caller, id: &str) -> Result<Value> {
+    const TOOL: &str = "instantiate_artifact";
     let opts = crate::query::read::EnrichOptions::default();
-    let mut record = if super::is_legacy_local(&caller) {
-        crate::query::read::get_record(&db, &id).await?
+    let mut record = if super::is_legacy_local(caller) {
+        crate::query::read::get_record(db, id).await?
     } else {
         crate::query::read::get_record_with_lens_as(
-            &crate::query::lens::ReadLens::live(&db),
-            &id,
+            &crate::query::lens::ReadLens::live(db),
+            id,
             opts,
-            super::principal(&caller),
+            super::principal(caller),
         )
         .await?
     }
     .ok_or_else(|| Error::engine(format!("{TOOL}: created artifact {id} is not readable")))?;
-    super::lifecycle::filter_enriched_record_with_auth(&db, &db, &caller, &mut record, opts)
-        .await?;
-    let mut result = serde_json::to_value(record)?;
-    let object = result
+    super::lifecycle::filter_enriched_record_with_auth(db, db, caller, &mut record, opts).await?;
+    Ok(serde_json::to_value(record)?)
+}
+
+fn instantiate_receipt(mut record: Value, source_id: String, act: Option<i64>) -> Result<Value> {
+    let object = record
         .as_object_mut()
-        .expect("EnrichedRecord serializes as an object");
-    object.insert("source_id".into(), Value::String(args.source_id));
+        .ok_or_else(|| Error::engine("instantiate_artifact: record is not an object"))?;
+    object.insert("source_id".into(), Value::String(source_id));
     object.insert("previous_seq".into(), Value::Null);
-    if let Some(act) = act_alloc.get() {
+    if let Some(act) = act {
         object.insert("act".into(), act.into());
     }
-    Ok(result)
+    Ok(record)
+}
+
+/// Keyed replay of `instantiate_artifact`: the copy the first call created,
+/// named by the attested `record.created`, never a second copy. The caller
+/// must still view it. While the copy is unwritten since, the view is the
+/// live read the first call returned; enrichment drawn from other records
+/// (links in, children) is then current rather than pinned, as for
+/// `update_record`. Once the copy has been written, the view is rebuilt at
+/// the command's horizon.
+async fn replay_instantiate_artifact(
+    db: &Db,
+    mut tx: sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    source_id: &str,
+    replay: super::keyed_replay::KeyedReplay,
+) -> Result<Value> {
+    const TOOL: &str = "instantiate_artifact";
+    let copy = replay
+        .content()
+        .iter()
+        .find(|output| output.event_type == "record.created")
+        .map(|output| output.record_id.clone())
+        .ok_or_else(|| Error::engine(format!("{TOOL}: attested copy has no record.created")))?;
+    require_record_in(&mut tx, caller, TOOL, &copy, Capability::View).await?;
+    let horizon = replay.content_horizon_for(&copy).unwrap_or(i64::MAX);
+    let moved_on: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND seq>?)",
+    )
+    .bind(&copy)
+    .bind(horizon)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    let record = if moved_on {
+        super::lifecycle::read_record_as_attested(db, caller, &replay, &copy, TOOL).await?
+    } else {
+        read_instantiated_copy(db, caller, &copy).await?
+    };
+    let receipt = instantiate_receipt(record, source_id.to_string(), replay.act())?;
+    replay.settle();
+    Ok(receipt)
 }
 
 #[derive(Deserialize)]
@@ -3496,12 +3754,72 @@ pub(crate) fn diagnostic(code: &str, message: impl Into<String>, details: Value)
 /// Validate a prospective governed artifact before its authoring event is
 /// appended. Replay/import intentionally do not call this function: history is
 /// projected as written and an invalid historical source fails closed on open.
+/// Claim an MDX compile slot for a create's compiler check.
+///
+/// The slots are process-wide and refuse when none is free, which a test
+/// binary running many MDX tests in parallel can make routine. A test that
+/// is about replay and not about compiler load asks to wait for a slot
+/// instead ([`WaitForMdxCompiler`]); production always refuses.
+async fn admit_mdx_compiler() -> std::result::Result<tokio::sync::OwnedSemaphorePermit, mdx::Failure>
+{
+    #[cfg(test)]
+    if MDX_COMPILER_WAIT.with(std::cell::Cell::get) {
+        loop {
+            match mdx::try_admit() {
+                Ok(permit) => return Ok(permit),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+    }
+    mdx::try_admit()
+}
+
+#[cfg(test)]
+thread_local! {
+    static MDX_COMPILER_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For the current test thread, until dropped: a create's compiler check
+/// waits for a free compile slot rather than being refused. Pair it with
+/// `mdx::test_guard()` so a saturating test cannot hold every slot meanwhile.
+#[cfg(test)]
+pub(crate) struct WaitForMdxCompiler;
+
+#[cfg(test)]
+impl WaitForMdxCompiler {
+    pub(crate) fn enable() -> Self {
+        MDX_COMPILER_WAIT.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+/// Turns the waiting back off for the current test thread until dropped, for
+/// the part of a test that is about the compiler being full.
+#[cfg(test)]
+pub(crate) struct WaitForMdxCompilerOff;
+
+#[cfg(test)]
+impl WaitForMdxCompilerOff {
+    pub(crate) fn disable() -> Self {
+        MDX_COMPILER_WAIT.with(|flag| flag.set(false));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WaitForMdxCompiler {
+    fn drop(&mut self) {
+        MDX_COMPILER_WAIT.with(|flag| flag.set(false));
+    }
+}
+
 pub(crate) async fn validate_prospective_artifact(
     record_id: &str,
     record_type: &str,
     kind: Option<&str>,
     body: Option<&str>,
     runtime: Option<&str>,
+    package_marker: Option<&str>,
 ) -> Result<Option<Value>> {
     let v1 =
         record_type == "Document" && kind == Some("artifact") && runtime == Some(mdx::RUNTIME_ID);
@@ -3524,25 +3842,25 @@ pub(crate) async fn validate_prospective_artifact(
     })?;
     if html_artifact {
         let source = body.to_owned();
-        let manifest =
-            tokio::task::spawn_blocking(move || crate::artifact_html::validate_cached(&source))
-                .await
-                .map_err(|_| {
-                    Error::engine("native.html.v1 validator worker terminated unexpectedly")
-                })?
-                .map_err(|failure| {
-                    let location = match (
-                        failure.details.get("line").and_then(Value::as_u64),
-                        failure.details.get("column").and_then(Value::as_u64),
-                    ) {
-                        (Some(line), Some(column)) => format!(" at line {line}, column {column}"),
-                        _ => String::new(),
-                    };
-                    Error::engine(format!(
-                        "native.html.v1 validation failed for {record_id}: {}{location} [{}]",
-                        failure.message, failure.code
-                    ))
-                })?;
+        let body_limit = crate::artifact_html::body_limit_for_package_marker(package_marker);
+        let manifest = tokio::task::spawn_blocking(move || {
+            crate::artifact_html::validate_cached_with_limit(&source, body_limit)
+        })
+        .await
+        .map_err(|_| Error::engine("native.html.v1 validator worker terminated unexpectedly"))?
+        .map_err(|failure| {
+            let location = match (
+                failure.details.get("line").and_then(Value::as_u64),
+                failure.details.get("column").and_then(Value::as_u64),
+            ) {
+                (Some(line), Some(column)) => format!(" at line {line}, column {column}"),
+                _ => String::new(),
+            };
+            Error::engine(format!(
+                "native.html.v1 validation failed for {record_id}: {}{location} [{}]",
+                failure.message, failure.code
+            ))
+        })?;
         let diagnostics = serde_json::to_value(&manifest.diagnostics)
             .unwrap_or_else(|_| Value::Array(Vec::new()));
         return Ok(Some(json!({
@@ -3555,7 +3873,7 @@ pub(crate) async fn validate_prospective_artifact(
             "diagnostics": diagnostics,
         })));
     }
-    let permit = mdx::try_admit().map_err(|failure| {
+    let permit = admit_mdx_compiler().await.map_err(|failure| {
         if v1 {
             mdx_engine_error(record_id, failure)
         } else {
@@ -4337,18 +4655,35 @@ async fn live_artifact(db: &Db, id: &str) -> Result<bool> {
         .await?)
 }
 
-async fn live_v2_artifact(db: &Db, id: &str) -> Result<bool> {
+fn live_v2_artifact_sql() -> String {
     let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
-    let sql = format!(
+    format!(
         "SELECT EXISTS(SELECT 1 FROM records r
           JOIN facet_values f ON f.record_id=r.id AND f.key='runtime'
           WHERE r.id=? AND r.deleted_at IS NULL AND f.value IN (?,?) AND {predicate})"
-    );
-    Ok(sqlx::query_scalar(&sql)
+    )
+}
+
+async fn live_v2_artifact(db: &Db, id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(&live_v2_artifact_sql())
         .bind(id)
         .bind(mdx_v2::RUNTIME_ID)
         .bind(HTML_RUNTIME)
         .fetch_one(db.write_pool())
+        .await?)
+}
+
+/// [`live_v2_artifact`] inside an open write transaction, for the keyed paths
+/// that must run it after their replay lookup.
+async fn live_v2_artifact_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    id: &str,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(&live_v2_artifact_sql())
+        .bind(id)
+        .bind(mdx_v2::RUNTIME_ID)
+        .bind(HTML_RUNTIME)
+        .fetch_one(&mut **tx)
         .await?)
 }
 
@@ -4668,6 +5003,8 @@ mod advance_pin;
 mod grants;
 #[path = "artifacts/inputs.rs"]
 mod inputs;
+#[path = "artifacts/membership.rs"]
+mod membership;
 #[path = "artifacts/modules.rs"]
 mod modules;
 
@@ -4682,6 +5019,7 @@ pub(crate) use grants::{
     ArtifactModuleGrantPreparation,
 };
 use inputs::*;
+pub(crate) use membership::collection_contains_in;
 use modules::*;
 
 fn module_releases_json(closure: &BTreeMap<String, ReleaseMaterial>) -> Vec<Value> {
@@ -7765,29 +8103,12 @@ async fn materialize_live_mdx_v2(
     let mut tx = db.write_pool().begin().await?;
     super::require_record_in(&mut tx, caller, tool, artifact_id, Capability::View).await?;
     let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
-    let sql = format!(
-        "WITH body_source AS (
-             SELECT e.id, e.seq, json_extract(e.payload, '$.body') AS body
-               FROM content_events e
-              WHERE e.record_id = ?
-                AND e.type IN ('record.created', 'record.updated', 'receipt.committed.v1')
-                AND json_type(e.payload, '$.body') IS NOT NULL
-              ORDER BY e.seq DESC
-              LIMIT 1
-         )
-         SELECT body_source.id AS body_event_id, body_source.body, body_source.seq AS body_event_seq,
-                (SELECT id FROM content_events ORDER BY seq DESC LIMIT 1) AS snapshot_event_id,
-                (SELECT COALESCE(MAX(seq), 0) FROM content_events) AS snapshot_event_seq,
-                f.value AS runtime FROM records r
-           LEFT JOIN body_source ON TRUE
-           LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
-          WHERE r.id = ? AND r.deleted_at IS NULL AND {predicate}"
-    );
-    let row = sqlx::query(&sql)
-        .bind(artifact_id)
-        .bind(artifact_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let row = crate::record_body::live_artifact::live_artifact_body_source_on(
+        &mut *tx,
+        artifact_id,
+        &predicate,
+    )
+    .await?;
     let Some(row) = row else {
         tx.rollback().await?;
         return Ok(None);
@@ -7946,30 +8267,12 @@ async fn materialize_live_html(
     let mut tx = db.write_pool().begin().await?;
     super::require_record_in(&mut tx, caller, tool, artifact_id, Capability::View).await?;
     let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
-    let sql = format!(
-        "WITH body_source AS (
-             SELECT e.id, e.seq, json_extract(e.payload, '$.body') AS body
-               FROM content_events e
-              WHERE e.record_id = ?
-                AND e.type IN ('record.created', 'record.updated', 'receipt.committed.v1')
-                AND json_type(e.payload, '$.body') IS NOT NULL
-              ORDER BY e.seq DESC LIMIT 1
-         )
-         SELECT body_source.id AS body_event_id, body_source.body,
-                body_source.seq AS body_event_seq,
-                (SELECT id FROM content_events ORDER BY seq DESC LIMIT 1) AS snapshot_event_id,
-                (SELECT COALESCE(MAX(seq), 0) FROM content_events) AS snapshot_event_seq,
-                f.value AS runtime
-           FROM records r
-           LEFT JOIN body_source ON TRUE
-           LEFT JOIN facet_values f ON f.record_id=r.id AND f.key='runtime'
-          WHERE r.id=? AND r.deleted_at IS NULL AND {predicate}"
-    );
-    let row = sqlx::query(&sql)
-        .bind(artifact_id)
-        .bind(artifact_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let row = crate::record_body::live_artifact::live_artifact_body_source_on(
+        &mut *tx,
+        artifact_id,
+        &predicate,
+    )
+    .await?;
     let Some(row) = row else {
         tx.rollback().await?;
         return Ok(None);
@@ -8152,11 +8455,65 @@ async fn try_render_live_html_for_parent(
     Ok(Some(result))
 }
 
+/// The package marker among parsed facet writes: its stored value.
+/// `body_encoding` reads the raw `facets` argument through
+/// [`package_marker_of_facets_arg`], so a plain string and a `{ "value": ... }`
+/// wrapper are read the same way at decode and at write validation.
+pub(crate) fn package_marker_of_writes(
+    facets: &[crate::domain_transaction::FacetWrite],
+) -> Option<String> {
+    facets
+        .iter()
+        .find(|facet| facet.key == crate::artifact_html::PACKAGE_FACET_KEY)
+        .map(crate::domain_transaction::FacetWrite::stored_value)
+}
+
+/// The package marker of a raw `facets` argument, parsed with the same facet
+/// value grammar the write path uses; `None` when absent or unparseable.
+pub(crate) fn package_marker_of_facets_arg(tool: &str, facets: Option<&Value>) -> Option<String> {
+    let value = facets?.get(crate::artifact_html::PACKAGE_FACET_KEY)?;
+    crate::domain_transaction::parse_facet_write_value(
+        tool,
+        crate::artifact_html::PACKAGE_FACET_KEY,
+        value,
+    )
+    .ok()
+    .as_ref()
+    .map(crate::domain_transaction::FacetWrite::stored_value)
+}
+
+/// The HTML body limit of the live record `record_id`: the package limit when
+/// it carries the package marker facet, the ordinary limit otherwise.
+pub(crate) async fn html_body_limit_in(
+    conn: &mut sqlx::SqliteConnection,
+    record_id: &str,
+) -> Result<usize> {
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id = ? AND key = ?")
+            .bind(record_id)
+            .bind(crate::artifact_html::PACKAGE_FACET_KEY)
+            .fetch_optional(conn)
+            .await?;
+    Ok(crate::artifact_html::body_limit_for_package_marker(
+        marker.as_deref(),
+    ))
+}
+
+/// [`html_body_limit_in`] for a caller holding a pool, not a transaction.
+pub(crate) async fn html_body_limit_pool(
+    pool: &sqlx::SqlitePool,
+    record_id: &str,
+) -> Result<usize> {
+    let mut conn = pool.acquire().await?;
+    html_body_limit_in(&mut conn, record_id).await
+}
+
 pub(crate) fn validate_prospective_html(
     tool: &str,
     record_type: &str,
     kind: Option<&str>,
     runtime: Option<&str>,
+    package_marker: Option<&str>,
     body: Option<&str>,
 ) -> Result<Option<crate::artifact_html::Manifest>> {
     if record_type != "Document" || kind != Some("artifact") || runtime != Some(HTML_RUNTIME) {
@@ -8167,19 +8524,22 @@ pub(crate) fn validate_prospective_html(
             "{tool}: native.html.v1 artifact body is missing [html_invalid_document]"
         ))
     })?;
-    let manifest = crate::artifact_html::validate_cached(source).map_err(|failure| {
-        let location = match (
-            failure.details.get("line").and_then(Value::as_u64),
-            failure.details.get("column").and_then(Value::as_u64),
-        ) {
-            (Some(line), Some(column)) => format!(" at line {line}, column {column}"),
-            _ => String::new(),
-        };
-        Error::engine(format!(
-            "{tool}: {}{location} [{}]",
-            failure.message, failure.code
-        ))
-    })?;
+    let body_limit = crate::artifact_html::body_limit_for_package_marker(package_marker);
+    let manifest = crate::artifact_html::validate_cached_with_limit(source, body_limit).map_err(
+        |failure| {
+            let location = match (
+                failure.details.get("line").and_then(Value::as_u64),
+                failure.details.get("column").and_then(Value::as_u64),
+            ) {
+                (Some(line), Some(column)) => format!(" at line {line}, column {column}"),
+                _ => String::new(),
+            };
+            Error::engine(format!(
+                "{tool}: {}{location} [{}]",
+                failure.message, failure.code
+            ))
+        },
+    )?;
     Ok(Some(manifest))
 }
 
@@ -8281,24 +8641,11 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
         .await;
     };
     require_record(&db, &caller, TOOL, &args.id, Capability::View).await?;
-    let selector =
-        if let Some(event_id) = requested_boundary.get("event_id").and_then(Value::as_str) {
-            if requested_boundary.as_object().map(Map::len) != Some(1) {
-                return Err(Error::engine(
-                    "render_artifact: as_of event_id boundary has unknown fields",
-                ));
-            }
-            let content_seq: i64 = sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
-                .bind(event_id)
-                .fetch_optional(db.write_pool())
-                .await?
-                .ok_or_else(|| Error::engine("render_artifact: as_of event_id does not exist"))?;
-            lens::AsOfSelector::ContentSeq(lens::ContentSeqSelector { content_seq })
-        } else {
-            serde_json::from_value(requested_boundary.clone())
-                .map_err(|_| Error::engine("render_artifact: invalid as_of boundary"))?
-        };
-    let resolved = lens::resolve_as_of(&db, selector).await?;
+    // `event_id` is one of the shared `as_of` selectors; the position module
+    // resolves it, with the non-owner guard.
+    let selector: lens::AsOfSelector = serde_json::from_value(requested_boundary.clone())
+        .map_err(|_| Error::engine("render_artifact: invalid as_of boundary"))?;
+    let resolved = lens::resolve_as_of_for(&db, caller.counter_footing(), selector).await?;
     let runtime_event = sqlx::query(
         "SELECT type,payload FROM content_events
           WHERE record_id=? AND seq<=? AND type IN ('facet.set','facet.unset')
@@ -8344,7 +8691,12 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
                     details.insert("artifact_id".into(), json!(args.id));
                 }
                 let mut output = diagnostic(failure.code, failure.message, failure.details);
-                decorate_historical_render(&mut output, &resolved, requested_boundary);
+                decorate_historical_render(
+                    &mut output,
+                    &resolved,
+                    caller.counter_footing(),
+                    requested_boundary,
+                );
                 return Ok(attach_empty_timing_if_requested(
                     output,
                     args.include_timing,
@@ -8365,6 +8717,7 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
         crate::db::seed_meta_tier(&scratch).await?;
         lens::replay_projection(&db, &scratch, resolved.resolved_content_seq).await?;
         let read_lens = lens::ReadLens::historical(&scratch, &db, &resolved);
+        let footing = caller.counter_footing();
         let mut output = render_artifact_at(
             &read_lens,
             caller,
@@ -8375,7 +8728,7 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
             args.parent_origin.as_deref(),
         )
         .await?;
-        decorate_historical_render(&mut output, &resolved, requested_boundary);
+        decorate_historical_render(&mut output, &resolved, footing, requested_boundary);
         Ok(output)
     }
     .await;
@@ -8386,9 +8739,10 @@ async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Val
 fn decorate_historical_render(
     output: &mut Value,
     resolved: &lens::ResolvedAsOf,
+    footing: crate::mcp::registry::CounterFooting,
     requested_boundary: Value,
 ) {
-    lens::echo_temporal(output, resolved);
+    lens::echo_temporal(output, resolved, footing);
     let completeness = if output.get("status").and_then(Value::as_str) == Some("rendered") {
         "complete"
     } else {
@@ -8433,29 +8787,12 @@ pub(crate) async fn resolve_artifact(
     let projection = lens.projection().snapshot_pool();
     let authority = lens.meta().snapshot_pool();
     let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
-    let sql = format!(
-        "WITH body_source AS (
-             SELECT e.id, e.seq, json_extract(e.payload, '$.body') AS body
-               FROM content_events e
-              WHERE e.record_id = ?
-                AND e.type IN ('record.created', 'record.updated', 'receipt.committed.v1')
-                AND json_type(e.payload, '$.body') IS NOT NULL
-              ORDER BY e.seq DESC
-              LIMIT 1
-         )
-         SELECT body_source.id AS body_event_id, body_source.body, body_source.seq AS body_event_seq,
-                (SELECT id FROM content_events ORDER BY seq DESC LIMIT 1) AS snapshot_event_id,
-                (SELECT COALESCE(MAX(seq), 0) FROM content_events) AS snapshot_event_seq,
-                f.value AS runtime FROM records r
-           LEFT JOIN body_source ON TRUE
-           LEFT JOIN facet_values f ON f.record_id = r.id AND f.key = 'runtime'
-          WHERE r.id = ? AND r.deleted_at IS NULL AND {predicate}"
-    );
-    let Some(row) = sqlx::query(&sql)
-        .bind(artifact_id)
-        .bind(artifact_id)
-        .fetch_optional(projection)
-        .await?
+    let Some(row) = crate::record_body::live_artifact::live_artifact_body_source_on(
+        projection,
+        artifact_id,
+        &predicate,
+    )
+    .await?
     else {
         return Ok(Err(diagnostic(
             "invalid_artifact_shape",
@@ -10516,12 +10853,21 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
             "type": "object",
             "properties": {
                 "source_id": { "type": "string", "description": "Live governed Document kind:artifact to copy." },
-                "title": { "type": "string", "description": "Optional name override; omission copies the source name exactly." }
+                "title": { "type": "string", "description": "Optional name override; omission copies the source name exactly." },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["source_id"],
             "additionalProperties": false
         }),
-        instantiate_artifact,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(instantiate_artifact(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     registry.register(
         ToolKind::ManageRendererBinding,
@@ -10533,12 +10879,21 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
             "properties": {
                 "action": { "type": "string", "enum": ["read", "bind", "unbind"] },
                 "artifact_id": { "type": "string" },
-                "collection_id": { "type": "string", "description": "Required for bind; optional for unbind, and useful to repair one edge of an ambiguous generic-link state." }
+                "collection_id": { "type": "string", "description": "Required for bind; optional for unbind, and useful to repair one edge of an ambiguous generic-link state." },
+                "idempotency_key": crate::mcp::tools::keyed_replay::idempotency_key_schema()
             },
             "required": ["action", "artifact_id"],
             "additionalProperties": false
         }),
-        manage_renderer_binding,
+        |db, caller, arguments| {
+            crate::mcp::tools::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_renderer_binding(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     registry.register(
         ToolKind::ManageMdxModules,
@@ -10552,11 +10907,20 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "expected_source_event_id": { "type": "string" },
                 "expected_source_sha256": { "type": "string" },
                 "expected_status_event_seq": { "type": "integer", "description": "Required for deprecate/withdraw compare-and-set against the exact inspected status event." },
-                "replacement": { "type": "string" }
+                "replacement": { "type": "string" },
+                "idempotency_key": crate::mcp::tools::keyed_replay::idempotency_key_schema()
             },
             "required": ["action","module_id"], "additionalProperties": false
         }),
-        manage_mdx_modules,
+        |db, caller, arguments| {
+            crate::mcp::tools::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_mdx_modules(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     registry.register(
         ToolKind::ManageArtifactInputs,
@@ -10568,10 +10932,19 @@ pub fn register_artifact_tools(registry: &mut ToolRegistry) -> Result<()> {
                 "artifact_id": { "type": "string" }, "port_name": { "type": "string" },
                 "collection_id": { "type": "string" },
                 "bindings": { "type": "array", "minItems": 1, "maxItems": 100, "description": "Required for bind_many: between 1 and 100 {\"port_name\",\"collection_id\"} entries applied atomically.", "items": { "type": "object", "properties": { "port_name": { "type": "string" }, "collection_id": { "type": "string" } }, "required": ["port_name","collection_id"], "additionalProperties": false } },
-                "event_seq": { "type": "integer", "description": "Required with the exact current collection_id for unbind compare-and-set." }
+                "event_seq": { "type": "integer", "description": "Required with the exact current collection_id for unbind compare-and-set." },
+                "idempotency_key": crate::mcp::tools::keyed_replay::idempotency_key_schema()
             }, "required": ["action","artifact_id"], "additionalProperties": false
         }),
-        manage_artifact_inputs,
+        |db, caller, arguments| {
+            crate::mcp::tools::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_artifact_inputs(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     registry.register(
         ToolKind::ManageArtifactModuleGrants,
@@ -14602,6 +14975,11 @@ export const nativeArtifact = {{
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn html_parent_origin_binds_live_and_historical_legacy_and_named_delivery() {
+        // Other root fixtures install the default HTML origins without the MDX
+        // guard. Keep this exceptional allowlist entirely in its own process.
+        if crate::test_process::run_isolated_if_parent().await {
+            return;
+        }
         use axum::body::{to_bytes, Body};
         use axum::http::{header::CONTENT_SECURITY_POLICY, Request};
         use tower::ServiceExt;
@@ -17904,57 +18282,9 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
     #[allow(clippy::await_holding_lock)]
     async fn include_timing_true_missing_body_diagnostic_carries_empty_timing() {
         let _guard = mdx::test_guard();
-        let db = crate::create_database(":memory:")
-            .await
-            .expect("test database");
-        let mut registry = crate::mcp::ToolRegistry::new();
-        crate::mcp::register_surface_tools(&mut registry).expect("artifact tools register");
-        let artifact_id = "55555555-5555-4555-8555-555555555555";
-        // `create_record` requires a body for an MDX source, so create the
-        // artifact whole and then strip `$.body` from its events. The live
-        // materializer then sees a v2 runtime with no authoritative body and
-        // takes the pre-telemetry `invalid_artifact_body` path.
-        // content_events is append-only by trigger, so the fixture drops the
-        // update guard and restores it verbatim around the strip, all on one
-        // acquired connection.
-        let mut fixture = db.write_pool().acquire().await.expect("fixture connection");
-        let update_guard: String = sqlx::query_scalar(
-            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_events_no_update'",
-        )
-        .fetch_one(&mut *fixture)
-        .await
-        .expect("content_events update guard");
-        sqlx::query("DROP TRIGGER content_events_no_update")
-            .execute(&mut *fixture)
-            .await
-            .expect("drop content_events update guard for fixture");
-        registry
-            .call(
-                db.clone(),
-                Caller::local(),
-                "create_record",
-                json!({
-                    "id": artifact_id,
-                    "type": "Document",
-                    "kind": "artifact",
-                    "name": "Bodyless v2",
-                    "body": "export const nativeArtifact = { schema: \"native.mdx.artifact.v2\", inputs: {}, module_inputs: {}, capability_requests: [] }\n\n<Metric label=\"x\" value=\"y\" />",
-                    "facets": { "runtime": mdx_v2::RUNTIME_ID },
-                    "reason": "Exercise the pre-telemetry missing-body diagnostic.",
-                }),
-            )
-            .await
-            .expect("create v2 artifact");
-        sqlx::query("UPDATE content_events SET payload = json_remove(payload, '$.body') WHERE record_id = ?")
-            .bind(artifact_id)
-            .execute(&mut *fixture)
-            .await
-            .expect("strip artifact body");
-        sqlx::query(&update_guard)
-            .execute(&mut *fixture)
-            .await
-            .expect("restore content_events update guard");
-        drop(fixture);
+        // Import a bodyless legacy artifact without altering immutable events.
+        let db = super::live_body_reader_tests::fixture(Some(mdx_v2::RUNTIME_ID)).await;
+        let artifact_id = "bbb00000-0000-4000-8000-000000000001";
 
         let without = render_artifact(db.clone(), Caller::local(), json!({ "id": artifact_id }))
             .await
@@ -18887,6 +19217,535 @@ export function Grouped() { return <Metric label="Grouped" value={1} /> }"#,
             details["redaction_micros"].as_u64().unwrap_or(0) > 0,
             "redaction micros must be measured: {details:#}"
         );
+        db.close().await;
+    }
+}
+
+#[cfg(test)]
+mod live_body_reader_tests {
+    use super::*;
+
+    const ID: &str = "bbb00000-0000-4000-8000-000000000001";
+
+    pub(super) async fn fixture(runtime_id: Option<&str>) -> Db {
+        let db = crate::create_database(":memory:").await.unwrap();
+        // Import a bodyless legacy create through the projector, bypassing only
+        // modern required-facet/source admission; immutable event guards stay.
+        let payload = json!({"type":"Document", "kind":"artifact", "name":"Legacy source fixture",
+            "home_id": crate::schema::UNFILED_RECORD_ID})
+        .to_string();
+        let id = append(&db, "record.created", &payload, false).await;
+        let (local_seq, created_at): (i64, String) =
+            sqlx::query_as("SELECT seq,created_at FROM content_events WHERE id=?")
+                .bind(&id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        let event = crate::events::EventRow {
+            local_seq,
+            id,
+            record_id: ID.into(),
+            event_type: "record.created".into(),
+            payload: Some(payload),
+            actor: None,
+            run_key: None,
+            parent_key: None,
+            intent: None,
+            created_at,
+            causal_envelope: crate::events::CausalEnvelopeV1::legacy_unknown(),
+            act: None,
+        };
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        crate::projector::project(&mut conn, &event).await.unwrap();
+        drop(conn);
+        if let Some(runtime_id) = runtime_id {
+            sqlx::query("INSERT INTO facet_values(id,record_id,key,value) VALUES ('fixture-runtime',?,'runtime',?)")
+                .bind(ID).bind(runtime_id).execute(db.write_pool()).await.unwrap();
+        }
+        db
+    }
+
+    async fn append(db: &Db, family: &str, payload: &str, malformed: bool) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        // Disposable historical malformed fixture only. Append guards remain;
+        // metadata admission is restored on this connection before commit.
+        let trigger: Option<String> = if malformed {
+            let ddl: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'")
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+                .persistent(false)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            Some(ddl)
+        } else {
+            None
+        };
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,?,?,1,'legacy_unknown')")
+            .bind(&id).bind(ID).bind(family).bind(payload).execute(&mut *tx).await.unwrap();
+        if let Some(ddl) = trigger {
+            sqlx::query(&ddl)
+                .persistent(false)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        id
+    }
+
+    async fn resolve(db: &Db) -> Result<std::result::Result<ResolvedArtifact, Value>> {
+        resolve_artifact(
+            &lens::ReadLens::live(db),
+            &Caller::local(),
+            ID,
+            V2SnapshotMode::InspectOnly,
+            false,
+        )
+        .await
+    }
+
+    async fn source_seq(db: &Db, event_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+            .bind(event_id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn latest_present_source_consumers_keep_exclusive_horizon_and_identity() {
+        let db = fixture(None).await;
+        for record_id in [ID, "absent"] {
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            assert_eq!(
+                exact_artifact_source_before(&mut tx, record_id, i64::MAX)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "artifact attestation has no exact source event"
+            );
+            assert_eq!(
+                modules::latest_body_source_in(&mut tx, record_id)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+                "module has no authoritative body source event"
+            );
+            tx.rollback().await.unwrap();
+        }
+        let first = append(&db, "record.created", r#"{"body":"same bytes"}"#, false).await;
+        let first_seq = source_seq(&db, &first).await;
+        let mut previous = first;
+        for family in ["record.updated", "receipt.committed.v1"] {
+            let next = append(&db, family, r#"{"body":"same bytes"}"#, false).await;
+            let next_seq = source_seq(&db, &next).await;
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            assert_eq!(
+                exact_artifact_source_before(&mut tx, ID, next_seq)
+                    .await
+                    .unwrap(),
+                (previous, "same bytes".into())
+            );
+            assert_eq!(
+                exact_artifact_source_before(&mut tx, ID, next_seq + 1)
+                    .await
+                    .unwrap(),
+                (next.clone(), "same bytes".into())
+            );
+            assert_eq!(
+                modules::latest_body_source_in(&mut tx, ID).await.unwrap(),
+                (next.clone(), "same bytes".into())
+            );
+            tx.rollback().await.unwrap();
+            previous = next;
+        }
+        append(&db, "record.updated", r#"{"name":"metadata only"}"#, false).await;
+        append(
+            &db,
+            "unit.revision.recorded.v1",
+            r#"{"body":"excluded","content":{"content":"excluded"}}"#,
+            false,
+        )
+        .await;
+        append(&db, "facet.set", r#"{"body":"excluded"}"#, false).await;
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        assert!(exact_artifact_source_before(&mut tx, ID, first_seq)
+            .await
+            .is_err());
+        for source in [
+            modules::latest_body_source_in(&mut tx, ID).await.unwrap(),
+            exact_artifact_source_before(&mut tx, ID, i64::MAX)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(source, (previous.clone(), "same bytes".into()));
+        }
+        // Both readers must see a source inserted in their caller's uncommitted
+        // transaction, rather than opening another connection or substituting a hash.
+        let pending = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'record.updated',?,1,'legacy_unknown')")
+            .bind(&pending).bind(ID).bind(r#"{"body":"pending"}"#)
+            .execute(&mut *tx).await.unwrap();
+        for source in [
+            modules::latest_body_source_in(&mut tx, ID).await.unwrap(),
+            exact_artifact_source_before(&mut tx, ID, i64::MAX)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(source, (pending.clone(), "pending".into()));
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_present_source_consumers_keep_sql_value_and_duplicate_semantics() {
+        let db = fixture(None).await;
+        for (payload, expected) in [
+            (r#"{"body":""}"#, Some("")),
+            (r#"{"body":"first","body":"last"}"#, Some("first")),
+            // Keep the existing String decoder: SQLite NULL decodes as empty.
+            (r#"{"body":null}"#, Some("")),
+            (r#"{"body":null,"body":"last"}"#, Some("")),
+            (r#"{"body":23}"#, None),
+            (r#"{"body":true}"#, None),
+            (
+                r#"{"body":{"nested":"value"}}"#,
+                Some(r#"{"nested":"value"}"#),
+            ),
+            (r#"{"body":["value"]}"#, Some(r#"["value"]"#)),
+        ] {
+            let event_id = append(&db, "record.updated", payload, false).await;
+            let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+            for result in [
+                modules::latest_body_source_in(&mut tx, ID).await,
+                exact_artifact_source_before(&mut tx, ID, i64::MAX).await,
+            ] {
+                if let Some(body) = expected {
+                    assert_eq!(result.unwrap(), (event_id.clone(), body.into()));
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::Sqlx(_))),
+                        "{payload}: {result:?}"
+                    );
+                }
+            }
+            tx.rollback().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_present_source_consumers_keep_malformed_sql_error() {
+        let db = fixture(None).await;
+        let valid = append(&db, "record.updated", r#"{"body":"valid"}"#, false).await;
+        let malformed = append(&db, "record.updated", "{malformed", true).await;
+        let malformed_seq = source_seq(&db, &malformed).await;
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        assert_eq!(
+            exact_artifact_source_before(&mut tx, ID, malformed_seq)
+                .await
+                .unwrap(),
+            (valid, "valid".into())
+        );
+        for result in [
+            modules::latest_body_source_in(&mut tx, ID).await,
+            exact_artifact_source_before(&mut tx, ID, malformed_seq + 1).await,
+        ] {
+            assert!(matches!(
+                &result,
+                Err(Error::Sqlx(sqlx::Error::Database(_)))
+            ));
+            assert!(result.unwrap_err().to_string().contains("malformed JSON"));
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn live_body_reader_presence_duplicates_and_family_boundary() {
+        let _guard = mdx::test_guard();
+        for runtime_id in [mdx_v2::RUNTIME_ID, HTML_RUNTIME] {
+            let db = fixture(Some(runtime_id)).await;
+            // Bodyless create retains missing-body diagnostic (not missing source).
+            for payload in [
+                "{}",
+                "{\"body\":null}",
+                "{\"body\":null,\"body\":\"second\"}",
+            ] {
+                append(&db, "record.updated", payload, false).await;
+                let diagnostic = resolve(&db).await.unwrap().err().unwrap();
+                assert_eq!(
+                    diagnostic["diagnostic"]["message"],
+                    "artifact body is missing"
+                );
+                let diagnostic = if runtime_id == HTML_RUNTIME {
+                    materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .rendered
+                } else {
+                    materialize_live_mdx_v2(
+                        &db,
+                        &Caller::local(),
+                        ID,
+                        "render_artifact",
+                        false,
+                        true,
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .rendered
+                };
+                assert_eq!(
+                    diagnostic["diagnostic"]["message"],
+                    "artifact body is missing"
+                );
+            }
+            let selected = append(
+                &db,
+                "receipt.committed.v1",
+                "{\"body\":\"first\",\"body\":null}",
+                false,
+            )
+            .await;
+            append(&db, "record.updated", "{}", false).await;
+            let snapshot = append(
+                &db,
+                "unit.revision.recorded.v1",
+                "{\"body\":\"ignored\",\"content\":{\"content\":\"ignored\"}}",
+                false,
+            )
+            .await;
+            let result = resolve(&db).await.unwrap();
+            if runtime_id == HTML_RUNTIME {
+                let row = result.ok().unwrap();
+                assert_eq!(row.body, "first");
+                assert_eq!(row.body_event_id.as_deref(), Some(selected.as_str()));
+                assert_eq!(row.snapshot_event_id, snapshot);
+                assert!(row.snapshot_event_seq > row.event_seq);
+            } else {
+                let diagnostic = result.err().unwrap();
+                assert_eq!(
+                    diagnostic["diagnostic"]["code"],
+                    "artifact_source_unattested"
+                );
+                assert_eq!(
+                    diagnostic["diagnostic"]["details"]["source_event_id"],
+                    selected
+                );
+                assert_eq!(
+                    diagnostic["diagnostic"]["details"]["source_sha256"],
+                    mdx::sha256_hex(b"first")
+                );
+            }
+            // Object body is selected as JSON text, without text-only fallback.
+            append(&db, "record.updated", "{\"body\":{\"legacy\":true}}", false).await;
+            let result = resolve(&db).await.unwrap();
+            if runtime_id == HTML_RUNTIME {
+                assert_eq!(result.ok().unwrap().body, "{\"legacy\":true}");
+            } else {
+                assert_eq!(
+                    result.err().unwrap()["diagnostic"]["details"]["source_sha256"],
+                    mdx::sha256_hex(b"{\"legacy\":true}")
+                );
+            }
+            // Numeric cells retain SQLx String-decoding refusal at every caller.
+            append(&db, "record.updated", "{\"body\":7}", false).await;
+            assert!(resolve(&db).await.is_err());
+            assert!(
+                materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                    .await
+                    .is_err()
+                    == (runtime_id == HTML_RUNTIME)
+            );
+            assert!(
+                materialize_live_mdx_v2(
+                    &db,
+                    &Caller::local(),
+                    ID,
+                    "render_artifact",
+                    false,
+                    false,
+                    None
+                )
+                .await
+                .is_err()
+                    == (runtime_id == mdx_v2::RUNTIME_ID)
+            );
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn live_body_reader_malformed_refusal_follows_authorization() {
+        let _guard = mdx::test_guard();
+        let db = fixture(Some(mdx_v2::RUNTIME_ID)).await;
+        append(&db, "record.updated", "{", true).await;
+        crate::authorization::replace_explicit_policy(
+            &db,
+            "fixture",
+            ID,
+            vec![crate::authorization::AllowEntry::account(
+                "acct:allowed",
+                Capability::View,
+            )],
+        )
+        .await
+        .unwrap();
+        for html in [false, true] {
+            let denied = Caller::authenticated("acct:denied");
+            let result = if html {
+                materialize_live_html(&db, &denied, ID, "render_artifact")
+                    .await
+                    .map(|_| ())
+            } else {
+                materialize_live_mdx_v2(&db, &denied, ID, "render_artifact", false, false, None)
+                    .await
+                    .map(|_| ())
+            };
+            let error = result.unwrap_err().to_string();
+            assert!(!error.contains("malformed JSON"), "{error}");
+            let result = if html {
+                materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                    .await
+                    .map(|_| ())
+            } else {
+                materialize_live_mdx_v2(
+                    &db,
+                    &Caller::local(),
+                    ID,
+                    "render_artifact",
+                    false,
+                    false,
+                    None,
+                )
+                .await
+                .map(|_| ())
+            };
+            assert!(result.unwrap_err().to_string().contains("malformed JSON"));
+        }
+        assert!(resolve(&db)
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("malformed JSON"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn live_body_reader_missing_runtime_deleted_and_ungoverned() {
+        let _guard = mdx::test_guard();
+        let db = fixture(None).await;
+        assert_eq!(
+            resolve(&db).await.unwrap().err().unwrap()["diagnostic"]["code"],
+            "missing_runtime"
+        );
+        assert!(
+            materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(materialize_live_mdx_v2(
+            &db,
+            &Caller::local(),
+            ID,
+            "render_artifact",
+            false,
+            false,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none());
+        sqlx::query("UPDATE records SET kind='note' WHERE id=?")
+            .bind(ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&db).await.unwrap().err().unwrap()["diagnostic"]["code"],
+            "invalid_artifact_shape"
+        );
+        assert!(
+            materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(materialize_live_mdx_v2(
+            &db,
+            &Caller::local(),
+            ID,
+            "render_artifact",
+            false,
+            false,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none());
+        sqlx::query("UPDATE records SET kind='artifact',deleted_at='2026-10-11' WHERE id=?")
+            .bind(ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&db).await.unwrap().err().unwrap()["diagnostic"]["code"],
+            "invalid_artifact_shape"
+        );
+        assert!(
+            materialize_live_html(&db, &Caller::local(), ID, "render_artifact")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(materialize_live_mdx_v2(
+            &db,
+            &Caller::local(),
+            ID,
+            "render_artifact",
+            false,
+            false,
+            None
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let missing = "bbb00000-0000-4000-8000-000000000002";
+        assert!(resolve_artifact(
+            &lens::ReadLens::live(&db),
+            &Caller::local(),
+            missing,
+            V2SnapshotMode::InspectOnly,
+            false
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(
+            materialize_live_html(&db, &Caller::local(), missing, "render_artifact")
+                .await
+                .is_err()
+        );
+        assert!(materialize_live_mdx_v2(
+            &db,
+            &Caller::local(),
+            missing,
+            "render_artifact",
+            false,
+            false,
+            None
+        )
+        .await
+        .is_err());
         db.close().await;
     }
 }

@@ -213,11 +213,11 @@ const CLOSERS = new Set(Object.values(OPENERS));
 // advisory warning instead of an analysis (never a refusal). Bytes match
 // the hosted body limit, so every installable package fits; tokens and
 // steps are generous multiples of what that many bytes can produce.
-export const LINT_BUDGET = Object.freeze({
-  scriptBytes: LIMITS.html.body_max_bytes,
-  tokens: 2 * LIMITS.html.body_max_bytes,
-  steps: 64 * LIMITS.html.body_max_bytes,
-});
+const budgetFor = (bodyMax) => Object.freeze({ scriptBytes: bodyMax, tokens: 2 * bodyMax, steps: 64 * bodyMax });
+export const LINT_BUDGET = budgetFor(LIMITS.html.body_max_bytes);
+// The same bounds sized to the package body limit, for an installed app
+// package bundle (`{ package: true }`); ordinary HTML keeps `LINT_BUDGET`.
+export const PACKAGE_LINT_BUDGET = budgetFor(LIMITS.html.package_body_max_bytes);
 // A receiver chain is only a hint, so it is read at most this far back.
 const CHAIN_MAX_WORDS = 16;
 
@@ -395,12 +395,14 @@ const resultShaped = (read) => read.kind === "destructure"
 /**
  * Advisory findings for one package with the work it took: `html` is the
  * bundle, `sqlNeeds` the parsed SQL needs from its declaration, `budget`
- * overrides [`LINT_BUDGET`] (tests use a small one). `exhausted` names the
+ * overrides [`LINT_BUDGET`] (tests use a small one), and `{ package: true }`
+ * starts from [`PACKAGE_LINT_BUDGET`] instead, for an installed app package
+ * bundle. `exhausted` names the
  * bound that stopped the analysis, which then reports one warning instead
  * of guessing. Every finding is a warning.
  */
-export function completenessAnalysis(html, sqlNeeds, budget) {
-  budget = { ...LINT_BUDGET, ...budget };
+export function completenessAnalysis(html, sqlNeeds, budget, { package: isPackage = false } = {}) {
+  budget = { ...(isPackage ? PACKAGE_LINT_BUDGET : LINT_BUDGET), ...budget };
   const report = { findings: [], tokens: 0, work: 0, exhausted: null };
   if (!Array.isArray(sqlNeeds) || sqlNeeds.length === 0) return report;
   const scripts = inlineScripts(html);
@@ -443,8 +445,10 @@ export function completenessAnalysis(html, sqlNeeds, budget) {
 
 /**
  * Advisory findings for one package: `html` is the bundle, `sqlNeeds` the
- * parsed SQL needs from its declaration. Every finding is a warning.
+ * parsed SQL needs from its declaration; `{ package: true }` lints an
+ * installed app package bundle against the package budget. Every finding is
+ * a warning.
  */
-export function completenessFindings(html, sqlNeeds) {
-  return completenessAnalysis(html, sqlNeeds).findings;
+export function completenessFindings(html, sqlNeeds, options) {
+  return completenessAnalysis(html, sqlNeeds, undefined, options).findings;
 }

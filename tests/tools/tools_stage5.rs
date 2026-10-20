@@ -1626,6 +1626,71 @@ async fn rollup_cache_hits_and_invalidates_on_content_meta_and_spec_digest() {
 }
 
 #[tokio::test]
+async fn rollup_revision_is_kept_for_owners_and_withheld_from_non_owners() {
+    // S0 (design 08b4c21): the rollup's revision counter is workspace-wide, so
+    // only an owner may receive it. A hosted member who can see the rollup
+    // still must not learn the counter, while owner footing keeps it.
+    let db = db().await;
+    let registry = registry();
+    let bearer = call(
+        &registry,
+        &db,
+        "create_record",
+        json!({ "type": "Collection", "kind": "folder", "name": "counter footing ledger" }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let child = create_child_with_amount(&registry, &db, &bearer, "only", Some(json!(7))).await;
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": bearer,
+            "facets": { "rollup": rollup_envelope(&bearer, "sum", Some("amount")) }
+        }),
+    )
+    .await;
+    for record in [&bearer, &child] {
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            record,
+            vec![AllowEntry::account("acct:member", Capability::View)],
+        )
+        .await
+        .unwrap();
+    }
+    let address = json!({ "record_id": bearer, "rollup_name": "total_spend" });
+
+    let owner = call_as(
+        &registry,
+        &db,
+        Caller::local(),
+        "resolve_rollup",
+        address.clone(),
+    )
+    .await;
+    assert_eq!(owner["value"], json!(7.0));
+    assert!(
+        owner.get("revision").is_some(),
+        "an owner keeps the workspace-wide revision counter"
+    );
+
+    let member = Caller::authenticated("acct:member")
+        .with_hosting_context("host:member", "db:test")
+        .with_hosting_owner(false);
+    let non_owner = call_as(&registry, &db, member, "resolve_rollup", address).await;
+    assert_eq!(non_owner["value"], json!(7.0));
+    assert!(
+        non_owner.get("revision").is_none(),
+        "a non-owner must not receive the workspace-wide counter"
+    );
+}
+
+#[tokio::test]
 async fn rollup_cache_misses_when_authorization_narrows_without_content_events() {
     let db = db().await;
     let registry = registry();

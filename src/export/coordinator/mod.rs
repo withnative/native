@@ -750,6 +750,17 @@ async fn finalize_standby_export(
         },
         None => None,
     };
+    if manifest.is_some() {
+        // Relational damage (orphaned rows, non-portable embeddings) is
+        // integrity-clean and self-consistently manifested, so it must be
+        // refused here, on the exported file, before publication — not left
+        // for device admission. Ordinary exports skip this with the manifest.
+        let path = export.path();
+        if let Err(err) = crate::standby_snapshot::validate_standby_export_relations(&path).await {
+            drop(file);
+            return Err((Box::new(export), err));
+        }
+    }
     Ok(FinalizedExport {
         export,
         file,
@@ -1190,5 +1201,115 @@ mod tests {
         drain.await.unwrap();
         assert!(!path.exists(), "drain completed before snapshot cleanup");
         assert!(coordinator.try_begin("late".into()).is_none());
+    }
+
+    fn standby_context() -> crate::standby_snapshot::HostedStandbyManifestContext {
+        use crate::standby_snapshot::{
+            ProducerBuildIdentity, StandbyConsumerIdentity, StandbyConsumerPlatform,
+            STANDBY_CONSUMER_CONTRACT,
+        };
+        let consumer = StandbyConsumerIdentity {
+            contract: STANDBY_CONSUMER_CONTRACT.into(),
+            version: 1,
+            platform: StandbyConsumerPlatform::LinuxX8664,
+            source_sha: "b".repeat(40),
+            artifact_sha256: "c".repeat(64),
+            engine_schema_version: crate::CURRENT_ENGINE_SCHEMA_VERSION,
+            ddl_sha256: crate::schema::FROZEN_DDL_SHA256.into(),
+        };
+        crate::standby_snapshot::HostedStandbyManifestContext::new_with_producer(
+            "route-1".into(),
+            consumer,
+            ProducerBuildIdentity::new("a".repeat(40), crate::schema::FROZEN_DDL_SHA256.into())
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn standby_finalize_refuses_export_only_foreign_key_damage() {
+        use sqlx::Connection;
+        let db = crate::create_database(":memory:").await.unwrap();
+
+        // A fresh export is relationally healthy: the new check passes it.
+        let healthy = crate::export::export_connected_db(&db, None).await.unwrap();
+        crate::standby_snapshot::validate_standby_export_relations(&healthy.path())
+            .await
+            .unwrap();
+        healthy.cleanup().await;
+
+        // Plant export-only corruption: orphan one links row in the exported
+        // copy, with enforcement off so the write lands. The live source is
+        // never touched.
+        let export = crate::export::export_connected_db(&db, None).await.unwrap();
+        let path = export.path();
+        let mut raw = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO links (id, source_id, target_id, relationship)
+             VALUES ('plant-orphan', 'no-such-source', 'no-such-target', 'relates_to')",
+        )
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        raw.close().await.unwrap();
+
+        // Still integrity-clean: `integrity_check` passes on the damaged copy
+        // (shown below), and the sha/manifest finalize derives are read from
+        // the file as-is, so they would authenticate the damage rather than
+        // catch it. Only the relational check refuses it.
+        let mut integrity = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(false)
+                .read_only(true),
+        )
+        .await
+        .unwrap();
+        let verdict: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut integrity)
+            .await
+            .unwrap();
+        integrity.close().await.unwrap();
+        assert_eq!(verdict, "ok");
+
+        // The new relational check refuses the corrupted copy ...
+        assert!(
+            crate::standby_snapshot::validate_standby_export_relations(&path)
+                .await
+                .is_err()
+        );
+        // ... and finalization with a standby context refuses publication,
+        // returning ownership so the caller still cleans up the refused image.
+        let err =
+            match finalize_standby_export(export.with_hosted_standby_context(standby_context()))
+                .await
+            {
+                Ok(_) => panic!("corrupted standby export finalized"),
+                Err((refused, err)) => {
+                    refused.cleanup().await;
+                    err
+                }
+            };
+        assert!(err.to_string().contains("relational validation"));
+        assert!(!path.exists(), "refused export left its snapshot behind");
+
+        // Source unaffected: a fresh export from the same live database is
+        // still healthy.
+        let again = crate::export::export_connected_db(&db, None).await.unwrap();
+        crate::standby_snapshot::validate_standby_export_relations(&again.path())
+            .await
+            .unwrap();
+        again.cleanup().await;
+        db.close().await;
     }
 }

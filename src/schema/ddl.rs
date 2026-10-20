@@ -279,6 +279,22 @@
 //! Dictionary inserts follow call-sequence capture so last_insert_rowid stays
 //! bound to the call. Readers and canonical interchange decode to TEXT IDs
 //! and preserve their logical order. Engine 55 compacts the displaced pages.
+//!
+//! ENGINE SCHEMA 87 (9 Oct 2026, task 6ec81db): `Configuration` becomes the
+//! eleventh spine type, so the `records.type` CHECK widens. SQLite cannot alter
+//! a CHECK in place; the 86→87 edge rebuilds `records` from [`RECORDS_DDL`],
+//! keeping every row, rowid, index and trigger.
+//!
+//! ENGINE SCHEMA 88 (10 Oct 2026, task b2583dc): private nullable unread
+//! override on message_preferences; NULL retains legacy awareness derivation.
+//!
+//! ENGINE SCHEMA 89 (10 Oct 2026, task 5b5bfa5): caller-bound account-config
+//! mappings are folded from provision/replacement control events. Mapped targets
+//! have ON DELETE RESTRICT; replacement advances lineage without changing the
+//! old record. No binding registry or query-catalog surface is added.
+
+//! ENGINE SCHEMA 90: immutable plan-bound SQL batch receipts, stamped by act
+//! independently of content events so no-event archive receipts survive copies.
 
 pub(crate) const PROVENANCE_ACTION_ATTESTATIONS_DDL: &str = r#"CREATE TABLE provenance_action_attestations (
      id                      TEXT PRIMARY KEY,
@@ -516,6 +532,29 @@ pub(crate) const WORKSPACE_RULE_INSTALLATION_DDL: [&str; 2] = [
        ON workspace_rule_installations(root, namespace, name)"#,
 ];
 
+/// Engine84 host-asserted app attribution (task `50f5aca`): one row beside
+/// each action attestation a v2 app's call issued, naming the exact install
+/// generation the hosted shell vouched for. Append-only like the attestation
+/// it annotates; event payloads and attestation digests are unchanged.
+/// Shared verbatim by fresh DDL and the 83→84 migration.
+pub(crate) const PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL: [&str; 4] = [
+    r#"CREATE TABLE provenance_action_app_attributions (
+     action_attestation_id TEXT PRIMARY KEY REFERENCES provenance_action_attestations(id),
+     package               TEXT NOT NULL CHECK (length(trim(package)) > 0),
+     version               TEXT NOT NULL CHECK (length(trim(version)) > 0),
+     install_event_id      TEXT NOT NULL CHECK (length(trim(install_event_id)) > 0),
+     assertion             TEXT NOT NULL CHECK (assertion IN ('host'))
+   )"#,
+    r#"CREATE INDEX idx_provenance_action_app_attributions_app
+       ON provenance_action_app_attributions(package, version, install_event_id)"#,
+    r#"CREATE TRIGGER provenance_action_app_attributions_no_update
+       BEFORE UPDATE ON provenance_action_app_attributions
+       BEGIN SELECT RAISE(ABORT, 'provenance_action_app_attributions is append-only'); END"#,
+    r#"CREATE TRIGGER provenance_action_app_attributions_no_delete
+       BEFORE DELETE ON provenance_action_app_attributions
+       BEGIN SELECT RAISE(ABORT, 'provenance_action_app_attributions is append-only'); END"#,
+];
+
 /// Stored schema-config JSON occurrences; deletion follows the source row.
 pub const SCHEMA_CONFIG_JSON_NODES_DDL: &str = r#"CREATE TABLE schema_config_json_nodes (
      config_id      TEXT NOT NULL REFERENCES schema_config(id) ON DELETE CASCADE,
@@ -552,7 +591,159 @@ pub const FACET_VALUE_JSON_NODES_DDL: &str = r#"CREATE TABLE facet_value_json_no
      PRIMARY KEY (facet_id, ordinal)
    )"#;
 
-pub const DDL_STATEMENTS: [&str; 358] = [
+/// Stored facet-observation JSON occurrences; the facet-history twin of
+/// `facet_value_json_nodes`. Only object/array roots project, every node is a
+/// `parsed_text_candidate`, and malformed or over-budget text keeps the
+/// observation write with no nodes. Deletion follows the source row.
+pub const FACET_OBSERVATION_JSON_NODES_DDL: &str = r#"CREATE TABLE facet_observation_json_nodes (
+     observation_id TEXT NOT NULL REFERENCES facet_observations(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (observation_id, ordinal)
+   )"#;
+
+/// Stored record-body JSON occurrences; the `records.body` twin of
+/// `facet_value_json_nodes`. Only object/array roots project, every node is a
+/// `parsed_text_candidate`, and scalar/malformed/over-budget text keeps the
+/// body write with no nodes. Tombstoned rows keep nodes physically;
+/// visibility belongs to the later caller view. Hard delete cascades.
+pub const RECORD_BODY_JSON_NODES_DDL: &str = r#"CREATE TABLE record_body_json_nodes (
+     record_id      TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+     ordinal        INTEGER NOT NULL CHECK (ordinal >= 0),
+     path           TEXT NOT NULL,
+     parent_path    TEXT,
+     parent_ordinal INTEGER CHECK (parent_ordinal >= 0),
+     member_key     TEXT,
+     array_index    INTEGER CHECK (array_index >= 0),
+     depth          INTEGER NOT NULL CHECK (depth >= 0),
+     node_type      TEXT NOT NULL CHECK (node_type IN ('object','array','string','number','boolean','null')),
+     text_value     TEXT,
+     number_text    TEXT,
+     bool_value     INTEGER CHECK (bool_value IN (0,1)),
+     PRIMARY KEY (record_id, ordinal)
+   )"#;
+
+/// S1/S2 identity and immutable message speaker facts. No recipient/liveness registry.
+pub const PERSONA_PARTICIPANTS_DDL: [&str; 4] = [
+    r#"CREATE TABLE personas (
+     persona_id TEXT PRIMARY KEY REFERENCES records(id),
+     owner_person_id TEXT NOT NULL REFERENCES records(id),
+     owner_principal TEXT NOT NULL,
+     state TEXT NOT NULL CHECK (state IN ('active','retired')),
+     registered_event_seq INTEGER NOT NULL,
+     retired_event_seq INTEGER,
+     updated_at TEXT NOT NULL,
+     CHECK ((state='retired') = (retired_event_seq IS NOT NULL))
+    )"#,
+    r#"CREATE INDEX idx_personas_owner ON personas(owner_principal, persona_id)"#,
+    r#"CREATE TABLE message_speakers (
+     message_id TEXT PRIMARY KEY REFERENCES records(id),
+     speaker_kind TEXT NOT NULL CHECK (speaker_kind IN ('persona','agent')),
+     persona_id TEXT REFERENCES personas(persona_id),
+     agent_key TEXT,
+     session_hint TEXT,
+     owner_principal TEXT NOT NULL,
+     assurance TEXT NOT NULL CHECK (assurance IN ('host_asserted','client_asserted','correlation_only')),
+     stamp TEXT CHECK (stamp IS NULL OR json_valid(stamp)),
+     event_seq INTEGER NOT NULL,
+     CHECK ((speaker_kind='persona' AND persona_id IS NOT NULL AND agent_key IS NULL AND session_hint IS NULL)
+         OR (speaker_kind='agent' AND persona_id IS NULL AND agent_key IS NOT NULL))
+    )"#,
+    r#"CREATE INDEX idx_message_speakers_persona ON message_speakers(persona_id, message_id)"#,
+];
+
+/// The `records` table, shared by the fresh DDL and the 86→87 rebuild.
+pub(crate) const RECORDS_DDL: &str = r#"CREATE TABLE records (
+     id            TEXT PRIMARY KEY,
+     type          TEXT NOT NULL,
+     kind          TEXT,
+     name          TEXT NOT NULL DEFAULT '',
+     body          TEXT,
+
+     home_id     TEXT REFERENCES records(id) ON DELETE SET NULL,
+
+     lifecycle     TEXT,
+     owner_id      TEXT REFERENCES records(id),
+
+     -- Engine-owned work coordination projection. The account is the occupancy
+     -- sentinel; a live claim always has its event timestamp, while run context
+     -- is optional. Public record reads deliberately omit all three columns.
+     claimed_by_account TEXT,
+     claimed_run_key    TEXT,
+     claimed_at         TEXT,
+     -- Derived nearest explicit replacement-policy boundary. Nullable at the
+     -- SQLite layer so a v8 file can add/backfill it in place; engine open and
+     -- conformance reject every committed NULL or non-explicit anchor.
+     policy_anchor_id TEXT REFERENCES records(id),
+     -- NON-NULL per spine decision 2e5ed3e Am.2 §3 (dedup/merge fails-wrong
+     -- without it). DEFAULT 'enduring' keeps creation cheap — reconciled with
+     -- the candidate DDL 9561d43 during the build (option (a)).
+     persistence   TEXT NOT NULL DEFAULT 'enduring' CHECK (persistence IN ('enduring','occurrent')),
+     maturity      TEXT,
+
+     summary          TEXT,
+     last_activity_at TEXT,
+
+     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+     deleted_at    TEXT,
+     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
+      -- E3 M1 currency counts (v73): caller-independent currency. is_current
+      -- is tri-state: 1 iff zero live incoming `supersedes`, NULL when >=1
+      -- live incoming leaves whole/partial scope unknown. 0 is reserved for
+      -- a future explicit whole-record assertion and is never written here
+      -- (the CHECK admits it so that assertion needs no migration).
+      -- DEFAULT 1 because a created record has no incoming links yet;
+      -- creation omits both columns so defaults apply. successor_count is
+      -- the live incoming `supersedes` count (deleted source excluded); it
+      -- may include an invisible successor but never stores/displays names.
+      is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),
+      successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),
+
+     CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation','Configuration')),
+     CHECK ((claimed_by_account IS NULL AND claimed_run_key IS NULL AND claimed_at IS NULL)
+         OR (claimed_by_account IS NOT NULL AND claimed_at IS NOT NULL))
+   )"#;
+
+pub const ACCOUNT_CONFIGS_DDL: &str = r#"CREATE TABLE account_configs (
+     account_id TEXT NOT NULL,
+     kind TEXT NOT NULL,
+     record_id TEXT NOT NULL UNIQUE REFERENCES records(id) ON DELETE RESTRICT,
+     created_at TEXT NOT NULL,
+     PRIMARY KEY(account_id,kind)
+   )"#;
+
+/// Immutable plan-bound batch envelopes, including zero-event batches. The
+/// act stamp carries them through existing canonical snapshot/delta machinery.
+pub(crate) const SQL_WRITE_RECEIPTS_DDL: [&str; 4] = [
+    r#"CREATE TABLE sql_write_receipts (
+     principal TEXT NOT NULL CHECK (length(trim(principal)) > 0),
+     plan_id TEXT NOT NULL CHECK (length(trim(plan_id)) > 0),
+     profile TEXT NOT NULL CHECK (profile = 'native.sql-selected-sqlite-commit.v1'),
+     prepared_digest TEXT NOT NULL CHECK (length(prepared_digest) = 64),
+     anchor_id TEXT NOT NULL UNIQUE REFERENCES provenance_action_attestations(id),
+     act INTEGER NOT NULL CHECK (act > 0),
+     envelope TEXT NOT NULL CHECK (json_valid(envelope)),
+     envelope_digest TEXT NOT NULL CHECK (length(envelope_digest) = 64),
+     PRIMARY KEY (principal, plan_id)
+   )"#,
+    r#"CREATE INDEX idx_sql_write_receipts_act ON sql_write_receipts(act) WHERE act IS NOT NULL"#,
+    r#"CREATE TRIGGER sql_write_receipts_no_update BEFORE UPDATE ON sql_write_receipts
+       BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END"#,
+    r#"CREATE TRIGGER sql_write_receipts_no_delete BEFORE DELETE ON sql_write_receipts
+       BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END"#,
+];
+
+pub const DDL_STATEMENTS: [&str; 373] = [
     r#"CREATE TABLE content_events (
      seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
      id                      TEXT NOT NULL UNIQUE,
@@ -701,57 +892,7 @@ pub const DDL_STATEMENTS: [&str; 358] = [
    )"#,
     r#"CREATE INDEX idx_replicated_message_references_resolution
        ON replicated_message_references(resolved_local_id, source_message_id)"#,
-    r#"CREATE TABLE records (
-     id            TEXT PRIMARY KEY,
-     type          TEXT NOT NULL,
-     kind          TEXT,
-     name          TEXT NOT NULL DEFAULT '',
-     body          TEXT,
-
-     home_id     TEXT REFERENCES records(id) ON DELETE SET NULL,
-
-     lifecycle     TEXT,
-     owner_id      TEXT REFERENCES records(id),
-
-     -- Engine-owned work coordination projection. The account is the occupancy
-     -- sentinel; a live claim always has its event timestamp, while run context
-     -- is optional. Public record reads deliberately omit all three columns.
-     claimed_by_account TEXT,
-     claimed_run_key    TEXT,
-     claimed_at         TEXT,
-     -- Derived nearest explicit replacement-policy boundary. Nullable at the
-     -- SQLite layer so a v8 file can add/backfill it in place; engine open and
-     -- conformance reject every committed NULL or non-explicit anchor.
-     policy_anchor_id TEXT REFERENCES records(id),
-     -- NON-NULL per spine decision 2e5ed3e Am.2 §3 (dedup/merge fails-wrong
-     -- without it). DEFAULT 'enduring' keeps creation cheap — reconciled with
-     -- the candidate DDL 9561d43 during the build (option (a)).
-     persistence   TEXT NOT NULL DEFAULT 'enduring' CHECK (persistence IN ('enduring','occurrent')),
-     maturity      TEXT,
-
-     summary          TEXT,
-     last_activity_at TEXT,
-
-     created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-     deleted_at    TEXT,
-     archived      INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
-      -- E3 M1 currency counts (v73): caller-independent currency. is_current
-      -- is tri-state: 1 iff zero live incoming `supersedes`, NULL when >=1
-      -- live incoming leaves whole/partial scope unknown. 0 is reserved for
-      -- a future explicit whole-record assertion and is never written here
-      -- (the CHECK admits it so that assertion needs no migration).
-      -- DEFAULT 1 because a created record has no incoming links yet;
-      -- creation omits both columns so defaults apply. successor_count is
-      -- the live incoming `supersedes` count (deleted source excluded); it
-      -- may include an invisible successor but never stores/displays names.
-      is_current      INTEGER NULL DEFAULT 1 CHECK (is_current IS NULL OR is_current IN (0,1)),
-      successor_count INTEGER NOT NULL DEFAULT 0 CHECK (successor_count >= 0),
-
-     CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation')),
-     CHECK ((claimed_by_account IS NULL AND claimed_run_key IS NULL AND claimed_at IS NULL)
-         OR (claimed_by_account IS NOT NULL AND claimed_at IS NOT NULL))
-   )"#,
+    RECORDS_DDL,
     r#"CREATE INDEX idx_records_type      ON records(type)       WHERE deleted_at IS NULL"#,
     r#"CREATE INDEX idx_records_kind      ON records(type, kind) WHERE deleted_at IS NULL"#,
     r#"CREATE INDEX idx_records_home      ON records(home_id)  WHERE deleted_at IS NULL"#,
@@ -968,6 +1109,7 @@ pub const DDL_STATEMENTS: [&str; 358] = [
      archived           INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1)),
      last_event_seq     INTEGER NOT NULL REFERENCES awareness_events(seq),
      version            INTEGER NOT NULL CHECK (version > 0),
+     unread_override    INTEGER CHECK (unread_override IN (0,1)),
      PRIMARY KEY (subject_account_id, message_id)
    )"#,
     r#"CREATE INDEX idx_message_preferences_due
@@ -1444,6 +1586,8 @@ pub const DDL_STATEMENTS: [&str; 358] = [
    )"#,
     SCHEMA_CONFIG_JSON_NODES_DDL,
     FACET_VALUE_JSON_NODES_DDL,
+    FACET_OBSERVATION_JSON_NODES_DDL,
+    RECORD_BODY_JSON_NODES_DDL,
     r#"CREATE TABLE jobs (
      id          TEXT PRIMARY KEY,
      kind        TEXT NOT NULL,
@@ -1619,6 +1763,7 @@ pub const DDL_STATEMENTS: [&str; 358] = [
    )"#,
     r#"CREATE INDEX idx_agent_runs_account_started
        ON agent_runs(account_id, started_at, activity_id)"#,
+    ACCOUNT_CONFIGS_DDL,
     r#"CREATE TABLE member_contexts (
      account_id       TEXT PRIMARY KEY,
      person_record_id TEXT NOT NULL REFERENCES records(id),
@@ -2823,8 +2968,59 @@ pub const DDL_STATEMENTS: [&str; 358] = [
        BEGIN UPDATE authorization_grant_revision SET epoch = epoch + 1 WHERE id = 1; END"#,
     WORKSPACE_RULE_INSTALLATION_DDL[0],
     WORKSPACE_RULE_INSTALLATION_DDL[1],
-    r#"PRAGMA user_version = 82"#,
+    PERSONA_PARTICIPANTS_DDL[0],
+    PERSONA_PARTICIPANTS_DDL[1],
+    PERSONA_PARTICIPANTS_DDL[2],
+    PERSONA_PARTICIPANTS_DDL[3],
+    PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL[0],
+    PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL[1],
+    PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL[2],
+    PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL[3],
+    SQL_WRITE_RECEIPTS_DDL[0],
+    SQL_WRITE_RECEIPTS_DDL[1],
+    SQL_WRITE_RECEIPTS_DDL[2],
+    SQL_WRITE_RECEIPTS_DDL[3],
+    r#"PRAGMA user_version = 90"#,
 ];
+
+/// The six triggers that keep the two external-content FTS5 indexes
+/// (`records_fts` over name+body, `records_name_idx` over name) in step with
+/// `records`. Each does one FTS insert, delete command or delete+insert and
+/// nothing else, so a private scratch fold may drop them, run the fold, and
+/// rebuild both indexes from `records` (`INSERT INTO <fts>(<fts>)
+/// VALUES('rebuild')`) before anyone reads the scratch. Every other trigger
+/// must stay: authorization epochs, grant revisions and content-event
+/// metadata write state during a fold, and the remaining guards are not worth
+/// the risk of reasoning about one by one.
+pub(crate) const FTS_INDEX_TRIGGERS: [&str; 6] = [
+    "records_fts_ai",
+    "records_fts_ad",
+    "records_fts_au",
+    "records_name_idx_ai",
+    "records_name_idx_ad",
+    "records_name_idx_au",
+];
+
+/// The two FTS5 tables [`FTS_INDEX_TRIGGERS`] maintain.
+pub(crate) const FTS_INDEX_TABLES: [&str; 2] = ["records_fts", "records_name_idx"];
+
+/// The `CREATE TRIGGER` statement for each of [`FTS_INDEX_TRIGGERS`], taken
+/// from [`DDL_STATEMENTS`] itself so a recreated trigger is the schema
+/// authority's definition and cannot drift from a pasted copy. `None` if the
+/// authority no longer declares one of them, which the caller must treat as an
+/// error rather than silently leaving an index unmaintained.
+pub(crate) fn fts_index_trigger_ddl() -> Option<Vec<&'static str>> {
+    FTS_INDEX_TRIGGERS
+        .iter()
+        .map(|name| {
+            let prefix = format!("CREATE TRIGGER {name} ");
+            DDL_STATEMENTS
+                .iter()
+                .copied()
+                .find(|statement| statement.starts_with(&prefix))
+        })
+        .collect()
+}
 
 /// The policy-log projections — independently replayed from `policy_events`.
 pub const POLICY_PROJECTION_TABLES: [&str; 2] = ["record_policies", "policy_entries"];
@@ -2842,9 +3038,10 @@ pub const RELATIONSHIP_PROJECTION_TABLES: [&str; 5] = [
 /// The instruction-control projections synchronously folded from
 /// `control_events`. The applications marker is included because it is itself
 /// deterministic replay state, though it is not a product-facing table.
-pub const CONTROL_PROJECTION_TABLES: [&str; 11] = [
+pub const CONTROL_PROJECTION_TABLES: [&str; 12] = [
     "agent_runs",
     "member_contexts",
+    "account_configs",
     "instruction_bindings",
     "onboarding_programmes",
     "onboarding_programme_sources",
@@ -2877,13 +3074,15 @@ pub const DERIVATION_PROJECTION_TABLES: [&str; 15] = [
 ];
 
 /// The content-log projections — the surface the content rebuild-and-diff checks.
-pub const PROJECTION_TABLES: [&str; 46] = [
+pub const PROJECTION_TABLES: [&str; 50] = [
     "records",
     "links",
     "facet_values",
     "facet_observations",
     "facet_times",
     "facet_value_json_nodes",
+    "facet_observation_json_nodes",
+    "record_body_json_nodes",
     "annotation_targets",
     "attribution_targets",
     "attribution_assertions",
@@ -2893,6 +3092,8 @@ pub const PROJECTION_TABLES: [&str; 46] = [
     "message_audiences",
     "message_origin_state",
     "message_origin_principals",
+    "personas",
+    "message_speakers",
     "message_conversations",
     "message_mentions",
     "record_mentions",

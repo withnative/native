@@ -130,9 +130,7 @@ fn body_from_record_event(event_type: &str, payload: &str) -> Result<Vec<u8>> {
         ));
     }
     let payload: Value = serde_json::from_str(payload)?;
-    let body = payload
-        .as_object()
-        .and_then(|object| object.get("body"))
+    let body = crate::record_body::event_body_value(event_type, &payload)
         .ok_or_else(|| Error::engine("record event is not body-bearing"))?;
     match body {
         Value::Null => Ok(Vec::new()),

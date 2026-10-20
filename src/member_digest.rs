@@ -291,8 +291,13 @@ mod tests {
     use super::*;
     use crate::schema::member_schema::member_ddl_statements;
 
+    // Re-blessed with `MEMBER_SCHEMA_DIGEST_GOLDEN` for engine 89 (5b5bfa5):
+    // the additive CallerBound account_configs table changes both the schema
+    // digest and the shipped-table array, even when its rows are empty.
+    // Profile-minor justification is the same additive schema change documented
+    // in member_schema.rs; existing content encoding and values are unchanged.
     const CONTENT_DIGEST_GOLDEN: &str =
-        "db8b59951e30fca153a85c02beaae3baf646be938ff640ccb6fb02c4ad7e25b0";
+        "acc9d1e490710ec0a07b20091efe00e2288e0aaee8125ee0d10bbca51e863e7b";
 
     fn digest(conn: &rusqlite::Connection) -> String {
         content_digest(conn).expect("test digest must succeed")

@@ -844,6 +844,7 @@ async fn build_projection(
 
     let mut projection = crate::query::turso_sql::IsolatedProjection::default();
     projection.as_of_seq = as_of_seq;
+    projection.principal = Some(caller.actor().to_string());
     projection.insert("records", records)?;
     projection.insert("content_events", events)?;
     projection.insert("links", projected_links)?;

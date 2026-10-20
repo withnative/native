@@ -216,10 +216,10 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
         json!({ "type": "Collection", "kind": "folder", "name": "Work" }),
     )
     .await;
-    create(
+    let open_work = create(
         &registry,
         &db,
-        json!({ "type": "WorkItem", "name": "child", "home_id": root }),
+        json!({ "type": "WorkItem", "kind": "task", "name": "child", "home_id": root, "lifecycle": "open" }),
     )
     .await;
     let archived = create(&registry, &db, json!({ "type": "WorkItem", "name": "old" })).await;
@@ -272,6 +272,13 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
         .as_str()
         .unwrap()
         .starts_with("# Working in Native"));
+    assert!(out["orientation"]["content"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .contains("`app-builder-1.0.0` for installed apps"));
     assert_eq!(out["engine"]["name"], "native-ce");
     assert_eq!(
         out["engine"]["schema_version"],
@@ -319,7 +326,7 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
     assert_eq!(fixed["scope"], "engine");
     assert_eq!(fixed["kind"], "fixed");
     assert_eq!(fixed["source"]["type"], "engine");
-    assert_eq!(fixed["source"]["template_version"], 10);
+    assert_eq!(fixed["source"]["template_version"], 11);
     assert!(fixed["source"].get("record_id").is_none());
     assert!(fixed["content"]
         .as_str()
@@ -370,6 +377,8 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
     assert!(continuation_tools.contains(&"set_intent"));
     assert!(continuation_tools.contains(&"get_dashboard"));
     assert!(continuation_tools.contains(&"get_structure"));
+    assert!(continuation_tools.contains(&"query_sql"));
+    assert!(continuation_tools.contains(&"search"));
     let recent_step = out["next_steps"]["items"]
         .as_array()
         .unwrap()
@@ -380,7 +389,32 @@ async fn bootstrap_returns_only_bounded_first_call_context() {
     assert!(recent_step["why"]
         .as_str()
         .unwrap()
-        .contains("decide whether it is relevant"));
+        .contains("most recently active record"));
+    assert!(recent_step["why"]
+        .as_str()
+        .unwrap()
+        .contains("already hold a reference"));
+    let sql_step = out["next_steps"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["tool"] == "query_sql")
+        .unwrap();
+    let selected = call(&registry, &db, "query_sql", sql_step["arguments"].clone()).await;
+    let rows = selected["rows"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["id"].as_str() == Some(open_work.as_str())),
+        "{selected}"
+    );
+    assert!(
+        rows.iter().all(|row| row["type"] == "WorkItem"
+            && matches!(
+                row["lifecycle"].as_str(),
+                Some("open" | "in_progress" | "blocked")
+            )),
+        "{selected}"
+    );
     for step in out["next_steps"]["items"].as_array().unwrap() {
         let tool = step["tool"].as_str().unwrap();
         let spec = registry

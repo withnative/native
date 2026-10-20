@@ -16,6 +16,7 @@ pub enum SampleFailure {
     Busy,
     Closed,
     Invalid,
+    KitMajorUnavailable(u32),
     Expired,
 }
 #[derive(Clone)]
@@ -256,18 +257,27 @@ impl LaunchDelivery {
             .config
             .resolve_parent_origin(None)
             .map_err(|_| SampleFailure::Invalid)?;
-        if parent.len() > 256
-            || self.config.artifact_origin.len() > 256
+        if parent.len() > kit_delivery::ORIGIN_MAX
+            || self.config.artifact_origin.len() > kit_delivery::ORIGIN_MAX
             || manifest.body_digest.len() > 64
         {
             return Err(SampleFailure::Invalid);
         }
-        let html = inject(source, &parent).map_err(|_| SampleFailure::Invalid)?;
+        let (html, kit_release) = self.kit.compose(source, &parent, manifest).map_err(|e| {
+            if e.code == "kit_major_unavailable" {
+                SampleFailure::KitMajorUnavailable(
+                    manifest.kit_policy.as_ref().expect("requested kit").major,
+                )
+            } else {
+                SampleFailure::Invalid
+            }
+        })?;
         let mut id = [0; 32];
         rand::rng().fill_bytes(&mut id);
         let now = fixture_now.unwrap_or_else(Instant::now);
         let expires = now.checked_add(TICKET_TTL).ok_or(SampleFailure::Invalid)?;
         let descriptor = Launch {
+            kit_release,
             url: format!(
                 "{}/artifact-runtime/v1/launch/{}",
                 self.config.artifact_origin,
@@ -452,6 +462,25 @@ mod tests {
             RuntimeConfig::new("https://parent.test", "https://artifact.test").unwrap(),
         )
     }
+    #[test]
+    fn kit_policy_refuses_instance_sample_launch() {
+        let source = SOURCE.replace("</head>", r#"<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":2}</script></head>"#);
+        let manifest = validate(&source).unwrap();
+        let d = fixture();
+        assert!(matches!(
+            d.reserve_sample_launch(&source, &manifest, "principal", None, "artifact"),
+            Err(SampleFailure::KitMajorUnavailable(2))
+        ));
+        assert_eq!(
+            d.issue_launch(&source, &manifest, "principal", None, "artifact")
+                .err()
+                .unwrap()
+                .code,
+            "kit_major_unavailable"
+        );
+        assert!(d.tickets.lock().unwrap().entries.is_empty());
+    }
+
     fn headers(host: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(HOST, HeaderValue::from_str(host).unwrap());
@@ -491,6 +520,7 @@ mod tests {
                     .unwrap()
                     .try_into()
                     .unwrap(),
+                BODY_LIMIT,
             )
             .unwrap();
         let reservation = d
@@ -814,6 +844,7 @@ mod tests {
                 p.id,
                 e,
                 Launch {
+                    kit_release: None,
                     url: "unused".into(),
                     expires_in_ms: 30000
                 },
@@ -889,6 +920,7 @@ mod tests {
                     id,
                     entry,
                     Launch {
+                        kit_release: None,
                         url: hex::encode(id),
                         expires_in_ms: 30000,
                     },

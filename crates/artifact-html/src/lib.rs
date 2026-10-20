@@ -12,6 +12,7 @@
 //! own engine error at the composition boundary (one `From` impl in
 //! `src/error.rs`), mirroring the `native-artifact-runtime` precedent.
 
+pub mod bundle_url;
 pub mod html;
 pub mod verify;
 pub mod write_diagnostics;

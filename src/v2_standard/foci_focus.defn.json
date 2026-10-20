@@ -1,0 +1,51 @@
+{
+  "family": "native.foci.focus",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "Collection",
+  "kinds": [
+    {
+      "token": "focus",
+      "description": "A named sidebar focus grouping saved views. v1 string patterns and lengths (uuid v4/v7 ids, #RRGGBB colour, 1-60 code-point names) are NOT enforced by the store in this revision; they must be enforced by a Foci consumer, and store-level text formats are pending. Cardinality one on parent is not enforced by the store; one parent, no cycles and depth <= 1 belong to a Foci consumer. No audience-change guard exists yet: a write is not fenced against a concurrent change to the home's access policy.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "name",
+          "type": "text",
+          "required": true,
+          "description": "Human name shown in the sidebar. v1's name limits must be enforced by a Foci consumer; this package does not enforce them. The interpreter's 4,096-byte text ceiling still applies."
+        },
+        {
+          "name": "colour",
+          "type": "text",
+          "required": false,
+          "description": "Optional #RRGGBB colour. The pattern must be enforced by a Foci consumer; this package does not enforce it. The interpreter's 4,096-byte text ceiling still applies."
+        },
+        {
+          "name": "view_order",
+          "type": "list",
+          "required": true,
+          "max_items": 128,
+          "items": {
+            "type": "text"
+          },
+          "description": "Ordered saved-view ids for this focus. May be empty. Id shapes must be enforced by a Foci consumer; this package does not enforce them. The interpreter's 4,096-byte text ceiling still applies to each id."
+        }
+      ],
+      "links": [
+        {
+          "predicate": "parent",
+          "target": {
+            "family": "native.foci.focus",
+            "kind": "focus"
+          },
+          "direction": "out",
+          "cardinality": "one"
+        }
+      ]
+    }
+  ]
+}

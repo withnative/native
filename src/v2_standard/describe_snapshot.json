@@ -5,19 +5,19 @@
       "package": {
         "namespace": "native.standard",
         "name": "document",
-        "version": 1,
-        "digest": "c3805cc3b4bfe3bd2abab594ffcdd83e664966dee9efcbc94d5548fc340372e3"
+        "version": 2,
+        "digest": "75d87e958aa4e9b0a41353aa85674d9224daf9630fe462cae6c56a705a3519ae"
       },
-      "version": 1,
-      "digest": "6f0dab56958edc57378098a3f5bcde76d32f2d34f0e58d590cb534fecb91da61",
+      "version": 2,
+      "digest": "766ef3b4a18348730a07386b58906d3e94d0e7534cadde9e967037688b572471",
       "primary_type": "Document",
       "kind": "note",
       "fields": [
         {
           "name": "title",
           "type": "text",
-          "required": true,
-          "description": "Short human title."
+          "required": false,
+          "description": "Short human title. May be absent: v1 notes are often untitled and no title is invented."
         },
         {
           "name": "body",
@@ -50,8 +50,8 @@
         ],
         "pin": {
           "family": "native.standard.document",
-          "version": 1,
-          "digest": "6f0dab56958edc57378098a3f5bcde76d32f2d34f0e58d590cb534fecb91da61"
+          "version": 2,
+          "digest": "766ef3b4a18348730a07386b58906d3e94d0e7534cadde9e967037688b572471"
         },
         "creatable_homes": [
           "kernel:root"
@@ -223,5 +223,47 @@
         }
       ]
     }
-  ]
+  ],
+  "namespace_policy": {
+    "reserved": [
+      "native",
+      "native.*"
+    ],
+    "case_matching": "ASCII case-insensitive",
+    "applies_to": [
+      "package_namespace",
+      "definition_family"
+    ],
+    "publication": "exact_compiled_first_party_package",
+    "existing_packages": "Packages already installed stay readable, adoptable and replayable. Reinstall requires the exact revision to be compiled into this binary. Retrying an older compiled revision after a binary upgrade is refused if that revision is no longer included."
+  },
+  "directed_links": {
+    "interpreter": "native.defn/4 and later",
+    "targets": [
+      {
+        "family": "<definition family>",
+        "kind": "<recorded kind>"
+      },
+      {
+        "any_record": true
+      }
+    ],
+    "matching": "family+kind matches any retained recorded version; any_record includes bare records and excludes principals and homes; self-links refuse",
+    "authority": {
+      "source": "Edit",
+      "target": "View"
+    },
+    "semantics": "directed predicate; direction either permits outgoing admission and does not create symmetry; cardinality is declaration metadata, not a selection reducer",
+    "prepare": "prepare_link4_as returns endpoint heads, binding revisions, exact pins and selected declaration; link4_as rechecks these and current authority atomically",
+    "harness": {
+      "record_discovery": "describe --record <id>",
+      "prepare": "link-prepare --source <id> --predicate <declared predicate> --target <id> --operation-key <unique retry key>",
+      "commit": "link-commit --json <file containing unchanged prepared request>",
+      "read": "read --id <id>",
+      "create": "create --family <family> --kind <kind> --home <visible creatable home> --json <field object file>",
+      "discovery": "Scope definitions govern creation; record discovery governs existing anchor permissions even when its old version is disabled. Creation of disabled families refuses; retained bound targets still match."
+    },
+    "retry": "principal-scoped operation_key preserves one stable edge identity; discovery is advisory",
+    "dependencies": "selectors create no semantic dependency; active semantic consumers require explicit exact pins; no automatic mapping"
+  }
 }

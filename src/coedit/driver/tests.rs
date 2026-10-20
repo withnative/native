@@ -1185,6 +1185,9 @@ async fn delete_only_update_without_state_vector_advance_is_dirty_until_version_
             vec![AcknowledgedContributor {
                 principal: "acct:alice".into(),
                 executor_kind: "authenticated_principal".into(),
+                run_key: None,
+                app: None,
+                channel: None,
             }]
         );
         state.registry.version_snapshot(&peer.session).unwrap()

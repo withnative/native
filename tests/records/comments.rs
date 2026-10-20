@@ -3,7 +3,10 @@
 // ascending order of the slugs they replaced, so thread orderings keyed on the
 // id are unchanged.
 
-use native_ce::citations::{capture_target_in, AnnotationTargetInput, SelectorInput, SourceSlot};
+use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
+use native_ce::citations::{
+    capture_target_in, AnnotationTargetInput, BodySourcePin, SelectorInput, SourceSlot,
+};
 use native_ce::conformance::rebuild_and_diff;
 use native_ce::events::EventRow;
 use native_ce::generated::kinds::CoreKind;
@@ -14,10 +17,15 @@ use native_ce::meta::{
 };
 use native_ce::projector::replay_with_blob_seeds;
 use native_ce::query::events::log_prefix;
+use native_ce::query::principal::QueryPrincipal;
 use native_ce::query::read::{get_record_with, EnrichOptions};
+use native_ce::query::sql::query_sql;
+use native_ce::record_body::body_at_seq_in_pool;
 use native_ce::store::{append, AppendSpec};
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 
 async fn db() -> Db {
     let db = create_database(":memory:").await.unwrap();
@@ -390,6 +398,7 @@ async fn comment_targets_enforce_root_bearer_and_body_invariants() {
                 target_record_id: root.clone(),
                 source_slot: SourceSlot::Body,
                 purpose: Some("comment_context".into()),
+                source_pin: None,
                 selectors: vec![
                     SelectorInput::TextQuote {
                         exact: "Root".into(),
@@ -1470,4 +1479,700 @@ async fn informational_roots_reject_resolution_with_a_refusal_that_names_the_sta
         "resolved"
     );
     assert_eq!(resolved["summary"], "Answered inline");
+}
+
+/// Latest body-carrying event for a record, in the stored-proof domain: the
+/// payload-body guard, not a generic per-record MAX. A metadata-only write
+/// (rename, facet, lifecycle) can share the `record.updated` type, so only
+/// the guard tells a body revision apart. This mirrors
+/// `record_body::BODY_CARRYING_EVENT_SQL`, the authority the live cut proof
+/// (`coedit::live::stored_body_via`) reads through; keep the predicate
+/// verbatim with it.
+async fn latest_body_seq(db: &Db, record_id: &str) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT seq FROM content_events WHERE record_id = ?1
+         AND ((type IN ('record.created','record.updated','receipt.committed.v1')
+               AND json_type(payload,'$.body') IS NOT NULL)
+              OR (type = 'unit.revision.recorded.v1'
+                  AND json_type(payload,'$.content.content') IS NOT NULL))
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(record_id)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap()
+}
+
+/// Latest body-carrying event for a record, per the shared body-history
+/// contract (`record_body::BODY_CARRYING_EVENT_SQL`). The pin's
+/// `source_event_id` must name exactly this revision.
+async fn latest_body_event_id(db: &Db, id: &str) -> String {
+    // Inline mirror of `src/record_body.rs::BODY_CARRYING_EVENT_SQL`; the two
+    // must move together. It deliberately selects the latest *body-carrying*
+    // event, not `MAX(seq)`, so a body-preserving update does not move it.
+    sqlx::query_scalar(
+        "SELECT id FROM content_events
+          WHERE record_id = ?
+            AND ((type IN ('record.created','record.updated','receipt.committed.v1')
+                    AND json_type(payload,'$.body') IS NOT NULL)
+              OR (type = 'unit.revision.recorded.v1'
+                    AND json_type(payload,'$.content.content') IS NOT NULL))
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+}
+
+async fn current_body(db: &Db, record_id: &str) -> String {
+    sqlx::query_scalar::<_, Option<String>>("SELECT body FROM records WHERE id = ?1")
+        .bind(record_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+        .unwrap_or_default()
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The ratified reopen comparison a live highlight proves against the
+/// projected provenance: the stored body revision is at or before the
+/// capture sequence with an equal digest. A later body write invalidates,
+/// even an equal-bytes restore; a missing proof or malformed provenance
+/// never proves.
+fn reopen_proven(
+    body_seq: Option<i64>,
+    body_sha: &str,
+    capture_seq: Option<i64>,
+    capture_sha: &str,
+) -> bool {
+    match (body_seq, capture_seq) {
+        (Some(body), Some(captured)) => body <= captured && body_sha == capture_sha,
+        _ => false,
+    }
+}
+
+/// Anchor provenance (task 9761ead): `comment_anchors` projects the stored
+/// body-anchor capture (`source_event_seq`, `source_sha256`) under the same
+/// both-ends visibility fence as before, so a later live reopen can prove
+/// the exact recorded range while any later body write — even an
+/// equal-bytes restore the digest alone would re-validate — invalidates.
+#[tokio::test]
+async fn comment_anchors_project_capture_provenance_for_reopen_proof() {
+    let db = db().await;
+    let registry = registry();
+    let body_v1 = "The quick brown fox jumps over the lazy dog";
+    let bearer = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Bearer", "body": body_v1 }),
+    )
+    .await;
+    replace_explicit_policy(
+        &db,
+        "test:policy",
+        &bearer,
+        vec![AllowEntry::account("alice", Capability::View)],
+    )
+    .await
+    .unwrap();
+    let root = anchored_comment(
+        &registry,
+        &db,
+        "c0aa0000-0000-4000-8000-000000000019",
+        &bearer,
+        "Could this be clearer?",
+        body_v1,
+        "quick brown fox",
+    )
+    .await;
+    // A second anchored root, deleted below, proves a hidden annotation
+    // leaves no row while its bearer stays visible.
+    let doomed = anchored_comment(
+        &registry,
+        &db,
+        "c0aa0000-0000-4000-8000-000000000020",
+        &bearer,
+        "Typo note",
+        body_v1,
+        "lazy dog",
+    )
+    .await;
+
+    // The stored capture is the authority: physical content-events MAX for
+    // the bearer (metadata included) with the captured body digest.
+    let stored: (Option<i64>, String, String, Option<String>) = sqlx::query(
+        "SELECT source_event_seq, source_sha256, selectors, purpose
+         FROM annotation_targets WHERE annotation_id = ?1",
+    )
+    .bind(&root)
+    .fetch_one(db.pool())
+    .await
+    .map(|row| {
+        (
+            row.try_get("source_event_seq").unwrap(),
+            row.try_get("source_sha256").unwrap(),
+            row.try_get::<String, _>("selectors").unwrap(),
+            row.try_get("purpose").unwrap(),
+        )
+    })
+    .unwrap();
+    let (capture_seq, capture_sha, capture_selectors, capture_purpose) = stored;
+    let capture_seq = capture_seq.expect("body capture stores a sequence");
+    assert_eq!(capture_sha, sha_hex(body_v1.as_bytes()));
+
+    // Both ends visible: the projection carries the exact stored provenance.
+    let alice = QueryPrincipal::authenticated("alice", true);
+    let rows = query_sql(
+        &db,
+        alice.clone(),
+        "SELECT annotation_id, target_record_id, purpose, selectors,
+                source_event_seq, source_sha256
+         FROM comment_anchors ORDER BY annotation_id",
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows.len(), 2);
+    let row = rows
+        .iter()
+        .find(|row| row["annotation_id"] == root)
+        .expect("kept anchor projected");
+    assert_eq!(row["target_record_id"], bearer);
+    assert_eq!(
+        row["purpose"],
+        serde_json::to_value(&capture_purpose).unwrap()
+    );
+    assert_eq!(row["selectors"], capture_selectors);
+    assert_eq!(row["source_event_seq"].as_i64(), Some(capture_seq));
+    assert_eq!(row["source_sha256"], capture_sha);
+
+    // Hidden bearer: Bea sees neither anchor. Hidden annotation: deleting
+    // the comment removes its row while the bearer stays visible to Alice.
+    let bea = QueryPrincipal::authenticated("bea", true);
+    assert!(
+        query_sql(&db, bea, "SELECT annotation_id FROM comment_anchors")
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    native_ce::store::delete_record(&db, &doomed).await.unwrap();
+    let rows = query_sql(
+        &db,
+        alice.clone(),
+        "SELECT annotation_id FROM comment_anchors",
+    )
+    .await
+    .unwrap()
+    .rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["annotation_id"], root);
+
+    // At capture the stored body revision is the capture event itself, and
+    // the recorded range resolves to the captured bytes.
+    let body_seq = latest_body_seq(&db, &bearer).await;
+    assert_eq!(body_seq, Some(capture_seq));
+    assert_eq!(
+        body_at_seq_in_pool(db.pool(), &bearer, capture_seq)
+            .await
+            .unwrap(),
+        Some(body_v1.as_bytes().to_vec())
+    );
+    assert!(reopen_proven(
+        body_seq,
+        &sha_hex(current_body(&db, &bearer).await.as_bytes()),
+        Some(capture_seq),
+        &capture_sha
+    ));
+
+    // A metadata-only write after capture moves the bearer MAX but no body
+    // revision: the comparison stays valid and the anchor stays current.
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": bearer, "name": "Renamed bearer" }),
+    )
+    .await;
+    let bearer_max: i64 =
+        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?1")
+            .bind(&bearer)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        bearer_max > capture_seq,
+        "metadata write must advance the bearer log"
+    );
+    assert_eq!(latest_body_seq(&db, &bearer).await, Some(capture_seq));
+    assert!(reopen_proven(
+        latest_body_seq(&db, &bearer).await,
+        &sha_hex(current_body(&db, &bearer).await.as_bytes()),
+        Some(capture_seq),
+        &capture_sha
+    ));
+    let read = call(
+        &registry,
+        &db,
+        "get_record",
+        json!({ "ids": [&bearer], "include_comments": true }),
+    )
+    .await;
+    assert_eq!(
+        read["records"][0]["comments"][0]["target"]["validation"]["status"],
+        "current"
+    );
+
+    // A later body revision invalidates, by sequence and by digest.
+    let body_v2 = "The quick brown fox jumps over the sleepy cat";
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": bearer, "body": body_v2,
+            "if_body_digest": current_body_digest(&registry, &db, &bearer).await
+        }),
+    )
+    .await;
+    let revised_seq = latest_body_seq(&db, &bearer)
+        .await
+        .expect("body revision stored");
+    assert!(revised_seq > capture_seq);
+    assert!(!reopen_proven(
+        Some(revised_seq),
+        &sha_hex(current_body(&db, &bearer).await.as_bytes()),
+        Some(capture_seq),
+        &capture_sha
+    ));
+
+    // An equal-bytes restore re-validates the digest — get_record says
+    // current again — but the newer body revision keeps the reopen unproved.
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({
+            "id": bearer, "body": body_v1,
+            "if_body_digest": current_body_digest(&registry, &db, &bearer).await
+        }),
+    )
+    .await;
+    assert_eq!(current_body(&db, &bearer).await, body_v1);
+    let restored_seq = latest_body_seq(&db, &bearer).await.expect("restore stored");
+    assert!(restored_seq > capture_seq);
+    let read = call(
+        &registry,
+        &db,
+        "get_record",
+        json!({ "ids": [&bearer], "include_comments": true }),
+    )
+    .await;
+    assert_eq!(
+        read["records"][0]["comments"][0]["target"]["validation"]["status"], "current",
+        "the digest alone re-validates after an equal-bytes restore"
+    );
+    assert!(
+        !reopen_proven(
+            Some(restored_seq),
+            &sha_hex(current_body(&db, &bearer).await.as_bytes()),
+            Some(capture_seq),
+            &capture_sha
+        ),
+        "only the projected capture sequence forbids the equal-bytes restore"
+    );
+
+    // The stored capture never moves under later writes: the projection
+    // still carries the capture-time pair.
+    let kept_sql = format!(
+        "SELECT source_event_seq, source_sha256 FROM comment_anchors
+         WHERE annotation_id = '{root}'"
+    );
+    let row = query_sql(&db, alice.clone(), kept_sql.as_str())
+        .await
+        .unwrap()
+        .rows
+        .pop()
+        .expect("kept anchor still projected");
+    assert_eq!(row["source_event_seq"].as_i64(), Some(capture_seq));
+    assert_eq!(row["source_sha256"], capture_sha);
+
+    // Missing proof never proves: a blob-anchored citation stores no body
+    // sequence, and the body-only relation carries no row for it.
+    let csv = "date,merchant,amount\n2026-08-01,Coffee,4.50\n";
+    let attachment = call(
+        &registry,
+        &db,
+        "attach_text",
+        json!({ "record_id": bearer, "text": csv, "filename": "statement.csv", "mime": "text/csv" }),
+    )
+    .await["attachment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let selected = "2026-08-01,Coffee,4.50";
+    let start = csv.find(selected).unwrap();
+    let citation = create(
+        &registry,
+        &db,
+        json!({
+            "type": "Annotation", "kind": "citation", "name": "CSV row",
+            "links": [{ "target_id": bearer, "relationship": "part_of" }],
+            "target": {
+                "target_record_id": attachment, "source_slot": "blob", "purpose": "imported_from",
+                "selectors": [
+                    { "type": "data_position", "start": start, "end": start + selected.len() },
+                    { "type": "fragment", "conforms_to": "https://www.rfc-editor.org/rfc/rfc7111", "value": "row=2" }
+                ]
+            }
+        }),
+    )
+    .await;
+    let blob_seq: Option<i64> = sqlx::query_scalar(
+        "SELECT source_event_seq FROM annotation_targets WHERE annotation_id = ?1",
+    )
+    .bind(&citation)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(blob_seq, None);
+    assert!(!reopen_proven(
+        Some(capture_seq),
+        &capture_sha,
+        blob_seq,
+        &capture_sha
+    ));
+    let blob_sql =
+        format!("SELECT annotation_id FROM comment_anchors WHERE annotation_id = '{citation}'");
+    assert!(query_sql(&db, alice, blob_sql.as_str())
+        .await
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+/// A body-preserving update advances `MAX(content_events.seq)` without
+/// advancing the latest body-carrying event, so a pin proved against the
+/// stored body revision stays valid — the distinction between the shared
+/// `BODY_CARRYING_EVENT_SQL` contract and a naive `MAX(seq)` anchor.
+#[tokio::test]
+async fn body_source_pin_survives_body_preserving_updates() {
+    let db = db().await;
+    let registry = registry();
+    let bearer = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Doc", "body": "Alpha. Beta. Gamma." }),
+    )
+    .await;
+    let event_v1 = latest_body_event_id(&db, &bearer).await;
+    let digest_v1 = current_body_digest(&registry, &db, &bearer).await;
+
+    let seq_before: i64 =
+        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
+            .bind(&bearer)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    // Body-preserving: a rename appends a `record.updated` event with no body
+    // value, so the sequence advances but the body-carrying revision does not.
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": bearer, "name": "Renamed" }),
+    )
+    .await;
+    let seq_after: i64 =
+        sqlx::query_scalar("SELECT MAX(seq) FROM content_events WHERE record_id = ?")
+            .bind(&bearer)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(
+        seq_after > seq_before,
+        "the metadata update advanced the record sequence"
+    );
+    assert_eq!(
+        latest_body_event_id(&db, &bearer).await,
+        event_v1,
+        "the body-carrying revision did not move"
+    );
+    assert_eq!(
+        current_body_digest(&registry, &db, &bearer).await,
+        digest_v1,
+        "the stored body is unchanged"
+    );
+
+    // The pin proved against the stored body revision still posts.
+    create(
+        &registry,
+        &db,
+        json!({
+            "id": "c0aa0000-0000-4000-8000-000000000077",
+            "type": "Annotation", "kind": "comment", "body": "Still valid", "lifecycle": "open",
+            "links": [{ "target_id": bearer.clone(), "relationship": "part_of" }],
+            "target": {
+                "target_record_id": bearer.clone(), "source_slot": "body", "purpose": "comment_context",
+                "selectors": [
+                    { "type": "text_quote", "exact": "Gamma" },
+                    { "type": "data_position", "start": 13, "end": 18 }
+                ],
+                "source_pin": { "source_event_id": event_v1, "source_body_sha256": digest_v1 }
+            }
+        }),
+    )
+    .await;
+}
+
+/// A pinned comment binds to the exact captured body revision, and refuses a
+/// delete/reinsert that restores identical bytes — the occurrence the caller
+/// proved is no longer the stored revision even though the hash matches.
+#[tokio::test]
+async fn body_source_pin_binds_a_comment_to_the_exact_captured_body_revision() {
+    let db = db().await;
+    let registry = registry();
+    let repeated = "Alpha. Beta. Beta. Gamma.";
+    let bearer = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Live doc", "body": repeated }),
+    )
+    .await;
+
+    // The capture is proved against occurrence 2 of "Beta": the quote is
+    // disambiguated by its neighbours and the data_position agrees.
+    let second = repeated.rfind("Beta").unwrap();
+    let prefix = repeated[..second].to_string();
+    let suffix = repeated[second + "Beta".len()..].to_string();
+    let selectors = json!([
+        { "type": "text_quote", "exact": "Beta", "prefix": prefix, "suffix": suffix },
+        { "type": "data_position", "start": second, "end": second + "Beta".len() }
+    ]);
+
+    let event_v1 = latest_body_event_id(&db, &bearer).await;
+    let digest_v1 = current_body_digest(&registry, &db, &bearer).await;
+
+    let pinned_comment = |id: &str, event: &str, digest: &str| {
+        json!({
+            "id": id,
+            "type": "Annotation", "kind": "comment", "body": "Pinned", "lifecycle": "open",
+            "links": [{ "target_id": bearer.clone(), "relationship": "part_of" }],
+            "target": {
+                "target_record_id": bearer.clone(),
+                "source_slot": "body",
+                "purpose": "comment_context",
+                "selectors": selectors.clone(),
+                "source_pin": { "source_event_id": event, "source_body_sha256": digest }
+            }
+        })
+    };
+
+    // Matching pin: the comment anchors against the exact revision it named.
+    create(
+        &registry,
+        &db,
+        pinned_comment(
+            "c0aa0000-0000-4000-8000-000000000070",
+            &event_v1,
+            &digest_v1,
+        ),
+    )
+    .await;
+
+    // Delete occurrence 2, then reinsert identical text at the same offsets.
+    // The stored bytes and digest are unchanged; the body revision is not.
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": bearer, "body": "Alpha. Beta. Gamma.", "if_body_digest": digest_v1 }),
+    )
+    .await;
+    let digest_v2 = current_body_digest(&registry, &db, &bearer).await;
+    call(
+        &registry,
+        &db,
+        "update_record",
+        json!({ "id": bearer, "body": repeated, "if_body_digest": digest_v2 }),
+    )
+    .await;
+    assert_eq!(
+        current_body_digest(&registry, &db, &bearer).await,
+        digest_v1,
+        "restored bytes match the original"
+    );
+    let event_v3 = latest_body_event_id(&db, &bearer).await;
+    assert_ne!(
+        event_v3, event_v1,
+        "delete/reinsert advanced the body revision"
+    );
+
+    // The stale pin refuses even though the bytes and hash are identical.
+    let refusal = call_err(
+        &registry,
+        &db,
+        "create_record",
+        pinned_comment(
+            "c0aa0000-0000-4000-8000-000000000071",
+            &event_v1,
+            &digest_v1,
+        ),
+    )
+    .await;
+    assert!(refusal.contains("source pin"), "{refusal}");
+
+    // Re-proving against the restored revision posts normally.
+    create(
+        &registry,
+        &db,
+        pinned_comment(
+            "c0aa0000-0000-4000-8000-000000000072",
+            &event_v3,
+            &digest_v1,
+        ),
+    )
+    .await;
+}
+
+/// The pin stays optional, refuses a wrong hash, and rejects a malformed or
+/// unknown-keyed pin rather than silently discarding it.
+#[tokio::test]
+async fn body_source_pin_is_optional_and_rejects_malformed_or_mismatched_pins() {
+    let db = db().await;
+    let registry = registry();
+    let bearer = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Doc", "body": "Alpha. Beta. Gamma." }),
+    )
+    .await;
+    let event = latest_body_event_id(&db, &bearer).await;
+    let digest = current_body_digest(&registry, &db, &bearer).await;
+
+    let comment_with = |id: &str, target: Value| {
+        json!({
+            "id": id, "type": "Annotation", "kind": "comment", "body": "C", "lifecycle": "open",
+            "links": [{ "target_id": bearer.clone(), "relationship": "part_of" }], "target": target,
+        })
+    };
+
+    // Omitted pin: existing semantics, no source_pin key at all.
+    create(
+        &registry,
+        &db,
+        comment_with(
+            "c0aa0000-0000-4000-8000-000000000073",
+            json!({
+                "target_record_id": bearer.clone(), "source_slot": "body", "purpose": "comment_context",
+                "selectors": [
+                    { "type": "text_quote", "exact": "Gamma" },
+                    { "type": "data_position", "start": 13, "end": 18 }
+                ]
+            }),
+        ),
+    )
+    .await;
+
+    // Wrong hash for the current revision refuses.
+    let refusal = call_err(
+        &registry,
+        &db,
+        "create_record",
+        comment_with(
+            "c0aa0000-0000-4000-8000-000000000074",
+            json!({
+                "target_record_id": bearer.clone(), "source_slot": "body", "purpose": "comment_context",
+                "selectors": [{ "type": "text_quote", "exact": "Gamma" }],
+                "source_pin": { "source_event_id": event, "source_body_sha256": "0".repeat(64) }
+            }),
+        ),
+    )
+    .await;
+    assert!(refusal.contains("source pin"), "{refusal}");
+
+    // A partial pin is a parse error, never a silent drop.
+    let malformed = call_err(
+        &registry,
+        &db,
+        "create_record",
+        comment_with(
+            "c0aa0000-0000-4000-8000-000000000075",
+            json!({
+                "target_record_id": bearer.clone(), "source_slot": "body",
+                "selectors": [{ "type": "text_quote", "exact": "Gamma" }],
+                "source_pin": { "source_event_id": event }
+            }),
+        ),
+    )
+    .await;
+    assert!(malformed.contains("source_body_sha256"), "{malformed}");
+
+    // An unknown pin key refuses rather than being ignored.
+    let unknown = call_err(
+        &registry,
+        &db,
+        "create_record",
+        comment_with(
+            "c0aa0000-0000-4000-8000-000000000076",
+            json!({
+                "target_record_id": bearer.clone(), "source_slot": "body",
+                "selectors": [{ "type": "text_quote", "exact": "Gamma" }],
+                "source_pin": { "source_event_id": event, "source_body_sha256": digest, "extra": 1 }
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        unknown.contains("extra") || unknown.contains("unknown"),
+        "{unknown}"
+    );
+}
+
+/// The exact-revision check runs in the anchoring transaction before selectors
+/// are validated, so a stale pin refuses on the pin rather than on a selector
+/// outcome.
+#[tokio::test]
+async fn body_source_pin_is_checked_before_selectors_in_transaction() {
+    let db = db().await;
+    let registry = registry();
+    let bearer = create(
+        &registry,
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Doc", "body": "Alpha. Beta. Gamma." }),
+    )
+    .await;
+    let event = latest_body_event_id(&db, &bearer).await;
+
+    let pool = crate::common::fixture_write_pool(&db).await;
+    let mut tx = pool.begin().await.unwrap();
+    let error = match capture_target_in(
+        &mut tx,
+        AnnotationTargetInput {
+            target_record_id: bearer.clone(),
+            source_slot: SourceSlot::Body,
+            purpose: Some("comment_context".into()),
+            source_pin: Some(BodySourcePin {
+                source_event_id: event,
+                source_body_sha256: "0".repeat(64),
+            }),
+            selectors: vec![SelectorInput::TextQuote {
+                exact: "No such text".into(),
+                prefix: None,
+                suffix: None,
+                position_hint: None,
+            }],
+        },
+    )
+    .await
+    {
+        Ok(_) => panic!("a mismatched pin must refuse"),
+        Err(error) => error.to_string(),
+    };
+    tx.rollback().await.unwrap();
+    assert!(error.contains("source pin"), "{error}");
 }

@@ -63,7 +63,7 @@ async fn turso_local_describe_schema_is_normalized_allowlisted_and_owner_gated()
     assert_eq!(owner["engine"]["storage_profile"], "turso-local");
     assert_eq!(
         owner["engine"]["ddl_fingerprint"],
-        "b5ab158cdd8a07541875e9cdeb43976ce78bbc550b577756d99c3610ec5f884f"
+        "0d874847ce3dde8956c93c884d3ea4fb9a219f2ed8ee3b186f936b89a4570acb"
     );
     assert_eq!(owner["tables"].as_array().unwrap().len(), 40);
     assert_eq!(owner["ddl_statements"].as_array().unwrap().len(), 119);

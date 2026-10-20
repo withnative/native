@@ -210,6 +210,7 @@ pub enum HostRefusal {
     InvalidIngress,
     Busy,
     MountUnavailable,
+    KitMajorUnavailable,
     Deadline,
     Cancelled,
     HtmlUnavailable,
@@ -533,6 +534,7 @@ pub(super) fn delivery_error(e: crate::artifact_html::BodyDeliveryFailure) -> Ho
         Busy => HostRefusal::Busy,
         Expired => HostRefusal::Deadline,
         Cancelled => HostRefusal::Cancelled,
+        KitMajorUnavailable(_) => HostRefusal::KitMajorUnavailable,
         _ => HostRefusal::MountUnavailable,
     }
 }
@@ -543,6 +545,14 @@ pub(super) fn still_live(cancel: &AtomicBool, deadline: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supplied_kit_delivery_refusal_retains_internal_reason() {
+        assert_eq!(
+            delivery_error(crate::artifact_html::BodyDeliveryFailure::KitMajorUnavailable(1)),
+            HostRefusal::KitMajorUnavailable
+        );
+    }
+
     fn facts() -> sqlite::ResolvedSource {
         sqlite::ResolvedSource {
             source: "a".repeat(64),

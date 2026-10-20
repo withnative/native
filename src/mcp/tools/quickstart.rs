@@ -23,6 +23,8 @@ pub const ACTIONABLE_DEPENDENCIES: &[&str] = &[
     "bootstrap",
     "set_intent",
     "get_record",
+    "query_sql",
+    "search",
     "get_dashboard",
     "get_structure",
     "manage_onboarding",
@@ -99,6 +101,11 @@ If first-use onboarding is pending, give the person a seamless opening that offe
 
 If no onboarding is pending, continue the person's current request without replaying onboarding.
 
+When the person asks to build an app, read `guidance_read.read_guide` topic
+`app-builder-1.0.0` for installed apps using the supplied Preact kit, install
+preparation, and the person's Preview/Adopt. For dashboards, boards and views
+inside Native, use topic `compositions`.
+
 If Bootstrap identifies an actionable repair, explain the human problem and next step plainly. Do not lead with internal classifications or identifiers.
 
 Do not duplicate Bootstrap's orientation or standing instructions in your response. Demonstrate the relevant ideas through the work, and explain them when useful or requested.
@@ -123,6 +130,13 @@ async fn quickstart(_db: Db, _caller: Caller, arguments: Value) -> Result<Value>
             "read_only": true,
             "call_before_substantive_onboarding_guidance": true,
             "permission_boundary": "If another call requires explicit permission, request or await it rather than inventing Bootstrap state."
+        },
+        "app_authoring": {
+            "when": "The person asks to build an app.",
+            "guide_topic": "app-builder-1.0.0",
+            "route": "Installed apps: supplied Preact kit, install preparation, then the person's Preview/Adopt.",
+            "artifact_views_topic": "compositions",
+            "artifact_views_scope": "Dashboards, boards and views inside Native."
         },
         "posture": {
             "goal": "Turn Native's internal context into a useful, accessible first experience.",
@@ -158,6 +172,11 @@ mod tests {
             .unwrap();
         assert_eq!(value["bootstrap_handoff"]["tool"], "bootstrap");
         assert_eq!(value["posture"]["optimise_for"], "near-term value");
+        assert_eq!(value["app_authoring"]["guide_topic"], "app-builder-1.0.0");
+        assert!(value["app_authoring"]["route"]
+            .as_str()
+            .unwrap()
+            .contains("Preview/Adopt"));
         let serialized = value.to_string();
         for forbidden in [
             "run_key",
@@ -260,6 +279,8 @@ mod tests {
                 "bootstrap",
                 "set_intent",
                 "get_record",
+                "query_sql",
+                "search",
                 "get_dashboard",
                 "get_structure",
                 "manage_onboarding",

@@ -10,16 +10,22 @@ mod common;
 
 #[path = "governance/build_provenance.rs"]
 mod build_provenance;
+#[path = "governance/caller_hosting_context.rs"]
+mod caller_hosting_context;
 #[path = "governance/canonical_interchange.rs"]
 mod canonical_interchange;
 #[path = "governance/definitions.rs"]
 mod definitions;
 #[path = "governance/facet_history.rs"]
 mod facet_history;
+#[path = "governance/facet_observation_json_nodes.rs"]
+mod facet_observation_json_nodes;
 #[path = "governance/facet_value_binding.rs"]
 mod facet_value_binding;
 #[path = "governance/facet_value_json_nodes.rs"]
 mod facet_value_json_nodes;
+#[path = "governance/foci_shapes.rs"]
+mod foci_shapes;
 #[path = "governance/home_contract.rs"]
 mod home_contract;
 #[path = "governance/kind_governance.rs"]

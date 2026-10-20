@@ -40,6 +40,50 @@ pub(crate) fn project(value: &str) -> Option<JsonDocument> {
     }
 }
 
+/// Which node table a flattened document lands in. The observation table is
+/// the facet-history twin of the facet-value table: same columns, keyed on
+/// the source observation row instead of the current facet row. `RecordBody`
+/// is the `records.body` twin: same columns, keyed on the owning record.
+#[derive(Clone, Copy)]
+pub(crate) enum NodeTarget {
+    FacetValue,
+    FacetObservation,
+    RecordBody,
+}
+
+impl NodeTarget {
+    fn table(self) -> &'static str {
+        match self {
+            NodeTarget::FacetValue => "facet_value_json_nodes",
+            NodeTarget::FacetObservation => "facet_observation_json_nodes",
+            NodeTarget::RecordBody => "record_body_json_nodes",
+        }
+    }
+
+    fn source_table(self) -> &'static str {
+        match self {
+            NodeTarget::FacetValue => "facet_values",
+            NodeTarget::FacetObservation => "facet_observations",
+            NodeTarget::RecordBody => "records",
+        }
+    }
+
+    fn id_column(self) -> &'static str {
+        match self {
+            NodeTarget::FacetValue => "facet_id",
+            NodeTarget::FacetObservation => "observation_id",
+            NodeTarget::RecordBody => "record_id",
+        }
+    }
+
+    fn value_column(self) -> &'static str {
+        match self {
+            NodeTarget::FacetValue | NodeTarget::FacetObservation => "value",
+            NodeTarget::RecordBody => "body",
+        }
+    }
+}
+
 /// Replace every node for one facet in the caller's transaction. A value with
 /// no flattenable document leaves the facet with no nodes. The caller owns the
 /// transaction, including the source upsert or delete.
@@ -48,37 +92,67 @@ pub(crate) async fn replace(
     facet_id: &str,
     value: Option<&str>,
 ) -> Result<()> {
-    sqlx::query("DELETE FROM facet_value_json_nodes WHERE facet_id=?")
-        .bind(facet_id)
-        .execute(&mut *conn)
-        .await?;
+    replace_into(conn, NodeTarget::FacetValue, facet_id, value).await
+}
+
+/// Replace every node for one record body in the caller's transaction.
+/// The body is the already-coerced stored text (`record_body::coerce_body`);
+/// scalar, malformed or over-limit text leaves the record with no nodes and
+/// never fails the body write. Tombstoned rows keep their nodes physically.
+pub(crate) async fn replace_record_body(
+    conn: &mut SqliteConnection,
+    record_id: &str,
+    body: Option<&str>,
+) -> Result<()> {
+    replace_into(conn, NodeTarget::RecordBody, record_id, body).await
+}
+
+/// Replace every node for one source row in either node table, in the caller's
+/// transaction. Table and id column come from `NodeTarget` (never caller
+/// text), so no interpolated identifier can escape the allowlist. A value
+/// with no flattenable document leaves the row with no nodes.
+pub(crate) async fn replace_into(
+    conn: &mut SqliteConnection,
+    target: NodeTarget,
+    id: &str,
+    value: Option<&str>,
+) -> Result<()> {
+    let delete = format!(
+        "DELETE FROM {} WHERE {}=?",
+        target.table(),
+        target.id_column()
+    );
+    sqlx::query(&delete).bind(id).execute(&mut *conn).await?;
     let Some(value) = value else {
         return Ok(());
     };
     let Some(document) = project(value) else {
         return Ok(());
     };
-    for node in document.nodes {
-        sqlx::query(
-            "INSERT INTO facet_value_json_nodes
-            (facet_id,ordinal,path,parent_path,parent_ordinal,member_key,
+    let insert = format!(
+        "INSERT INTO {}
+            ({},ordinal,path,parent_path,parent_ordinal,member_key,
              array_index,depth,node_type,text_value,number_text,bool_value)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(facet_id)
-        .bind(node.ordinal as i64)
-        .bind(node.path)
-        .bind(node.parent_path)
-        .bind(node.parent_ordinal.map(|value| value as i64))
-        .bind(node.member_key)
-        .bind(node.array_index.map(|value| value as i64))
-        .bind(node.depth as i64)
-        .bind(node.node_type.as_str())
-        .bind(node.text_value)
-        .bind(node.number_text)
-        .bind(node.bool_value.map(i64::from))
-        .execute(&mut *conn)
-        .await?;
+        target.table(),
+        target.id_column()
+    );
+    for node in document.nodes {
+        sqlx::query(&insert)
+            .bind(id)
+            .bind(node.ordinal as i64)
+            .bind(node.path)
+            .bind(node.parent_path)
+            .bind(node.parent_ordinal.map(|value| value as i64))
+            .bind(node.member_key)
+            .bind(node.array_index.map(|value| value as i64))
+            .bind(node.depth as i64)
+            .bind(node.node_type.as_str())
+            .bind(node.text_value)
+            .bind(node.number_text)
+            .bind(node.bool_value.map(i64::from))
+            .execute(&mut *conn)
+            .await?;
     }
     Ok(())
 }
@@ -87,21 +161,40 @@ pub(crate) async fn replace(
 /// over-budget values are skipped with no nodes rather than aborting the
 /// enclosing migration edge or canonical import.
 pub(crate) async fn backfill(conn: &mut SqliteConnection) -> Result<()> {
+    backfill_into(conn, NodeTarget::FacetValue).await
+}
+
+/// The same scan over every stored facet observation (facet history).
+pub(crate) async fn backfill_observations(conn: &mut SqliteConnection) -> Result<()> {
+    backfill_into(conn, NodeTarget::FacetObservation).await
+}
+
+/// Keyset scan over every stored record body, including hidden, archived and
+/// tombstoned rows. Only object/array parsed-text candidates produce nodes;
+/// scalar, malformed and over-limit bodies are skipped with no nodes.
+pub(crate) async fn backfill_record_bodies(conn: &mut SqliteConnection) -> Result<()> {
+    backfill_into(conn, NodeTarget::RecordBody).await
+}
+
+async fn backfill_into(conn: &mut SqliteConnection, target: NodeTarget) -> Result<()> {
+    let select = format!(
+        "SELECT id,{} AS value FROM {} WHERE (? IS NULL OR id>?) ORDER BY id COLLATE BINARY LIMIT 1",
+        target.value_column(),
+        target.source_table()
+    );
     let mut after: Option<String> = None;
     loop {
-        let row = sqlx::query(
-            "SELECT id,value FROM facet_values WHERE (? IS NULL OR id>?) ORDER BY id COLLATE BINARY LIMIT 1",
-        )
-        .bind(&after)
-        .bind(&after)
-        .fetch_optional(&mut *conn)
-        .await?;
+        let row = sqlx::query(&select)
+            .bind(&after)
+            .bind(&after)
+            .fetch_optional(&mut *conn)
+            .await?;
         let Some(row) = row else {
             break;
         };
         let id: String = row.try_get("id")?;
         let value: Option<String> = row.try_get("value")?;
-        replace(conn, &id, value.as_deref()).await?;
+        replace_into(conn, target, &id, value.as_deref()).await?;
         after = Some(id);
     }
     Ok(())

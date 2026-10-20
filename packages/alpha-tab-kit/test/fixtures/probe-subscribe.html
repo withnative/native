@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kit subscribe probe</title>
+</head>
+<body>
+<main>
+<h1>Kit subscribe probe</h1>
+<p id="surface">pending</p>
+</main>
+<script>
+// App contract v2 (instant reads): native.query and native.subscribe exist only
+// when the host offers app.subscribe.v2. `window.probe` drives them from the
+// test and records every frame each subscription hears, so ordering and
+// once-only delivery can be asserted.
+const heard = {};
+const unsubscribes = {};
+const settle = (promise) => promise.then(
+  (result) => ({ ok: result, frozen: Object.isFrozen(result) && Object.isFrozen(result.rows) }),
+  (error) => ({ error: { name: error.name, status: error.status, code: error.code, message: error.message } }),
+);
+window.probe = {
+  surface: () => {
+    const native = window.native;
+    return {
+      artifactQuery: typeof window.nativeArtifact.query,
+      artifactSubscribe: typeof window.nativeArtifact.subscribe,
+      native: typeof native,
+      nativeQuery: typeof (native && native.query),
+      nativeSubscribe: typeof (native && native.subscribe),
+      nativeCall: typeof (native && native.call),
+      nativeSession: typeof (native && native.session),
+      same: native && native.query ? native.query === window.nativeArtifact.query && native.subscribe === window.nativeArtifact.subscribe : null,
+      nativeFrozen: native ? Object.isFrozen(native) : null,
+    };
+  },
+  query: (query) => settle(window.nativeArtifact.query(query)),
+  // Starts a query without waiting for it, so several can be in flight at once.
+  start: (name, query) => { heard[name] = []; window.probe[`pending:${name}`] = settle(window.nativeArtifact.query(query)); },
+  finish: (name) => window.probe[`pending:${name}`],
+  subscribe: (name, query) => {
+    heard[name] = [];
+    const unsubscribe = window.nativeArtifact.subscribe(query, (frame) => heard[name].push({ ...frame, frozen: Object.isFrozen(frame) }));
+    unsubscribes[name] = unsubscribe;
+    return { type: typeof unsubscribe, frozen: Object.isFrozen(unsubscribe), delivered: heard[name].length };
+  },
+  unsubscribe: (name) => { unsubscribes[name](); },
+  // The callback unsubscribes from inside its own delivery.
+  subscribeOnce: (name, query) => {
+    heard[name] = [];
+    unsubscribes[name] = window.nativeArtifact.subscribe(query, (frame) => { heard[name].push(frame); unsubscribes[name](); });
+  },
+  // The callback throws on every delivery: the bridge reports it and keeps delivering.
+  subscribeThrowing: (name, query) => {
+    heard[name] = [];
+    unsubscribes[name] = window.nativeArtifact.subscribe(query, (frame) => { heard[name].push(frame.status); throw new Error("callback failed"); });
+  },
+  heard: (name) => heard[name],
+  names: () => Object.keys(unsubscribes),
+  attempt: (fn) => { try { fn(); return null; } catch (error) { return `${error.name}: ${error.message}`; } },
+  throwsOnSubscribe: (callback) => window.probe.attempt(() => window.nativeArtifact.subscribe({ sql: "select 1" }, callback)),
+  // Queries a test cannot send over evaluate(): functions cannot be serialized.
+  badQueries: () => Promise.all([
+    undefined, null, [], "select 1", {}, { sql: "" }, { sql: 5 }, { sql: "select 1", params: "x" }, { sql: "select 1", params: {} },
+    { sql: "select 1", parameters: [1] }, { sql: "select 1", extra: 1 },
+    { sql: "select 1", params: [{ toJSON: () => { throw new Error("no"); } }] },
+    { sql: "select 1", toJSON: () => 7 },
+  ].map((query) => settle(window.nativeArtifact.query(query)))),
+  badSubscribes: () => {
+    const outcomes = [];
+    for (const [index, query] of [undefined, null, [], {}, { sql: "" }, { sql: "select 1", params: "x" }, { sql: "select 1", parameters: [1] }].entries()) {
+      const name = `bad-${index}`;
+      heard[name] = [];
+      unsubscribes[name] = window.nativeArtifact.subscribe(query, (frame) => heard[name].push(frame));
+      outcomes.push(name);
+    }
+    return outcomes;
+  },
+  // A query whose shape cannot be probed: an ownKeys trap that throws, and a revoked proxy.
+  hostileQueries: () => {
+    const trap = new Proxy({ sql: "select 1" }, { ownKeys() { throw new Error("no keys"); } });
+    const revoked = Proxy.revocable({ sql: "select 1" }, {});
+    revoked.revoke();
+    const outcomes = [window.probe.attempt(() => window.nativeArtifact.query(trap).catch(() => {})), window.probe.attempt(() => window.nativeArtifact.query(revoked.proxy).catch(() => {}))];
+    for (const [index, query] of [trap, revoked.proxy].entries()) {
+      const name = `hostile-${index}`;
+      heard[name] = [];
+      outcomes.push(window.probe.attempt(() => { unsubscribes[name] = window.nativeArtifact.subscribe(query, (frame) => heard[name].push(frame)); }));
+    }
+    return outcomes;
+  },
+  // Refused (a malformed query) and unsubscribed in the same task: the refusal still arrives.
+  subscribeRefusedThenUnsubscribe: (name) => {
+    heard[name] = [];
+    const unsubscribe = window.nativeArtifact.subscribe({ sql: "" }, (frame) => heard[name].push(frame));
+    unsubscribe();
+    return heard[name].length;
+  },
+  // A live subscription unsubscribed in the same task gets nothing.
+  subscribeThenUnsubscribe: (name) => {
+    heard[name] = [];
+    const unsubscribe = window.nativeArtifact.subscribe({ sql: "select 1" }, (frame) => heard[name].push(frame));
+    unsubscribe();
+  },
+  bigQuery: (chars) => settle(window.nativeArtifact.query({ sql: `select '${"x".repeat(chars)}'` })),
+  // The frame is going away: the bridge treats pagehide as the host port closing.
+  pagehide: () => window.dispatchEvent(new Event("pagehide")),
+};
+window.nativeArtifact.ready.then(() => {
+  const surface = window.probe.surface();
+  document.getElementById("surface").textContent = `query:${surface.nativeQuery} subscribe:${surface.nativeSubscribe}`;
+});
+</script>
+</body>
+</html>

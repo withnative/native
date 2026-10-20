@@ -23,6 +23,14 @@ const charCount = (text) => [...text].length;
 const isPlainObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+// App contract v2 marker: the optional `contract` declaration key. Mirrors
+// `alpha_tab_sessions::APP_CONTRACT_V2` and `is_app_v2_declaration`. A v2
+// declaration is exactly `{contract, needs: [], effects: []}`: the one Adopt
+// is the whole consent, so nothing else is declared.
+export const APP_CONTRACT_V2 = "native.app.v2";
+export const isAppV2Declaration = (declaration) => isPlainObject(declaration)
+  && hasOwn(declaration, "contract") && declaration.contract === APP_CONTRACT_V2;
+
 // `valid_sql_need_key`: ^[a-z][a-z0-9_.]{0,39}$
 export function validSqlNeedKey(key) {
   return key.length >= 1 && key.length <= D.sql_need_key_max_chars && /^[a-z][a-z0-9_.]*$/.test(key);
@@ -428,8 +436,20 @@ export function parseDeclaration(declaration) {
     fail("declaration.shape", 1786, "declaration must be an object");
     return out;
   }
-  if (Object.keys(declaration).length !== 2 || !hasOwn(declaration, "needs") || !hasOwn(declaration, "effects")) {
-    fail("declaration.shape", 1789, "declaration must hold exactly 'needs' and 'effects'");
+  const hasContract = hasOwn(declaration, "contract");
+  if (hasContract && declaration.contract !== APP_CONTRACT_V2) {
+    fail("declaration.contract", 0, `declaration 'contract' must be '${APP_CONTRACT_V2}' [invalid_contract]`);
+    return out;
+  }
+  if (Object.keys(declaration).length !== 2 + Number(hasContract) || !hasOwn(declaration, "needs") || !hasOwn(declaration, "effects")) {
+    fail(hasContract ? "declaration.contract" : "declaration.shape", hasContract ? 0 : 1789, hasContract
+      ? `a '${APP_CONTRACT_V2}' declaration must hold exactly 'contract', 'needs' and 'effects' [invalid_contract]`
+      : "declaration must hold exactly 'needs' and 'effects'");
+    return out;
+  }
+  if (hasContract && !(Array.isArray(declaration.needs) && declaration.needs.length === 0
+    && Array.isArray(declaration.effects) && declaration.effects.length === 0)) {
+    fail("declaration.contract", 0, `a '${APP_CONTRACT_V2}' declaration must hold empty 'needs' and 'effects' [invalid_contract]`);
     return out;
   }
   if (!Array.isArray(declaration.effects)) {

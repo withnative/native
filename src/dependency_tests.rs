@@ -46,6 +46,7 @@ fn entry_v(family: &str, version: u32) -> DefinitionEntry {
 
 fn manifest_v(version: u32, entry_version: u32) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: NS.to_string(),
         name: NAME.to_string(),
         version,
@@ -68,6 +69,7 @@ fn manifest_v(version: u32, entry_version: u32) -> PackageManifest {
 /// only, no behaviour, no surface, empty declared reads.
 fn definitions_only_manifest_v(version: u32, entry_version: u32) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: NS.to_string(),
         name: NAME.to_string(),
         version,

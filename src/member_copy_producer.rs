@@ -312,6 +312,11 @@ fn table_source(table: &str) -> (String, &'static str, bool) {
              AND EXISTS (SELECT 1 FROM temp._query_sql_visible_records AS v WHERE v.id = t.record_id)",
             true,
         ),
+        "account_configs" => (
+            "main.account_configs AS t".into(),
+            "t.account_id = ? AND EXISTS (SELECT 1 FROM temp._query_sql_visible_records AS v WHERE v.id = t.record_id)",
+            true,
+        ),
         "member_contexts" => (
             "main.member_contexts AS t".into(),
             "t.account_id = ? \

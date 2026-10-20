@@ -31,7 +31,7 @@ use crate::query::fts::{
 use crate::query::lens::{self, ReadLens};
 use crate::query::{activity, events, pipeline, sql};
 
-use super::super::registry::{Caller, ToolRegistry};
+use super::super::registry::{Caller, CounterFooting, ToolRegistry};
 use super::super::ToolKind;
 use super::parse_args;
 
@@ -2014,6 +2014,7 @@ fn record_producing_query(tool: &str, arguments: Value) -> Result<bool> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn annotate_record_page_snapshot(
     output: &mut Value,
     request: &Value,
@@ -2022,6 +2023,8 @@ fn annotate_record_page_snapshot(
     resolved_content_seq: i64,
     content_head_seq: i64,
     continuation_supported: bool,
+    continuation_as_of: Value,
+    withhold_counters: bool,
 ) {
     let Some(object) = output.as_object_mut() else {
         return;
@@ -2030,14 +2033,21 @@ fn annotate_record_page_snapshot(
         return;
     }
     object.insert("local_database_id".into(), json!(local_database_id));
-    object.entry("as_of").or_insert_with(|| {
-        json!({
-            "content_seq": resolved_content_seq,
-        })
-    });
+    if !withhold_counters {
+        object.entry("as_of").or_insert_with(|| {
+            json!({
+                "content_seq": resolved_content_seq,
+            })
+        });
+    }
     object.insert("observed_at".into(), json!(observed_at));
-    object.insert("resolved_content_seq".into(), json!(resolved_content_seq));
-    object.insert("content_head_seq".into(), json!(content_head_seq));
+    if withhold_counters {
+        object.remove("resolved_content_seq");
+        object.remove("content_head_seq");
+    } else {
+        object.insert("resolved_content_seq".into(), json!(resolved_content_seq));
+        object.insert("content_head_seq".into(), json!(content_head_seq));
+    }
 
     let next_request = if continuation_supported
         && object
@@ -2050,10 +2060,7 @@ fn annotate_record_page_snapshot(
         let returned = object.get("returned").and_then(Value::as_i64).unwrap_or(0);
         if let Some(next) = next.as_object_mut() {
             next.insert("offset".into(), json!(offset + returned));
-            next.insert(
-                "as_of".into(),
-                json!({ "content_seq": resolved_content_seq }),
-            );
+            next.insert("as_of".into(), continuation_as_of);
             if let Some(page_basis_digest) = object.get("page_basis_digest").and_then(Value::as_str)
             {
                 next.insert("if_page_basis_digest".into(), json!(page_basis_digest));
@@ -2064,6 +2071,13 @@ fn annotate_record_page_snapshot(
         Value::Null
     };
     object.insert("next_request".into(), next_request);
+}
+
+fn page_has_more(output: &Value) -> bool {
+    output
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn coordination_page_request(mut request: Value, include_coordination: bool) -> Value {
@@ -2159,6 +2173,19 @@ async fn execute_live_record_query(
         }
         let continuation_request =
             coordination_page_request(arguments.clone(), include_coordination);
+        // Built only when a next page exists: a snapshot with no stable
+        // position id is refused when it needs to be continued, not when it
+        // is read.
+        let continuation_as_of = if !include_interpretation && page_has_more(&output) {
+            crate::position::continuation_as_of(
+                &mut snapshot,
+                caller.counter_footing(),
+                content_head_seq,
+            )
+            .await?
+        } else {
+            Value::Null
+        };
         annotate_record_page_snapshot(
             &mut output,
             &continuation_request,
@@ -2167,6 +2194,8 @@ async fn execute_live_record_query(
             content_head_seq,
             content_head_seq,
             !include_interpretation,
+            continuation_as_of,
+            false,
         );
         Ok(output)
     }
@@ -2384,7 +2413,7 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
         annotate_query_record_paths(&db, &caller, db.write_pool(), &mut output).await?;
         return Ok(output);
     };
-    let resolved = lens::resolve_as_of(&db, selector).await?;
+    let resolved = lens::resolve_as_of_for(&db, caller.counter_footing(), selector).await?;
     let content_observed_at =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let local_database_id = crate::identity::database_id(&db).await?;
@@ -2422,8 +2451,21 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             annotate_coordination_observation(&mut output, &coordination_observed_at);
         }
-        lens::echo_temporal(&mut output, &resolved);
+        lens::echo_temporal(&mut output, &resolved, caller.counter_footing());
         if record_producing {
+            // Built only when a next page exists: a snapshot with no stable
+            // position id is refused when it needs to be continued, not when
+            // it is read.
+            let continuation_as_of = if page_has_more(&output) {
+                crate::position::continuation_as_of(
+                    &mut *db.write_pool().acquire().await?,
+                    caller.counter_footing(),
+                    resolved.resolved_content_seq,
+                )
+                .await?
+            } else {
+                Value::Null
+            };
             annotate_record_page_snapshot(
                 &mut output,
                 &request,
@@ -2432,6 +2474,8 @@ async fn query_record(db: Db, caller: Caller, mut arguments: Value) -> Result<Va
                 resolved.resolved_content_seq,
                 resolved.content_head_seq,
                 true,
+                continuation_as_of,
+                lens::withholds_counters(&resolved, caller.counter_footing()),
             );
         }
         Ok(output)
@@ -2994,6 +3038,13 @@ fn validate_saved_sql_in(
 ) -> Result<()> {
     use crate::query::sql_contract as contract;
     use contract::FunctionAllowance as Allow;
+    // Native 702de73: the ad-hoc sqlite-local dialect is never a saving
+    // allowance; saved SQL is portable (new) or legacy (already stored).
+    if allowance == Allow::SqliteAdHoc {
+        return Err(Error::engine(
+            "saved governed SQL cannot use the ad-hoc sqlite-local function allowance",
+        ));
+    }
     if definition.v != SAVED_SQL_VERSION || definition.kind != "governed_sql" {
         return Err(Error::engine(
             "saved governed SQL envelope/version mismatch",
@@ -3053,14 +3104,16 @@ fn validate_saved_sql_in(
     match allowance {
         // E2: an unordered top-level LIMIT still refuses, but names the
         // exact default the ad-hoc path would apply.
-        Allow::Portable => sql::validate(&definition.sql).map_err(|error| {
-            if error.to_string().contains("LIMIT without ORDER BY") {
-                if let Some(repair) = sql::default_order_repair(&definition.sql) {
-                    return Error::engine(format!("{error}; {repair}"));
+        Allow::Portable | Allow::SqliteAdHoc => {
+            sql::validate(&definition.sql).map_err(|error| {
+                if error.to_string().contains("LIMIT without ORDER BY") {
+                    if let Some(repair) = sql::default_order_repair(&definition.sql) {
+                        return Error::engine(format!("{error}; {repair}"));
+                    }
                 }
-            }
-            error
-        })?,
+                error
+            })?
+        }
         Allow::LegacySavedSql => sql::validate_legacy_saved_sql(&definition.sql)?,
     }
     if let Some(name) = logical_cte_shadow(&definition.sql, |name| {
@@ -3071,11 +3124,22 @@ fn validate_saved_sql_in(
         )));
     }
     let used_relations = match allowance {
-        Allow::Portable => sql::validated_relation_dependencies(&definition.sql)?,
+        Allow::Portable | Allow::SqliteAdHoc => {
+            sql::validated_relation_dependencies(&definition.sql)?
+        }
         Allow::LegacySavedSql => {
             sql::validated_relation_dependencies_legacy_saved_sql(&definition.sql)?
         }
     };
+    // `catalog_operations` rows resolve only in online executor ad-hoc
+    // query_sql from the serving pinned catalogue; a pinned definition can
+    // never carry them. Dependency observation is alias-aware, so a
+    // same-named CTE or literal never trips this.
+    if used_relations.contains("catalog_operations") {
+        return Err(Error::engine(
+            "saved governed SQL cannot read 'catalog_operations': serving catalogue rows resolve only in online executor ad-hoc query_sql",
+        ));
+    }
     if definition.relations.is_empty() {
         return Err(Error::engine(
             "saved governed SQL must declare relation dependencies",
@@ -3178,7 +3242,7 @@ fn validate_saved_sql_in(
         .map(|column| column.name.clone())
         .collect::<Vec<_>>();
     let prepared_labels = match allowance {
-        Allow::Portable => sql::validated_output_columns(&definition.sql)?,
+        Allow::Portable | Allow::SqliteAdHoc => sql::validated_output_columns(&definition.sql)?,
         Allow::LegacySavedSql => sql::validated_output_columns_legacy_saved_sql(&definition.sql)?,
     };
     if prepared_labels != declared_labels {
@@ -3570,7 +3634,7 @@ async fn resolve_rollup(db: Db, caller: Caller, arguments: Value) -> Result<Valu
         )
         .await?;
         if revision(&db).await? == expected {
-            if !caller.is_host_owner() {
+            if caller.counter_footing() != CounterFooting::Owner {
                 payload
                     .as_object_mut()
                     .expect("rollup payload is an object")
@@ -4156,7 +4220,7 @@ pub(crate) async fn query_sql(db: Db, caller: Caller, arguments: Value) -> Resul
                 error.to_string(),
             )
         })?;
-    let result = sql::query_sql_request_owned(db, (&caller).into(), request)
+    let result = sql::query_sql_request_ad_hoc(db, (&caller).into(), request)
         .await
         .map_err(crate::query::sql_contract::ensure_categorized)?;
     Ok(json!({
@@ -4341,6 +4405,11 @@ fn finish_saved_sql(
             &definition.sql,
             &["my_message_state", "my_mentions"],
         );
+    // Exact relation completeness is distinct from receipt reproducibility:
+    // current bindings, visible actor records and their names are not pinned
+    // by a source event head. Include column-less dependencies conservatively.
+    let reaction_dependent = definition.relations.contains_key("message_reactions")
+        || crate::query::sql::saved_sql_reads_any_relation(&definition.sql, &["message_reactions"]);
     let definition_bytes = serde_json::to_vec(definition)?;
     let parameters_bytes = serde_json::to_vec(&parameters)?;
     let rows_bytes = serde_json::to_vec(&rows)?;
@@ -4380,6 +4449,7 @@ fn finish_saved_sql(
     let snapshot = format!("native.snapshot.v1.{:x}", token_digest.finalize());
     let row_count = rows.len();
     let completeness = if run_dependent
+        || reaction_dependent
         || message_state_dependent
         || definition.relations.keys().any(|name| {
             crate::query::sql_contract::LOGICAL_RELATIONS
@@ -4437,7 +4507,7 @@ fn finish_saved_sql(
             "row_count": row_count,
             "truncated": truncated,
             "completeness": completeness,
-            "replayable": !activity_dependent && !run_dependent && !message_state_dependent,
+            "replayable": !activity_dependent && !run_dependent && !message_state_dependent && !reaction_dependent,
             "observation_window_hours": activity_dependent.then_some(24),
             "catalog_revision": definition.catalog_revision,
             "relations": relation_receipts,
@@ -6001,6 +6071,46 @@ mod governed_sql_tests {
     }
 
     #[test]
+    fn saved_sql_admission_refuses_catalog_operations() {
+        let columns = vec![SavedSqlColumn {
+            name: "executor".into(),
+            column_type: SavedSqlColumnType::Text,
+            nullable: false,
+        }];
+        let definition = SavedSqlDefinition {
+            v: SAVED_SQL_VERSION.into(),
+            kind: "governed_sql".into(),
+            profile: SavedSqlProfile {
+                id: "sqlite-local".into(),
+                revision: 1,
+            },
+            catalog_revision: crate::query::sql_contract::LOGICAL_CATALOG_REVISION,
+            relations: BTreeMap::from([(
+                "catalog_operations".into(),
+                SavedSqlRelationDependency {
+                    identity: "native.query-sql.catalog-operations".into(),
+                    semantic_version: 1,
+                },
+            )]),
+            sql: "SELECT executor FROM catalog_operations ORDER BY executor".into(),
+            parameters: Vec::new(),
+            output: SavedSqlOutput {
+                schema_sha256: saved_sql_schema_sha256(&columns).unwrap(),
+                columns,
+                row_identity: vec!["executor".into()],
+                order: vec![SavedSqlOrder {
+                    column: "executor".into(),
+                    direction: SavedSqlDirection::Asc,
+                }],
+            },
+            bounds: SavedSqlBounds { rows: 10 },
+        };
+        let error =
+            validate_saved_sql(&definition).expect_err("saved definitions cannot pin serving rows");
+        assert!(error.to_string().contains("catalog_operations"), "{error}");
+    }
+
+    #[test]
     fn saved_sql_heading_relation_pins_identity_and_version() {
         // Record-grouped counts have a stable record row identity; body heading
         // ordinals themselves remain revision-local integers, never identifiers.
@@ -6394,6 +6504,52 @@ mod governed_sql_tests {
                 "{relation}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_saved_receipts_distinguish_relation_completeness() {
+        let db = create_database(":memory:").await.unwrap();
+        let sql = "SELECT name,id FROM records WHERE type=?1 AND (SELECT count(*) FROM message_reactions) >= 0";
+        let mut counted = definition(sql, 10);
+        counted.relations.insert(
+            "message_reactions".into(),
+            SavedSqlRelationDependency {
+                identity: "native.query-sql.message-reactions".into(),
+                semantic_version: 1,
+            },
+        );
+        validate_saved_sql(&counted).unwrap();
+        let output = execute_saved_sql(db.clone(), &Caller::local(), &counted, None)
+            .await
+            .unwrap();
+        assert_eq!(output["receipt"]["replayable"], false);
+        assert_eq!(output["receipt"]["completeness"], "best_effort");
+        assert_eq!(
+            crate::query::sql_contract::LOGICAL_RELATIONS
+                .iter()
+                .find(|r| r.name == "message_reactions")
+                .unwrap()
+                .completeness,
+            "complete"
+        );
+        assert_eq!(
+            output["receipt"]["relations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["name"] == "message_reactions")
+                .count(),
+            1
+        );
+        // A literal is not a dependency and must not degrade unrelated SQL.
+        let unrelated = definition(
+            "SELECT name,id FROM records WHERE type=?1 AND 'message_reactions'='message_reactions'",
+            10,
+        );
+        let output = execute_saved_sql(db, &Caller::local(), &unrelated, None)
+            .await
+            .unwrap();
+        assert_eq!(output["receipt"]["replayable"], true);
     }
 
     /// 6867ce6 review: a column-less read of `runs` or `run_intents` never

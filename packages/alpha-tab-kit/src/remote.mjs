@@ -124,15 +124,14 @@ export function createMcpClient({ origin = DEFAULT_ORIGIN, bearer, fetchImpl = g
   let id = 0;
   let runKey = null;
 
-  async function tool(name, envelope) {
-    id += 1;
-    const { status, value, text } = await postJson(fetchImpl, `${origin}/mcp`, {
+  async function send(toolName, args, requestId) {
+    return postJson(fetchImpl, `${origin}/mcp`, {
       jsonrpc: "2.0",
-      id,
+      id: requestId,
       method: "tools/call",
       params: {
-        name,
-        arguments: envelope,
+        name: toolName,
+        arguments: args,
         _meta: {
           "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
           "io.modelcontextprotocol/clientInfo": { name: clientName, version: "0.1.0" },
@@ -144,22 +143,40 @@ export function createMcpClient({ origin = DEFAULT_ORIGIN, bearer, fetchImpl = g
       accept: "application/json, text/event-stream",
       "mcp-protocol-version": PROTOCOL_VERSION,
       "mcp-method": "tools/call",
-      "mcp-name": name,
+      "mcp-name": toolName,
     }, timeoutMs).catch((error) => {
       if (error.name === "TimeoutError") {
-        const readOnly = name === "bootstrap" || name.endsWith("_read");
+        const readOnly = toolName === "bootstrap" || toolName.endsWith("_read");
         const warning = readOnly ? "" : " — a write may or may not have committed; inspect before retrying";
-        throw new Error(redact(`${name}: no response after ${timeoutMs / 1000}s${warning}`));
+        throw new Error(redact(`${toolName}: no response after ${timeoutMs / 1000}s${warning}`));
       }
       throw error;
     });
-    if (status === 401 || status === 403) throw new Error(`${name}: unauthorized (${status}); run \`alpha-tab-kit login\` again`);
-    if (status < 200 || status >= 300 || !value) throw new Error(`${name}: HTTP ${status}: ${redact(text, 300)}`);
-    if (value.error) throw new Error(`${name}: ${redact(value.error.message ?? JSON.stringify(value.error))}`);
+  }
+
+  async function tool(name, envelope) {
+    id += 1;
+    const first = await send(name, envelope, id);
+    const outcome = checkReply(name, envelope, first);
+    if (!outcome.retry) return outcome.detail;
+    // Lean refused a direct hidden operation: nothing ran, so retry once
+    // through call_executor with the same envelope plus its executor.
+    id += 1;
+    const retryArgs = retryEnvelope(outcome.repair, name, envelope);
+    const second = await send("call_executor", retryArgs, id);
+    return checkReply("call_executor", retryArgs, second, false).detail;
+  }
+
+  function checkReply(toolName, envelope, { status, value, text }, allowLeanRetry = true) {
+    if (status === 401 || status === 403) throw new Error(`${toolName}: unauthorized (${status}); run \`alpha-tab-kit login\` again`);
+    if (status < 200 || status >= 300 || !value) throw new Error(`${toolName}: HTTP ${status}: ${redact(text, 300)}`);
+    if (value.error) throw new Error(`${toolName}: ${redact(value.error.message ?? JSON.stringify(value.error))}`);
     const result = value.result ?? {};
     const detail = result.structuredContent ?? parseContent(result.content);
-    if (result.isError) throw new Error(`${name}.${envelope.operation ?? ""}: ${redact(typeof detail === "string" ? detail : JSON.stringify(detail))}`);
-    return detail;
+    if (!result.isError) return { detail };
+    const repair = allowLeanRetry ? leanRepair(detail) : null;
+    if (repair) return { detail: null, retry: true, repair };
+    throw new Error(`${toolName}.${envelope.operation ?? ""}: ${redact(typeof detail === "string" ? detail : JSON.stringify(detail))}`);
   }
 
   return {
@@ -179,6 +196,18 @@ export function createMcpClient({ origin = DEFAULT_ORIGIN, bearer, fetchImpl = g
       return tool(executor, { operation, ...(runKey ? { run_key: runKey } : {}), format: "json", plan_id, target, effect_summary });
     },
   };
+}
+
+function leanRepair(detail) {
+  const repair = detail?.repair;
+  if (repair?.code === "call_executor_required") return repair;
+  return null;
+}
+
+function retryEnvelope(repair, name, envelope) {
+  const next = repair?.next_call;
+  if (next?.tool === "call_executor" && next.arguments && typeof next.arguments === "object") return next.arguments;
+  return { executor: name, ...envelope };
 }
 
 function parseContent(content) {

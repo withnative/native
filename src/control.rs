@@ -36,11 +36,14 @@ pub(crate) use alpha_tab_provenance::complete_update_in as complete_alpha_tab_up
 
 pub const CONTROL_EVENT_SCHEMA_VERSION: i64 = 1;
 
-pub const CONTROL_EVENT_TYPES: [&str; 32] = [
+pub const CONTROL_EVENT_TYPES: [&str; 35] = [
     "agent_run.started.v1",
     "agent_run.started.v2",
     "agent_run.closed.v1",
+    "agent_run.identity_enriched.v1",
     "member_context.provisioned",
+    "account_config.provisioned",
+    "account_config.replaced",
     "instruction_binding.created",
     "instruction_binding.changed",
     "instruction_binding.enabled",
@@ -97,6 +100,27 @@ pub struct AgentRunStartedPayload {
     /// never normalised against a model list. The field and column exist so a
     /// future reader attributing the run's work has the claim on record; no
     /// engine path reads it to decide anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_model: Option<String>,
+}
+
+/// Missing->present enrichment of an already-admitted run's self-asserted
+/// identity (task c2e2b7d). One event fills only `NULL` columns on
+/// `agent_runs`; first present values win, including empty strings. The
+/// version fill is coupled to the name: when the stored name is pinned and
+/// the incoming name conflicts, the incoming version is refused with it so a
+/// conflicting client's version is never attached to the pinned name. A
+/// version without a name fills only when no name is pinned. Never overwrites
+/// the start event and never `UPDATE`s outside this reducer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRunIdentityEnrichedPayload {
+    pub activity_id: String,
+    pub account_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_mcp_client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_mcp_client_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported_model: Option<String>,
 }
@@ -191,6 +215,24 @@ pub struct MemberContextProvisionedPayload {
     pub account_id: String,
     pub person_record_id: String,
     pub root_record_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfigProvisionedPayload {
+    pub account_id: String,
+    pub kind: String,
+    pub record_id: String,
+    pub created_at: String,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfigReplacedPayload {
+    pub account_id: String,
+    pub kind: String,
+    pub previous_record_id: String,
+    pub record_id: String,
     pub created_at: String,
 }
 
@@ -594,7 +636,10 @@ pub const ALPHA_TAB_ORDER_MAX_ENTRY_CHARS: usize = 160;
 pub enum ControlEventPayload {
     AgentRunStarted(AgentRunStartedPayload),
     AgentRunClosed(AgentRunClosedPayload),
+    AgentRunIdentityEnriched(AgentRunIdentityEnrichedPayload),
     MemberContextProvisioned(MemberContextProvisionedPayload),
+    AccountConfigProvisioned(AccountConfigProvisionedPayload),
+    AccountConfigReplaced(AccountConfigReplacedPayload),
     InstructionBindingCreated(InstructionBindingStatePayload),
     InstructionBindingChanged(InstructionBindingStatePayload),
     InstructionBindingEnabled(InstructionBindingTogglePayload),
@@ -631,7 +676,10 @@ impl ControlEventPayload {
         match self {
             Self::AgentRunStarted(_) => "agent_run.started.v2",
             Self::AgentRunClosed(_) => "agent_run.closed.v1",
+            Self::AgentRunIdentityEnriched(_) => "agent_run.identity_enriched.v1",
             Self::MemberContextProvisioned(_) => "member_context.provisioned",
+            Self::AccountConfigProvisioned(_) => "account_config.provisioned",
+            Self::AccountConfigReplaced(_) => "account_config.replaced",
             Self::InstructionBindingCreated(_) => "instruction_binding.created",
             Self::InstructionBindingChanged(_) => "instruction_binding.changed",
             Self::InstructionBindingEnabled(_) => "instruction_binding.enabled",
@@ -666,8 +714,11 @@ impl ControlEventPayload {
 
     fn aggregate_kind(&self) -> &'static str {
         match self {
-            Self::AgentRunStarted(_) | Self::AgentRunClosed(_) => "agent_run",
+            Self::AgentRunStarted(_)
+            | Self::AgentRunClosed(_)
+            | Self::AgentRunIdentityEnriched(_) => "agent_run",
             Self::MemberContextProvisioned(_) => "member_context",
+            Self::AccountConfigProvisioned(_) | Self::AccountConfigReplaced(_) => "account_config",
             Self::InstructionBindingCreated(_)
             | Self::InstructionBindingChanged(_)
             | Self::InstructionBindingEnabled(_)
@@ -704,7 +755,10 @@ impl ControlEventPayload {
         Ok(match self {
             Self::AgentRunStarted(value) => serde_json::to_string(value)?,
             Self::AgentRunClosed(value) => serde_json::to_string(value)?,
+            Self::AgentRunIdentityEnriched(value) => serde_json::to_string(value)?,
             Self::MemberContextProvisioned(value) => serde_json::to_string(value)?,
+            Self::AccountConfigProvisioned(value) => serde_json::to_string(value)?,
+            Self::AccountConfigReplaced(value) => serde_json::to_string(value)?,
             Self::InstructionBindingCreated(value) | Self::InstructionBindingChanged(value) => {
                 serde_json::to_string(value)?
             }
@@ -1064,6 +1118,7 @@ fn expected_aggregate_kind(event_type: &str) -> Option<&'static str> {
     match event_type {
         value if value.starts_with("agent_run.") => Some("agent_run"),
         "member_context.provisioned" => Some("member_context"),
+        "account_config.provisioned" | "account_config.replaced" => Some("account_config"),
         value if value.starts_with("instruction_binding.") => Some("instruction_binding"),
         value if value.starts_with("alpha_tab.") => Some("alpha_tab"),
         value if value.starts_with("onboarding_programme_source.") => {
@@ -1190,6 +1245,12 @@ fn validate_alpha_tab(event: &ControlEventRow, value: &AlphaTabStatePayload) -> 
         .map_err(|reason| {
             Error::engine(format!(
                 "control event alpha tab consented_declaration sessions invalid: {reason}"
+            ))
+        })?;
+    crate::alpha_tab_sessions::validate_declaration_contract(&value.consented_declaration)
+        .map_err(|reason| {
+            Error::engine(format!(
+                "control event alpha tab consented_declaration contract invalid: {reason}"
             ))
         })?;
     validate_alpha_tab_request(value.request.as_deref())?;
@@ -1320,6 +1381,12 @@ fn validate_alpha_tab_adopt(event: &ControlEventRow, value: &AlphaTabAdoptPayloa
         .map_err(|reason| {
             Error::engine(format!(
                 "control event alpha tab consented_declaration sessions invalid: {reason}"
+            ))
+        })?;
+    crate::alpha_tab_sessions::validate_declaration_contract(&value.consented_declaration)
+        .map_err(|reason| {
+            Error::engine(format!(
+                "control event alpha tab consented_declaration contract invalid: {reason}"
             ))
         })?;
     if event.aggregate_id != alpha_tab_aggregate_id(&value.account_id, &value.package) {
@@ -1467,6 +1534,37 @@ fn validate_v2_optional_text(label: &str, value: Option<&str>, max_chars: usize)
 
 /// Validate new appends. Historical replay uses the tolerant stored validator,
 /// so tightening restore admission does not rewrite legacy event semantics.
+fn validate_account_config(
+    event: &ControlEventRow,
+    account: &str,
+    kind: &str,
+    id: &str,
+    at: &str,
+    old: Option<&str>,
+) -> Result<()> {
+    if !crate::identity::account::is_account_token(account)
+        || event.aggregate_id != account
+        || kind != crate::mcp::tools::account_config::KIND
+        || !crate::mcp::tools::account_config::canonical_record_id(id)
+        || old.is_some_and(|old| {
+            old == id || !crate::mcp::tools::account_config::canonical_record_id(old)
+        })
+        || event.actor != account
+    {
+        return Err(Error::engine(
+            "invalid caller-bound account config control event",
+        ));
+    }
+    let key = match old {
+        None => format!("provision:v1:account-config:{account}:{kind}"),
+        Some(old) => format!("provision:v1:account-config-replace:{account}:{kind}:{old}"),
+    };
+    if event.idempotency_key != key {
+        return Err(Error::engine("invalid account config control identity"));
+    }
+    timestamp("account config created_at", at)
+}
+
 pub fn validate_control_event(event: &ControlEventRow) -> Result<()> {
     if event.event_type == "alpha_tab.import_reset" {
         return Err(Error::engine(
@@ -1553,6 +1651,75 @@ pub(crate) fn validate_stored_control_event(event: &ControlEventRow) -> Result<(
                 return Err(Error::engine(
                     "agent run closure requires a valid full run key",
                 ));
+            }
+        }
+        "account_config.provisioned" => {
+            let v: AccountConfigProvisionedPayload = decode(event)?;
+            validate_account_config(
+                event,
+                &v.account_id,
+                &v.kind,
+                &v.record_id,
+                &v.created_at,
+                None,
+            )?;
+        }
+        "account_config.replaced" => {
+            let v: AccountConfigReplacedPayload = decode(event)?;
+            validate_account_config(
+                event,
+                &v.account_id,
+                &v.kind,
+                &v.record_id,
+                &v.created_at,
+                Some(&v.previous_record_id),
+            )?;
+        }
+        "agent_run.identity_enriched.v1" => {
+            let value: AgentRunIdentityEnrichedPayload = decode(event)?;
+            nonblank("agent run activity_id", &value.activity_id)?;
+            nonblank("agent run account_id", &value.account_id)?;
+            if event.aggregate_id != value.activity_id {
+                return Err(Error::engine(
+                    "agent run aggregate id does not match activity_id",
+                ));
+            }
+            if event.actor != value.account_id {
+                return Err(Error::engine(
+                    "agent run enrichment actor does not match account_id",
+                ));
+            }
+            if !matches!(
+                crate::runkey::validate_full(event.run_key.as_deref()),
+                crate::runkey::KeyOutcome::Valid(_)
+            ) {
+                return Err(Error::engine(
+                    "agent run enrichment requires a valid full run key",
+                ));
+            }
+            if value.reported_mcp_client_name.is_none()
+                && value.reported_mcp_client_version.is_none()
+                && value.reported_model.is_none()
+            {
+                return Err(Error::engine(
+                    "agent run enrichment must carry at least one identity field",
+                ));
+            }
+            for (label, field) in [
+                ("client name", value.reported_mcp_client_name.as_deref()),
+                (
+                    "client version",
+                    value.reported_mcp_client_version.as_deref(),
+                ),
+                ("declared model", value.reported_model.as_deref()),
+            ] {
+                if let Some(text) = field {
+                    if text.len() > MAX_REPORTED_RUN_IDENTITY_BYTES {
+                        return Err(Error::engine(format!(
+                            "agent run enrichment {label} exceeds {MAX_REPORTED_RUN_IDENTITY_BYTES} bytes"
+                        )));
+                    }
+                }
             }
         }
         "member_context.provisioned" => {
@@ -1821,6 +1988,73 @@ pub(crate) fn validate_stored_control_event(event: &ControlEventRow) -> Result<(
     Ok(())
 }
 
+/// Fill-only projection for `agent_run.identity_enriched.v1`: first present
+/// values win, including empty strings. The version fill is coupled to the
+/// name so a conflicting client's version is never attached to a pinned name.
+async fn apply_identity_enrichment(
+    conn: &mut SqliteConnection,
+    event: &ControlEventRow,
+    activity_id: &str,
+    account_id: &str,
+    name: Option<&str>,
+    version: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    let run_key = event.run_key.as_deref().expect("validated run key");
+    let row = sqlx::query(
+        "SELECT reported_mcp_client_name,reported_mcp_client_version,reported_model,ended_at
+           FROM agent_runs WHERE activity_id=? AND run_key=? AND account_id=?",
+    )
+    .bind(activity_id)
+    .bind(run_key)
+    .bind(account_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| {
+        Error::engine(format!(
+            "control event {} ({}) targets a missing agent run",
+            event.id, event.event_type
+        ))
+    })?;
+    if row.try_get::<Option<String>, _>("ended_at")?.is_some() {
+        return Err(Error::engine(format!(
+            "control event {} ({}) targets a closed agent run",
+            event.id, event.event_type
+        )));
+    }
+    let stored_name: Option<String> = row.try_get("reported_mcp_client_name")?;
+    let stored_version: Option<String> = row.try_get("reported_mcp_client_version")?;
+    let stored_model: Option<String> = row.try_get("reported_model")?;
+    let next_name = stored_name.clone().or_else(|| name.map(str::to_string));
+    let name_conflicts = matches!(
+        (&stored_name, name),
+        (Some(stored), Some(incoming)) if stored != incoming
+    );
+    let version_allowed = stored_version.is_none()
+        && version.is_some()
+        && !name_conflicts
+        && (stored_name.is_none() || name == stored_name.as_deref());
+    let next_version = if version_allowed {
+        version.map(str::to_string)
+    } else {
+        stored_version.clone()
+    };
+    let next_model = stored_model.clone().or_else(|| model.map(str::to_string));
+    let result = sqlx::query(
+        "UPDATE agent_runs SET reported_mcp_client_name=?,reported_mcp_client_version=?,reported_model=?
+          WHERE activity_id=? AND run_key=? AND account_id=?",
+    )
+    .bind(next_name)
+    .bind(next_version)
+    .bind(next_model)
+    .bind(activity_id)
+    .bind(run_key)
+    .bind(account_id)
+    .execute(&mut *conn)
+    .await?;
+    require_one(result, event).await
+}
+
 async fn require_one(
     result: sqlx::sqlite::SqliteQueryResult,
     event: &ControlEventRow,
@@ -1912,6 +2146,42 @@ pub(crate) async fn project_control(
             .execute(&mut *conn)
             .await?;
             require_one(result, event).await?;
+        }
+        "account_config.provisioned" => {
+            let v: AccountConfigProvisionedPayload = decode(event)?;
+            sqlx::query(
+                "INSERT INTO account_configs(account_id,kind,record_id,created_at) VALUES(?,?,?,?)",
+            )
+            .bind(v.account_id)
+            .bind(v.kind)
+            .bind(v.record_id)
+            .bind(v.created_at)
+            .execute(&mut *conn)
+            .await?;
+        }
+        "account_config.replaced" => {
+            let v: AccountConfigReplacedPayload = decode(event)?;
+            let changed = sqlx::query("UPDATE account_configs SET record_id=?,created_at=? WHERE account_id=? AND kind=? AND record_id=?")
+                .bind(v.record_id).bind(v.created_at).bind(v.account_id).bind(v.kind).bind(v.previous_record_id)
+                .execute(&mut *conn).await?.rows_affected();
+            if changed != 1 {
+                return Err(Error::engine(
+                    "account config replacement lineage CAS failed",
+                ));
+            }
+        }
+        "agent_run.identity_enriched.v1" => {
+            let value: AgentRunIdentityEnrichedPayload = decode(event)?;
+            apply_identity_enrichment(
+                conn,
+                event,
+                &value.activity_id,
+                &value.account_id,
+                value.reported_mcp_client_name.as_deref(),
+                value.reported_mcp_client_version.as_deref(),
+                value.reported_model.as_deref(),
+            )
+            .await?;
         }
         "member_context.provisioned" => {
             let value: MemberContextProvisionedPayload = decode(event)?;
@@ -2776,6 +3046,15 @@ async fn append_control_event_on_internal(
     } else {
         validate_control_event(&event)?;
     }
+    match &input.payload {
+        ControlEventPayload::AccountConfigProvisioned(v) => {
+            crate::mcp::tools::account_config::validate_new_target_on(conn, &v.record_id).await?
+        }
+        ControlEventPayload::AccountConfigReplaced(v) => {
+            crate::mcp::tools::account_config::validate_new_target_on(conn, &v.record_id).await?
+        }
+        _ => {}
+    }
     let act = act_alloc.get_or_allocate(conn).await?;
     event.seq = sqlx::query_scalar(
         "INSERT INTO control_events
@@ -2931,6 +3210,253 @@ pub(crate) async fn ensure_agent_run_with_channel(
     })
 }
 
+/// Read-pool binding for one full run key: the account it is bound to and
+/// whether it is closed. `Ok(None)` is no admitted run. Uses the read pool
+/// only, so an unchanged-identity call never takes a write connection. Never
+/// mutates; the write-path rechecks transactionally before admitting or
+/// enriching to close the check-then-act race.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunBinding {
+    pub activity_id: String,
+    pub account_id: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+}
+
+pub(crate) async fn read_run_binding(db: &Db, run_key: &str) -> Result<Option<RunBinding>> {
+    let row = sqlx::query(
+        "SELECT activity_id,account_id,started_at,ended_at FROM agent_runs WHERE run_key=?",
+    )
+    .bind(run_key)
+    .fetch_optional(db.pool())
+    .await?;
+    row.map(|row| {
+        Ok(RunBinding {
+            activity_id: row.try_get("activity_id")?,
+            account_id: row.try_get("account_id")?,
+            started_at: row.try_get("started_at")?,
+            ended_at: row.try_get("ended_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Outcome of one synchronous first-call admission/enrichment: the committed
+/// stored identity plus what changed and what was refused. Refusals are
+/// response-level honesty only and never decide access or routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FirstCallOutcome {
+    pub lifecycle: AgentRunLifecycle,
+    pub stored: ReportedRunIdentity,
+    pub admitted: bool,
+    pub enriched: bool,
+    pub refused_name: bool,
+    pub refused_version: bool,
+    pub refused_model: bool,
+}
+
+/// Admit a missing run or enrich missing->present fields of an existing one,
+/// transactionally rechecking the read-pool fast path. Missing runs are
+/// admitted with the clamped first-call identity; existing runs fill only
+/// `NULL` columns via `agent_run.identity_enriched.v1`, first present wins.
+/// Cross-account and closed-run mismatches are refused before any content
+/// mutation by the wrapper's pre-handler read check; this function rechecks
+/// them inside the write transaction and refuses the same way.
+pub(crate) async fn admit_or_enrich_run(
+    db: &Db,
+    run_key: &str,
+    account_id: &str,
+    reported: ReportedRunIdentity,
+    channel: crate::provenance::Channel,
+) -> Result<FirstCallOutcome> {
+    if !matches!(
+        crate::runkey::validate_full(Some(run_key)),
+        crate::runkey::KeyOutcome::Valid(_)
+    ) {
+        return Err(Error::engine(
+            "first-call capture requires a valid full run key",
+        ));
+    }
+    let reported = reported.clamped();
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    if let Some(row) = sqlx::query(
+        "SELECT activity_id,account_id,started_at,ended_at,reported_mcp_client_name,reported_mcp_client_version,reported_model
+           FROM agent_runs WHERE run_key=?",
+    )
+    .bind(run_key)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let bound: String = row.try_get("account_id")?;
+        if bound != account_id {
+            return Err(Error::engine(
+                "run key is already bound to another authenticated account",
+            ));
+        }
+        let ended_at: Option<String> = row.try_get("ended_at")?;
+        if ended_at.is_some() {
+            return Err(Error::engine(
+                "cannot capture identity for a closed durable activity",
+            ));
+        }
+        let stored = ReportedRunIdentity {
+            client_name: row.try_get("reported_mcp_client_name")?,
+            client_version: row.try_get("reported_mcp_client_version")?,
+            model: row.try_get("reported_model")?,
+        };
+        let name_conflicts = matches!(
+            (&stored.client_name, &reported.client_name),
+            (Some(stored), Some(incoming)) if stored != incoming
+        );
+        let fill_name = stored.client_name.is_none() && reported.client_name.is_some();
+        let fill_version = stored.client_version.is_none()
+            && reported.client_version.is_some()
+            && !name_conflicts
+            && (stored.client_name.is_none()
+                || reported.client_name.as_deref() == stored.client_name.as_deref());
+        let fill_model =
+            stored.model.is_none() && reported.model.is_some();
+        let refused_name =
+            reported.client_name.is_some() && !fill_name && stored.client_name != reported.client_name;
+        let refused_version = reported.client_version.is_some()
+            && !fill_version
+            && stored.client_version != reported.client_version;
+        let refused_model =
+            reported.model.is_some() && !fill_model && stored.model != reported.model;
+        if !(fill_name || fill_version || fill_model) {
+            let lifecycle = AgentRunLifecycle {
+                activity_id: row.try_get("activity_id")?,
+                started_at: row.try_get("started_at")?,
+                ended_at,
+                changed: false,
+            };
+            tx.rollback().await?;
+            return Ok(FirstCallOutcome {
+                lifecycle,
+                stored,
+                admitted: false,
+                enriched: false,
+                refused_name,
+                refused_version,
+                refused_model,
+            });
+        }
+        let activity_id: String = row.try_get("activity_id")?;
+        // Version-fill evidence: when the version fills on a name-pinned run,
+        // the matching name rides along so the reducer can verify the version
+        // belongs to the pinned client rather than refusing it as unattributed.
+        let name_evidence = fill_name
+            || (fill_version
+                && reported.client_name.as_deref() == stored.client_name.as_deref());
+        let payload = AgentRunIdentityEnrichedPayload {
+            activity_id: activity_id.clone(),
+            account_id: account_id.to_string(),
+            reported_mcp_client_name: name_evidence
+                .then(|| reported.client_name.clone())
+                .flatten(),
+            reported_mcp_client_version: fill_version
+                .then(|| reported.client_version.clone())
+                .flatten(),
+            reported_model: fill_model.then(|| reported.model.clone()).flatten(),
+        };
+        append_control_event_in(
+            &mut tx,
+            NewControlEvent::authored(
+                format!("agent-run-identity-enriched:{}:{}", activity_id, uuid::Uuid::new_v4()),
+                &activity_id,
+                account_id,
+                Some(run_key.to_string()),
+                "Fill missing run identity observed on a later call; first present values win.",
+                ControlEventPayload::AgentRunIdentityEnriched(payload),
+            )?,
+            &mut act_alloc,
+        )
+        .await?;
+        tx.commit().await?;
+        let stored_after = read_agent_run_reported_identity(db, run_key)
+            .await?
+            .unwrap_or_default();
+        let lifecycle = AgentRunLifecycle {
+            activity_id,
+            started_at: row.try_get("started_at")?,
+            ended_at,
+            changed: true,
+        };
+        return Ok(FirstCallOutcome {
+            lifecycle,
+            stored: stored_after,
+            admitted: false,
+            enriched: true,
+            refused_name,
+            refused_version,
+            refused_model,
+        });
+    }
+    let activity_id = uuid::Uuid::new_v4().to_string();
+    let started_at = now_iso();
+    append_control_event_in(
+        &mut tx,
+        NewControlEvent::authored(
+            format!("agent-run-start:{run_key}"),
+            &activity_id,
+            account_id,
+            Some(run_key.to_string()),
+            "Admit the run on its first canonical call, bound before the handler mutates so cross-account refusal precedes any direct write. A failed handler leaves the admitted run in place by design: the call happened, and only the admission — never the handler's outcome — is what this event claims.",
+            ControlEventPayload::AgentRunStarted(AgentRunStartedPayload {
+                activity_id: activity_id.clone(),
+                account_id: account_id.to_string(),
+                started_at: started_at.clone(),
+                channel: (channel != crate::provenance::Channel::Unknown).then_some(channel),
+                reported_mcp_client_name: reported.client_name.clone(),
+                reported_mcp_client_version: reported.client_version.clone(),
+                reported_model: reported.model.clone(),
+            }),
+        )?,
+        &mut act_alloc,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(FirstCallOutcome {
+        lifecycle: AgentRunLifecycle {
+            activity_id,
+            started_at,
+            ended_at: None,
+            changed: true,
+        },
+        stored: reported,
+        admitted: true,
+        enriched: false,
+        refused_name: false,
+        refused_version: false,
+        refused_model: false,
+    })
+}
+
+/// Read-pool fast path for first-call capture: the stored identity for one
+/// admitted run, or `Ok(None)` when no run is admitted. Uses the read pool
+/// only.
+pub(crate) async fn read_stored_identity(
+    db: &Db,
+    run_key: &str,
+) -> Result<Option<ReportedRunIdentity>> {
+    let row = sqlx::query(
+        "SELECT reported_mcp_client_name,reported_mcp_client_version,reported_model
+           FROM agent_runs WHERE run_key=?",
+    )
+    .bind(run_key)
+    .fetch_optional(db.pool())
+    .await?;
+    row.map(|row| {
+        Ok(ReportedRunIdentity {
+            client_name: row.try_get("reported_mcp_client_name")?,
+            client_version: row.try_get("reported_mcp_client_version")?,
+            model: row.try_get("reported_model")?,
+        })
+    })
+    .transpose()
+}
+
 /// Close the caller-bound run explicitly. Repeating the same closure is a
 /// read-only success; no timeout, claim, task or transport state calls here.
 pub(crate) async fn close_agent_run(
@@ -2952,7 +3478,7 @@ pub(crate) async fn close_agent_run(
     .bind(run_key)
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or_else(|| Error::engine("close_run requires a successful prior set_intent"))?;
+    .ok_or_else(|| Error::engine("close_run requires a prior admitted run"))?;
     let bound: String = row.try_get("account_id")?;
     if bound != account_id {
         return Err(Error::engine(
@@ -3214,7 +3740,7 @@ pub(crate) async fn rebuild_alpha_tab_projections_in(conn: &mut SqliteConnection
     Ok(())
 }
 
-const CONTROL_OBJECTS: [&str; 19] = [
+const CONTROL_OBJECTS: [&str; 20] = [
     "control_events",
     "idx_control_events_aggregate",
     "control_events_no_update",
@@ -3222,6 +3748,7 @@ const CONTROL_OBJECTS: [&str; 19] = [
     "agent_runs",
     "idx_agent_runs_account_started",
     "member_contexts",
+    "account_configs",
     "instruction_bindings",
     "idx_instruction_bindings_source",
     "onboarding_programmes",
@@ -3306,6 +3833,11 @@ pub(crate) async fn canonical_projection_snapshot(
         }))
     })
     .collect::<Result<Vec<_>>>()?;
+    let account_configs = sqlx::query("SELECT account_id,kind,record_id,created_at FROM account_configs ORDER BY account_id,kind")
+        .fetch_all(&mut conn).await?.into_iter().map(|row| Ok(json!({
+            "account_id":row.try_get::<String,_>("account_id")?, "kind":row.try_get::<String,_>("kind")?,
+            "record_id":row.try_get::<String,_>("record_id")?, "created_at":row.try_get::<String,_>("created_at")?
+        }))).collect::<Result<Vec<_>>>()?;
     let instruction_bindings = sqlx::query(
         "SELECT id,scope_kind,scope_id,source_record_id,position,enabled,created_by,created_at,updated_at FROM instruction_bindings ORDER BY id",
     )
@@ -3470,6 +4002,7 @@ pub(crate) async fn canonical_projection_snapshot(
     Ok(json!({
         "agent_runs": agent_runs,
         "member_contexts": member_contexts,
+        "account_configs": account_configs,
         "instruction_bindings": instruction_bindings,
         "onboarding_programmes": onboarding_programmes,
         "onboarding_programme_sources": onboarding_programme_sources,
@@ -3546,7 +4079,7 @@ pub async fn state_violations_on(conn: &mut SqliteConnection) -> Result<Vec<Stri
              OR lower(name) GLOB 'control_events_*'
              OR lower(name) = 'control_event_applications'
              OR lower(name) IN (
-               'agent_runs','idx_agent_runs_account_started','member_contexts','instruction_bindings','onboarding_programmes',
+               'agent_runs','idx_agent_runs_account_started','member_contexts','account_configs','instruction_bindings','onboarding_programmes',
                'onboarding_programme_sources','member_obligations',
                 'member_obligation_progress','seeded_instruction_sources','idx_instruction_bindings_source',
                 'alpha_tab_installs','idx_alpha_tab_installs_artifact','alpha_tab_orders',

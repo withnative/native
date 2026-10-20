@@ -1,0 +1,14 @@
+{
+  "family": "native.relationship.relates_to",
+  "version": 1,
+  "interpreter": "native.defn/4",
+  "primary_type": "Relationship",
+  "kinds": [{
+    "token": "relation",
+    "description": "relates_to.v1: two arbitrary record participants, unordered pair identity, either eligible edit anchor, source provenance and deterministic assertion retraction. Semantic state is served through the compiled provider, not fields.",
+    "maturity": "current",
+    "identity": {"mode": "record"},
+    "fields": [{"name": "body", "type": "text", "required": false}],
+    "links": []
+  }]
+}

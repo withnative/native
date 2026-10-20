@@ -1,15 +1,16 @@
 use crate::conformance::rebuild_and_diff_control;
 use crate::control::{
-    alpha_tab_aggregate_id, alpha_tab_order_aggregate_id, append_control_event,
-    append_control_event_in, close_agent_run, control_events_in_act_range, ensure_agent_run,
-    member_obligation_aggregate_id, programme_source_aggregate_id,
+    admit_or_enrich_run, alpha_tab_aggregate_id, alpha_tab_order_aggregate_id,
+    append_control_event, append_control_event_in, close_agent_run, control_events_in_act_range,
+    ensure_agent_run, member_obligation_aggregate_id, programme_source_aggregate_id,
     read_agent_run_reported_identity, read_all_control_events, replay_control,
-    AlphaTabAdoptPayload, AlphaTabOrderPayload, AlphaTabStatePayload, ControlEventPayload,
-    ControlEventRow, EmptyPayload, InstructionBindingReorderedPayload,
-    InstructionBindingStatePayload, InstructionBindingTogglePayload,
-    MemberContextProvisionedPayload, MemberObligationProgressedPayload,
-    MemberObligationRebasedPayload, MemberObligationResolvedPayload, MemberObligationStatePayload,
-    NewControlEvent, OnboardingProgrammeSourcePayload, OnboardingProgrammeSourceRemovedPayload,
+    AgentRunIdentityEnrichedPayload, AlphaTabAdoptPayload, AlphaTabOrderPayload,
+    AlphaTabStatePayload, ControlEventPayload, ControlEventRow, EmptyPayload,
+    InstructionBindingReorderedPayload, InstructionBindingStatePayload,
+    InstructionBindingTogglePayload, MemberContextProvisionedPayload,
+    MemberObligationProgressedPayload, MemberObligationRebasedPayload,
+    MemberObligationResolvedPayload, MemberObligationStatePayload, NewControlEvent,
+    OnboardingProgrammeSourcePayload, OnboardingProgrammeSourceRemovedPayload,
     OnboardingProgrammeStatePayload, ProgrammeGenerationPublishedPayload, ReportedRunIdentity,
     SeededInstructionSourceAppliedPayload, ALPHA_TAB_ADOPTION_VERIFIED,
 };
@@ -375,7 +376,7 @@ async fn replay_rebuilds_every_projection_and_reports_drift() {
     append_minimal_graph(&db).await;
     let result = rebuild_and_diff_control(&db).await.unwrap();
     assert!(result.equal, "{result:#?}");
-    assert_eq!(result.tables.len(), 11);
+    assert_eq!(result.tables.len(), 12);
 
     sqlx::query("UPDATE instruction_bindings SET position=999 WHERE id='binding-1'")
         .execute(db.write_pool())
@@ -1437,6 +1438,252 @@ async fn absent_client_info_records_absence_not_an_empty_string() {
     db.close().await;
 }
 
+fn enriched(
+    client_name: Option<&str>,
+    client_version: Option<&str>,
+    model: Option<&str>,
+) -> ReportedRunIdentity {
+    ReportedRunIdentity {
+        client_name: client_name.map(str::to_string),
+        client_version: client_version.map(str::to_string),
+        model: model.map(str::to_string),
+    }
+}
+
+/// Missing->present enrichment fills only `NULL` columns: first present wins
+/// (including empty strings), a conflicting name refuses with its version so
+/// no foreign version attaches to the pinned name, and a matching name with
+/// a new version fills the version with its name evidence.
+#[tokio::test]
+async fn identity_enrichment_fills_missing_and_never_overwrites() {
+    let db = create_database(":memory:").await.unwrap();
+    let channel = crate::provenance::Channel::Mcp;
+    let admitted = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        ReportedRunIdentity::default(),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(admitted.admitted);
+    assert_eq!(admitted.stored, ReportedRunIdentity::default());
+
+    let filled = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("hazel"), None, None),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(filled.enriched);
+    assert!(!filled.refused_name);
+    assert_eq!(filled.stored.client_name.as_deref(), Some("hazel"));
+    assert_eq!(filled.stored.client_version, None);
+
+    // Matching name plus a new version fills the version (name evidence rides
+    // along so the reducer can verify the version belongs to the pinned name).
+    let versioned = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("hazel"), Some("2.1.0"), None),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(versioned.enriched);
+    assert_eq!(versioned.stored.client_version.as_deref(), Some("2.1.0"));
+
+    // Conflicting name refuses with its version: the pinned pair is unchanged
+    // and the response says so honestly.
+    let conflicted = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("other"), Some("9.9"), None),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(!conflicted.enriched);
+    assert!(conflicted.refused_name);
+    assert!(conflicted.refused_version);
+    let kept = read_agent_run_reported_identity(&db, AGENT_RUN)
+        .await
+        .unwrap()
+        .expect("admitted run reads back");
+    assert_eq!(kept.client_name.as_deref(), Some("hazel"));
+    assert_eq!(kept.client_version.as_deref(), Some("2.1.0"));
+
+    // A later model declaration fills while the slot is empty, then sticks.
+    let modelled = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(None, None, Some("m1")),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(modelled.enriched);
+    assert_eq!(modelled.stored.model.as_deref(), Some("m1"));
+    let remodelled = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(None, None, Some("m2")),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(!remodelled.enriched);
+    assert!(remodelled.refused_model);
+
+    assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+    db.close().await;
+}
+
+/// The enrichment reducer refuses closed and missing runs instead of
+/// inventing or resurrecting projection rows.
+#[tokio::test]
+async fn identity_enrichment_refuses_closed_and_missing_runs() {
+    let db = create_database(":memory:").await.unwrap();
+    let channel = crate::provenance::Channel::Mcp;
+    let admitted = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("hazel"), Some("2.1.0"), None),
+        channel,
+    )
+    .await
+    .unwrap();
+    close_agent_run(&db, AGENT_RUN, "acct_alice").await.unwrap();
+
+    let closed = admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(None, None, Some("m1")),
+        channel,
+    )
+    .await;
+    assert!(closed.is_err(), "closed identity is final: {closed:?}");
+
+    // A forged enrichment event for a closed run fails at the reducer, as
+    // does one targeting a run that was never admitted. Neither writes a row.
+    let stale = append_control_event(
+        &db,
+        NewControlEvent::authored(
+            format!(
+                "agent-run-identity-enriched:{}:test",
+                admitted.lifecycle.activity_id
+            ),
+            &admitted.lifecycle.activity_id,
+            "acct_alice",
+            Some(AGENT_RUN.into()),
+            "forged enrichment test",
+            ControlEventPayload::AgentRunIdentityEnriched(AgentRunIdentityEnrichedPayload {
+                activity_id: admitted.lifecycle.activity_id.clone(),
+                account_id: "acct_alice".into(),
+                reported_mcp_client_name: None,
+                reported_mcp_client_version: None,
+                reported_model: Some("m1".into()),
+            }),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert!(stale.is_err(), "reducer must refuse closed runs");
+    let missing = append_control_event(
+        &db,
+        NewControlEvent::authored(
+            "agent-run-identity-enriched:missing:test",
+            "missing-activity",
+            "acct_alice",
+            Some("scout-chair-z748b2".into()),
+            "forged enrichment test",
+            ControlEventPayload::AgentRunIdentityEnriched(AgentRunIdentityEnrichedPayload {
+                activity_id: "missing-activity".into(),
+                account_id: "acct_alice".into(),
+                reported_mcp_client_name: Some("hazel".into()),
+                reported_mcp_client_version: None,
+                reported_model: None,
+            }),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert!(missing.is_err(), "reducer must refuse missing runs");
+    assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+    db.close().await;
+}
+
+/// Admission plus enrichment replays byte-identically into a fresh database,
+/// and pre-change start events (v1 shape, no identity fields) still decode
+/// with every identity field absent.
+#[tokio::test]
+async fn admission_and_enrichment_replay_and_old_events_stay_compatible() {
+    let db = create_database(":memory:").await.unwrap();
+    let channel = crate::provenance::Channel::Mcp;
+    admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("hazel"), None, None),
+        channel,
+    )
+    .await
+    .unwrap();
+    admit_or_enrich_run(
+        &db,
+        AGENT_RUN,
+        "acct_alice",
+        enriched(Some("hazel"), Some("2.1.0"), Some("m1")),
+        channel,
+    )
+    .await
+    .unwrap();
+    assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
+
+    let mut conn = db.write_pool().acquire().await.unwrap();
+    let events = read_all_control_events(&mut conn).await.unwrap();
+    drop(conn);
+    assert!(events
+        .iter()
+        .any(|event| event.event_type == "agent_run.identity_enriched.v1"));
+    let replayed = create_database(":memory:").await.unwrap();
+    let mut target = replayed.write_pool().acquire().await.unwrap();
+    replay_control(&mut target, &events).await.unwrap();
+    replay_control(&mut target, &events).await.unwrap();
+    drop(target);
+    let source = read_agent_run_reported_identity(&db, AGENT_RUN)
+        .await
+        .unwrap();
+    let mirrored = read_agent_run_reported_identity(&replayed, AGENT_RUN)
+        .await
+        .unwrap();
+    assert_eq!(source, mirrored);
+    assert!(rebuild_and_diff_control(&replayed).await.unwrap().equal);
+
+    // A v1 start event carries no identity keys at all: decoding must yield
+    // absence for every new field, never a default string.
+    let legacy: crate::control::AgentRunStartedPayload = serde_json::from_str(
+        r#"{"activity_id":"a","account_id":"b","started_at":"2026-08-03T12:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.reported_mcp_client_name, None);
+    assert_eq!(legacy.reported_mcp_client_version, None);
+    assert_eq!(legacy.reported_model, None);
+    assert!(crate::control::CONTROL_EVENT_TYPES.contains(&"agent_run.identity_enriched.v1"));
+    replayed.close().await;
+    db.close().await;
+}
+
 #[tokio::test]
 async fn declared_model_is_stamped_at_admission_and_first_wins() {
     let db = create_database(":memory:").await.unwrap();
@@ -1616,18 +1863,30 @@ async fn reported_model_has_no_decision_reader() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     // `contribution.rs` names the literal only in a comment-only forward
     // reference ("when a writer lands, `reported_model` joins ..."): no read.
-    // `mcp/registry.rs` names it only in the display slice's absence
-    // assertion (`reported_model` must NOT appear in the contribution run
-    // block) and its doc comment: a negative check, not a read.
+    // `mcp/registry.rs` names it in identity/display regression fixtures,
+    // including presence and absence assertions: no production reader.
+    // `mcp/executor_prototype.rs` names it only in the cfg(test) first-write
+    // wire test's model-absence assertions. Its production prefix is pinned
+    // separately below so allowing that fixture cannot admit a model reader.
     // The two standby modules name it only while constructing complete
     // `AgentRunStartedPayload` fixtures for act-cut/materialisation coverage;
     // neither reads the reported value or uses it to decide behaviour.
     // `query/sql.rs` projects the column into the caller-relative `runs`
     // relation (task 6867ce6) for display beside a constant `self_declared`
     // label: the value decides neither admission nor anything else there.
+    // `mcp/kernel_v2/sql.rs` projects a display-only column: native rows
+    // emit NULL; imported rows retain declarations beside the constant
+    // imported_historical assurance. Visibility uses account/Person proofs,
+    // and the declared model never decides admission, routing or priority.
+    // `v1_import/tests.rs` names the column in its legacy schema fixture and
+    // display-fidelity query only. The whole file is a cfg(test) module;
+    // it adds no production reader or model-based decision.
     // `export.rs` names the column only in its cfg(test) standby admission
     // regression: it counts retained run metadata after filtering. This is
     // fixture verification, with no production reader or decision use.
+    // `v1_import/tests.rs` names the column only in its synthetic run schema
+    // and a SQL projection assertion of imported historical run metadata.
+    // This is test-only fixture verification, with no decision use.
     let literal_allowed = [
         "act.rs",
         "conformance/rebuild.rs",
@@ -1635,6 +1894,8 @@ async fn reported_model_has_no_decision_reader() {
         "control_tests.rs",
         "contribution.rs",
         "export.rs",
+        "mcp/executor_prototype.rs",
+        "mcp/kernel_v2/sql.rs",
         "mcp/registry.rs",
         "migrations.rs",
         "query/sql.rs",
@@ -1642,6 +1903,7 @@ async fn reported_model_has_no_decision_reader() {
         "standby/act_materialise.rs",
         "standby/authority_probe.rs",
         "turso_local.rs",
+        "v1_import/tests.rs",
     ];
     // Every file allowed to name the accessor or the identity type. The
     // production read lives in `mcp/tools/intent.rs` (the response
@@ -1653,6 +1915,8 @@ async fn reported_model_has_no_decision_reader() {
     // default identity for admission calls or read it back in migration tests.
     // `export.rs` constructs the identity only in that cfg(test) fixture;
     // the declared model is never used to choose admission or behavior.
+    // `query/sql_conformance.rs` admits fixture runs with the default
+    // identity through the sanctioned path; nothing reads the model.
     let accessor_allowed = [
         "control.rs",
         "control_tests.rs",
@@ -1666,6 +1930,7 @@ async fn reported_model_has_no_decision_reader() {
         "mcp/tools/work.rs",
         "migrations.rs",
         "query/sql.rs",
+        "query/sql_conformance.rs",
         "turso_local.rs",
     ];
     // Every file allowed to name the caller-context builder that carries the
@@ -1695,6 +1960,15 @@ async fn reported_model_has_no_decision_reader() {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
+                if relative == "mcp/executor_prototype.rs" {
+                    let (production, _) = content
+                        .split_once("\n#[cfg(test)]\nmod tests {")
+                        .expect("the reviewed Executor test module must remain cfg(test)");
+                    assert!(
+                        !production.contains("reported_model"),
+                        "the production Executor must not read the reported model claim"
+                    );
+                }
                 if content.contains("reported_model") {
                     literal_files.push(relative.clone());
                 }
@@ -2936,4 +3210,93 @@ mod private_body_admission_v2 {
         assert!(rebuild_and_diff_control(&db).await.unwrap().equal);
         db.close().await;
     }
+}
+
+#[tokio::test]
+async fn alpha_tab_control_seam_refuses_a_v2_marker_that_declares_anything() {
+    use crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest;
+    let db = create_database(":memory:").await.unwrap();
+    record(&db, ALPHA_FIXTURE_ARTIFACT_ID).await;
+    let aggregate = alpha_tab_aggregate_id("acct_alice", "agent.attention-cockpit");
+    let v2 = json!({"contract": "native.app.v2", "needs": [], "effects": []});
+    let session = json!({
+        "session": "session.body.v1", "key": "doc",
+        "scope": {"type": "Document", "kind": "note"}, "mode": "edit", "presence": true
+    });
+    let refused_shapes = [
+        json!({"contract": "native.app.v2", "needs": ["attention.query.v1"], "effects": []}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": ["task.triage-set.v1"]}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": [], "sessions": []}),
+        json!({"contract": "native.app.v2", "needs": [], "effects": [], "sessions": [session]}),
+        json!({"contract": "native.app.v3", "needs": [], "effects": []}),
+        json!({"contract": 2, "needs": [], "effects": []}),
+    ];
+    for (index, declaration) in refused_shapes.iter().enumerate() {
+        let mut install = alpha_tab_payload(None);
+        install.consented_declaration = declaration.clone();
+        let refused = append_control_event(
+            &db,
+            command(
+                &format!("alpha-v2-bad-install-{index}"),
+                &aggregate,
+                ControlEventPayload::AlphaTabInstalled(install),
+            ),
+        )
+        .await
+        .expect_err(&format!("install {declaration} must be refused"))
+        .to_string();
+        assert!(
+            refused.contains("contract invalid"),
+            "{declaration}: {refused}"
+        );
+    }
+
+    let mut install = alpha_tab_payload(None);
+    install.consented_declaration = v2.clone();
+    install.declaration_digest = alpha_tab_declaration_digest(&v2).unwrap();
+    let installed = append_control_event(
+        &db,
+        command(
+            "alpha-v2-install",
+            &aggregate,
+            ControlEventPayload::AlphaTabInstalled(install.clone()),
+        ),
+    )
+    .await
+    .expect("a clean v2 marker installs");
+
+    for (index, declaration) in refused_shapes.iter().enumerate() {
+        let mut adopt = alpha_tab_adopt_payload(&installed.id);
+        adopt.consented_declaration = declaration.clone();
+        adopt.declaration_digest = install.declaration_digest.clone();
+        let refused = append_control_event(
+            &db,
+            command(
+                &format!("alpha-v2-bad-adopt-{index}"),
+                &aggregate,
+                ControlEventPayload::AlphaTabAdopted(adopt),
+            ),
+        )
+        .await
+        .expect_err(&format!("adopt {declaration} must be refused"))
+        .to_string();
+        assert!(
+            refused.contains("contract invalid"),
+            "{declaration}: {refused}"
+        );
+    }
+    let mut adopt = alpha_tab_adopt_payload(&installed.id);
+    adopt.consented_declaration = v2;
+    adopt.declaration_digest = install.declaration_digest;
+    append_control_event(
+        &db,
+        command(
+            "alpha-v2-adopt",
+            &aggregate,
+            ControlEventPayload::AlphaTabAdopted(adopt),
+        ),
+    )
+    .await
+    .expect("a clean v2 marker adopts");
+    db.close().await;
 }

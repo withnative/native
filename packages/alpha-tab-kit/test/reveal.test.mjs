@@ -111,7 +111,7 @@ class CustomEvent extends Event {
 function loadFrame(source = bootstrap) {
   const parentPosts = [];
   const sandbox = {
-    __NATIVE_WORKBENCH_ORIGIN__: HOST,
+    __NATIVE_WORKBENCH_ORIGIN__: HOST, __NATIVE_KIT_FACTORY__: null, __NATIVE_KIT_RELEASE__: null,
     setTimeout,
     clearTimeout,
     AbortController,
@@ -223,8 +223,64 @@ test("ready advertises the reveal feature beside unchanged fields", () => {
     assert.equal(oldReady.features, undefined, "offered capabilities cannot upgrade historical bytes");
     assert.equal(oldFrame.window.nativeArtifact.onReveal, undefined);
     assert.equal(oldFrame.window.nativeArtifact.publishLocation, undefined);
+    assert.equal(oldFrame.window.nativeArtifact.publishUnsaved, undefined);
     assert.equal(typeof oldFrame.window.nativeArtifact.read, "function", "legacy read API survives");
   }
+});
+
+test("unsaved close-risk publishes only when negotiated, with bounded reasons", () => {
+  const frame = loadFrame();
+  const port = initFrame(frame);
+  const api = frame.window.nativeArtifact;
+  assert.equal(typeof api.publishUnsaved, "function");
+  api.publishUnsaved(null);
+  api.publishUnsaved({ reason: "Your changes are still saving." });
+  assert.equal(channelPosts(port).filter((m) => m.type === "unsaved").length, 0,
+    "a current API does not imply negotiated unsaved capability");
+
+  const riskFrame = loadFrame();
+  const riskPort = initFrame(riskFrame, { hostFeatures: ["surface.unsaved.v1"] });
+  const riskReady = channelPosts(riskPort).find((m) => m.type === "ready");
+  assert.ok(riskReady.features.includes("surface.unsaved.v1"), "negotiated unsaved is advertised");
+  const riskApi = riskFrame.window.nativeArtifact;
+  riskApi.publishUnsaved(null);
+  riskApi.publishUnsaved({});
+  riskApi.publishUnsaved({ reason: "Your changes to 'Launch plan' are still saving." });
+  assert.deepEqual(Array.from(channelPosts(riskPort).filter((m) => m.type === "unsaved"), (m) => `${m.unsaved_version}:${JSON.stringify(m.state)}`),
+    ["surface.unsaved.v1:null", "surface.unsaved.v1:{}", `surface.unsaved.v1:${JSON.stringify({ reason: "Your changes to 'Launch plan' are still saving." })}`]);
+  assert.throws(() => riskApi.publishUnsaved({ reason: "" }), /invalid unsaved state/);
+  assert.throws(() => riskApi.publishUnsaved({ reason: "x".repeat(201) }), /invalid unsaved state/);
+  assert.throws(() => riskApi.publishUnsaved({ reason: "line\nbreak" }), /invalid unsaved state/);
+  assert.throws(() => riskApi.publishUnsaved({ reason: "ok", extra: 1 }), /invalid unsaved state/);
+  assert.throws(() => riskApi.publishUnsaved("risk"), /invalid unsaved state/);
+  assert.equal(channelPosts(riskPort).filter((m) => m.type === "unsaved").length, 3,
+    "invalid states are refused without sending");
+  riskPort._emit("close", {});
+  assert.throws(() => riskApi.publishUnsaved(null), /unsaved observation unavailable/);
+  assert.equal(channelPosts(riskPort).filter((m) => m.type === "unsaved").length, 3,
+    "closed channel cannot publish more risk");
+});
+
+test("port close ends subscriptions even when an error callback unsubscribes mid-loop", () => {
+  const frame = loadFrame();
+  const port = initFrame(frame, { hostFeatures: ["app.subscribe.v2"] });
+  const { sandbox } = frame;
+  const seen = [];
+  sandbox.__seen = seen;
+  const unsubs = vm.runInContext(`({
+    a: null, b: null, c: null,
+    subscribeA() { this.a = window.native.subscribe({ sql: "select 1" }, (frame) => { __seen.push(["a", frame.code]); this.b(); }); },
+    subscribeBC() {
+      this.b = window.native.subscribe({ sql: "select 1" }, (frame) => { __seen.push(["b", frame.code]); });
+      this.c = window.native.subscribe({ sql: "select 1" }, (frame) => { __seen.push(["c", frame.code]); });
+    },
+  })`, sandbox);
+  unsubs.subscribeA();
+  unsubs.subscribeBC();
+  port._emit("close", {});
+  assert.equal(JSON.stringify(seen), JSON.stringify([["a", "port_closed"], ["c", "port_closed"]]),
+    "an unsubscribe during teardown skips the dead entry without throwing");
+  assert.equal(diagnostics(port).filter((m) => m.code === "html_subscription_failed").length, 0);
 });
 
 test("a reveal before registration is retained latest-one and replayed once", () => {

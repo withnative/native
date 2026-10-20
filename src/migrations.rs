@@ -182,6 +182,12 @@ impl EngineMigrationRegistry {
 /// [`CURRENT_ENGINE_SCHEMA_VERSION`]. `EngineMigrationRegistry::new` refuses a
 /// gap or a non-forward edge, so this list and the declared baseline cannot
 /// drift apart.
+///
+/// Adding an edge also means one entry in
+/// [`crate::schema::step_down::ADDITIONS`], which test fixtures use to rebuild
+/// older schemas. Record the frozen `ENGINE_N` shape and DDL pins from the
+/// current engine-N DDL *before* adding N+1; never measure them by stepping
+/// N+1 down with that helper, which would make its pin check circular.
 fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
     vec![
         Arc::new(Engine39To40Migration),
@@ -227,6 +233,14 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine79To80Migration),
         Arc::new(Engine80To81Migration),
         Arc::new(Engine81To82Migration),
+        Arc::new(Engine82To83Migration),
+        Arc::new(Engine83To84Migration),
+        Arc::new(Engine84To85Migration),
+        Arc::new(Engine85To86Migration),
+        Arc::new(Engine86To87Migration),
+        Arc::new(Engine87To88Migration),
+        Arc::new(Engine88To89Migration),
+        Arc::new(Engine89To90Migration),
     ]
 }
 
@@ -3403,6 +3417,442 @@ impl EngineMigrationStep for Engine81To82Migration {
     }
 }
 
+/// Additive S1/S2 edge; existing messages remain human-spoken (no backfill).
+#[derive(Debug)]
+struct Engine82To83Migration;
+impl EngineMigrationStep for Engine82To83Migration {
+    fn from(&self) -> i64 {
+        82
+    }
+    fn to(&self) -> i64 {
+        83
+    }
+    fn name(&self) -> &str {
+        "engine-82-to-83-persona-participants"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 82 {
+                crate::db::validate_supported_engine_migration_source(connection, 82).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection, 82).await?;
+            for statement in crate::schema::ddl::PERSONA_PARTICIPANTS_DDL {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            let history_marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut *connection)
+                .await?;
+            if history_marker == crate::interchange::source_history_application_id(5) {
+                // Revision 6 adds only personas and message_speakers, both
+                // rebuilt purely from the content log. Revision-5 history
+                // therefore remains exhaustive; preserve delta eligibility.
+                // Unstamped, older, foreign and future markers stay untouched.
+                sqlx::query(&format!(
+                    "PRAGMA application_id = {}",
+                    crate::interchange::source_history_application_id(6)
+                ))
+                .execute(&mut *connection)
+                .await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// Host-asserted app attribution side table (task `50f5aca`). Additive
+/// only: no existing row, payload or digest changes, and there is nothing to
+/// backfill because no call before this edge carried an app. The
+/// source-history marker is left alone: a migrated file holds no app rows to
+/// be missing, so its history stays exhaustive.
+#[derive(Debug)]
+struct Engine83To84Migration;
+impl EngineMigrationStep for Engine83To84Migration {
+    fn from(&self) -> i64 {
+        83
+    }
+    fn to(&self) -> i64 {
+        84
+    }
+    fn name(&self) -> &str {
+        "engine-83-to-84-provenance-action-app-attributions"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 83 {
+                crate::db::validate_supported_engine_migration_source(connection, 83).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection, 83).await?;
+            for statement in crate::schema::ddl::PROVENANCE_ACTION_APP_ATTRIBUTIONS_DDL {
+                sqlx::query(statement).execute(&mut *connection).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// SQLite-only facet-observation node carrier: the facet-history twin of the
+/// facet-value carrier. The runner owns BEGIN/stamp/COMMIT. Malformed,
+/// scalar or over-budget observation text is skipped by the backfill rather
+/// than aborting the edge. The table is derived purely from the content log,
+/// so the source-history marker is left alone.
+#[derive(Debug)]
+struct Engine84To85Migration;
+impl EngineMigrationStep for Engine84To85Migration {
+    fn from(&self) -> i64 {
+        84
+    }
+    fn to(&self) -> i64 {
+        85
+    }
+    fn name(&self) -> &str {
+        "engine-84-to-85-facet-observation-json-nodes"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 84 {
+                crate::db::validate_supported_engine_migration_source(connection, 84).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection, 84).await?;
+            sqlx::query(crate::schema::ddl::FACET_OBSERVATION_JSON_NODES_DDL)
+                .execute(&mut *connection)
+                .await?;
+            crate::facet_value_json_nodes::backfill_observations(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// SQLite-only record-body node carrier: the `records.body` twin of the
+/// facet-value carrier. The runner owns BEGIN/stamp/COMMIT. Scalar,
+/// malformed, NULL or over-budget body text is skipped by the backfill rather
+/// than aborting the edge; hidden, archived and tombstoned rows are included
+/// physically. The table is derived purely from the content log, so the
+/// source-history marker is left alone.
+#[derive(Debug)]
+struct Engine85To86Migration;
+impl EngineMigrationStep for Engine85To86Migration {
+    fn from(&self) -> i64 {
+        85
+    }
+    fn to(&self) -> i64 {
+        86
+    }
+    fn name(&self) -> &str {
+        "engine-85-to-86-record-body-json-nodes"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 85 {
+                crate::db::validate_supported_engine_migration_source(connection, 85).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection, 85).await?;
+            sqlx::query(crate::schema::ddl::RECORD_BODY_JSON_NODES_DDL)
+                .execute(&mut *connection)
+                .await?;
+            crate::facet_value_json_nodes::backfill_record_bodies(connection).await
+        }
+        .boxed()
+    }
+}
+
+/// Private read preferences are independent of monotonic human awareness.
+/// Existing preference rows acquire NULL (legacy-derived unread); no event,
+/// projection version, act, or canonical history stamp changes.
+#[derive(Debug)]
+struct Engine87To88Migration;
+impl EngineMigrationStep for Engine87To88Migration {
+    fn from(&self) -> i64 {
+        87
+    }
+    fn to(&self) -> i64 {
+        88
+    }
+    fn name(&self) -> &str {
+        "engine-87-to-88-private-read-preference"
+    }
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 87 {
+                crate::db::validate_supported_engine_migration_source(connection, 87).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(connection,87).await?;
+            sqlx::query("ALTER TABLE message_preferences ADD COLUMN unread_override INTEGER CHECK (unread_override IN (0,1))")
+                .execute(&mut *connection).await?;
+            Ok(())
+        }.boxed()
+    }
+}
+
+/// Engine 87 makes `Configuration` the eleventh spine type, which widens the
+/// `records.type` CHECK. SQLite cannot alter a CHECK in place, so the edge
+/// rebuilds `records`: rename aside, recreate from the current definition,
+/// copy every row, drop the old table, then recreate its indexes and triggers.
+///
+/// Three properties are load-bearing:
+///
+/// 1. **Rowids are copied.** `records_fts` and `records_name_idx` are
+///    external-content FTS tables keyed by `records.rowid`; `records` has a
+///    TEXT primary key, so its rowid is implicit and would otherwise be
+///    renumbered, silently misaligning both search indexes.
+/// 2. **The new table is populated before its triggers exist.** The FTS and
+///    authorization triggers are created last, so the bulk copy neither
+///    double-writes the search indexes nor bumps the authorization epoch. The
+///    old table's triggers go with it when it is dropped.
+/// 3. **Foreign keys are fenced** (as in the 39→40 and 49→50 rebuilds) and
+///    `legacy_alter_table` is on for the rename, so the many tables whose
+///    foreign keys name `records` keep that name instead of being rewritten to
+///    the aside table. The runner checks `foreign_key_check` before commit.
+///
+/// The indexes and triggers to restore are captured from the database being
+/// migrated, not listed here: the engine-86 source shape is verified exactly
+/// by the preflight, and the exact post-migration shape check proves the
+/// restored set equals the fresh definition. No row changes meaning: existing
+/// types are a strict subset of the widened set, so the copy cannot violate
+/// the new CHECK.
+#[derive(Debug)]
+struct Engine86To87Migration;
+
+impl EngineMigrationStep for Engine86To87Migration {
+    fn from(&self) -> i64 {
+        86
+    }
+
+    fn to(&self) -> i64 {
+        87
+    }
+
+    fn name(&self) -> &str {
+        "engine-86-to-87-configuration-spine-type"
+    }
+
+    fn requires_foreign_keys_disabled(&self) -> bool {
+        true
+    }
+
+    fn preflight<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await?;
+            if version == 86 {
+                crate::db::validate_supported_engine_migration_source(connection, 86).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn apply<'a>(&'a self, connection: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            rebuild_records_table(connection, crate::schema::ddl::RECORDS_DDL, "records_v86").await
+        }
+        .boxed()
+    }
+}
+
+#[derive(Debug)]
+struct Engine88To89Migration;
+impl EngineMigrationStep for Engine88To89Migration {
+    fn from(&self) -> i64 {
+        88
+    }
+    fn to(&self) -> i64 {
+        89
+    }
+    fn name(&self) -> &str {
+        "engine-88-to-89-account-configs"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            if version == 88 {
+                crate::db::validate_supported_engine_migration_source(conn, 88).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            sqlx::query(crate::schema::ddl::ACCOUNT_CONFIGS_DDL)
+                .execute(&mut *conn)
+                .await?;
+            let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut *conn)
+                .await?;
+            if marker == crate::interchange::source_history_application_id(6) {
+                sqlx::query(&format!(
+                    "PRAGMA application_id = {}",
+                    crate::interchange::source_history_application_id(7)
+                ))
+                .execute(&mut *conn)
+                .await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+#[derive(Debug)]
+struct Engine89To90Migration;
+impl EngineMigrationStep for Engine89To90Migration {
+    fn from(&self) -> i64 {
+        89
+    }
+    fn to(&self) -> i64 {
+        90
+    }
+    fn name(&self) -> &str {
+        "engine-89-to-90-sql-write-receipts"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            // Pending preflights see the original preimage, including older sources.
+            if version == 89 {
+                crate::db::validate_supported_engine_migration_source(conn, 89).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Validate the actual intermediate source under the migration transaction.
+            crate::db::validate_supported_engine_migration_source(conn, 89).await?;
+            for statement in crate::schema::ddl::SQL_WRITE_RECEIPTS_DDL {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+            let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut *conn)
+                .await?;
+            if marker == crate::interchange::source_history_application_id(7) {
+                sqlx::query(&format!(
+                    "PRAGMA application_id = {}",
+                    crate::interchange::source_history_application_id(8)
+                ))
+                .execute(&mut *conn)
+                .await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// The row copy for a `records` rebuild, shared by the SQLite and Turso paths.
+/// `rowid` is listed first on both sides: see [`Engine86To87Migration`].
+pub(crate) fn records_rebuild_copy(target: &str, source: &str, columns: &[String]) -> String {
+    let list = columns.join(", ");
+    format!(
+        "INSERT INTO {target} (rowid, {list}) SELECT rowid, {list} FROM {source} ORDER BY rowid"
+    )
+}
+
+/// Rebuild `records` from `records_ddl`, keeping every row, rowid, index and
+/// trigger. The caller owns the transaction and the foreign-key fence.
+///
+/// Also used by the migration tests, with an older definition, to reconstruct
+/// a source file; production passes the current [`RECORDS_DDL`].
+///
+/// [`RECORDS_DDL`]: crate::schema::ddl::RECORDS_DDL
+pub(crate) async fn rebuild_records_table(
+    connection: &mut SqliteConnection,
+    records_ddl: &str,
+    aside: &str,
+) -> Result<()> {
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('records')")
+        .fetch_all(&mut *connection)
+        .await?;
+    // Everything attached to `records` goes with the old table. Auto-indexes
+    // have no SQL and are recreated by the new definition itself.
+    let dependents: Vec<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_schema
+          WHERE tbl_name = 'records' AND type IN ('index','trigger') AND sql IS NOT NULL
+          ORDER BY rowid",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    for statement in [
+        "PRAGMA legacy_alter_table=ON".to_owned(),
+        format!("ALTER TABLE records RENAME TO {aside}"),
+        records_ddl.to_owned(),
+    ] {
+        sqlx::query(&statement).execute(&mut *connection).await?;
+    }
+    let rebuilt: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('records')")
+        .fetch_all(&mut *connection)
+        .await?;
+    if rebuilt != columns {
+        return Err(Error::engine(
+            "records rebuild would change the column set; refusing",
+        ));
+    }
+    for statement in [
+        records_rebuild_copy("records", aside, &columns),
+        format!("DROP TABLE {aside}"),
+    ]
+    .into_iter()
+    .chain(dependents)
+    .chain(["PRAGMA legacy_alter_table=OFF".to_owned()])
+    {
+        sqlx::query(&statement).execute(&mut *connection).await?;
+    }
+    Ok(())
+}
+
 /// Backfill `body_task_items` from current bodies.
 ///
 /// For each record whose stored body is non-empty text, scan the CURRENT body
@@ -3661,7 +4111,7 @@ const ENGINE_62_TO_63_MUTATION_TOOLS: &[&str] = &[
     "update_record",
 ];
 
-/// These read tools arrived after the reviewed deletion set was frozen.
+/// These read/mixed tools arrived after the reviewed deletion set was frozen.
 /// PR A capture drops their new observational calls. Historical rows with
 /// these names remain retained pending a separate consumer/corpus audit;
 /// neither renumbering nor a current Read disposition silently widens DELETE.
@@ -3670,6 +4120,15 @@ const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
     "authority_act_head",
     "authority_act_delta",
     "manage_alpha_tabs",
+    // Persona list/register/retire calls arrived at83. Keep all historical
+    // calls; never widen the frozen deletion predicate for a new tool.
+    "manage_participants",
+    // The account-scoped configuration tool arrived at89. Retain its
+    // historical calls without changing the frozen cleanup predicate.
+    "manage_account_config",
+    // Hosted outbox status is a post-freeze, host-only read. Retain any
+    // historical evidence; the frozen deletion predicate is unchanged.
+    "outbox_status",
 ];
 
 /// Read actions that arrived after the 62→63 freeze on already-shipped
@@ -4289,6 +4748,7 @@ pub async fn preflight_production_migration_read_only(path: &Path) -> Result<i64
         .busy_timeout(Duration::from_secs(5));
     let mut connection = SqliteConnection::connect_with(&options).await?;
     let outcome: Result<i64> = async {
+        crate::db::refuse_v2_database(&mut connection).await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut connection)
             .await?;
@@ -5271,6 +5731,69 @@ mod tests {
             .await;
     }
 
+    #[tokio::test]
+    async fn engine_89_to_90_rejects_unknown_and_partial_source_before_receipt_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sql-receipts-source.db");
+        create_current_schema(&path).await;
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap();
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        let step = EngineMigrationRegistry::production()
+            .pending(89, 90)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        // A current shape merely stamped 89 is unknown, never a released source.
+        sqlx::query("PRAGMA user_version=89")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(step.preflight(&mut conn).await.is_err());
+        assert!(step.apply(&mut conn).await.is_err());
+        sqlx::query("PRAGMA user_version=90")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        crate::schema::step_down::step_down(&mut conn, 89)
+            .await
+            .unwrap();
+
+        // Partial released shape must also refuse at both admission boundaries.
+        let mut tx = conn.begin().await.unwrap();
+        sqlx::query("DROP TABLE account_configs")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert!(step.preflight(&mut tx).await.is_err());
+        assert!(step.apply(&mut tx).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM sqlite_schema WHERE name='sql_write_receipts'"
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+            0,
+            "refusal must precede receipt DDL"
+        );
+        tx.rollback().await.unwrap();
+
+        // The genuine frozen 89 source still passes and reaches the current shape.
+        let mut tx = conn.begin().await.unwrap();
+        step.preflight(&mut tx).await.unwrap();
+        step.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=90")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        crate::db::validate_supported_engine_migration_source(&mut tx, 90)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
     fn synthetic_zero_to_current_registry() -> EngineMigrationRegistry {
         let migrations = (0..CURRENT_ENGINE_SCHEMA_VERSION)
             .map(|from| {
@@ -5401,13 +5924,7 @@ mod tests {
             SqliteConnection::connect_with(&single_connection_options(&seed).unwrap())
                 .await
                 .unwrap();
-        revert_to_engine_75(&mut connection).await;
-        sqlx::query("DROP TABLE body_blocks")
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=74")
-            .execute(&mut connection)
+        crate::schema::step_down::step_down(&mut connection, 74)
             .await
             .unwrap();
         connection.close().await.unwrap();
@@ -5757,56 +6274,13 @@ mod tests {
 
     #[tokio::test]
     async fn unreserved_portable_migration_preserves_precommit_only_fence_timing() {
-        assert!(
-            matches!(CURRENT_ENGINE_SCHEMA_VERSION, 75..=82),
-            "refresh historical edge fixture"
-        );
         let dir = tempfile::tempdir().unwrap();
         // This plain portable target is deliberately outside HOSTED layouts.
         let path = dir.path().join("portable.db");
         create_current_schema(&path).await;
         {
             let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .execute_batch("DROP TABLE schema_config_json_nodes;")
-                .unwrap();
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 82 {
-                connection
-                    .execute_batch("DROP TABLE facet_value_json_nodes;")
-                    .unwrap();
-            }
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 80 {
-                connection
-                    .execute_batch("DROP TABLE workspace_rule_installations;")
-                    .unwrap();
-            }
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 79 {
-                connection
-                    .execute_batch(
-                        "ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id;",
-                    )
-                    .unwrap();
-            }
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 78 {
-                connection
-                    .execute_batch(
-                        "ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance;",
-                    )
-                    .unwrap();
-            }
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 77 {
-                connection
-                    .execute_batch("DROP TRIGGER content_event_reaction_meta_insert; DROP TABLE content_event_reaction_meta;")
-                    .unwrap();
-            }
-            if CURRENT_ENGINE_SCHEMA_VERSION >= 76 {
-                connection
-                    .execute_batch("DROP TABLE vocabulary_value_json_nodes;")
-                    .unwrap();
-            }
-            connection
-                .execute_batch("DROP TABLE body_blocks; PRAGMA user_version=74;")
-                .unwrap();
+            crate::schema::step_down::step_down_rusqlite(&connection, 74);
         }
         let offbox = tempfile::tempdir().unwrap();
         let backup = test_preimage_store(offbox.path(), dir.path());
@@ -5837,17 +6311,7 @@ mod tests {
                     // A later edge's precommit fence sees only its earlier committed stamps;
                     // only a fence after the final target commit is forbidden.
                     assert!(
-                        matches!(
-                            (CURRENT_ENGINE_SCHEMA_VERSION, version),
-                            (75, 74)
-                                | (76, 74..=75)
-                                | (77, 74..=76)
-                                | (78, 74..=77)
-                                | (79, 74..=78)
-                                | (80, 74..=79)
-                                | (81, 74..=80)
-                                | (82, 74..=81)
-                        ),
+                        (74..CURRENT_ENGINE_SCHEMA_VERSION).contains(&version),
                         "unexpected committed source/intermediate stamp {version}"
                     );
                     Ok(())
@@ -6108,6 +6572,14 @@ mod tests {
             (79, 80, "engine-79-to-80-workspace-rule-installations"),
             (80, 81, "engine-80-to-81-schema-config-json-nodes"),
             (81, 82, "engine-81-to-82-facet-value-json-nodes"),
+            (82, 83, "engine-82-to-83-persona-participants"),
+            (83, 84, "engine-83-to-84-provenance-action-app-attributions"),
+            (84, 85, "engine-84-to-85-facet-observation-json-nodes"),
+            (85, 86, "engine-85-to-86-record-body-json-nodes"),
+            (86, 87, "engine-86-to-87-configuration-spine-type"),
+            (87, 88, "engine-87-to-88-private-read-preference"),
+            (88, 89, "engine-88-to-89-account-configs"),
+            (89, 90, "engine-89-to-90-sql-write-receipts"),
         ] {
             if from < start {
                 continue;
@@ -6124,7 +6596,21 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // The runner fences foreign keys for table rebuilds; do the same.
+            let fence = step.requires_foreign_keys_disabled();
+            if fence {
+                sqlx::query("PRAGMA foreign_keys=OFF")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
             step.apply(&mut *connection).await.unwrap();
+            if fence {
+                sqlx::query("PRAGMA foreign_keys=ON")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            }
             sqlx::query(&format!("PRAGMA user_version={to}"))
                 .execute(&mut *connection)
                 .await
@@ -10255,7 +10741,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_62_to_63_retains_post_freeze_authority_act_reads() {
+    async fn engine_62_to_63_retains_post_freeze_authority_and_persona_calls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("authority-act-read-retention.db");
         create_current_schema(&path).await;
@@ -10264,7 +10750,21 @@ mod tests {
             .foreign_keys(true);
         let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
         revert_to_engine_62(&mut connection).await;
-        for (seq, tool) in [(1, "authority_act_head"), (2, "authority_act_delta")] {
+        let calls = [
+            ("authority_act_head", r#"{"cursor":"historical"}"#),
+            ("authority_act_delta", r#"{"cursor":"historical"}"#),
+            ("manage_participants", r#"{"action":"list"}"#),
+            (
+                "manage_participants",
+                r#"{"action":"register_persona","name":"Chief","reason":"historical"}"#,
+            ),
+            (
+                "manage_participants",
+                r#"{"action":"retire_persona","persona_id":"historical","reason":"historical"}"#,
+            ),
+        ];
+        for (index, (tool, arguments)) in calls.iter().enumerate() {
+            let seq = index as i64 + 1;
             insert_read_log_call(
                 &mut connection,
                 seq,
@@ -10272,7 +10772,7 @@ mod tests {
                 Some("run:act"),
                 None,
                 None,
-                r#"{"cursor":"historical"}"#,
+                arguments,
                 "ok",
                 None,
             )
@@ -10281,7 +10781,7 @@ mod tests {
         let report = read_log_62_to_63_attention_report(&mut connection)
             .await
             .unwrap();
-        assert_eq!(report.total_calls, 2);
+        assert_eq!(report.total_calls, calls.len() as i64);
         assert_eq!(report.disposable_calls, 0);
         assert_eq!(report.unknown_tool_calls, 0);
         let step = EngineMigrationRegistry::production()
@@ -10298,16 +10798,10 @@ mod tests {
                 .unwrap();
         assert_eq!(
             retained,
-            vec![
-                (
-                    "authority_act_head".into(),
-                    r#"{"cursor":"historical"}"#.into()
-                ),
-                (
-                    "authority_act_delta".into(),
-                    r#"{"cursor":"historical"}"#.into()
-                ),
-            ]
+            calls
+                .into_iter()
+                .map(|(tool, arguments)| (tool.to_owned(), arguments.to_owned()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -10973,13 +11467,7 @@ mod tests {
     /// addition can never leak into a released-shape pin. Test fixtures only;
     /// this is not a rollback API.
     async fn revert_to_engine_75(connection: &mut SqliteConnection) {
-        revert_to_engine_76(connection).await;
-        sqlx::query("DROP TABLE vocabulary_value_json_nodes")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=75")
-            .execute(&mut *connection)
+        crate::schema::step_down::step_down(connection, 75)
             .await
             .unwrap();
     }
@@ -10992,9 +11480,7 @@ mod tests {
     /// DDL under the shape contract. Test fixtures only; this is not a
     /// rollback API.
     async fn revert_to_engine_72(connection: &mut SqliteConnection) {
-        revert_to_engine_75(connection).await;
-        sqlx::query("DROP TABLE body_blocks")
-            .execute(&mut *connection)
+        crate::schema::step_down::step_down(connection, 74)
             .await
             .unwrap();
         sqlx::query("DROP TABLE body_task_items")
@@ -11531,24 +12017,12 @@ mod tests {
             .foreign_keys(true);
         let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
         for statement in crate::schema::DDL_STATEMENTS {
-            if version < 81 && statement.starts_with("CREATE TABLE schema_config_json_nodes") {
-                continue;
-            }
-            if version < 82 && statement.starts_with("CREATE TABLE facet_value_json_nodes") {
-                continue;
-            }
-            if version < 80 && statement.contains("workspace_rule_installations") {
-                continue;
-            }
-            let statement =
-                crate::schema::contract::alpha_tab_installs_create_for_version(statement, version);
-            sqlx::query(&statement)
+            sqlx::query(statement)
                 .execute(&mut connection)
                 .await
                 .unwrap();
         }
-        sqlx::query(&format!("PRAGMA user_version={version}"))
-            .execute(&mut connection)
+        crate::schema::step_down::step_down(&mut connection, version)
             .await
             .unwrap();
         connection
@@ -11641,24 +12115,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(before.is_some());
-        sqlx::query("DROP TABLE facet_value_json_nodes")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE schema_config_json_nodes")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE workspace_rule_installations")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=78")
-            .execute(&mut *connection)
+        crate::schema::step_down::step_down(&mut connection, 78)
             .await
             .unwrap();
         assert_eq!(
@@ -11793,48 +12250,7 @@ mod tests {
     }
 
     async fn revert_to_engine_76(connection: &mut SqliteConnection) {
-        sqlx::query("DROP TABLE IF EXISTS facet_value_json_nodes")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE IF EXISTS schema_config_json_nodes")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        let columns: Vec<String> =
-            sqlx::query_scalar("SELECT name FROM pragma_table_info('alpha_tab_installs')")
-                .fetch_all(&mut *connection)
-                .await
-                .unwrap();
-        if columns
-            .iter()
-            .any(|name| name == "body_read_admission_event_id")
-        {
-            sqlx::query("DROP TABLE IF EXISTS workspace_rule_installations")
-                .execute(&mut *connection)
-                .await
-                .unwrap();
-            sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN body_read_admission_event_id")
-                .execute(&mut *connection)
-                .await
-                .unwrap();
-        }
-        if columns.iter().any(|name| name == "adoption_provenance") {
-            sqlx::query("ALTER TABLE alpha_tab_installs DROP COLUMN adoption_provenance")
-                .execute(&mut *connection)
-                .await
-                .unwrap();
-        }
-        sqlx::query("DROP TRIGGER IF EXISTS content_event_reaction_meta_insert")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("DROP TABLE IF EXISTS content_event_reaction_meta")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=76")
-            .execute(&mut *connection)
+        crate::schema::step_down::step_down(connection, 76)
             .await
             .unwrap();
     }
@@ -12585,18 +13001,11 @@ mod tests {
             // Uninterpreted physical storage sentinel, not a rule admission receipt.
             sqlx::query("INSERT INTO workspace_rule_installations(root,namespace,name,snapshot_json,snapshot_digest,event_seq,actor,created_at) VALUES('native:root','fixture','preserved','{}',?,1,'fixture:physical','2000-01-01T00:00:00Z')")
                 .bind("a".repeat(64)).execute(db.write_pool()).await.unwrap();
-            sqlx::query("DROP TABLE facet_value_json_nodes")
-                .execute(db.write_pool())
+            let mut step_down_connection = db.write_pool().acquire().await.unwrap();
+            crate::schema::step_down::step_down(&mut step_down_connection, 80)
                 .await
                 .unwrap();
-            sqlx::query("DROP TABLE schema_config_json_nodes")
-                .execute(db.write_pool())
-                .await
-                .unwrap();
-            sqlx::query("PRAGMA user_version=80")
-                .execute(db.write_pool())
-                .await
-                .unwrap();
+            drop(step_down_connection);
             db.close().await;
             let offbox = tempfile::tempdir().unwrap();
             let backup = test_preimage_store(offbox.path(), dir.path());
@@ -12754,6 +13163,793 @@ mod tests {
         );
     }
 
+    /// Engine 84 adds only the empty app-attribution side table.
+    #[tokio::test]
+    async fn engine_83_to_84_adds_only_the_app_attribution_table() {
+        let mut connection = schema79_connection(83).await;
+        Engine83To84Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine83To84Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=84")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM provenance_action_app_attributions")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0);
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 84)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Engine 85 projects flattenable facet-observation text and skips every
+    /// value that cannot produce nodes, without aborting the edge.
+    #[tokio::test]
+    async fn engine_84_to_85_backfills_flattenable_observations_and_skips_bad_values() {
+        let mut connection = schema79_connection(84).await;
+        sqlx::query("INSERT INTO records(id,type,kind) VALUES('r1','Document','note')")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let oversize = format!(
+            "{{\"a\":\"{}\"}}",
+            "x".repeat(crate::json_nodes::MAX_JSON_SOURCE_BYTES)
+        );
+        // `unset` carries a NULL value; the rest cover each skipped class.
+        let observations: [(&str, Option<&str>); 7] = [
+            ("obj", Some(r#"{"a":1}"#)),
+            ("arr", Some("[true]")),
+            ("scalar", Some("5")),
+            ("plain", Some("plain text")),
+            ("malformed", Some("{oops")),
+            ("big", Some(oversize.as_str())),
+            ("unset", None),
+        ];
+        for (key, value) in observations {
+            sqlx::query(
+                "INSERT INTO facet_observations(id,record_id,key,value,op,as_of,observed_at,event_seq)
+                 VALUES(?,?,?,?,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',1)",
+            )
+            .bind(format!("fo:r1:{key}"))
+            .bind("r1")
+            .bind(key)
+            .bind(value)
+            .bind(if value.is_some() { "set" } else { "unset" })
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        }
+        Engine84To85Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine84To85Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=85")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        type ObservationNodeRow = (String, i64, String, String);
+        let rows: Vec<ObservationNodeRow> = sqlx::query_as(
+            "SELECT observation_id,ordinal,path,node_type FROM facet_observation_json_nodes ORDER BY observation_id,ordinal",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("fo:r1:arr".into(), 0, "".into(), "array".into()),
+                ("fo:r1:arr".into(), 1, "/0".into(), "boolean".into()),
+                ("fo:r1:obj".into(), 0, "".into(), "object".into()),
+                ("fo:r1:obj".into(), 1, "/a".into(), "number".into()),
+            ]
+        );
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 85)
+                .await
+                .unwrap()
+        );
+    }
+
+    fn records_snapshot_sql() -> String {
+        format!(
+            "SELECT json_array(rowid, {}) FROM records ORDER BY rowid",
+            crate::schema::step_down::RECORDS_COLUMNS.join(", ")
+        )
+    }
+
+    #[tokio::test]
+    async fn engine_87_to_88_preserves_private_preferences_and_awareness_history() {
+        let mut connection = schema79_connection(87).await;
+        sqlx::query("INSERT INTO awareness_events(seq,id,idempotency_key,intent_sha256,schema_version,subject_account_id,message_id,lane,action,authenticated_actor,executor_kind,expected_version,reason_code,payload,created_at) VALUES (40,'opened','opened-key',?,1,'acct:a','message:a','human','human.opened','acct:a','human_attested',0,'fixture','{\"stage\":\"opened\"}','2026-10-01T00:00:00.000Z'),(41,'muted','muted-key',?,1,'acct:a','message:a','preference','mute.set','acct:a','system',0,'fixture','{\"attention_flag\":false,\"muted\":true,\"snoozed_until\":null,\"archived\":false}','2026-10-01T00:01:00.000Z')")
+            .bind("0".repeat(64)).bind("1".repeat(64)).execute(&mut connection).await.unwrap();
+        sqlx::query("INSERT INTO message_preferences(subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version) VALUES('acct:a','message:a',0,1,NULL,0,41,1)").execute(&mut connection).await.unwrap();
+        sqlx::query("INSERT INTO human_message_awareness(subject_account_id,message_id,stage,opened_at,last_event_seq,version) VALUES('acct:a','message:a','opened','2026-10-01T00:00:00.000Z',40,1)").execute(&mut connection).await.unwrap();
+        let events_before: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT seq,id,payload FROM awareness_events ORDER BY seq")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        let human_before: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT stage,opened_at,last_event_seq,version FROM human_message_awareness",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        let step = EngineMigrationRegistry::production()
+            .pending(87, 88)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut connection).await.unwrap();
+        step.apply(&mut connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=88")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 88)
+                .await
+                .unwrap()
+        );
+        let preference: (bool, Option<bool>, i64, i64) = sqlx::query_as(
+            "SELECT muted,unread_override,last_event_seq,version FROM message_preferences",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(preference, (true, None, 41, 1));
+        assert_eq!(
+            sqlx::query_as::<_, (i64, String, String)>(
+                "SELECT seq,id,payload FROM awareness_events ORDER BY seq"
+            )
+            .fetch_all(&mut connection)
+            .await
+            .unwrap(),
+            events_before
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String, i64, i64)>(
+                "SELECT stage,opened_at,last_event_seq,version FROM human_message_awareness"
+            )
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
+            human_before
+        );
+        assert!(EngineMigrationRegistry::production()
+            .pending(88, 88)
+            .unwrap()
+            .is_empty());
+        // A stamped source that already has the column is drift, not an
+        // invitation to run an ad-hoc or partially repeated ALTER.
+        sqlx::query("PRAGMA user_version=87")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(step.preflight(&mut connection).await.is_err());
+        connection.close().await.unwrap();
+    }
+
+    /// The engine-86 shape is the source shape of the `Configuration` edge: a
+    /// current database stepped down one edge carries exactly the frozen
+    /// engine-86 shape, the edge produces the current shape, and the two differ.
+    #[tokio::test]
+    async fn engine_86_shape_is_the_pre_configuration_source_shape() {
+        let mut connection = schema79_connection(86).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_86_SHAPE_CONTRACT_SHA256
+        );
+        let step = EngineMigrationRegistry::production()
+            .pending(86, 87)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(step.name(), "engine-86-to-87-configuration-spine-type");
+        step.preflight(&mut connection).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        step.apply(&mut connection).await.unwrap();
+        sqlx::query("PRAGMA user_version=87")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 87)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !crate::db::validate_engine_shape_on_for_test(&mut connection, 86)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The 86→87 `records` rebuild keeps every row, every rowid (the external
+    /// content FTS indexes are keyed on them), every index and trigger and the
+    /// foreign keys of the tables that reference `records`, and afterwards the
+    /// table accepts a `Configuration` record while still refusing an
+    /// unknown type. The rows are written with raw SQL so that every one of
+    /// the ten earlier types is present; the runner-level test below covers
+    /// event-sourced records and full conformance.
+    #[tokio::test]
+    async fn engine_86_to_87_keeps_every_record_and_accepts_configuration() {
+        let mut conn = schema79_connection(86).await;
+        let types = [
+            "Document",
+            "Program",
+            "WorkItem",
+            "Outcome",
+            "Entity",
+            "Collection",
+            "Resolution",
+            "Conversation",
+            "Message",
+            "Annotation",
+        ];
+        for (index, record_type) in types.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO records (id, type, kind, name, body, home_id, policy_anchor_id, lifecycle, persistence, maturity, summary)
+                 VALUES (?, ?, 'kind-x', ?, ?, NULL, NULL, 'open', 'enduring', 'draft', ?)",
+            )
+            .bind(format!("mig-{index}"))
+            .bind(*record_type)
+            .bind(format!("Migrated {record_type} zebrafish"))
+            .bind(format!("body of {record_type} with ünïcode and quokka {index}"))
+            .bind(format!("summary {index}"))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        // A hard-deleted record leaves a rowid gap; a claimed and a soft-deleted
+        // record exercise the nullable columns.
+        sqlx::query("INSERT INTO records (id, type, name, home_id, owner_id, policy_anchor_id) VALUES ('mig-hard-deleted','Document','gone',NULL,'mig-0',NULL)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM records WHERE id='mig-hard-deleted'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO records (id, type, name, home_id, owner_id, policy_anchor_id, claimed_by_account, claimed_run_key, claimed_at) VALUES ('mig-claimed','WorkItem','Claimed',NULL,'mig-0',NULL,'acct','run-1','2026-10-01T00:00:00.000Z')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO records (id, type, name, home_id, policy_anchor_id, deleted_at) VALUES ('mig-soft-deleted','Document','Soft deleted',NULL,NULL,'2026-10-02T00:00:00.000Z')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO links (id, source_id, target_id, relationship) VALUES ('mig-link','mig-0','mig-1','relates_to')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        // Before the edge the old CHECK refuses the new type.
+        assert!(sqlx::query(
+            "INSERT INTO records (id, type, name) VALUES ('too-early','Configuration','x')"
+        )
+        .execute(&mut conn)
+        .await
+        .is_err());
+
+        let snapshot = records_snapshot_sql();
+        let rows_before: Vec<String> = sqlx::query_scalar(&snapshot)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows_before.len(), 12, "fixture must hold real rows");
+        let fts_before: Vec<i64> = sqlx::query_scalar(
+            "SELECT rowid FROM records_fts WHERE records_fts MATCH 'zebrafish' ORDER BY rowid",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(fts_before.len(), 10);
+        let epoch_before: i64 =
+            sqlx::query_scalar("SELECT epoch FROM authorization_revision WHERE id=1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap();
+        let objects_sql = "SELECT type, name FROM sqlite_schema WHERE tbl_name='records' AND type IN ('index','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY type, name";
+        let objects_before: Vec<(String, String)> = sqlx::query_as(objects_sql)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert!(objects_before.len() >= 17, "{objects_before:?}");
+
+        // Apply the edge exactly as the runner does: foreign keys fenced off.
+        let step = EngineMigrationRegistry::production()
+            .pending(86, 87)
+            .unwrap()
+            .pop()
+            .unwrap();
+        step.preflight(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        step.apply(&mut conn).await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version=87")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let rows_after: Vec<String> = sqlx::query_scalar(&snapshot)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(rows_after, rows_before, "every row and rowid must survive");
+        let fts_after: Vec<i64> = sqlx::query_scalar(
+            "SELECT rowid FROM records_fts WHERE records_fts MATCH 'zebrafish' ORDER BY rowid",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(fts_after, fts_before);
+        for index in ["records_fts", "records_name_idx"] {
+            sqlx::query(&format!(
+                "INSERT INTO {index}({index}) VALUES('integrity-check')"
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let objects_after: Vec<(String, String)> = sqlx::query_as(objects_sql)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(objects_after, objects_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT epoch FROM authorization_revision WHERE id=1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+            epoch_before,
+            "the bulk copy must not bump the authorization epoch"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pragma_foreign_key_check")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM links WHERE id='mig-link'")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+            1
+        );
+        // Referencing tables still name `records`, not the aside table.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE sql LIKE '%records_v86%'"
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap(),
+            0
+        );
+
+        // The widened table now accepts a Configuration, indexes it for
+        // search, and still refuses an unknown type.
+        sqlx::query("INSERT INTO records (id, type, kind, name, body, home_id, policy_anchor_id) VALUES ('mig-config','Configuration','record_view','Saved narwhal view','{}',NULL,NULL)")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM records WHERE rowid IN (SELECT rowid FROM records_fts WHERE records_fts MATCH 'narwhal')"
+            )
+            .fetch_one(&mut conn)
+            .await
+            .unwrap(),
+            "mig-config"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT epoch FROM authorization_revision WHERE id=1")
+                .fetch_one(&mut conn)
+                .await
+                .unwrap(),
+            epoch_before + 1
+        );
+        assert!(sqlx::query(
+            "INSERT INTO records (id, type, name) VALUES ('mig-bogus','Bogus','x')"
+        )
+        .execute(&mut conn)
+        .await
+        .is_err());
+        assert!(crate::db::validate_engine_shape_on_for_test(&mut conn, 87)
+            .await
+            .unwrap());
+    }
+
+    /// The production runner pins the historical 86→87 edge, then takes the
+    /// event-sourced database to current with backup, fenced apply,
+    /// `foreign_key_check`, exact shape, open and
+    /// the full conformance suite (including rebuild-and-diff, so the
+    /// rebuilt `records` table must equal a fold of the event log). Afterwards
+    /// the engine itself creates a `Configuration` record that conformance,
+    /// search and a reopen all accept.
+    #[tokio::test]
+    async fn engine_86_to_87_runner_verifies_and_the_engine_accepts_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-86-to-87-runner.db");
+        let db = crate::create_database(&path.to_string_lossy())
+            .await
+            .unwrap();
+        for (index, (record_type, kind)) in [
+            ("Document", "note"),
+            ("WorkItem", "task"),
+            ("Outcome", "target"),
+            ("Entity", "person"),
+            ("Collection", "folder"),
+            ("Resolution", "decision"),
+            ("Conversation", "discussion"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            crate::store::create_record(
+                &db,
+                serde_json::json!({
+                    "id": format!("1a7e4000-0000-4000-8000-0000000000{index:02}"),
+                    "type": record_type,
+                    "kind": kind,
+                    "name": format!("Pre-migration {record_type} zebrafish"),
+                    "body": "carried across the rebuild"
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        db.close().await;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 86)
+            .await
+            .unwrap();
+        let snapshot = records_snapshot_sql();
+        let rows_before: Vec<String> = sqlx::query_scalar(&snapshot)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        assert_eq!(header_version(&path), 86);
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let result = migrate_database_with_reservation(
+            &path,
+            "configuration-user",
+            "configuration-run",
+            87,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, "migrated", "{result:?}");
+        assert!(result.backup.is_some());
+        assert_eq!(header_version(&path), 87);
+
+        let mut after = SqliteConnection::connect_with(&options).await.unwrap();
+        let rows_after: Vec<String> = sqlx::query_scalar(&snapshot)
+            .fetch_all(&mut after)
+            .await
+            .unwrap();
+        assert_eq!(rows_after, rows_before);
+        after.close().await.unwrap();
+
+        // Preserve the historical 86→87 proof above, then use the production
+        // runner to reach the current schema before ordinary serving opens it.
+        let current = migrate_database_with_reservation(
+            &path,
+            "configuration-current-user",
+            "configuration-current-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(current.outcome, "migrated", "{current:?}");
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let config_id = "1a7e4000-0000-4000-8000-0000000000c0";
+        crate::store::create_record(
+            &db,
+            serde_json::json!({
+                "id": config_id,
+                "type": "Configuration",
+                "kind": "record_view",
+                "name": "Saved narwhal view",
+                "body": "{}"
+            }),
+        )
+        .await
+        .unwrap();
+        let stored: (String, String) =
+            sqlx::query_as("SELECT type, name FROM records WHERE id = ?")
+                .bind(config_id)
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            ("Configuration".into(), "Saved narwhal view".into())
+        );
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM records WHERE rowid IN (SELECT rowid FROM records_fts WHERE records_fts MATCH 'narwhal')",
+        )
+        .fetch_one(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(found, 1);
+        let report = crate::conformance::run_conformance(&db).await;
+        assert!(report.ok, "{report:?}");
+        db.close().await;
+        let reopened = crate::open_existing_database_at(&path).await.unwrap();
+        reopened.close().await;
+    }
+
+    /// A released engine-86 database has no `kind:Configuration` vocabulary.
+    /// SQLite seeds it on ordinary open (the core-kind reconciliation loops the
+    /// spine types), so an upgraded file converges with a fresh one: after the
+    /// runner and its verification open, the vocabulary exists, the full
+    /// conformance suite (rebuild-and-diff of the meta log) is green, and a
+    /// reopen is a no-op.
+    #[tokio::test]
+    async fn engine_86_database_without_the_configuration_vocabulary_is_seeded_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engine-86-vocabulary.db");
+        crate::create_database(&path.to_string_lossy())
+            .await
+            .unwrap()
+            .close()
+            .await;
+        let vocabulary = crate::meta::kind::kind_vocabulary_id("Configuration");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))
+            .unwrap()
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 86)
+            .await
+            .unwrap();
+        // Remove the vocabulary and its genesis event, as a released file lacks them.
+        for guard in ["meta_events_no_delete", "meta_events_no_update"] {
+            sqlx::query(&format!("DROP TRIGGER IF EXISTS {guard}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let removed = sqlx::query("DELETE FROM meta_events WHERE subject_id = ?")
+            .bind(&vocabulary)
+            .execute(&mut conn)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(removed, 1);
+        sqlx::query("DELETE FROM vocabularies WHERE id = ?")
+            .bind(&vocabulary)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // Put the append-only guards back so the file is a valid engine-86 shape.
+        for statement in crate::schema::DDL_STATEMENTS {
+            if statement.contains("TRIGGER meta_events_no_") {
+                sqlx::query(statement).execute(&mut conn).await.unwrap();
+            }
+        }
+        conn.close().await.unwrap();
+        assert_eq!(header_version(&path), 86);
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let result = migrate_database_with_reservation(
+            &path,
+            "vocabulary-user",
+            "vocabulary-run",
+            87,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(result.outcome, "migrated", "{result:?}");
+        assert_eq!(header_version(&path), 87);
+        // Preserve the historical 86→87 proof above, then use the production
+        // runner to reach the current schema before ordinary serving opens it.
+        let current = migrate_database_with_reservation(
+            &path,
+            "vocabulary-current-user",
+            "vocabulary-current-run",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(current.outcome, "migrated", "{current:?}");
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, name FROM vocabularies WHERE id = ?")
+                .bind(&vocabulary)
+                .fetch_all(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![(vocabulary.clone(), "kind:Configuration".into())]
+        );
+        let report = crate::conformance::run_conformance(&db).await;
+        assert!(report.ok, "{report:?}");
+        db.close().await;
+        let events_after_first_open: i64 = {
+            let db = crate::open_existing_database_at(&path).await.unwrap();
+            let count = sqlx::query_scalar("SELECT COUNT(*) FROM meta_events")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+            db.close().await;
+            count
+        };
+        let db = crate::open_existing_database_at(&path).await.unwrap();
+        let again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meta_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(again, events_after_first_open, "reopen must seed nothing");
+        db.close().await;
+    }
+
+    /// Engine 86 projects flattenable record bodies and skips every body
+    /// that cannot produce nodes, without aborting the edge. Tombstoned and
+    /// empty-id rows are included physically; the stepped-down source85
+    /// shape must equal the premeasured ENGINE_85 pin.
+    #[tokio::test]
+    async fn engine_85_to_86_backfills_record_bodies_and_skips_bad_values() {
+        let mut connection = schema79_connection(85).await;
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut connection)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_85_SHAPE_CONTRACT_SHA256
+        );
+        let oversize = format!(
+            "{{\"a\":\"{}\"}}",
+            "x".repeat(crate::json_nodes::MAX_JSON_SOURCE_BYTES)
+        );
+        let bodies: [(&str, Option<&str>, Option<&str>); 9] = [
+            ("", Some(r#"{"e":1}"#), None),
+            ("r1", Some(r#"{"a":1}"#), None),
+            ("r2", Some("[true]"), None),
+            ("r3", Some("5"), None),
+            ("r4", Some("plain text"), None),
+            ("r5", Some("{oops"), None),
+            ("r6", Some(oversize.as_str()), None),
+            ("r7", None, None),
+            ("r8", Some(r#"{"t":1}"#), Some("2026-01-02T00:00:00Z")),
+        ];
+        for (id, body, deleted_at) in bodies {
+            sqlx::query("INSERT INTO records(id,type,kind,body,deleted_at) VALUES(?,?,?,?,?)")
+                .bind(id)
+                .bind("Document")
+                .bind("note")
+                .bind(body)
+                .bind(deleted_at)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        Engine85To86Migration
+            .preflight(&mut connection)
+            .await
+            .unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        Engine85To86Migration.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=86")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        type BodyNodeRow = (String, i64, String, String);
+        let rows: Vec<BodyNodeRow> = sqlx::query_as(
+            "SELECT record_id,ordinal,path,node_type FROM record_body_json_nodes ORDER BY record_id,ordinal",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("".into(), 0, "".into(), "object".into()),
+                ("".into(), 1, "/e".into(), "number".into()),
+                ("r1".into(), 0, "".into(), "object".into()),
+                ("r1".into(), 1, "/a".into(), "number".into()),
+                ("r2".into(), 0, "".into(), "array".into()),
+                ("r2".into(), 1, "/0".into(), "boolean".into()),
+                ("r8".into(), 0, "".into(), "object".into()),
+                ("r8".into(), 1, "/t".into(), "number".into()),
+            ]
+        );
+        assert!(
+            crate::db::validate_engine_shape_on_for_test(&mut connection, 86)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Allocated measurement entry for the engine-84 shape: reconstructs
+    /// schema84 from the current DDL minus the observation node table.
+    #[tokio::test]
+    async fn schema84_measure_contracts() {
+        let mut source84 = schema79_connection(84).await;
+        let mut current = schema79_connection(85).await;
+        let source_shape = crate::db::schema_shape_contract_sha256_for_test(&mut source84)
+            .await
+            .unwrap();
+        let current_shape = crate::db::schema_shape_contract_sha256_for_test(&mut current)
+            .await
+            .unwrap();
+        use sha2::{Digest, Sha256};
+        let source_ddl = crate::schema::contract::historical_ddl_for_test(84);
+        println!(
+            "{}",
+            serde_json::json!({
+                "engine_version":85,"source84_shape_sha256":source_shape,
+                "source84_ddl_sha256":hex::encode(Sha256::digest(source_ddl.as_bytes())),
+                "source84_ddl_statements":crate::schema::DDL_STATEMENTS.len()-1,
+                "current_shape_sha256":current_shape,
+                "current_ddl_sha256":crate::schema::contract::ddl_sha256(),
+                "current_ddl_bytes":crate::schema::canonical_ddl().len(),
+                "current_ddl_statements":crate::schema::DDL_STATEMENTS.len()
+            })
+        );
+        source84.close().await.unwrap();
+        current.close().await.unwrap();
+    }
+
     #[test]
     fn engine_75_to_76_ddl_matches_fresh() {
         let fresh: Vec<_> = crate::schema::DDL_STATEMENTS
@@ -12859,13 +14055,7 @@ mod tests {
             .unwrap()
             .foreign_keys(true);
         let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
-        revert_to_engine_75(&mut conn).await;
-        sqlx::query("DROP TABLE body_blocks")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=74")
-            .execute(&mut conn)
+        crate::schema::step_down::step_down(&mut conn, 74)
             .await
             .unwrap();
         assert_eq!(
@@ -12931,13 +14121,7 @@ mod tests {
             .bind(record_id).bind(&body).execute(&mut conn).await.unwrap();
         sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES('oversized-event',?,'record.created',?,1,'legacy_unknown')")
             .bind(record_id).bind(serde_json::json!({"body":body}).to_string()).execute(&mut conn).await.unwrap();
-        revert_to_engine_75(&mut conn).await;
-        sqlx::query("DROP TABLE body_blocks")
-            .execute(&mut conn)
-            .await
-            .unwrap();
-        sqlx::query("PRAGMA user_version=74")
-            .execute(&mut conn)
+        crate::schema::step_down::step_down(&mut conn, 74)
             .await
             .unwrap();
         let step = EngineMigrationRegistry::production()
@@ -13060,9 +14244,7 @@ mod tests {
             .unwrap()
             .foreign_keys(true);
         let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
-        revert_to_engine_75(&mut conn).await;
-        sqlx::query("DROP TABLE body_blocks")
-            .execute(&mut conn)
+        crate::schema::step_down::step_down(&mut conn, 74)
             .await
             .unwrap();
         sqlx::query("DROP TABLE body_task_items")
@@ -14778,6 +15960,202 @@ mod tests {
             "rebuild drift after 70→71: {}",
             serde_json::to_string_pretty(&result.tables).unwrap()
         );
+        migrated.close().await;
+    }
+
+    #[tokio::test]
+    async fn persona_schema83_migration_promotes_only_revision5_history_stamp() {
+        let revision5 = crate::interchange::source_history_application_id(5);
+        let revision6 = crate::interchange::source_history_application_id(6);
+        for marker in [
+            0,
+            5,
+            -17,
+            0x1234_5678,
+            crate::interchange::source_history_application_id(4),
+            revision5,
+            revision6,
+            crate::interchange::source_history_application_id(7),
+        ] {
+            let mut source = schema79_connection(81).await;
+            sqlx::query(&format!("PRAGMA application_id = {marker}"))
+                .execute(&mut source)
+                .await
+                .unwrap();
+            let mut facet_tx = source.begin().await.unwrap();
+            Engine81To82Migration.apply(&mut facet_tx).await.unwrap();
+            let after_facet: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut *facet_tx)
+                .await
+                .unwrap();
+            assert_eq!(
+                after_facet, marker,
+                "main81→82 must leave history stamps unchanged"
+            );
+            sqlx::query("PRAGMA user_version=82")
+                .execute(&mut *facet_tx)
+                .await
+                .unwrap();
+            facet_tx.commit().await.unwrap();
+            let mut tx = source.begin().await.unwrap();
+            Engine82To83Migration.apply(&mut tx).await.unwrap();
+            tx.commit().await.unwrap();
+            let actual: i64 = sqlx::query_scalar("PRAGMA application_id")
+                .fetch_one(&mut source)
+                .await
+                .unwrap();
+            assert_eq!(
+                actual,
+                if marker == revision5 {
+                    revision6
+                } else {
+                    marker
+                }
+            );
+        }
+        let mut source = schema79_connection(82).await;
+        sqlx::query(&format!("PRAGMA application_id = {revision5}"))
+            .execute(&mut source)
+            .await
+            .unwrap();
+        let mut tx = source.begin().await.unwrap();
+        Engine82To83Migration.apply(&mut tx).await.unwrap();
+        let promoted: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(promoted, revision6);
+        tx.rollback().await.unwrap();
+        let restored: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&mut source)
+            .await
+            .unwrap();
+        assert_eq!(restored, revision5);
+        crate::db::validate_supported_engine_migration_source(&mut source, 82)
+            .await
+            .unwrap();
+    }
+
+    /// Forward migration is rehearsed on a COPY of an on-disk fixture with
+    /// authored documents, GFM projections, tasks, canonical identities, policies,
+    /// human direct and Collection Messages, replies and arrival awareness.
+    #[tokio::test]
+    async fn persona_schema83_migration_copy_preserves_existing_data_and_full_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("realistic-schema81-source.db");
+        let copy_path = dir.path().join("schema83-rehearsal-copy.db");
+        let db = crate::create_database(source_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let (thread, _) = crate::mcp::tools::participants::tests::fixture(&db).await;
+        let registry = crate::mcp::tools::participants::tests::registry();
+        let caller = crate::mcp::registry::Caller::authenticated("alice");
+        for n in 0..12 {
+            registry.call(db.clone(),caller.clone(),"create_record",serde_json::json!({"type":"Document","kind":"note","name":format!("Project note {n}"),"body":"# Project status\n\n- [ ] Follow up\n- [x] Completed\n\nHistorical project evidence.","home_id":thread,"reason":"realistic migration fixture"})).await.unwrap();
+        }
+        let mut prior = None;
+        for n in 0..24 {
+            let m = crate::mcp::tools::participants::tests::send(
+                &db,
+                &thread,
+                &format!("fixture-message-{n}"),
+                None,
+                &[crate::mcp::tools::participants::tests::BOB],
+                "reply",
+                prior.as_deref(),
+            )
+            .await
+            .unwrap();
+            prior = m["id"].as_str().map(str::to_owned);
+        }
+        registry.call(db.clone(),caller.clone(),"manage_messages",serde_json::json!({"action":"send","body":"A historic human direct message","origin":{"type":"direct","participant_ids":[crate::mcp::tools::participants::tests::ALICE,crate::mcp::tools::participants::tests::BOB]},"addressed_to":[crate::mcp::tools::participants::tests::BOB],"expectation":"none","idempotency_key":"historic-human-dm","reason":"fixture"})).await.unwrap();
+        registry.call(db.clone(),caller,"create_record",serde_json::json!({"type":"WorkItem","kind":"task","name":"Existing task","body":"Keep existing commitments","lifecycle":"open","home_id":thread,"reason":"fixture"})).await.unwrap();
+        let before = crate::interchange::export_canonical_interchange(&db)
+            .await
+            .unwrap();
+        let before: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        let db_id = crate::identity::database_id(&db).await.unwrap();
+        let mut step_down_connection = db.write_pool().acquire().await.unwrap();
+        crate::schema::step_down::step_down(&mut step_down_connection, 81)
+            .await
+            .unwrap();
+        drop(step_down_connection);
+        sqlx::query(&format!(
+            "PRAGMA application_id = {}",
+            crate::interchange::source_history_application_id(5)
+        ))
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_81_SHAPE_CONTRACT_SHA256
+        );
+        sqlx::query("VACUUM INTO ?")
+            .bind(copy_path.to_str().unwrap())
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        drop(conn);
+        db.close().await;
+        let original_bytes = std::fs::read(&source_path).unwrap();
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let report = migrate_database(
+            &copy_path,
+            &db_id,
+            "persona-schema83-copy",
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            &EngineMigrationRegistry::production(),
+            &backup,
+            always_fenced(),
+        )
+        .await;
+        assert_eq!(report.outcome, "migrated", "{report:?}");
+        assert_eq!(
+            header_version(&source_path),
+            81,
+            "original fixture was never migrated"
+        );
+        assert_eq!(header_version(&copy_path), CURRENT_ENGINE_SCHEMA_VERSION);
+        assert_eq!(std::fs::read(&source_path).unwrap(), original_bytes);
+        let head = crate::standby::read_authority_act_head_from_path(&copy_path)
+            .await
+            .unwrap();
+        head.validate().unwrap();
+        assert_eq!(
+            head.native_interchange_revision,
+            crate::interchange::REVISION
+        );
+        let migrated = crate::open_existing_database_at(&copy_path).await.unwrap();
+        let after = crate::interchange::export_canonical_interchange(&migrated)
+            .await
+            .unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        for section in before["sections"].as_array().unwrap() {
+            let name = section["name"].as_str().unwrap();
+            if matches!(name, "personas" | "message_speakers") {
+                continue;
+            }
+            let migrated_section = after["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap();
+            assert_eq!(
+                section, migrated_section,
+                "pre-existing section {name} changed"
+            );
+        }
+        // FULL executes all independent rebuild/diff authorities, including
+        // awareness/notification validation; not merely the source shape check.
+        let full = crate::conformance::run_conformance(&migrated).await;
+        assert!(full.ok, "{}", crate::conformance::format_report(&full));
+        eprintln!("persona migration rehearsal: source remains schema81; COPY migrated81→82→83; all {} pre-existing portable sections unchanged; FULL conformance/replay passed",before["sections"].as_array().unwrap().len()-2);
         migrated.close().await;
     }
 }

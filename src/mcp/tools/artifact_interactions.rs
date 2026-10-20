@@ -541,44 +541,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// from a missing row. A blanket catch would also hide real IO faults, so the
 /// extraction stays guarded by `json_valid` in SQL.
 async fn body_of_event(db: &Db, artifact_id: &str, event_id: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar::<_, Option<String>>(
-        "SELECT CASE WHEN json_valid(payload) THEN
-                    CASE WHEN json_type(payload,'$.body')='text'
-                         THEN json_extract(payload,'$.body') END
-                  END
-           FROM content_events
-          WHERE record_id=? AND id=?
-            AND type IN ('record.created','record.updated','receipt.committed.v1')
-          LIMIT 1",
+    let row = crate::record_body::pinned::exact_source_on(
+        db.pool(),
+        event_id,
+        crate::record_body::pinned::ExactSourcePolicy::GuardedTextForRecord(artifact_id),
     )
-    .bind(artifact_id)
-    .bind(event_id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten())
+    .await?;
+    Ok(row
+        .map(|row| row.try_get::<Option<String>, _>("body"))
+        .transpose()?
+        .flatten())
 }
 
 /// The current artifact body event, read directly rather than through artifact
 /// resolution so a resolution diagnostic can never supersede an exact
 /// historical classification.
 async fn current_artifact_body(db: &Db, artifact_id: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar::<_, Option<String>>(
-        "SELECT CASE WHEN json_valid(payload) THEN
-                    CASE WHEN json_type(payload,'$.body')='text'
-                         THEN json_extract(payload,'$.body') END
-                  END
-           FROM content_events
-          WHERE record_id=?
-            AND type IN ('record.created','record.updated','receipt.committed.v1')
-            AND CASE WHEN json_valid(payload)
-                     THEN json_type(payload,'$.body')='text'
-                     ELSE 0 END
-          ORDER BY seq DESC LIMIT 1",
-    )
-    .bind(artifact_id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten())
+    let row = crate::record_body::pinned::latest_guarded_text_on(db.pool(), artifact_id).await?;
+    Ok(row
+        .map(|row| row.try_get::<Option<String>, _>("body"))
+        .transpose()?
+        .flatten())
 }
 
 async fn current_artifact_runtime(db: &Db, artifact_id: &str) -> Result<Option<String>> {
@@ -709,6 +692,7 @@ async fn legacy_candidate_source(
 /// propagates.
 async fn cited_entry_effect(
     body: String,
+    body_limit: usize,
     runtime: Option<&str>,
     entry_id: &str,
     partition: &str,
@@ -720,7 +704,9 @@ async fn cited_entry_effect(
     };
     for candidate in order {
         if candidate == crate::artifact_html::RUNTIME_ID {
-            if let Ok(manifest) = crate::artifact_html::validate_cached(&body) {
+            if let Ok(manifest) =
+                crate::artifact_html::validate_cached_with_limit(&body, body_limit)
+            {
                 if let Some(entry) = manifest.interaction_manifest().interaction(entry_id) {
                     return Ok(Some(entry.effect));
                 }
@@ -787,14 +773,22 @@ async fn classify_cited_entry(
     invocation: &ArtifactInvocation,
 ) -> Result<CitedEntryClass> {
     let partition = caller.hosting_principal().unwrap_or("local").to_owned();
+    // A package bundle (marker facet) may exceed the ordinary HTML limit.
+    let body_limit =
+        super::artifacts::html_body_limit_pool(db.pool(), &invocation.artifact_id).await?;
     if let Some((event_id, runtime)) =
         attested_source(db, &invocation.artifact_id, &invocation.source_digest).await?
     {
         if let Some(body) = body_of_event(db, &invocation.artifact_id, &event_id).await? {
             if sha256_hex(body.as_bytes()) == invocation.source_digest {
-                if let Some(effect) =
-                    cited_entry_effect(body, runtime.as_deref(), &invocation.entry_id, &partition)
-                        .await?
+                if let Some(effect) = cited_entry_effect(
+                    body,
+                    body_limit,
+                    runtime.as_deref(),
+                    &invocation.entry_id,
+                    &partition,
+                )
+                .await?
                 {
                     return Ok(classify_effect(effect));
                 }
@@ -804,9 +798,14 @@ async fn classify_cited_entry(
     if let Some(body) = current_artifact_body(db, &invocation.artifact_id).await? {
         if sha256_hex(body.as_bytes()) == invocation.source_digest {
             let runtime = current_artifact_runtime(db, &invocation.artifact_id).await?;
-            if let Some(effect) =
-                cited_entry_effect(body, runtime.as_deref(), &invocation.entry_id, &partition)
-                    .await?
+            if let Some(effect) = cited_entry_effect(
+                body,
+                body_limit,
+                runtime.as_deref(),
+                &invocation.entry_id,
+                &partition,
+            )
+            .await?
             {
                 return Ok(classify_effect(effect));
             }
@@ -820,6 +819,7 @@ async fn classify_cited_entry(
                         attested_runtime_for_event(db, &invocation.artifact_id, &event_id).await?;
                     if let Some(effect) = cited_entry_effect(
                         body,
+                        body_limit,
                         runtime.as_deref(),
                         &invocation.entry_id,
                         &partition,
@@ -1548,6 +1548,83 @@ async fn invoke_record_create(
     Ok(committed_creation(invocation, created))
 }
 
+/// Largest serialized passage anchor a comment invocation may carry. The
+/// selector text is bounded by the anchored body; this only stops a frame
+/// from sending arbitrary bulk under the anchor input.
+const COMMENT_ANCHOR_MAX_BYTES: usize = 16 * 1024;
+
+/// Normalize a frame-supplied passage anchor into the target shape the
+/// comment write accepts, minus the bearer (always the entry's slot record).
+/// Shape only: `source_slot` must be `body`, `purpose` absent or
+/// `comment_context`, and 1..=4 selectors with exactly one `text_quote` and
+/// no fragment. Whether the selectors hold against the stored body is the
+/// ordinary target capture's decision, on the write transaction.
+pub(crate) fn comment_anchor_value(value: &Value) -> std::result::Result<Value, String> {
+    let fail = |detail: &str| format!("passage anchor is outside its declared domain: {detail}");
+    let object = value
+        .as_object()
+        .ok_or_else(|| fail("expected an object"))?;
+    if serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > COMMENT_ANCHOR_MAX_BYTES) {
+        return Err(fail("too large"));
+    }
+    if let Some(extra) = object.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "source_slot" | "purpose" | "selectors" | "source_pin"
+        )
+    }) {
+        return Err(fail(&format!("unknown field '{extra}'")));
+    }
+    if object.get("source_slot").and_then(Value::as_str) != Some("body") {
+        return Err(fail("source_slot must be 'body'"));
+    }
+    match object.get("purpose") {
+        None => {}
+        Some(Value::String(purpose)) if purpose == "comment_context" => {}
+        Some(_) => return Err(fail("purpose must be 'comment_context'")),
+    }
+    // Optional exact persisted-body source pin. Parsed structurally here with
+    // both fields required and unknown keys refused; the engine re-proves the
+    // exact revision against the stored body in the anchoring transaction.
+    let source_pin = match object.get("source_pin") {
+        None => None,
+        Some(value) => Some(
+            serde_json::from_value::<crate::citations::BodySourcePin>(value.clone())
+                .map_err(|error| fail(&format!("malformed source pin ({error})")))?,
+        ),
+    };
+    let selectors = object
+        .get("selectors")
+        .and_then(Value::as_array)
+        .filter(|selectors| (1..=4).contains(&selectors.len()))
+        .ok_or_else(|| fail("selectors must hold 1..=4 entries"))?;
+    let mut parsed = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        parsed.push(
+            serde_json::from_value::<crate::citations::SelectorInput>(selector.clone())
+                .map_err(|error| fail(&format!("malformed selector ({error})")))?,
+        );
+    }
+    let quotes = parsed
+        .iter()
+        .filter(|selector| matches!(selector, crate::citations::SelectorInput::TextQuote { .. }))
+        .count();
+    if quotes != 1
+        || parsed
+            .iter()
+            .any(|selector| matches!(selector, crate::citations::SelectorInput::Fragment { .. }))
+    {
+        return Err(fail("exactly one text_quote and no fragment selector"));
+    }
+    let mut normalized =
+        json!({ "source_slot": "body", "purpose": "comment_context", "selectors": parsed });
+    if let Some(pin) = source_pin {
+        normalized["source_pin"] = serde_json::to_value(pin)
+            .map_err(|error| fail(&format!("source pin serialization ({error})")))?;
+    }
+    Ok(normalized)
+}
+
 /// Compose a private comment plan from a resolved invocation. Every
 /// identity is engine-derived: the guard must be present (comments are
 /// consent-gated, no unguarded path), its artifact and source revision pin
@@ -1622,6 +1699,8 @@ async fn compose_comment_plan(
             format!("bearer slot '{bearer_slot}' is unfilled"),
         )));
     };
+    // A declared anchor input is the only other value a comment may carry.
+    let anchor_input = comment.anchor.as_ref().map(|anchor| anchor.input.as_str());
     if let Some(extra) = invocation
         .slots
         .keys()
@@ -1630,7 +1709,7 @@ async fn compose_comment_plan(
             invocation
                 .values
                 .keys()
-                .find(|name| *name != &comment.body.input)
+                .find(|name| *name != &comment.body.input && Some(name.as_str()) != anchor_input)
         })
     {
         return Ok(Err(reject(
@@ -1638,6 +1717,21 @@ async fn compose_comment_plan(
             format!("entry '{}' declares no slot '{extra}'", entry.id),
         )));
     }
+    let anchor = match anchor_input.and_then(|input| invocation.values.get(input)) {
+        None => None,
+        Some(value) => {
+            if comment.position != mdx_v2::CommentPosition::Root {
+                return Ok(Err(reject(
+                    "value_outside_domain",
+                    "a passage anchor is valid only on a root comment".to_string(),
+                )));
+            }
+            match comment_anchor_value(value) {
+                Ok(anchor) => Some(anchor),
+                Err(message) => return Ok(Err(reject("value_outside_domain", message))),
+            }
+        }
+    };
     let Some(body) = invocation.values.get(&comment.body.input) else {
         return Ok(Err(reject(
             "slot_unfilled",
@@ -1718,6 +1812,7 @@ async fn compose_comment_plan(
         target_id: bearer_id,
         position: position.to_string(),
         body: body.to_string(),
+        anchor,
         manifest_max_bytes: comment.body.max_bytes,
         scope_port: bound.port.clone(),
         scope_collection_id: bound.collection_id.clone(),
@@ -2465,7 +2560,9 @@ async fn invoke_artifact_interaction(db: Db, caller: Caller, arguments: Value) -
     let partition = caller.hosting_principal().unwrap_or("local").to_owned();
     let body = resolved.body.clone();
     let (source_sha256, manifest) = if resolved.runtime_id == crate::artifact_html::RUNTIME_ID {
-        match crate::artifact_html::validate_cached(&body) {
+        let body_limit =
+            super::artifacts::html_body_limit_pool(db.pool(), &invocation.artifact_id).await?;
+        match crate::artifact_html::validate_cached_with_limit(&body, body_limit) {
             Ok(manifest) => (
                 manifest.body_digest.clone(),
                 manifest.interaction_manifest(),
@@ -3309,8 +3406,26 @@ async fn commit_declared_write(
     // 7. Compare-and-set, at the granularity each facet actually moves at.
     for (record_id, observed) in &invocation.observed {
         for (observed_key, token) in observed {
-            let expected = FacetVersion::parse(token)
-                .expect("the envelope validator admitted only host-issued tokens");
+            // `rec:`/`obs:` parse directly; `rev:`/`obsv:` name the same state
+            // by event id and resolve to it. The envelope validator admitted
+            // only these shapes, so only an unresolvable id can fail here.
+            let expected = match crate::position::parse_facet_version(
+                &mut tx,
+                caller.counter_footing(),
+                token,
+            )
+            .await
+            {
+                Ok(Some(expected)) => expected,
+                Ok(None) => unreachable!("the envelope validator admitted only host-issued tokens"),
+                Err(error) if crate::position::is_unknown_position(&error) => {
+                    return refuse(
+                        "invalid_precondition",
+                        crate::position::UNKNOWN_POSITION_MESSAGE.to_owned(),
+                    );
+                }
+                Err(error) => return Err(error),
+            };
             let observed_spine = spine_facet_column(observed_key);
             let issued =
                 match (&expected, observed_spine) {
@@ -4457,6 +4572,170 @@ mod tests {
     /// declared bearer and body inputs. The entry below comes from a
     /// genuinely parsed manifest source, never hand-built JSON.
     #[tokio::test]
+    async fn compose_comment_plan_admits_only_a_declared_root_anchor() {
+        use native_artifact_runtime::artifact_intents::{
+            AlphaTabInstallGuard, ArtifactInvocation, INVOCATION_VERSION,
+        };
+        let source = |anchor: &str| {
+            format!(
+                r#"export const nativeArtifact = {{
+  schema: "native.mdx.artifact.v2",
+  inputs: {{ orders: {{ envelope: "native.collection-envelope.v1", required: true, expose_to_root: true }} }},
+  module_inputs: {{}},
+  capability_requests: [{{ capability: "input.read", scope: {{ port: "orders" }} }}],
+  interactions: [{{ id: "post", label: "Post", effect: "comment.create",
+    slots: {{ bearer: {{ domain: {{ kind: "bound_input", port: "orders" }} }} }},
+    comment: {{ position: "root", body: {{ input: "text", max_bytes: 100 }}{anchor} }} }}]
+}}
+
+<Metric label="Total" value={{1}} />
+"#
+            )
+        };
+        let parse = |anchor: &str| {
+            let parsed = native_artifact_runtime::mdx_v2::parse_artifact(&source(anchor))
+                .expect("manifest parses");
+            let native_artifact_runtime::mdx_v2::Manifest::Artifact(manifest) = parsed.manifest
+            else {
+                unreachable!()
+            };
+            let entry = manifest.interaction("post").unwrap().clone();
+            (manifest, entry)
+        };
+        let db = crate::create_database(":memory:").await.unwrap();
+        let caller = crate::mcp::Caller::local();
+        let guard = AlphaTabInstallGuard {
+            package: "agent.comment-anchor".into(),
+            expected_install_event_id: "event".into(),
+            artifact_id: "artifact".into(),
+            source_revision: "revision".into(),
+            version: "0.1.0".into(),
+            digest: format!("sha256:{}", "b".repeat(64)),
+            declaration_digest: "c".repeat(64),
+        };
+        let invocation = |values: BTreeMap<String, Value>| ArtifactInvocation {
+            version: INVOCATION_VERSION.into(),
+            artifact_id: "artifact".into(),
+            entry_id: "post".into(),
+            source_digest: "a".repeat(64),
+            slots: BTreeMap::from([("bearer".to_owned(), "record".to_owned())]),
+            values,
+            observed: BTreeMap::new(),
+            idempotency_key: "k".into(),
+            gesture: Some("click".into()),
+            include_next_plan: false,
+            alpha_install_guard: Some(guard.clone()),
+            reverses: None,
+        };
+        let good = json!({ "source_slot": "body", "selectors": [
+            { "type": "text_quote", "exact": "lazily" }, { "type": "data_position", "start": 3, "end": 9 } ] });
+        let values = |anchor: Value| {
+            BTreeMap::from([
+                ("text".to_owned(), json!("hi")),
+                ("target".to_owned(), anchor),
+            ])
+        };
+        async fn refusal(
+            db: &Db,
+            caller: &crate::mcp::Caller,
+            invocation: ArtifactInvocation,
+            entry: native_artifact_runtime::mdx_v2::InteractionEntry,
+            manifest: native_artifact_runtime::mdx_v2::ArtifactManifest,
+        ) -> Option<String> {
+            compose_comment_plan(db, caller, &invocation, &entry, &manifest, "revision")
+                .await
+                .unwrap()
+                .err()
+                .map(|(code, _)| code)
+        }
+        let code =
+            |manifest, entry, values| refusal(&db, &caller, invocation(values), entry, manifest);
+        // An entry without a declared anchor input never takes one.
+        let (manifest, entry) = parse("");
+        assert_eq!(
+            code(manifest, entry, values(good.clone())).await.as_deref(),
+            Some("unknown_slot")
+        );
+        // Declared: a well-formed anchor passes composition to the binding stage.
+        let (manifest, entry) = parse(r#", anchor: { input: "target" }"#);
+        let passed = code(manifest.clone(), entry.clone(), values(good.clone())).await;
+        assert!(
+            !matches!(
+                passed.as_deref(),
+                Some("unknown_slot" | "value_outside_domain")
+            ),
+            "{passed:?}"
+        );
+        // Malformed anchors refuse before any write.
+        for malformed in [
+            json!("lazily"),
+            json!({ "source_slot": "blob", "selectors": [{ "type": "text_quote", "exact": "x" }] }),
+            json!({ "source_slot": "body", "selectors": [{ "type": "text_quote" }] }),
+            json!({ "source_slot": "body", "selectors": [{ "type": "data_position", "start": 1, "end": 2 }] }),
+            json!({ "source_slot": "body", "target_record_id": "elsewhere", "selectors": [{ "type": "text_quote", "exact": "x" }] }),
+            json!({ "source_slot": "body", "purpose": "citation", "selectors": [{ "type": "text_quote", "exact": "x" }] }),
+        ] {
+            assert_eq!(
+                code(manifest.clone(), entry.clone(), values(malformed.clone()))
+                    .await
+                    .as_deref(),
+                Some("value_outside_domain"),
+                "{malformed}"
+            );
+        }
+        // A reply never carries an anchor, even from a forged entry.
+        let mut reply = entry.clone();
+        reply.comment.as_mut().unwrap().position =
+            native_artifact_runtime::mdx_v2::CommentPosition::Reply;
+        assert_eq!(
+            code(manifest, reply, values(good)).await.as_deref(),
+            Some("value_outside_domain")
+        );
+    }
+
+    #[test]
+    fn comment_anchor_value_normalizes_and_bounds_the_target() {
+        let normalized = comment_anchor_value(&json!({ "source_slot": "body", "selectors": [
+            { "type": "data_position", "start": 0, "end": 2 }, { "type": "text_quote", "exact": "hi", "prefix": "" } ] })).unwrap();
+        assert_eq!(normalized["source_slot"], "body");
+        assert_eq!(normalized["purpose"], "comment_context");
+        assert!(
+            normalized.get("target_record_id").is_none(),
+            "the bearer is never frame-supplied"
+        );
+        let bulk = json!({ "source_slot": "body", "selectors": [{ "type": "text_quote", "exact": "x".repeat(20_000) }] });
+        assert!(comment_anchor_value(&bulk)
+            .unwrap_err()
+            .contains("too large"));
+        let fragment = json!({ "source_slot": "body", "selectors": [{ "type": "text_quote", "exact": "x" },
+            { "type": "fragment", "conforms_to": "x", "value": "y" }] });
+        assert!(comment_anchor_value(&fragment).is_err());
+        // The optional exact source pin survives normalization into the plan
+        // anchor (and so into the command digest); a malformed or unknown-keyed
+        // pin refuses rather than being silently dropped.
+        let pinned = comment_anchor_value(&json!({
+            "source_slot": "body",
+            "source_pin": { "source_event_id": "event", "source_body_sha256": "a".repeat(64) },
+            "selectors": [{ "type": "text_quote", "exact": "hi" }]
+        }))
+        .unwrap();
+        assert_eq!(pinned["source_pin"]["source_event_id"], "event");
+        assert_eq!(pinned["source_pin"]["source_body_sha256"], "a".repeat(64));
+        assert!(comment_anchor_value(&json!({
+            "source_slot": "body",
+            "source_pin": { "source_event_id": "event" },
+            "selectors": [{ "type": "text_quote", "exact": "hi" }]
+        }))
+        .is_err());
+        assert!(comment_anchor_value(&json!({
+            "source_slot": "body",
+            "source_pin": { "source_event_id": "event", "source_body_sha256": "a".repeat(64), "extra": 1 },
+            "selectors": [{ "type": "text_quote", "exact": "hi" }]
+        }))
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn compose_comment_plan_refuses_before_binding() {
         use native_artifact_runtime::artifact_intents::{
             AlphaTabInstallGuard, ArtifactInvocation, INVOCATION_VERSION,
@@ -4824,6 +5103,132 @@ mod tests {
         let record_id = format!("{event_id}-record");
         let payload = payload.to_string();
         insert_raw_event(db, &record_id, event_id, Some(&payload)).await;
+    }
+
+    #[tokio::test]
+    async fn pinned_body_preserves_lenient_sqlite_extraction_and_identity() {
+        let db = classifier_db().await;
+        // Lenient SQLite extraction uses the first key, unlike serde Value
+        // (last key) or the strict reader (duplicate rejection).
+        insert_raw_event(
+            &db,
+            CLASSIFIER_ARTIFACT,
+            "duplicate",
+            Some(r#"{"body":"é","body":"other"}"#),
+        )
+        .await;
+        insert_body(&db, CLASSIFIER_ARTIFACT, "later", "newer").await;
+        assert_eq!(
+            body_of_event(&db, CLASSIFIER_ARTIFACT, "duplicate")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("é")
+        );
+        assert!(body_of_event(&db, "other-record", "duplicate")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(body_of_event(&db, CLASSIFIER_ARTIFACT, "missing")
+            .await
+            .unwrap()
+            .is_none());
+        let row = crate::record_body::pinned::exact_source_on(
+            db.pool(),
+            "duplicate",
+            crate::record_body::pinned::ExactSourcePolicy::GuardedTextForRecord(
+                CLASSIFIER_ARTIFACT,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.get::<String, _>("id"), "duplicate");
+        assert_eq!(row.get::<String, _>("record_id"), CLASSIFIER_ARTIFACT);
+        assert_eq!(row.get::<String, _>("type"), "record.created");
+        assert!(row.get::<i64, _>("seq") > 0);
+        insert_body(&db, CLASSIFIER_ARTIFACT, "nul", "é\0tail").await;
+        assert_eq!(
+            body_of_event(&db, CLASSIFIER_ARTIFACT, "nul")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("é\0tail")
+        );
+        // This reader has never had the strict helper's body budget.
+        let large = "é".repeat(600_000);
+        insert_body(&db, CLASSIFIER_ARTIFACT, "large", &large).await;
+        assert_eq!(
+            body_of_event(&db, CLASSIFIER_ARTIFACT, "large")
+                .await
+                .unwrap(),
+            Some(large)
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_body_absence_and_latest_fallback_remain_distinct() {
+        let db = classifier_db().await;
+        insert_body(&db, CLASSIFIER_ARTIFACT, "empty", "").await;
+        for (id, payload) in [
+            ("sql-null", None),
+            ("null", Some(r#"{"body":null}"#)),
+            ("absent", Some("{}")),
+            ("object", Some(r#"{"body":{}}"#)),
+            ("number", Some(r#"{"body":42}"#)),
+        ] {
+            insert_raw_event(&db, CLASSIFIER_ARTIFACT, id, payload).await;
+            assert!(
+                body_of_event(&db, CLASSIFIER_ARTIFACT, id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{id}"
+            );
+        }
+        // One malformed legacy insert in this disposable :memory: fixture;
+        // restore metadata admission immediately and keep append-only guards.
+        let mut legacy_fixture = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let trigger: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'")
+            .fetch_one(&mut *legacy_fixture).await.unwrap();
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES ('malformed',?,'record.updated','{',1,'legacy_unknown')")
+            .bind(CLASSIFIER_ARTIFACT).execute(&mut *legacy_fixture).await.unwrap();
+        sqlx::query(&trigger)
+            .persistent(false)
+            .execute(&mut *legacy_fixture)
+            .await
+            .unwrap();
+        legacy_fixture.commit().await.unwrap();
+        assert!(body_of_event(&db, CLASSIFIER_ARTIFACT, "malformed")
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES ('unit',?,'unit.revision.recorded.v1',?,1,'complete')")
+            .bind(CLASSIFIER_ARTIFACT).bind(r#"{"body":"excluded"}"#)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert!(body_of_event(&db, CLASSIFIER_ARTIFACT, "unit")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            body_of_event(&db, CLASSIFIER_ARTIFACT, "empty")
+                .await
+                .unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            current_artifact_body(&db, CLASSIFIER_ARTIFACT)
+                .await
+                .unwrap(),
+            Some(String::new())
+        );
     }
 
     #[tokio::test]

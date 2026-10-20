@@ -1,24 +1,30 @@
 //! Durable local standby generations.
 //!
-//! This module owns offline verification, filesystem publication, and
-//! deterministic startup selection/retention. It performs no network refresh,
-//! packaging or full MCP freshness disclosure.
+//! This module owns verification, filesystem publication, deterministic
+//! startup selection/retention, the refresh controller (a whole-snapshot
+//! checkpoint advanced in place by authenticated whole-act deltas) and the
+//! standby status projection.
 
 mod act_cut;
 mod act_delta;
 mod act_materialise;
 mod authority_probe;
+mod release_head;
 #[cfg(test)]
 pub(crate) use authority_probe::read_authority_act_head;
 /// Slice-A freeze-receipt seam: the read-only file-path act-head probe and
 /// the closed evidence contract it observes. Re-exported for release tooling;
 /// the `Db`-handle probe stays crate-internal.
 pub use authority_probe::{
-    read_authority_act_head_from_path, ActCutoverV1, AuthorityActHeadV1, BindingSystemSeedV1,
-    ContentCausalCutoverV1, LogMaxSeqV1, NonSequencedMaxActV1, StoragePortabilityPolicyHeadV1,
-    AUTHORITY_ACT_HEAD_CONTRACT, AUTHORITY_ACT_HEAD_VERSION, REQUIRED_NATIVE_INTERCHANGE_REVISION,
+    is_revision_unsupported, read_authority_act_head_from_path, ActCutoverV1, AuthorityActHeadV1,
+    BindingSystemSeedV1, ContentCausalCutoverV1, LogMaxSeqV1, NonSequencedMaxActV1,
+    StoragePortabilityPolicyHeadV1, AUTHORITY_ACT_HEAD_CONTRACT, AUTHORITY_ACT_HEAD_VERSION,
+    REQUIRED_NATIVE_INTERCHANGE_REVISION,
 };
+pub use release_head::{read_release_act_head_from_path, validate_release_act_head};
 mod companion_closure;
+#[cfg(test)]
+pub(crate) use companion_closure::read_companion_section_on;
 pub mod delta_transport;
 // R2's content-only materialiser is a proof-only module: it accepts a merely
 // structurally valid delta (no trust gate), has no callers outside its own
@@ -40,14 +46,20 @@ pub fn enable_bounded_verification_diagnostics() {
 }
 
 pub use generation_store::{
-    AcceptedGenerationHint, ActivatedGeneration, GenerationStore, InstalledGeneration,
-    StandbyStartupOutcome, StandbyStartupReason, StatusOnlyStartup,
+    AcceptedGenerationHint, ActivatedGeneration, ConsumerRebind, GenerationHead, GenerationStore,
+    InstalledGeneration, StandbyAuditOutcome, StandbyStartupOutcome, StandbyStartupReason,
+    StatusOnlyStartup,
 };
-pub(crate) use refresh::validate_exact_origin;
 pub use refresh::{
-    DeltaFallbackClass, RefreshCause, RefreshFailureClass, StandbyRefreshConfig,
-    StandbyRefreshController, StandbyRefreshDaemonGuard, StandbyRefreshOutcome,
-    StandbyRefreshState, StandbySnapshotDownload,
+    current_attempt_detail, sanitize_retained_detail, start_background_refresh,
+    start_background_refresh_with_store, BackgroundRefresh, DeltaFallbackClass,
+    RefreshAttemptFailure, RefreshAttemptPhase, RefreshCause, RefreshFailureClass,
+    RefreshFailureReceipt, StandbyDeltaOutcome, StandbyRefreshConfig, StandbyRefreshController,
+    StandbyRefreshDaemonGuard, StandbyRefreshOutcome, StandbyRefreshState, StandbySnapshotDownload,
+    StandbyTransferActivity, StandbyTransferProgress, StandbyTransferStage,
+};
+pub(crate) use refresh::{
+    start_background_refresh_after_startup, validate_exact_origin, RefreshHints,
 };
 pub use runtime::{observe_installed_consumer_identity, StandbyRuntimeConfig};
 pub use status::{

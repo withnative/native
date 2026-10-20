@@ -17,8 +17,14 @@ use serde_json::Value;
 pub const SESSION_BODY_V1: &str = "session.body.v1";
 
 /// Top-level declaration keys this contract reserves. The tool gate requires
-/// `needs` + `effects` and permits optional `sessions`; nothing else.
-pub const DECLARATION_KEYS: [&str; 3] = ["needs", "effects", "sessions"];
+/// `needs` + `effects` and permits optional `sessions` and `contract`;
+/// nothing else.
+pub const DECLARATION_KEYS: [&str; 4] = ["needs", "effects", "sessions", "contract"];
+
+/// The only value the optional `contract` declaration key accepts. It marks
+/// an install as an app-contract v2 install (`{contract, needs: [], effects: []}`):
+/// the one Adopt is the whole consent, so no needs or effects are declared.
+pub const APP_CONTRACT_V2: &str = "native.app.v2";
 const SESSION_KEYS: [&str; 5] = ["session", "key", "scope", "mode", "presence"];
 const SCOPE_KEYS: [&str; 2] = ["type", "kind"];
 
@@ -134,6 +140,41 @@ pub fn validate_declaration_sessions(declaration: &Value) -> Result<(), String> 
         None => Ok(()),
         Some(sessions) => parse_sessions(Some(sessions)).map(|_| ()),
     }
+}
+
+/// Validate the optional top-level `contract` member of a declaration.
+///
+/// Absent is fine and imposes nothing, so v1 declarations are untouched. A
+/// present value must be exactly [`APP_CONTRACT_V2`]; any other value
+/// (including a non-string) is refused rather than ignored, so an unknown
+/// future contract can never be consented to as if it were v1.
+///
+/// A v2 declaration declares nothing: the one Adopt is the whole consent, so
+/// `needs` and `effects` must be empty arrays and `sessions` must be absent
+/// (not merely empty). This is the single home of that rule; the tool gate,
+/// the canonical form and the control consent seam all call it, so no path
+/// can store or digest a v2 marker carrying declarations.
+pub fn validate_declaration_contract(declaration: &Value) -> Result<(), String> {
+    let object = declaration
+        .as_object()
+        .ok_or("declaration must be an object")?;
+    match object.get("contract") {
+        None => return Ok(()),
+        Some(Value::String(value)) if value == APP_CONTRACT_V2 => {}
+        Some(_) => return Err(format!("contract must be '{APP_CONTRACT_V2}'")),
+    }
+    let empty = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    };
+    if !empty("needs") || !empty("effects") || object.contains_key("sessions") {
+        return Err(format!(
+            "a {APP_CONTRACT_V2} declaration must hold empty 'needs' and 'effects' and no 'sessions'"
+        ));
+    }
+    Ok(())
 }
 
 /// Deterministic canonical form of a present `sessions` array, or `None` when

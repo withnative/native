@@ -112,13 +112,23 @@ pub(super) async fn project_message_audience_declared(
     }
     assert_portable_person(conn, &owner_id, &event.event_type).await?;
     let sender = declared_principal(&payload.sender_principal, &event.event_type)?;
+    let has_speaker: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_speakers WHERE message_id=?)")
+            .bind(&event.record_id)
+            .fetch_one(&mut *conn)
+            .await?;
+    if !has_speaker
+        && payload
+            .addressed_to
+            .iter()
+            .any(|r| r.recipient_id == owner_id)
+    {
+        return Err(Error::engine(
+            "Message sender cannot be an addressed_to recipient without a valid speaker",
+        ));
+    }
     let mut seen = std::collections::BTreeSet::new();
     for recipient in &payload.addressed_to {
-        if recipient.recipient_id == owner_id {
-            return Err(Error::engine(
-                "Message addressed_to must exclude its sender",
-            ));
-        }
         if !seen.insert(recipient.recipient_id.as_str()) {
             return Err(Error::engine(format!(
                 "Message audience contains duplicate recipient {}",
@@ -127,11 +137,6 @@ pub(super) async fn project_message_audience_declared(
         }
         assert_portable_person(conn, &recipient.recipient_id, &event.event_type).await?;
         let principal = declared_principal(&recipient.principal, &event.event_type)?;
-        if principal == sender {
-            return Err(Error::engine(
-                "Message addressed_to must exclude its sender principal",
-            ));
-        }
         sqlx::query(
             "INSERT INTO links (id,source_id,target_id,relationship,note,created_at)
              VALUES (?,?,?,'addressed_to',NULL,?)",

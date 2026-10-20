@@ -96,7 +96,6 @@ async fn touches_for_tool(
 fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
     let registry = registry();
     let specs = registry.specs().collect::<Vec<_>>();
-    assert_eq!(specs.len(), ToolKind::ALL.len() - 7);
     assert!(
         specs.iter().all(|spec| spec.kind.is_some()),
         "a local tool used the custom/no-record registration escape hatch"
@@ -115,11 +114,13 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
         ToolKind::ManageMemberships,
         ToolKind::WorkspaceRead,
         ToolKind::StandbyStatus,
+        ToolKind::OutboxStatus,
         ToolKind::ReachRead,
         ToolKind::ReachConnect,
         ToolKind::AuthorityActHead,
         ToolKind::AuthorityActDelta,
     ]);
+    assert_eq!(specs.len(), ToolKind::ALL.len() - hosted_only.len());
     let expected_local = exhaustive
         .difference(&hosted_only)
         .copied()
@@ -131,7 +132,7 @@ fn every_local_registration_uses_the_exhaustive_tool_kind_path() {
             .copied()
             .collect::<HashSet<_>>(),
         hosted_only,
-        "hosted membership management, workspace directory, reach, and standby-only status stay off the local registry"
+        "hosted membership management, workspace directory, reach, and configured status services stay off the local registry"
     );
     for spec in &specs {
         assert_eq!(spec.name, spec.kind.unwrap().name());

@@ -4,7 +4,7 @@
 //! binary selects it, opens the real SQLite file without startup writes, and
 //! cannot be bypassed through an exact-name JSON-RPC call.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,72 @@ fn assert_bounded_verification_diagnostics(stderr: &str) {
     );
 }
 
+// The locked default fmt timer emits UTC with six fractional digits.
+// Check its shape without depending on the clock's value.
+fn assert_timestamp_shape(timestamp: &str) {
+    let timestamp_shape = b"0000-00-00T00:00:00.000000Z";
+    assert_eq!(timestamp.len(), timestamp_shape.len(), "formatter prefix");
+    assert!(
+        timestamp
+            .bytes()
+            .zip(timestamp_shape)
+            .all(|(actual, expected)| {
+                if *expected == b'0' {
+                    actual.is_ascii_digit()
+                } else {
+                    actual == *expected
+                }
+            }),
+        "unexpected formatter prefix: {timestamp}"
+    );
+}
+
+// The read-only markdown vault shares the bounded stderr contract: one line
+// per event, printable ASCII, a closed set of messages, one absolute-path
+// field on creation and guard lines, one printable detail on failure lines.
+// Emission escapes control characters and truncates each field to a per-site
+// budget (`markdown_vault::diag_field`), so a hostile path stays single-line
+// within the byte budget; this validator pins the resulting shapes.
+fn assert_vault_diagnostic(line: &str) {
+    let (head, message) = line
+        .split_once("native_ce::standby::vault: ")
+        .unwrap_or_else(|| panic!("unexpected vault diagnostic: {line}"));
+    let timestamp = head
+        .get(..27)
+        .unwrap_or_else(|| panic!("vault diagnostic without timestamp: {line}"));
+    assert_timestamp_shape(timestamp);
+    assert!(
+        matches!(
+            head.get(27..).unwrap_or(""),
+            "  INFO " | "  WARN " | "  ERROR "
+        ),
+        "unexpected vault diagnostic level: {line}"
+    );
+    const NOTICE: &str = "created read-only markdown vault; to turn it off set \"markdown_folder\": false in node.json path=";
+    const GUARD: &str = "markdown vault default beside the local copy is unsafe; vault is off - set \"markdown_folder\" to an explicit path to enable it replica_root=";
+    const FAILURE: &str = "vault initialization failed error=";
+    const UPDATE_FAILED: &str = "vault update failed error=";
+    if let Some(path) = message
+        .strip_prefix(NOTICE)
+        .or_else(|| message.strip_prefix(GUARD))
+    {
+        assert!(
+            path.starts_with('/') && path.bytes().all(|byte| (b' '..=b'~').contains(&byte)),
+            "vault path field must be absolute printable ASCII: {path}"
+        );
+    } else if let Some(detail) = message
+        .strip_prefix(FAILURE)
+        .or_else(|| message.strip_prefix(UPDATE_FAILED))
+    {
+        assert!(
+            !detail.is_empty() && detail.bytes().all(|byte| (b' '..=b'~').contains(&byte)),
+            "vault failure detail must be printable ASCII: {detail}"
+        );
+    } else {
+        panic!("unexpected vault event: {message}");
+    }
+}
+
 // Status-only startup is a successful validation outcome with no ready reader.
 // Keep the same closed formatter/event/field contract on connected transitions.
 fn assert_bounded_verification_receipts(stderr: &str) -> bool {
@@ -114,8 +180,16 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         "hardened-generation",
         "startup-generation",
         "startup-snapshot",
+        "startup-lock",
+        "startup-cleanup",
+        "startup-rebind",
+        "startup-selection",
+        "startup-prune",
+        "startup-generation-verify",
+        "background-retention",
         "byte-manifest-consumer-identity",
         "engine-manifest-state",
+        "sqlite-quick-check-foreign-keys",
         "sqlite-integrity-foreign-keys",
         "observational-conformance",
         "awareness-projections",
@@ -144,12 +218,13 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         "portable-identity-state",
         "storage-portability-policy-state",
     ];
-    let events: [(&str, &[&str]); 11] = [
+    let events: [(&str, &[&str]); 13] = [
         ("standby startup verification started", &[]),
         (
             "standby startup verification finished",
             &["elapsed_ms", "ok", "serving"],
         ),
+        ("standby startup phase finished", &["phase", "elapsed_ms"]),
         ("standby phase started", &["phase"]),
         ("standby phase finished", &["phase", "elapsed_ms", "ok"]),
         ("standby suite started", &[]),
@@ -161,7 +236,14 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
             "standby writer contention window",
             &["domain", "transactions", "busy_retries", "failures"],
         ),
-        ("standby writer contention slow", &["domain", "held_ms"]),
+        (
+            "standby writer contention slow",
+            &["domain", "operation", "held_ms"],
+        ),
+        (
+            "standby writer contention over cap",
+            &["domain", "operation", "count"],
+        ),
     ];
     let mut serving_completion = false;
     let mut startup_completion = false;
@@ -171,26 +253,16 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
             "bounded diagnostic line ({} bytes)",
             line.len()
         );
+        if line.contains("native_ce::standby::vault: ") {
+            assert_vault_diagnostic(line);
+            continue;
+        }
         let (timestamp, message) = line
             .split_once("  INFO native_ce::standby::verification: ")
             .unwrap_or_else(|| panic!("unexpected standby diagnostic: {line}"));
         // The locked default fmt timer emits UTC with six fractional digits.
         // Check its shape without depending on the clock's value.
-        let timestamp_shape = b"0000-00-00T00:00:00.000000Z";
-        assert_eq!(timestamp.len(), timestamp_shape.len(), "formatter prefix");
-        assert!(
-            timestamp
-                .bytes()
-                .zip(timestamp_shape)
-                .all(|(actual, expected)| {
-                    if *expected == b'0' {
-                        actual.is_ascii_digit()
-                    } else {
-                        actual == *expected
-                    }
-                }),
-            "unexpected formatter prefix: {timestamp}"
-        );
+        assert_timestamp_shape(timestamp);
         let (event, required, field_text) = events
             .iter()
             .find_map(|(event, required)| {
@@ -209,7 +281,12 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         if !field_text.is_empty() {
             for field in field_text.split(' ') {
                 let (key, value) = field.split_once('=').expect("key=value field");
-                assert!(required.contains(&key), "unexpected field: {field}");
+                let timing_field = event == "standby startup phase finished"
+                    && ["generation_id", "ok", "serving", "deferred"].contains(&key);
+                assert!(
+                    required.contains(&key) || timing_field,
+                    "unexpected field: {field}"
+                );
                 assert!(
                     fields.insert(key, value).is_none(),
                     "duplicate verification field: {key}"
@@ -227,11 +304,39 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
                         };
                         assert!(names.contains(&name), "unexpected fixed name: {name}");
                     }
+                    "generation_id" => {
+                        let id = value
+                            .strip_prefix('"')
+                            .and_then(|v| v.strip_suffix('"'))
+                            .expect("quoted generation identity");
+                        assert!(
+                            id.len() == 64
+                                && id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                            "bounded generation identity"
+                        );
+                    }
                     "domain" => assert!(
                         matches!(value, "\"workspace\"" | "\"host_catalog\""),
                         "fixed writer domain"
                     ),
-                    "elapsed_ms" | "held_ms" | "transactions" | "busy_retries" | "failures" => {
+                    // Catalog hold attribution labels are fixed server-side
+                    // strings, but the set is open-ended (the migration
+                    // journal passes its own diagnosed operation names), so
+                    // the parser accepts any quoted label here. Leakage is
+                    // still excluded by the fixture/run-key assertions below.
+                    "operation" => assert!(
+                        value.len() >= 2
+                            && value.starts_with('"')
+                            && value.ends_with('"')
+                            && value
+                                .bytes()
+                                .all(|byte| byte == b'"' || (b' '..=b'~').contains(&byte)),
+                        "quoted operation label: {value}"
+                    ),
+                    "elapsed_ms" | "held_ms" | "transactions" | "busy_retries" | "failures"
+                    | "count" => {
                         assert!(
                             !value.is_empty()
                                 && value.bytes().all(|byte| byte.is_ascii_digit())
@@ -242,7 +347,7 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
                     "attempt" => {
                         assert!(matches!(value, "1" | "2" | "3"), "bounded handoff attempt")
                     }
-                    "ok" | "serving" | "ready" => assert!(
+                    "ok" | "serving" | "ready" | "deferred" => assert!(
                         value.parse::<bool>().is_ok(),
                         "invalid boolean outcome: {value}"
                     ),
@@ -252,6 +357,23 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
         }
         for key in required {
             assert!(fields.contains_key(key), "missing {key} in {event}");
+        }
+        if event == "standby startup phase finished" {
+            let extra: &[&str] = match fields["phase"] {
+                "\"startup-generation-verify\"" => &["generation_id", "ok"],
+                "\"startup-prune\"" => &["deferred"],
+                "\"startup-selection\"" if fields.contains_key("serving") => &["serving"],
+                "\"startup-selection\"" => &[],
+                phase => panic!("unexpected startup timing phase: {phase}"),
+            };
+            assert_eq!(
+                fields.len(),
+                required.len() + extra.len(),
+                "closed timing fields"
+            );
+            for key in extra {
+                assert!(fields.contains_key(key), "missing {key} in timing event");
+            }
         }
         if event == "standby startup verification finished" {
             startup_completion |= fields["ok"].parse::<bool>().unwrap();
@@ -274,7 +396,7 @@ fn assert_bounded_verification_receipts(stderr: &str) -> bool {
     serving_completion
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FileEvidence {
     kind: &'static str,
     mode: u32,
@@ -635,10 +757,35 @@ fn create_private_empty_file(path: &Path) {
 }
 
 fn precreate_generation_lease(replica_root: &Path, generation_id: &str) {
-    let path = replica_root
-        .join("accepted/leases")
-        .join(format!("{generation_id}.lock"));
-    create_private_empty_file(&path);
+    // The serving lease, and the checkpoint lock that startup verification
+    // holds shared while it hashes the generation.
+    for kind in ["lock", "checkpoint"] {
+        let path = replica_root
+            .join("accepted/leases")
+            .join(format!("{generation_id}.{kind}"));
+        create_private_empty_file(&path);
+    }
+}
+
+/// A serving process writes exactly two pieces of state beside the generation
+/// it serves: its build marker (`accepted/heads/<id>.reader.json`) and the
+/// lock it holds while serving (`accepted/heads/<id>.reader.lock`), which
+/// in-place deltas wait for. Check both files' shape and return the tree
+/// without them, so every other path - database, generation directories, the
+/// heads directory itself - stays under the byte-and-mode invariant.
+fn without_serving_reader_marker(
+    mut tree: BTreeMap<PathBuf, FileEvidence>,
+    generation_id: &str,
+) -> BTreeMap<PathBuf, FileEvidence> {
+    for kind in ["reader.json", "reader.lock"] {
+        let path = PathBuf::from("accepted/heads").join(format!("{generation_id}.{kind}"));
+        let evidence = tree
+            .remove(&path)
+            .unwrap_or_else(|| panic!("serving process did not record {kind}: {tree:#?}"));
+        assert_eq!(evidence.kind, "file");
+        assert_eq!(evidence.mode & 0o777, 0o600);
+    }
+    tree
 }
 
 async fn install_fixture_generation(
@@ -723,22 +870,32 @@ async fn snapshot_fixture(
     (snapshot_bytes, manifest, observed)
 }
 
-fn spawn_snapshot_endpoint(
+fn spawn_gzip_snapshot_endpoint(
     snapshot: Vec<u8>,
     manifest: StandbySnapshotManifest,
     bearer: &'static str,
+    authority_head: Value,
 ) -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     const CHUNK_SIZE: usize = 1024 * 1024;
-    const API: &str = "native.standby-snapshot-export.v1";
+    const API: &str = "native.standby-snapshot-export.v2";
     const HANDLE: &str = "0dc9aadc-46b9-438d-8fca-5f719a8d6dc7";
-    let request_count = 2 + snapshot.len().div_ceil(CHUNK_SIZE);
+    assert_eq!(manifest.snapshot.size_bytes, snapshot.len() as u64);
     let sha256 = hex::encode(Sha256::digest(&snapshot));
+    assert_eq!(manifest.snapshot.sha256, sha256);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+    encoder.write_all(&snapshot).unwrap();
+    let encoded = encoder.finish().unwrap();
+    let encoded_sha256 = hex::encode(Sha256::digest(&encoded));
+    let range_count = encoded.len().div_ceil(CHUNK_SIZE);
+    let request_count = 2 + range_count;
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let accept_deadline = Instant::now() + Duration::from_secs(20);
-        for request_index in 0..request_count {
+        let mut served_offsets = BTreeSet::new();
+        for wire_index in 0..=request_count {
+            let request_index = wire_index.saturating_sub(1);
             let (mut stream, _) = loop {
                 match listener.accept() {
                     Ok(connection) => break connection,
@@ -773,8 +930,10 @@ fn spawn_snapshot_endpoint(
             let head = String::from_utf8(request[..header_end].to_vec()).unwrap();
             let mut lines = head.lines();
             let request_line = lines.next().unwrap();
-            let base = format!("/v1/databases/{HOSTED_ROUTE_ID}/standby-snapshot/exports");
-            let encoded_base = "/v1/databases/standby%2Dprocess%2Droute/standby-snapshot/exports";
+            // This host supports the preferred v2 route directly. A v1 or
+            // unscoped request is a fixture failure, never a fallback success.
+            let base = format!("/v2/databases/{HOSTED_ROUTE_ID}/standby-snapshot/exports");
+            let encoded_base = "/v2/databases/standby%2Dprocess%2Droute/standby-snapshot/exports";
             let suffix = if request_index == 0 {
                 "".to_string()
             } else if request_index == 1 {
@@ -786,10 +945,6 @@ fn spawn_snapshot_endpoint(
             let expected_plain = format!("{method} {base}{suffix} HTTP/1.1");
             let encoded_suffix = suffix.replace('-', "%2D");
             let expected_encoded = format!("{method} {encoded_base}{encoded_suffix} HTTP/1.1");
-            assert!(
-                request_line == expected_plain || request_line == expected_encoded,
-                "refresh did not use the scoped hosted route: {request_line}"
-            );
             let headers = lines
                 .filter_map(|line| line.split_once(':'))
                 .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
@@ -798,10 +953,6 @@ fn spawn_snapshot_endpoint(
             assert_eq!(
                 headers.get("authorization").map(String::as_str),
                 Some(expected_authorization.as_str())
-            );
-            assert_eq!(
-                headers.get("accept-encoding").map(String::as_str),
-                Some("identity")
             );
             let content_length = headers
                 .get("content-length")
@@ -813,15 +964,44 @@ fn spawn_snapshot_endpoint(
                 assert_ne!(read, 0, "refresh request body ended early");
                 request.extend_from_slice(&buffer[..read]);
             }
+            if wire_index == 0 {
+                assert_eq!(request_line, "POST /mcp/standby%2Dprocess%2Droute HTTP/1.1");
+                let body: Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                assert_eq!(body["params"]["name"], "export");
+                assert_eq!(
+                    body["params"]["arguments"]["operation"],
+                    "authority_act_head"
+                );
+                let response = serde_json::to_vec(&json!({
+                    "jsonrpc":"2.0", "id":body["id"],
+                    "result":{"content":[],"structuredContent":authority_head,"isError":false}
+                }))
+                .unwrap();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+                continue;
+            }
+            assert_eq!(
+                headers.get("accept-encoding").map(String::as_str),
+                Some("identity")
+            );
+            assert!(
+                request_line == expected_plain || request_line == expected_encoded,
+                "refresh did not use the scoped hosted route: {request_line}"
+            );
             if request_index == 0 {
                 let body: Value =
                     serde_json::from_slice(&request[header_end..header_end + content_length])
                         .unwrap();
                 assert_eq!(body["contract"], API);
                 assert_eq!(body["version"], 1);
+                assert_eq!(body.as_object().unwrap().len(), 3);
                 assert_eq!(
-                    body["consumer"]["artifact_sha256"],
-                    manifest.consumer.artifact_sha256
+                    body["consumer"],
+                    serde_json::to_value(&manifest.consumer).unwrap()
                 );
                 let response = serde_json::to_vec(&json!({
                     "api":API,"export_handle":HANDLE,"status":"pending",
@@ -834,24 +1014,40 @@ fn spawn_snapshot_endpoint(
                 let response = serde_json::to_vec(&json!({
                     "api":API,"export_handle":HANDLE,"status":"ready",
                     "expires_at":"2026-09-29T23:59:59Z", "manifest":manifest,
-                    "size_bytes":snapshot.len(),"sha256":sha256
+                    "size_bytes":manifest.snapshot.size_bytes,"sha256":sha256,
+                    "transfer":{"encoding":"gzip","level":1},
+                    "encoded_size_bytes":encoded.len(),"encoded_sha256":encoded_sha256
                 }))
                 .unwrap();
                 write!(stream, "HTTP/1.1 200 OK\r\nx-native-export-api: {API}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
                 stream.write_all(&response).unwrap();
             } else {
-                let offset = (request_index - 2) * CHUNK_SIZE;
-                let end = (offset + CHUNK_SIZE).min(snapshot.len());
+                let range = headers.get("range").expect("gzip range request");
+                let (offset, _) = range
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split_once('-')
+                    .unwrap();
+                let offset = offset.parse::<usize>().unwrap();
+                assert!(offset.is_multiple_of(CHUNK_SIZE), "encoded range alignment");
+                assert!(offset < encoded.len(), "encoded range bounds");
+                assert!(served_offsets.insert(offset), "duplicate encoded range");
+                let end = (offset + CHUNK_SIZE).min(encoded.len());
                 assert_eq!(
                     headers.get("range").map(String::as_str),
                     Some(format!("bytes={offset}-{}", end - 1).as_str())
                 );
-                let bytes = &snapshot[offset..end];
-                write!(stream, "HTTP/1.1 206 Partial Content\r\nx-native-export-api: {API}\r\nContent-Type: {STANDBY_SNAPSHOT_MEDIA_TYPE}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {offset}-{}/{}\r\nETag: \"{sha256}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", end - 1, snapshot.len(), bytes.len()).unwrap();
+                let bytes = &encoded[offset..end];
+                write!(stream, "HTTP/1.1 206 Partial Content\r\nx-native-export-api: {API}\r\nContent-Type: application/gzip\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {offset}-{}/{}\r\nETag: \"{encoded_sha256}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", end - 1, encoded.len(), bytes.len()).unwrap();
                 stream.write_all(bytes).unwrap();
             }
             stream.flush().unwrap();
         }
+        assert_eq!(
+            served_offsets.len(),
+            range_count,
+            "all encoded ranges served"
+        );
     });
     (origin, server)
 }
@@ -866,7 +1062,23 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     let source_path = directory.path().join("source.db");
     let origin_id = create_fixture(&source_path).await;
     let (snapshot, manifest, _) = snapshot_fixture(&source_path, &origin_id).await;
-    let (hosted_origin, server) = spawn_snapshot_endpoint(snapshot, manifest, BEARER);
+    let expected_manifest = manifest.clone();
+    let authority = native_ce::open_existing_database(source_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let authority_head = native_ce::standby::delta_transport::observe_authority_act_head(
+        &authority,
+        HOSTED_ROUTE_ID,
+    )
+    .await
+    .unwrap();
+    authority.close().await;
+    let (hosted_origin, server) = spawn_gzip_snapshot_endpoint(
+        snapshot,
+        manifest,
+        BEARER,
+        serde_json::to_value(authority_head).unwrap(),
+    );
 
     let generated_entry = generated_native_local_entry();
     let (replica_root, runtime_config) = if let Some((_, args)) = generated_entry.as_ref() {
@@ -904,6 +1116,9 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
             "version":1,
             "hosted_origin":hosted_origin,
             "credential_file":credential,
+            // The fixture serves only the startup refresh; keep the next
+            // scheduled tick beyond this test however slow the build is.
+            "refresh_interval_seconds":3600,
         }))
         .unwrap(),
     )
@@ -1031,7 +1246,7 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
         assert!(live_status["next_safe_action"]
             .as_str()
             .unwrap()
-            .contains("full verification and readiness"));
+            .contains("device verification and readiness"));
     } else {
         assert_eq!(live_status["mode"], "standby");
         assert_eq!(
@@ -1056,6 +1271,30 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
     assert_eq!(state["last_attempt_cause"], "startup");
     assert!(state["snapshot_captured_at"].as_str().is_some());
 
+    // Publication must retain the decoded claims and actual SQLite bytes,
+    // not the gzip identity used for HTTP ranges and download progress.
+    let accepted: Value = serde_json::from_slice(&std::fs::read(&current).unwrap()).unwrap();
+    assert_eq!(state["installed_generation_id"], accepted["generation_id"]);
+    assert_eq!(
+        accepted["snapshot_sha256"],
+        expected_manifest.snapshot.sha256
+    );
+    let generation = replica_root
+        .join("accepted/generations")
+        .join(accepted["generation_id"].as_str().unwrap());
+    let saved_manifest: StandbySnapshotManifest =
+        serde_json::from_slice(&std::fs::read(generation.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(saved_manifest, expected_manifest);
+    let accepted_snapshot = generation.join("snapshot.db");
+    assert_eq!(
+        std::fs::metadata(&accepted_snapshot).unwrap().len(),
+        expected_manifest.snapshot.size_bytes
+    );
+    assert_eq!(
+        sha256_path(&accepted_snapshot),
+        expected_manifest.snapshot.sha256
+    );
+
     let output = run_mcp_with_env(
         &runtime_config,
         true,
@@ -1076,6 +1315,159 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
         "standby"
     );
     assert_eq!(successful_tool(&output, 3)["records"][0]["id"], FIXTURE_ID);
+}
+
+/// The one-shot `--standby-refresh` parser must reject an
+/// invalid/unsupported/duplicate cause selector, a missing value, an unknown
+/// option, and wrong arity before it reads a config, opens a store, or touches
+/// the network. A failure therefore leaves no replica or refresh state behind.
+#[test]
+fn standby_one_shot_refresh_rejects_invalid_cause_selectors_without_side_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let standby_config = directory.path().join("standby.json");
+    let refresh_config = directory.path().join("refresh.json");
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+
+    let rejected: &[&[&str]] = &[
+        // `manual` is reachable only through the legacy two-positional form.
+        &["--cause", "manual"],
+        &["--cause", "soon"],
+        &["--cause"],
+        &["--cause", "wake", "--cause", "wake"],
+        &["--verbose"],
+    ];
+    for extra in rejected {
+        let mut command = Command::new(&binary);
+        command
+            .env_clear()
+            .arg("--standby-refresh")
+            .arg(&standby_config)
+            .arg(&refresh_config)
+            .args(*extra);
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "args {extra:?}: {output:#?}");
+        assert!(!directory.path().join("replica").exists(), "args {extra:?}");
+        assert!(!standby_config.exists(), "args {extra:?}");
+        assert!(!refresh_config.exists(), "args {extra:?}");
+    }
+
+    let output = Command::new(&binary)
+        .env_clear()
+        .arg("--standby-refresh")
+        .arg("only-one.json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:#?}");
+    assert!(!directory.path().join("replica").exists());
+}
+
+/// With a running standby process owning the daemon/controller lock, the
+/// one-shot CLI must enqueue the selected automatic cause through
+/// `request_refresh(cause)` rather than converting it to Manual. The durable
+/// coalesced trigger set then retains that cause and keeps
+/// `manual_refresh_pending` false.
+#[test]
+fn standby_one_shot_refresh_enqueues_selected_automatic_cause_under_daemon_lock() {
+    if !supported_standby_host() || !lowercase_hex(native_ce::FULL_GIT_SHA, 40) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let replica_root = directory.path().join("replica");
+    let origin_id = "ndb_0123456789abcdef0123456789abcdef";
+    let runtime_config = directory.path().join("standby.json");
+    write_runtime_config(&runtime_config, &replica_root, origin_id);
+
+    let credential = directory.path().join("snapshot.credential");
+    std::fs::write(&credential, "standby-token\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // macOS temp directories commonly use /var, which aliases /private/var.
+    let credential = std::fs::canonicalize(&credential).unwrap();
+    let refresh_config = directory.path().join("refresh.json");
+    std::fs::write(
+        &refresh_config,
+        serde_json::to_vec(&json!({
+            "contract": "native.standby-refresh-config.v1",
+            "version": 1,
+            "hosted_origin": "http://127.0.0.1:9",
+            "credential_file": credential,
+            "refresh_interval_seconds": 3600,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // This process owns the daemon lock, exactly as a running standby process
+    // would, so each one-shot CLI takes its enqueue branch.
+    let store =
+        GenerationStore::open(&replica_root, HOSTED_ROUTE_ID, Some(origin_id.into())).unwrap();
+    let observed = native_ce::standby::observe_installed_consumer_identity().unwrap();
+    let controller = native_ce::standby::StandbyRefreshController::new(
+        native_ce::standby::StandbyRuntimeConfig {
+            replica_root: replica_root.clone(),
+            hosted_route_database_id: HOSTED_ROUTE_ID.into(),
+            origin_database_id: origin_id.into(),
+        },
+        native_ce::standby::StandbyRefreshConfig::from_json(
+            &std::fs::read(&refresh_config).unwrap(),
+        )
+        .unwrap(),
+        store,
+        observed,
+    )
+    .unwrap();
+    let _guard = controller
+        .try_acquire_daemon()
+        .unwrap()
+        .expect("the owning process can hold the daemon lock");
+
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    for cause in ["after_admitted_write", "wake"] {
+        for expected in ["accepted", "coalesced"] {
+            let output = Command::new(&binary)
+                .env_clear()
+                .arg("--standby-refresh")
+                .arg(&runtime_config)
+                .arg(&refresh_config)
+                .arg("--cause")
+                .arg(cause)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(0), "cause {cause}: {output:#?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(expected),
+                "cause {cause} expected {expected}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("manual"),
+                "automatic cause {cause} must not be labelled manual: {stderr}"
+            );
+        }
+    }
+
+    let pending: Value =
+        serde_json::from_slice(&std::fs::read(replica_root.join("refresh/pending.json")).unwrap())
+            .unwrap();
+    let causes = pending["causes"].as_array().unwrap();
+    for cause in ["after_admitted_write", "wake"] {
+        assert!(
+            causes.iter().any(|value| value == cause),
+            "pending must retain {cause}: {pending}"
+        );
+    }
+    assert!(!causes.iter().any(|value| value == "manual"), "{pending}");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(replica_root.join("refresh/state.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["manual_refresh_pending"], false);
 }
 
 #[tokio::test]
@@ -1206,7 +1598,7 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
         installed.id
     );
     assert_eq!(runtime["freshness"]["target_rpo_seconds"], 300);
-    assert_eq!(runtime["freshness"]["target_refresh_interval_seconds"], 120);
+    assert_eq!(runtime["freshness"]["target_refresh_interval_seconds"], 60);
     assert_eq!(runtime["serving_generation"]["frontier"]["version"], 1);
     assert_eq!(runtime["retained_generation_ids"], json!([installed.id]));
     assert_eq!(successful_tool(&output, 4)["records"][0]["id"], FIXTURE_ID);
@@ -1249,8 +1641,15 @@ async fn standby_process_serves_reads_rejects_writes_and_preserves_accepted_byte
     );
 
     let after_tree = tree_evidence(&replica_root);
+    let marker_path = replica_root
+        .join("accepted/heads")
+        .join(format!("{}.reader.json", installed.id));
+    let marker: Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+    assert_eq!(marker["generation_id"], installed.id);
+    assert!(lowercase_hex(marker["source_sha"].as_str().unwrap(), 40));
     assert_eq!(
-        after_tree, before_tree,
+        without_serving_reader_marker(after_tree, &installed.id),
+        before_tree,
         "standby changed DB/WAL/SHM or directory state"
     );
     // Standby capture suppression is structural (admission-time
@@ -1548,7 +1947,11 @@ async fn standby_executor_process_serves_generation_reads_refuses_writes() {
     // sidecar changed.
     assert_eq!(sql_evidence(&installed.snapshot_path), before_sql);
     let after_tree = tree_evidence(&replica_root);
-    assert_eq!(after_tree, before_tree, "standby changed DB/dir state");
+    assert_eq!(
+        without_serving_reader_marker(after_tree.clone(), &installed.id),
+        before_tree,
+        "standby changed DB/dir state"
+    );
     assert!(
         !after_tree
             .keys()
@@ -1580,7 +1983,8 @@ async fn standby_executor_process_serves_generation_reads_refuses_writes() {
         response(&restarted, 2)["result"]["structuredContent"]["error_code"],
         "STANDBY_READ_ONLY"
     );
-    assert_eq!(tree_evidence(&replica_root), before_tree);
+    // The restart rewrites the same marker with the same bytes.
+    assert_eq!(tree_evidence(&replica_root), after_tree);
     assert_eq!(sql_evidence(&installed.snapshot_path), before_sql);
 }
 
@@ -1912,7 +2316,7 @@ async fn standby_connection_advances_external_acceptance_from_status_only_on_bot
         );
         let refused = install_fixture_generation(&replica_root, &source_path, &origin).await;
         assert_ne!(json!(refused.id), served_before_refusal);
-        // Acceptance has already run every FULL check. Actual caller readiness
+        // Acceptance has already run the device checks. Actual caller readiness
         // must still refuse this candidate, preserving the old readable bundle.
         let deadline = Instant::now() + Duration::from_secs(180);
         while connected
@@ -2233,4 +2637,346 @@ async fn configured_owner_relay_keeps_one_stdio_connection_across_external_gener
     relay.stop();
     assert!(!root.join("must-not-create.db").exists());
     source.close().await;
+}
+
+/// Exercise the service entry point, not --standby: node serve must install
+/// its subscriber before its supervisor starts device verification.
+#[cfg(all(unix, feature = "mcp-executor-prototype"))]
+#[tokio::test]
+async fn node_serve_emits_bounded_startup_phase_timings() {
+    if !supported_standby_host() || !lowercase_hex(native_ce::FULL_GIT_SHA, 40) {
+        return;
+    }
+    struct NodeProcess(std::process::Child);
+    impl Drop for NodeProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let origin = create_fixture(&source_path).await;
+    let source = native_ce::open_existing_database(source_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let account = native_ce::identity::resolve_stdio_account_identity(&source, None)
+        .await
+        .unwrap();
+    source.close().await;
+    let replica = directory.path().join("replica");
+    install_fixture_generation(&replica, &source_path, &origin).await;
+    let standby_config = directory.path().join("standby.json");
+    write_runtime_config(&standby_config, &replica, &origin);
+    let credential = directory.path().join("token");
+    create_private_empty_file(&credential);
+    std::fs::write(&credential, "node-verification-test-token").unwrap();
+    let offline = TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_address = offline.local_addr().unwrap();
+    drop(offline);
+    let node_config = directory.path().join("node.json");
+    std::fs::write(
+        &node_config,
+        serde_json::to_vec(&json!({
+            "hosted_base_url":format!("http://{offline_address}"),
+            "home_id":"node-verification-test-home",
+            "db_id":HOSTED_ROUTE_ID,
+            "credential_file":credential,
+            "socket_directory":directory.path().join("socket"),
+            "standby_config":standby_config,
+            "account_id":account,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let mut node = NodeProcess(
+        Command::new(binary)
+            .args(["node", "serve", "--config"])
+            .arg(&node_config)
+            .env_clear()
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::null())
+            .stderr(stderr.reopen().unwrap())
+            .stdout(stdout.reopen().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let logs = std::fs::read_to_string(stderr.path()).unwrap();
+            assert!(
+                node.0.try_wait().unwrap().is_none(),
+                "node exited before verification: {logs}"
+            );
+            if logs.ends_with('\n')
+                && logs.lines().any(|line| {
+                    line.contains("standby startup verification finished")
+                        && line.contains("serving=true")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("node serve startup verification diagnostics");
+    drop(node);
+    let logs = std::fs::read_to_string(stderr.path()).unwrap();
+    // This validator accepts only the bounded target, closed events/fields and
+    // fixed phase names. RUST_LOG=trace must not enable other targets.
+    assert_bounded_verification_diagnostics(&logs);
+    for phase in [
+        "startup-lock",
+        "startup-cleanup",
+        "startup-generation-verify",
+        "startup-rebind",
+        "startup-snapshot",
+        "startup-selection",
+        "startup-prune",
+    ] {
+        assert!(
+            logs.lines()
+                .any(|line| line.contains(&format!("phase=\"{phase}\""))
+                    && line.contains("elapsed_ms=")),
+            "missing startup timing {phase}: {logs}"
+        );
+    }
+    assert!(
+        std::fs::read(stdout.path()).unwrap().is_empty(),
+        "diagnostics must stay off stdout"
+    );
+    assert!(!logs.contains("node-verification-test-token"));
+}
+
+/// With `standby_config` and no `markdown_folder`, node serve publishes the
+/// default vault beside the local copy and prints one notice with its path
+/// and the off switch. This exercises the service entry point's subscriber:
+/// the notice must survive the bounded-diagnostics filter.
+#[cfg(all(unix, feature = "mcp-executor-prototype"))]
+#[tokio::test]
+async fn node_serve_creates_default_vault_and_prints_notice() {
+    if !supported_standby_host() || !lowercase_hex(native_ce::FULL_GIT_SHA, 40) {
+        return;
+    }
+    struct NodeProcess(std::process::Child);
+    impl Drop for NodeProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let origin = create_fixture(&source_path).await;
+    let source = native_ce::open_existing_database(source_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let account = native_ce::identity::resolve_stdio_account_identity(&source, None)
+        .await
+        .unwrap();
+    source.close().await;
+    let replica = directory.path().join("replica");
+    install_fixture_generation(&replica, &source_path, &origin).await;
+    let standby_config = directory.path().join("standby.json");
+    write_runtime_config(&standby_config, &replica, &origin);
+    let credential = directory.path().join("token");
+    create_private_empty_file(&credential);
+    std::fs::write(&credential, "node-vault-notice-test-token").unwrap();
+    let offline = TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_address = offline.local_addr().unwrap();
+    drop(offline);
+    let node_config = directory.path().join("node.json");
+    std::fs::write(
+        &node_config,
+        serde_json::to_vec(&json!({
+            "hosted_base_url":format!("http://{offline_address}"),
+            "home_id":"node-vault-notice-test-home",
+            "db_id":HOSTED_ROUTE_ID,
+            "credential_file":credential,
+            "socket_directory":directory.path().join("socket"),
+            "standby_config":standby_config,
+            "account_id":account,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let expected_vault = directory.path().join("vault");
+    let expected_notice = format!(
+        "created read-only markdown vault; to turn it off set \"markdown_folder\": false in node.json path={}",
+        expected_vault.display()
+    );
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let mut node = NodeProcess(
+        Command::new(binary)
+            .args(["node", "serve", "--config"])
+            .arg(&node_config)
+            .env_clear()
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::null())
+            .stderr(stderr.reopen().unwrap())
+            .stdout(stdout.reopen().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let logs = std::fs::read_to_string(stderr.path()).unwrap();
+            assert!(
+                node.0.try_wait().unwrap().is_none(),
+                "node exited before the vault notice: {logs}"
+            );
+            if logs.contains(&expected_notice)
+                && logs.lines().any(|line| {
+                    line.contains("standby startup verification finished")
+                        && line.contains("serving=true")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("node serve default vault notice");
+    drop(node);
+    let logs = std::fs::read_to_string(stderr.path()).unwrap();
+    assert!(
+        logs.contains(&expected_notice),
+        "missing default vault notice: {logs}"
+    );
+    assert!(
+        expected_vault.join(".native").join("state.json").exists(),
+        "default vault was not created beside the local copy"
+    );
+    // The notice shares stderr with verification diagnostics, so the full
+    // bounded contract must accept both targets together.
+    assert_bounded_verification_diagnostics(&logs);
+    assert!(
+        std::fs::read(stdout.path()).unwrap().is_empty(),
+        "diagnostics must stay off stdout"
+    );
+    assert!(!logs.contains("node-vault-notice-test-token"));
+}
+
+/// When the derived default would equal the local copy itself (here the
+/// replica directory is itself named `vault`), node serve stays up, leaves
+/// the vault off, and warns once on the vault target with the unsafe root.
+#[cfg(all(unix, feature = "mcp-executor-prototype"))]
+#[tokio::test]
+async fn node_serve_disables_vault_for_unsafe_default_and_warns() {
+    if !supported_standby_host() || !lowercase_hex(native_ce::FULL_GIT_SHA, 40) {
+        return;
+    }
+    struct NodeProcess(std::process::Child);
+    impl Drop for NodeProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.db");
+    let origin = create_fixture(&source_path).await;
+    let source = native_ce::open_existing_database(source_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let account = native_ce::identity::resolve_stdio_account_identity(&source, None)
+        .await
+        .unwrap();
+    source.close().await;
+    let replica = directory.path().join("vault");
+    install_fixture_generation(&replica, &source_path, &origin).await;
+    let standby_config = directory.path().join("standby.json");
+    write_runtime_config(&standby_config, &replica, &origin);
+    let credential = directory.path().join("token");
+    create_private_empty_file(&credential);
+    std::fs::write(&credential, "node-vault-guard-test-token").unwrap();
+    let offline = TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_address = offline.local_addr().unwrap();
+    drop(offline);
+    let node_config = directory.path().join("node.json");
+    std::fs::write(
+        &node_config,
+        serde_json::to_vec(&json!({
+            "hosted_base_url":format!("http://{offline_address}"),
+            "home_id":"node-vault-guard-test-home",
+            "db_id":HOSTED_ROUTE_ID,
+            "credential_file":credential,
+            "socket_directory":directory.path().join("socket"),
+            "standby_config":standby_config,
+            "account_id":account,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let expected_guard = format!(
+        "vault is off - set \"markdown_folder\" to an explicit path to enable it replica_root={}",
+        replica.display()
+    );
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+    let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+    let mut node = NodeProcess(
+        Command::new(binary)
+            .args(["node", "serve", "--config"])
+            .arg(&node_config)
+            .env_clear()
+            .env("RUST_LOG", "trace")
+            .stdin(Stdio::null())
+            .stderr(stderr.reopen().unwrap())
+            .stdout(stdout.reopen().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let logs = std::fs::read_to_string(stderr.path()).unwrap();
+            assert!(
+                node.0.try_wait().unwrap().is_none(),
+                "node exited before the vault guard warning: {logs}"
+            );
+            if logs.contains(&expected_guard)
+                && logs.lines().any(|line| {
+                    line.contains("standby startup verification finished")
+                        && line.contains("serving=true")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("node serve unsafe vault default warning");
+    drop(node);
+    let logs = std::fs::read_to_string(stderr.path()).unwrap();
+    assert!(
+        logs.contains(&expected_guard),
+        "missing unsafe vault default warning: {logs}"
+    );
+    assert!(
+        !replica.join(".native").join("state.json").exists(),
+        "unsafe default vault must not be created"
+    );
+    assert_bounded_verification_diagnostics(&logs);
+    assert!(
+        std::fs::read(stdout.path()).unwrap().is_empty(),
+        "diagnostics must stay off stdout"
+    );
+    assert!(!logs.contains("node-vault-guard-test-token"));
 }

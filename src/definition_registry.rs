@@ -52,6 +52,7 @@ pub const REGISTRY_DDL: [&str; 3] = [
 /// form `family@version` plus `kinds`); the envelope's own declarations must
 /// equal the `family`/`version` arguments. Kind meaning is derived by parsing
 /// the hashed bytes; there is no out-of-band kinds argument.
+/// Namespace policy is enforced in the kernel/package wrappers, not here.
 pub async fn install_definition_artifact(
     db: &Db,
     family: &str,

@@ -92,6 +92,7 @@ struct AttachFromUrlArgs {
     maturity: Option<String>,
     max_bytes: Option<u64>,
     facets: Option<Map<String, Value>>,
+    idempotency_key: Option<String>,
 }
 
 /// Backend-neutral, fully parsed URL ingress request.  Keeping this typed
@@ -107,6 +108,9 @@ pub(crate) struct AttachmentUrlRequest {
     pub maturity: Option<String>,
     pub facets: Vec<FacetWrite>,
     pub url: String,
+    /// Validated, blank as absent. Only the SQLite handler is keyed; the
+    /// registry refuses a key on other engines before they parse it.
+    pub idempotency_key: Option<String>,
 }
 
 /// Backend-neutral result of the guarded URL ingress.  Network work is
@@ -266,9 +270,18 @@ impl AttachmentPhysicalPort for SqliteAttachmentTransaction<'_> {
 /// runs inside `create_attachment`'s write transaction — the projector does
 /// not validate `home_id`, so the tool layer must, race-free.
 async fn assert_attach_target_live(db: &Db, tool: &str, id: &str) -> Result<()> {
+    let mut conn = db.write_pool().acquire().await?;
+    assert_attach_target_live_on(&mut conn, tool, id).await
+}
+
+async fn assert_attach_target_live_on(
+    conn: &mut sqlx::SqliteConnection,
+    tool: &str,
+    id: &str,
+) -> Result<()> {
     let row = sqlx::query("SELECT deleted_at FROM records WHERE id = ?")
         .bind(id)
-        .fetch_optional(db.write_pool())
+        .fetch_optional(conn)
         .await?;
     let Some(row) = row else {
         return Err(Error::engine(format!("{tool}: record {id} does not exist")));
@@ -364,6 +377,8 @@ pub(crate) fn parse_attachment_from_url(
     let persistence = args.persistence;
     let maturity = args.maturity;
     let facets = parse_attachment_facets(tool, args.facets.as_ref())?;
+    let idempotency_key =
+        super::keyed_replay::idempotency_key(tool, args.idempotency_key.as_deref())?;
     if let Some(max_bytes) = args.max_bytes {
         if max_bytes == 0 || max_bytes > MAX_FETCH_BYTES {
             return Err(Error::engine(format!(
@@ -382,6 +397,7 @@ pub(crate) fn parse_attachment_from_url(
         maturity,
         facets,
         url,
+        idempotency_key,
     };
     Ok((request, config))
 }
@@ -400,6 +416,7 @@ pub(crate) async fn fetch_attachment_from_url(
         maturity,
         mut facets,
         url,
+        idempotency_key: _,
     } = request;
     let fetched = fetch::fetch_url(&url, config).await?;
     let filename = filename_arg.or_else(|| filename_from_url(&fetched.final_url));
@@ -483,6 +500,7 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
 
     if idempotent {
         return attach_text_keyed(
+            TOOL,
             &db,
             &caller,
             &provenance_arguments,
@@ -527,7 +545,8 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
     .await
 }
 
-/// Keyed `attach_text`: the whole call — blob row, attachment record, link
+/// Keyed `attach_text`, and the commit step of keyed `attach_from_url`
+/// (under `tool`): the whole call — blob row, attachment record, link
 /// and facets — under one idempotency key, using the same provenance
 /// command-attestation mechanism `create_record` uses.
 ///
@@ -542,6 +561,7 @@ async fn attach_text(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
 /// bearer and blob, which still exist because blobs are never hard-deleted.
 #[allow(clippy::too_many_arguments)]
 async fn attach_text_keyed(
+    tool: &'static str,
     db: &Db,
     caller: &Caller,
     provenance_arguments: &Value,
@@ -556,10 +576,9 @@ async fn attach_text_keyed(
     maturity: Option<&str>,
     extra_facets: Vec<FacetWrite>,
 ) -> Result<Value> {
-    const TOOL: &str = "attach_text";
     // Advisory preflight, same as the keyless path. The authoritative
     // authorization and liveness checks rerun inside the write transaction.
-    require_record(db, caller, TOOL, bearer_id, Capability::Edit).await?;
+    require_record(db, caller, tool, bearer_id, Capability::Edit).await?;
     // ONE transaction. Everything below either commits together or does not
     // exist. The reserved action identity is taken before the tentative
     // write so the miss path commits under one accepted action.
@@ -575,7 +594,7 @@ async fn attach_text_keyed(
         crate::domain_transaction::create_attachment(
             &mut port,
             AttachmentCreate {
-                tool: TOOL,
+                tool,
                 bearer_id,
                 bytes,
                 mime,
@@ -604,7 +623,7 @@ async fn attach_text_keyed(
     let hit = match crate::provenance::lookup_authorized_command_attestation_in(
         &mut tx,
         caller.credential(),
-        TOOL,
+        tool,
         provenance_arguments,
         caller.intent(),
     )
@@ -617,7 +636,7 @@ async fn attach_text_keyed(
         }
     };
     if let Some(attestation_id) = hit {
-        let attested = attested_attachment_in(&mut tx, &attestation_id).await?;
+        let attested = attested_attachment_in(&mut tx, tool, &attestation_id).await?;
         // Non-disclosure for the outputs: the receipt names the attachment,
         // its bearer and its blob, so the replaying caller must still view
         // both records. A caller that lost access gets the opaque denial,
@@ -625,17 +644,17 @@ async fn attach_text_keyed(
         require_record_in(
             &mut tx,
             caller,
-            TOOL,
+            tool,
             &attested.attachment_id,
             Capability::View,
         )
         .await?;
-        require_record_in(&mut tx, caller, TOOL, &attested.bearer_id, Capability::View).await?;
+        require_record_in(&mut tx, caller, tool, &attested.bearer_id, Capability::View).await?;
         tx.rollback().await?;
         crate::provenance::note_replayed_action_attestation(attestation_id);
         // Reads happen only after the rollback; holding a second connection
         // while the write transaction is live is the one deadlock trap here.
-        return read_attested_attachment_receipt(db, caller, &attested).await;
+        return read_attested_attachment_receipt(tool, db, caller, &attested).await;
     }
 
     crate::provenance::issue_reserved_pending_action_in(&mut tx, draft).await?;
@@ -659,6 +678,7 @@ struct AttestedAttachment {
 
 async fn attested_attachment_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    tool: &str,
     attestation_id: &str,
 ) -> Result<AttestedAttachment> {
     let rows = sqlx::query(
@@ -670,7 +690,7 @@ async fn attested_attachment_in(
     .bind(attestation_id)
     .fetch_all(&mut **tx)
     .await?;
-    let incomplete = || Error::engine("attach_text: idempotent receipt is incomplete");
+    let incomplete = || Error::engine(format!("{tool}: idempotent receipt is incomplete"));
     let mut created: Vec<String> = Vec::new();
     let mut bearers: Vec<(String, String)> = Vec::new();
     let mut blobs: Vec<(String, String)> = Vec::new();
@@ -740,11 +760,11 @@ async fn attested_attachment_in(
 /// metadata — read from the still-present blob row, never from a tentative
 /// insert, so a retry returns the same blob id rather than minting a twin.
 async fn read_attested_attachment_receipt(
+    tool: &str,
     db: &Db,
     caller: &Caller,
     attested: &AttestedAttachment,
 ) -> Result<Value> {
-    const TOOL: &str = "attach_text";
     // Re-check after the rollback: the in-transaction View checks ran before
     // it, so a concurrent tombstone or revocation in between must not yield
     // a receipt. A miss maps to the same opaque denial the sibling
@@ -761,7 +781,7 @@ async fn read_attested_attachment_receipt(
             .await?;
     if !matches!(live, Some(None)) {
         return Err(Error::engine(format!(
-            "{TOOL}: record {} does not exist",
+            "{tool}: record {} does not exist",
             attested.attachment_id
         )));
     }
@@ -772,19 +792,19 @@ async fn read_attested_attachment_receipt(
             .await?;
     if !matches!(bearer_live, Some(None)) {
         return Err(Error::engine(format!(
-            "{TOOL}: record {} does not exist",
+            "{tool}: record {} does not exist",
             attested.bearer_id
         )));
     }
-    require_record(db, caller, TOOL, &attested.attachment_id, Capability::View).await?;
-    require_record(db, caller, TOOL, &attested.bearer_id, Capability::View).await?;
+    require_record(db, caller, tool, &attested.attachment_id, Capability::View).await?;
+    require_record(db, caller, tool, &attested.bearer_id, Capability::View).await?;
     let name: Option<String> = sqlx::query_scalar("SELECT name FROM records WHERE id=?")
         .bind(&attested.attachment_id)
         .fetch_optional(db.write_pool())
         .await?;
     let Some(name) = name else {
         return Err(Error::engine(format!(
-            "{TOOL}: record {} does not exist",
+            "{tool}: record {} does not exist",
             attested.attachment_id
         )));
     };
@@ -792,7 +812,7 @@ async fn read_attested_attachment_receipt(
         .await?
         .ok_or_else(|| {
             Error::engine(format!(
-                "{TOOL}: blob {} referenced by attachment {} does not exist",
+                "{tool}: blob {} referenced by attachment {} does not exist",
                 attested.blob_id, attested.attachment_id
             ))
         })?;
@@ -823,6 +843,26 @@ fn filename_from_url(final_url: &str) -> Option<String> {
     }
 }
 
+/// Keyed calls never fetch twice, and keep the oracle ordering every keyed
+/// write keeps, in three steps:
+///
+/// 1. **Authorized lookup, before any network I/O.** A short `BEGIN
+///    IMMEDIATE` transaction repeats the Edit check on the bearer, then looks
+///    the key up. A hit replays the attachment the first call created, after
+///    re-checking View on it and on its bearer, and returns without fetching.
+///    A caller who has lost Edit is refused before the lookup, with the
+///    denial a fresh key gets.
+/// 2. **Fetch**, only on a miss, with no transaction open.
+/// 3. **Commit through the keyed attachment fold** `attach_text` uses: the
+///    tentative write reruns authorization and liveness, then looks the key
+///    up again in the same transaction. A same-key call that committed while
+///    this one was fetching is replayed here, and its tentative blob is
+///    rolled back. The authority index's unique violation is the backstop:
+///    `with_race_replay` reruns the call, whose step 1 then replays without
+///    fetching.
+///
+/// The redirect chain (`final_url`, `redirects`) is not attested, so keyed
+/// receipts omit it on the first call and the replay alike.
 async fn attach_from_url(
     db: Db,
     caller: Caller,
@@ -830,9 +870,51 @@ async fn attach_from_url(
     config: FetchConfig,
 ) -> Result<Value> {
     const TOOL: &str = "attach_from_url";
+    let provenance_arguments = arguments.clone();
     let (request, config) = parse_attachment_from_url(TOOL, arguments, config)?;
     require_record(&db, &caller, TOOL, &request.record_id, Capability::Edit).await?;
-    assert_attach_target_live(&db, TOOL, &request.record_id).await?;
+    let keyed = request.idempotency_key.is_some();
+    // Liveness is state, not authority. An unkeyed call checks it up front; a
+    // keyed one checks it after the replay lookup (below), so a retry replays
+    // an attachment that committed even if its bearer was tombstoned since.
+    if !keyed {
+        assert_attach_target_live(&db, TOOL, &request.record_id).await?;
+    }
+    if keyed {
+        let mut tx = crate::db::begin_write(db.write_pool()).await?;
+        require_record_in(&mut tx, &caller, TOOL, &request.record_id, Capability::Edit).await?;
+        if let Some(replay) =
+            super::keyed_replay::keyed_replay_in(&mut tx, &caller, TOOL, &provenance_arguments)
+                .await?
+        {
+            let attested = attested_attachment_in(&mut tx, TOOL, replay.attestation_id()).await?;
+            require_record_in(
+                &mut tx,
+                &caller,
+                TOOL,
+                &attested.attachment_id,
+                Capability::View,
+            )
+            .await?;
+            require_record_in(
+                &mut tx,
+                &caller,
+                TOOL,
+                &attested.bearer_id,
+                Capability::View,
+            )
+            .await?;
+            tx.rollback().await?;
+            let mut receipt =
+                read_attested_attachment_receipt(TOOL, &db, &caller, &attested).await?;
+            replay.settle();
+            receipt["url"] = json!(request.url);
+            return Ok(receipt);
+        }
+        // A miss: refuse a tombstoned bearer before spending a fetch on it.
+        assert_attach_target_live_on(&mut tx, TOOL, &request.record_id).await?;
+        tx.rollback().await?;
+    }
     let prepared = fetch_attachment_from_url(request, &config).await?;
     let PreparedAttachmentFromUrl {
         record_id,
@@ -850,6 +932,27 @@ async fn attach_from_url(
         redirects,
     } = prepared;
 
+    if keyed {
+        let mut result = attach_text_keyed(
+            TOOL,
+            &db,
+            &caller,
+            &provenance_arguments,
+            &record_id,
+            &bytes,
+            Some(&mime),
+            filename.as_deref(),
+            &name,
+            lifecycle.as_deref(),
+            owner_id.as_deref(),
+            persistence.as_deref(),
+            maturity.as_deref(),
+            facets,
+        )
+        .await?;
+        result["url"] = json!(url);
+        return Ok(result);
+    }
     let mut result = create_attachment(
         &db,
         AttachmentCreate {
@@ -1165,7 +1268,8 @@ pub fn register_attachment_tools_with(
         ToolKind::AttachFromUrl,
         "Fetch a URL (SSRF-guarded: http/https only, public addresses only, pinned \
          DNS, per-hop redirect revalidation, streamed size cap) and store the \
-         capture as an attachment under a record.",
+         capture as an attachment under a record. A keyed retry never fetches \
+         again; keyed receipts omit final_url and redirects.",
         json!({
             "type": "object",
             "properties": {
@@ -1187,14 +1291,22 @@ pub fn register_attachment_tools_with(
                     "description": "Byte cap for the fetched body.",
                     "minimum": 1,
                     "maximum": MAX_FETCH_BYTES
-                }
+                },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema()
             },
             "required": ["record_id", "url"],
             "additionalProperties": false
         }),
         move |db, caller, arguments| {
             let config = fetch_config.clone();
-            attach_from_url(db, caller, arguments, config)
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(attach_from_url(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                    config.clone(),
+                ))
+            })
         },
     )?;
     registry.register(
@@ -1839,10 +1951,11 @@ mod idempotency_tests {
             json!({ "action": "detach", "attachment_id": attested.attachment_id }),
         )
         .await;
-        let error = read_attested_attachment_receipt(&db, &Caller::local(), &attested)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error =
+            read_attested_attachment_receipt("attach_text", &db, &Caller::local(), &attested)
+                .await
+                .unwrap_err()
+                .to_string();
         assert!(
             error.contains("does not exist"),
             "detached attachment must map to the opaque denial, got: {error}"

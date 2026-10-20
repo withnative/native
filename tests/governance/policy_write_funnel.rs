@@ -148,6 +148,24 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
         // Narrow corruption fixtures embedded in module tests.
         ("src/authorization.rs", 1),
         ("src/query/sql.rs", 1),
+        // Importer tests construct a minimal, independent v1 snapshot, including
+        // ambiguous owners and empty policies that need direct source fixtures.
+        // A private member instruction fixture also changes its v1 grant to
+        // another account. The acknowledgement-history privacy fixture adds one
+        // source policy anchor and one entry. The home-quarantine fixture
+        // changes one source grant and adds a second account so it remains
+        // unsafe under the private-policy-wins decision. The hosted membership
+        // fixture adds one source anchor and one member entry. Main's
+        // imported_app_authors_follow_visible_person_for_non_root_members
+        // changes a root grant and inserts a source anchor and entries.
+        // These two tests also insert source policy anchors and entries:
+        // imported_member_move_preserves_record_local_policy_by_refusing_unsafe_relocation
+        // imported_folder_home_shape_and_archive_rules_match_v1_create_and_send
+        // Their SqliteConnection opens f.source (the temporary v1 source.db),
+        // before import; it never opens f.target (the v2 target.db).
+        // Main's 26 sites plus the shape fixture's two sites total 28.
+        // These 28 sites never write the v2 target or run in production.
+        ("src/v1_import/tests.rs", 28),
         // Grant revision regression fixture: an explicit policy insert and
         // entry insert/delete distinguish user edits from cascade cleanup.
         ("src/db.rs", 3),
@@ -167,6 +185,11 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
             .strip_prefix(Path::new(env!("CARGO_MANIFEST_DIR")))
             .unwrap();
         let source = fs::read_to_string(&path).unwrap();
+        if relative == Path::new("src/v1_import/tests.rs") {
+            let parent = normalized(&fs::read_to_string(root.join("v1_import.rs")).unwrap());
+            assert_eq!(parent.matches("mod tests;").count(), 1);
+            assert_eq!(parent.matches("#[cfg(test)] mod tests;").count(), 1);
+        }
         let normalized_source = without_query_sql_test_fixture_writes(relative, &source);
         let matches = mutation.find_iter(&normalized_source).collect::<Vec<_>>();
         let projector = projectors

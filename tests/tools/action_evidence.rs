@@ -131,7 +131,7 @@ fn the_carve_out_is_one_named_set_the_evaluator_surfaces_belong_to() {
     for tool in ["get_record", "query_record", "get_history", "read_guide"] {
         assert!(!is_action_evidence_surface(tool), "{tool} is attention");
     }
-    assert_eq!(surfaces.len(), 27, "the action-evidence set changed size");
+    assert_eq!(surfaces.len(), 28, "the action-evidence set changed size");
 }
 
 #[test]

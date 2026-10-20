@@ -22,8 +22,9 @@ Rows and relations are caller-filtered. Physical policy, principal, catalog, FTS
 `records.archived` is 0 or 1 on every advertised profile. Archived records
 remain in the complete caller-visible relation; add `WHERE archived=0` when
 that is your intended filter. Archive is independent of currency:
-`is_current=1` certifies no live incoming supersession, NULL means replacement
-scope is unknown, and 0 is reserved for explicit whole-record replacement.
+`is_current=1` certifies no live incoming supersession; NULL means not
+certified current. Check `successor_count` (≥1 means superseded).
+`is_current=0` is reserved for explicit whole-record replacement.
 A citation does not certify its source as current.
 
 On `sqlite-local`, `postgres-server`, and `turso-local`,
@@ -38,7 +39,8 @@ interpretation and rows use one governed query snapshot; no public schema
 basis or policy version is offered.
 The relation admits snapshots with at most 20,000 visible records. Above that,
 dependent queries return `result_too_large` before interpretation, including
-queries with a `record_id` predicate. Use `get_record` for a specific record.
+queries with a `record_id` predicate. Use `get_record` for a specific record
+(on a lean MCP surface, `call_executor` with `{"executor":"records_read","operation":"get_record","arguments":{"ids":[reference]}}`).
 On SQLite and PostgreSQL, queries that do not use this relation remain
 available, and the caller SQL's two-second execution timer begins after
 lifecycle interpretation. PostgreSQL also applies a two-second timeout to
@@ -191,8 +193,8 @@ it twice, within the statement's usual limits.
 
 `facet_times` puts typed time facet values on the timeline: one row per
 current value of a facet declared `date`, `instant`, `zoned` or `when`, for
-records the caller can see. Governed SQL has no date functions, so the row
-carries comparable columns. All-day rows (`all_day = 1`: a `date`, or an
+records the caller can see. Saved governed SQL has no date functions (ad-hoc
+`sqlite-local` SQL does), so the row carries comparable columns. All-day rows (`all_day = 1`: a `date`, or an
 all-day `when`) fill `start_date` and `end_date` as floating `YYYY-MM-DD`
 text, which orders correctly as text. Their millisecond columns are NULL.
 Timed rows (`all_day = 0`) fill `start_ms` and `end_ms` as UTC epoch
@@ -224,7 +226,8 @@ NULL, including all three for JSON null and containers. This describes the
 stored metadata syntax, not semantic validation or a new JSON parser.
 Usual SQL query/result/VM limits apply. Turso-local and PostgreSQL-server
 refuse this relation; use `vocabulary_values.metadata` there. SQL JSON
-functions and direct physical-table access remain unavailable.
+functions are unavailable in saved SQL, Turso and PostgreSQL (ad-hoc
+`sqlite-local` SQL has them); direct physical-table access remains unavailable.
 
 `schema_config_json_nodes` exposes all stored `schema_config.data` occurrences
 on online SQLite only. Join `config_id` to caller-filtered `schema_config.id`: global
@@ -255,14 +258,80 @@ Malformed, non-object or over-budget data refuses the whole write/migration:
 bytes per projected TEXT cell. Escaped `path` and `parent_path` values count
 toward that cell limit. Projection never truncates; ordinary SQL results
 still use the existing truncation flag/hint.
-No JSON function is added to the grammar.
+No JSON function is added to the portable grammar.
+
+`facet_value_json_nodes` flattens facet values whose stored text parses as a
+JSON object or array, on online SQLite only. Join `facet_id` to
+`facet_values.id`: a node is visible only when its facet row is. Its
+`interpretation` is always `parsed_text_candidate`, because the stored bytes
+record syntax rather than whether the value was written as structured data or
+as a string. Scalar, malformed or over-budget values have no nodes, and the
+facet row itself is unaffected. Member/offline, PostgreSQL and Turso refuse
+this relation. `path` is an escaped RFC 6901 JSON Pointer, `(facet_id, ordinal)`
+is the key, `parent_ordinal` identifies the parent occurrence and `number_text`
+keeps the exact numeric token. Find records whose JSON facet `config` has member
+`team`:
+
+```sql
+SELECT f.record_id FROM facet_value_json_nodes n JOIN facet_values f ON f.id = n.facet_id WHERE f.key = 'config' AND n.path = '/team' AND n.text_value = ?1 ORDER BY f.record_id
+```
+
+`facet_observation_json_nodes` flattens facet-observation history whose stored
+text parses as a JSON object or array, on online SQLite only. Join
+`observation_id` to `facet_observations.id`: a node is visible only when its
+observation row is, and every node carries the owning observation's `record_id`,
+`key` and `as_of`. Its `interpretation` is always `parsed_text_candidate`,
+because the stored bytes record syntax rather than whether the value was written
+as structured data or as a string. Scalar, malformed, unset or over-budget
+values have no nodes, and the observation row itself is unaffected.
+Member/offline, PostgreSQL and Turso refuse this relation. `path` is an escaped
+RFC 6901 JSON Pointer, `(observation_id, ordinal)` is the key, `parent_ordinal`
+identifies the parent occurrence and `number_text` keeps the exact numeric
+token. Find records whose JSON observation of facet `config` has member `team`
+at one `as_of`:
+
+```sql
+SELECT record_id FROM facet_observation_json_nodes WHERE key = 'config' AND as_of = ?1 AND path = '/team' AND text_value = ?2 ORDER BY record_id
+```
+
+`record_body_json_nodes` flattens record bodies whose stored text parses as a
+JSON object or array, on online SQLite only. Join `record_id` to
+`records.id`: a node is visible only when its record is, so hidden and
+tombstoned records contribute no rows even though their nodes are retained
+physically. Its `interpretation` is always `parsed_text_candidate`, because
+the stored bytes record syntax rather than whether the body was written as
+structured data or as a string. Scalar, malformed or over-budget bodies have
+no nodes, and the record itself is unaffected. Member/offline, PostgreSQL and
+Turso refuse this relation. `path` is an escaped RFC 6901 JSON Pointer,
+`(record_id, ordinal)` is the key, `parent_ordinal` identifies the parent
+occurrence and `number_text` keeps the exact numeric token. Find records whose
+JSON body has member `team`:
+
+```sql
+SELECT record_id FROM record_body_json_nodes WHERE path = '/team' AND text_value = ?1 ORDER BY record_id
+```
+
+`content_event_apps` names the app behind a write, on online SQLite only. A
+v2 app acts with the user's own authority, so its events carry the user as
+`actor`; this relation adds one row per visible content event that a call from
+the app produced, naming `package`, `version` and the exact `install_event_id`
+the hosted shell vouched for (`assertion` is always `host`). Rows appear only
+where `content_events` discloses the actor, and an invalidated attestation
+attributes nothing. It lists content events only: relationship writes an app
+made are not in it. Member/offline, PostgreSQL and Turso refuse this relation.
+Content one app wrote, newest first:
+
+```sql
+SELECT e.local_seq, e.record_id, e.type FROM content_event_apps a JOIN content_events e ON e.id = a.event_id WHERE a.package = ?1 ORDER BY e.local_seq DESC LIMIT 50
+```
 
 `body_blocks` exposes chunks of the current body of each visible record on
 SQLite-local. Order by `record_id, block_index, chunk_index` and page by that
 key to reassemble a body or select a section without reading `records.body`.
 `text` is at most 32 KiB per row, so a body above the SQL cell limit can be
 read over multiple pages. `heading_path` is a JSON array of ancestor/self heading objects;
-portable SQL has no JSON functions. `start_offset` and `end_offset` are byte
+saved SQL, Turso and PostgreSQL have no JSON functions (ad-hoc `sqlite-local`
+SQL can expand it with `json_each`). `start_offset` and `end_offset` are byte
 offsets in the stored body. Source-event sequence is withheld.
 
 `body_block_headings` flattens that caller-filtered path on online SQLite-local
@@ -310,9 +379,11 @@ have opened a Message.
 
 `my_message_state` has one row per Message the caller can see. `stage` is
 `unsurfaced`, `presented`, `opened` or `acknowledged`. `unread` is 1 until the
-caller opens or acknowledges a Message they did not write and have not
-archived; use the raw columns for another rule. `is_own` marks the caller's
-own Messages, `mentioned` an @-mention of the caller, `flagged`, `muted`,
+caller opens or acknowledges an unarchived Message whose speaker is not the
+caller; use the raw columns for another rule. `is_own` requires the caller's
+owner Person and no separate speaker fact. Persona speech is unread even when
+its author is the caller. `mentioned` marks an @-mention of the caller;
+`flagged`, `muted`,
 `archived` and `snoozed_until`/`snoozed_until_ms` are the caller's
 preferences, and `reactable` is 0 for a federated Message, which cannot take
 reactions. Unread and mention badges per channel:
@@ -326,7 +397,10 @@ opened it. `via = 'reference'` is a reference in any record's body, including
 a comment, that resolves to the caller's person exactly as `get_record`
 resolves it: a short prefix that also matches another record the caller can
 see is ambiguous and does not count. Native tracks no seen state for
-references, so `seen` is NULL there. Order by `mentioned_at_ms`.
+references, so `seen` is NULL there. `own_source` marks the caller's human
+speech or an ordinary record owned by the caller; persona-spoken Messages
+have `own_source = 0` even when their owner is the caller.
+Order by `mentioned_at_ms`.
 
 Neither has a sequence, version or head column, so page them by
 keyset on values you already see, such as `records.created_at_ms` and `id`.
@@ -337,6 +411,43 @@ Work over them grows with what the caller may see, never with other people's
 state or hidden Messages beyond the caller's usual visibility check. A saved
 query that reads either, even only to count it, gets a receipt that is never
 replayable or complete, because read state changes without any content event.
+
+
+`message_reactions` (SQLite-local) exposes every latest winning addition on
+visible live Messages. Join `message_id` to `records.id`; use `reaction_id`
+(the winning history event UUID) as the unique row key. No sequence or raw
+account ID is exposed. `emoji` is the decoded canonical emoji. Object and
+legacy sequence payloads keep their original fold partitions, so two rows
+may have the same message, emoji and disclosed actor; do not deduplicate them.
+`actor_record_id` and `actor_name` identify a visible account-bound record.
+They may be NULL. `executor_kind` follows the history trusted/own/visible
+binding gate and is NULL when identity is withheld. Hidden actors still
+contribute rows and counts. `viewer` is 0/1 for the caller's own reaction.
+Order by `reacted_at_ms, reaction_id` for stable time ordering.
+
+Preparation is full-window, independent of output LIMIT or COUNT, and reads
+validated reaction metadata rather than event payloads. It admits at most
+20,000 visible live Message candidates, 100,000 visible reaction source
+events, 16 MiB of metadata (including conservative row overhead), and 20,000
+winning additions. Exceeding any bound or the shared deadline/value ceilings
+returns an error, never an incomplete relation. Normal result limits still
+apply. Unrelated hidden reaction history does not count toward these bounds.
+For reaction-dependent reads borrowing a caller transaction, freshness uses
+at most 20,000 **all** authorized visible records and 100,000 inspected source
+events **in aggregate**, separate from the reaction-history bound. Indexed
+reverse walks stop at each record's first eligible event; occurrence events
+count toward freshness. These walks and the authorization digest share the
+reaction preparation deadline/value scope. Exhaustion returns an error with
+no partial read or receipt. Owned reads retain their existing global envelope
+head. These admission counts are engineering assumptions, not ratified product
+limits; existing visibility materialization and unrelated relation preparation
+retain their separate behavior.
+
+Relation completeness describes the current authorized snapshot. Saved
+receipts remain `best_effort` and non-replayable, even for column-less reads:
+the source event head does not reproduce mutable bindings, visibility or
+actor names. These reads are available through the generic app SQL contract;
+type/kind-scoped reaction grants remain refused.
 
 
 `body_task_items` exposes GFM task-list items from the current body of each
@@ -434,6 +545,155 @@ refuses recursive CTEs in its validator. Turso-local compiles recursive queue
 operations as a non-read-only program, which the governed query gate refuses.
 This recipe is unavailable on both profiles; dialect similarity is insufficient.
 
+## Cues for common read questions
+
+**Lifecycle.** "Open" means `lifecycle = 'open'`. `in_progress` and `blocked`
+are distinct values, not synonyms. For "not done", join
+`record_lifecycle_interpretations` on `record_id` and filter
+`terminality = 'open'` (`terminal_positive` and `terminal_negative` are the
+finished values; `absent` and `unclassified` rows have NULL terminality). When a
+question is ambiguous, say which reading you used.
+
+**Words in bodies.** Use the full-text `search` tool where it is available.
+`body LIKE` is the fallback, and the oversized-body repair above applies to it.
+
+**Supersession.** A newer record supersedes an older one through a `links` row
+with `relationship = 'supersedes'`, `source_id` the newer and `target_id` the
+older. What superseded X: `SELECT source_id FROM links WHERE target_id = ?1 AND
+relationship = 'supersedes'`; what X superseded: swap the two columns. Both
+endpoints must be visible. `records.successor_count` counts every live
+incoming `supersedes` link, including ones you cannot see, and `is_current` is 1
+when it is 0 and NULL otherwise; so `successor_count` above the visible link
+count means hidden successors. `effective_relationships` carries no supersession.
+A decision is superseded only if someone recorded the link; absence of one
+proves nothing about prose that says "replaced by".
+
+**Ancestor path (SQLite-local).** `get_record` returns the path in one call. In
+SQL, walk `records.home_id` upwards with the same recursive-CTE limits as above.
+Bind `?1` as the record id; depth 0 is the record itself, and the walk stops at
+`native:root`, at a parent you cannot see (`home_id` NULL), or after 32 steps.
+
+<!-- ANCESTOR_PATH -->
+```sql
+WITH RECURSIVE up(id, name, home_id, depth) AS (
+  SELECT id, name, home_id, 0 FROM records WHERE id = ?1
+  UNION ALL
+  SELECT r.id, r.name, r.home_id, u.depth + 1
+  FROM records r JOIN up u ON r.id = u.home_id
+  WHERE u.id <> 'native:root' AND u.depth < 32
+)
+SELECT id, name, depth FROM up ORDER BY depth DESC
+```
+
+Rows run from the topmost reachable ancestor down to the record. A cycle repeats
+rows until the depth bound; PostgreSQL-server and Turso-local refuse recursive
+CTEs, as above.
+
+## SQL for reads behind call_executor
+
+On a lean surface these operations are reached through `call_executor`; when the question is about rows, `query_sql` answers it directly.
+
+**Full current body of one record.** Bind `?1` to its full record id (resolve a short reference with `get_record` first). `records.body` is the full current stored body, including for superseded records; this is not an as-of read or a currency claim.
+
+<!-- RECORD_BODY -->
+```sql
+SELECT id, name, body FROM records WHERE id = ?1
+```
+
+**Check currency and name successors.** Bind `?1` to the older record's full id. `is_current=1` certifies current; NULL means not certified current. Check `successor_count` (≥1 means superseded), which counts live incoming supersession including successors the caller cannot name. A `supersedes` link runs from newer source to older target. Only visible successors are named; a NULL name does not prove there are none.
+
+<!-- RECORD_CURRENCY -->
+```sql
+SELECT r.id, r.is_current, r.successor_count, s.id AS successor_id, s.name AS successor_name
+FROM records r
+LEFT JOIN links l ON l.target_id = r.id AND l.relationship = 'supersedes'
+LEFT JOIN records s ON s.id = l.source_id
+WHERE r.id = ?1
+ORDER BY r.id, l.id
+```
+
+**Links of a record.** An unpaged edge listing with its own order, unlike `manage_links.list`, which orders by direction, relationship, creation time, then id: bind `?1` and `?2` to the same record id. Only edges with both endpoints visible appear, as in the operation.
+
+<!-- LINKS_OF_RECORD -->
+```sql
+SELECT id, source_id, target_id, relationship, note FROM links WHERE source_id = ?1 OR target_id = ?2 ORDER BY created_at, id
+```
+
+**Facet history.** Like `manage_facet_observations.list`: bind `?1` as the record id and `?2` as the facet key. `op` tells set from unset observations; `as_of` reads back verbatim, and the unique `id` closes the order.
+
+<!-- FACET_HISTORY -->
+```sql
+SELECT record_id, key, value, op, vocab_ref, as_of, observed_at, event_seq FROM facet_observations WHERE record_id = ?1 AND key = ?2 ORDER BY as_of, observed_at, id
+```
+
+**Vocabulary values.** Like `manage_vocabularies.list_values`: bind `?1` as the vocabulary id. No join to `vocabularies` is needed: the relation is caller-independent, and `gloss` and `terminality` are its own columns. The operation's default alias resolution is not applied.
+
+<!-- VOCABULARY_VALUES -->
+```sql
+SELECT value, gloss, terminality, ordinal FROM vocabulary_values WHERE vocabulary_id = ?1 ORDER BY ordinal, value, id
+```
+
+**Relationships touching a record (SQLite-local).** Like `manage_relationships.find`, with counterpart names: bind `?1` and `?2` to the same record id. Two differences from `find`: it returns only physically active relationships, while these views also include retired or superseded ones — the logical views cannot reproduce `find`'s physical-status filter; and SQL returns one row per counterpart endpoint, not deduplicated results. The endpoints join inherits the all-endpoints-visible fence, so a relationship with any hidden endpoint contributes no rows. PostgreSQL-server and Turso-local refuse these relations; use the operation there.
+
+<!-- RELATIONSHIP_COUNTERPARTS -->
+```sql
+SELECT e.relationship_origin_db_id, e.relationship_id, r.relationship_type, e.ordinal, e.role, e.record_id, c.name AS counterpart_name
+FROM effective_relationship_endpoints e
+JOIN effective_relationships r ON r.relationship_origin_db_id = e.relationship_origin_db_id AND r.relationship_id = e.relationship_id
+JOIN records c ON c.id = e.record_id
+WHERE EXISTS (
+  SELECT 1 FROM effective_relationship_endpoints m
+  WHERE m.relationship_origin_db_id = e.relationship_origin_db_id
+    AND m.relationship_id = e.relationship_id
+    AND m.record_id = ?1
+)
+AND e.record_id <> ?2
+ORDER BY e.relationship_origin_db_id, e.relationship_id, e.ordinal
+```
+
+**Recent runs and their intents (SQLite-local).** The rows behind `get_run_activity`, with differences: the operation lists the caller's own runs, keeps old open runs, orders open runs before closed ones, and returns only the latest intent. This recipe uses activity visibility over the recent window, sorts by start time, and returns every declaration; runs with no declarations still appear, with NULL intent. PostgreSQL-server and Turso-local refuse these relations; `appears_active` freshness stays on the operation either way.
+
+<!-- RUN_ACTIVITY_INTENTS -->
+```sql
+SELECT a.run_key, i.ordinal, i.intent
+FROM agent_activity a LEFT JOIN run_intents i ON i.run_key = a.run_key
+ORDER BY a.started_at_ms DESC, a.run_key DESC, i.ordinal
+```
+
+Two cues need no new recipe: `query_record` excludes archived records by default, so add `AND archived = 0` (`records.archived` is 0 or 1 on every profile) to match it; and `get_structure`'s children are the containment recipe with depth 1.
+
+**Stays on the operation.** `scan`'s ranking and sampling; resolved facet shapes and the schema-config cascade (`resolve_facets`, `manage_schema_config.read`); relationship assertion history (`manage_relationships.read`/`why`); inbox ranking, routing and delivery (`manage_messages.*`); native-principal bindings (`manage_bindings.list`); run freshness beyond `appears_active`.
+
+## Serving operation catalogue
+
+`catalog_operations` holds one row per operation this server's executor
+catalogue can call, with the same pairs and contract digests
+`describe_operation` answers. Columns are `executor, operation, surface,
+access, plan_required, direct_execution_enabled, contract_version,
+contract_digest, source_tool, selector_field, selector_value,
+advertised_directly`: booleans are 0/1, `access` is `read` or `mutation`,
+and selector fields are NULL without a selector. Full operation schemas stay
+on `describe_operation`. Order by `executor, operation` for a deterministic
+listing:
+
+```sql
+SELECT executor, operation, contract_digest FROM catalog_operations ORDER BY executor, operation
+```
+
+`advertised_directly` is 1 for every row except on a lean MCP surface, where
+0 marks an operation that is not its own advertised tool operation and is
+reached through `call_executor` with `{executor, operation, arguments}`.
+This enumerates exactly those operations:
+
+```sql
+SELECT executor, operation, access, plan_required FROM catalog_operations WHERE advertised_directly = 0 ORDER BY executor, operation
+```
+
+It resolves only in online executor ad-hoc `query_sql`, including standby,
+which serves its advertised reads. Member/offline copies, saved governed
+SQL, alpha-tab needs, direct executions without serving context, and the
+PostgreSQL-server and Turso-local profiles refuse it.
+
 ## Time
 
 `now_ms()` is the only clock: zero arguments, admitted on every profile. The
@@ -445,8 +705,92 @@ Clock-free results carry `now_ms_ms: null` with `time_dependent: false`.
 `CURRENT_DATE`, `CURRENT_TIME` and `CURRENT_TIMESTAMP` are refused with a
 repair pointing at `now_ms()`.
 
+## SQLite functions in ad-hoc SQL
+
+Ad-hoc `query_sql` on online `sqlite-local` is SQLite's read-only dialect: it
+may call SQLite's JSON, date/time and a few text functions that the portable
+set does not offer. Saved governed SQL, alpha-tab needs, member/offline
+copies, `turso-local` and `postgres-server` keep the portable set, so a
+statement that works ad hoc on `sqlite-local` can be refused when saved or
+run elsewhere — the refusal names the function and says so.
+
+Admitted beyond the portable set: `json`, `json_extract`, `json_type`,
+`json_valid`, `json_array_length`, `json_quote`, `json_object`, `json_array`,
+`json_group_array`, `json_group_object`, `json_patch`, `json_remove`,
+`json_set`, `json_insert`, `json_replace`, the `->` and `->>` operators, and
+the table-valued `json_each` and `json_tree` in `FROM`; `date`, `time`,
+`datetime`, `julianday`, `strftime`, `unixepoch`; `instr`, `glob`, `typeof`,
+`unicode`, `total`, `substring`, `group_concat`, `char`, `hex`, `printf`,
+`format`, `ltrim`, `rtrim`, `ifnull`, `iif`, `sign`. Anything else is refused:
+non-deterministic or engine-exposing functions (`random`, `randomblob`,
+`zeroblob`, `load_extension`, `changes`, `total_changes`, `last_insert_rowid`,
+everything named `sqlite_*`) and any name not listed. The pinned SQLite build
+has no `floor` or `ceil`. Two-argument `round` and multi-argument
+`max`/`min` keep their portable refusals.
+
+`json_each` and `json_tree` open no new data path: they expand JSON that
+your statement already reads from caller-visible relations (or a parameter),
+so they return only rows you can see, and physical tables behind the views
+stay blocked.
+
+The date/time functions must be given an explicit time value, because the
+clock stays `now_ms()`. Zero-argument calls (`date()`, `strftime('%s')`), the
+literal `'now'` and the `'localtime'` and `'utc'` modifiers are refused, and
+so is binding the text `now`, `localtime` or `utc` as a parameter in a
+statement that calls a date/time function. A time built at run time (a
+string concatenated into `'now'`, or a stored value that says `now`) is
+beyond a static check; do not rely on it. For the current time use
+`now_ms()`:
+
+```sql
+SELECT id, datetime(updated_at_ms / 1000, 'unixepoch') AS updated
+FROM records
+WHERE updated_at_ms >= now_ms() - 86400000
+ORDER BY updated_at_ms DESC, id
+LIMIT 20
+```
+
+```sql
+SELECT j.value AS tag
+FROM facet_values f, json_each(f.value) j
+WHERE f.key = 'tags' AND json_valid(f.value)
+ORDER BY f.record_id, j.key
+LIMIT 50
+```
+
+## The caller
+
+`current_principal()` returns the calling principal's id: the same value
+stamped as `content_events.actor` and listed in `actors.actor`. It takes no
+arguments and always names the caller; the server binds it as a hidden
+parameter, like the clock, so it cannot be forged or redirected. It names a
+principal, not a person: join `actors` on `actor` for `person_id` where one is
+bound. A saved query or artifact port using it returns each viewer their own
+rows. Rule inputs refuse it.
+
+```sql
+SELECT record_id, MAX(created_at_ms) AS last_edit_ms
+FROM content_events
+WHERE actor = current_principal()
+GROUP BY record_id
+ORDER BY last_edit_ms DESC, record_id
+LIMIT 10
+```
+
 <!-- GENERATED:QUERY_SQL_CONTRACT -->
 
 The front-door scanner rejects multiple statements and obvious writes, DDL, transaction control, mutable pragmas, attachment/extension operations, and copy/export forms. Its lexical rules follow the active profile: caller placeholders are positional `?N` on every profile. SQLite/Turso understand their quoted forms but never PostgreSQL dollar quoting; PostgreSQL additionally understands escape strings, nested block comments, quoted identifiers, and dollar quoting. This remains defence in depth. The qualified backend parser, authorization provider, read-only controls, and function/catalog restrictions remain authoritative.
 
 Never infer availability from dialect similarity. Use `engine_info.query_sql.available` for the active profile.
+
+
+## Persona identity and message speakers
+
+`my_participants` lists only the caller's own active and retired personas.
+The logical `message_speakers` view has one row per speaker-bearing Message
+visible to the caller: message_id, speaker_kind, speaker_address, display_name
+and assurance. The utterance's current display name does not grant access to
+its private profile; historical Messages show renames. `my_message_state`
+and `my_mentions.own_source` distinguish persona speech from the owner's human
+speech. See the messaging guide for registration, claim validation, receipts
+and interchange behavior.

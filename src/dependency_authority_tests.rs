@@ -53,6 +53,7 @@ pub(crate) fn auth_manifest(
     entries: Vec<DefinitionEntry>,
 ) -> PackageManifest {
     PackageManifest {
+        operations: vec![],
         namespace: namespace.to_string(),
         name: name.to_string(),
         version,

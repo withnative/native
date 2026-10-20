@@ -26,6 +26,7 @@ pub(super) enum ManageArtifactInputsArgs {
         artifact_id: String,
         port_name: String,
         collection_id: String,
+        idempotency_key: Option<String>,
     },
     /// Bind between 1 and [`MAX_BIND_MANY_ITEMS`] ports atomically: every
     /// item validates before the first event appends, so one invalid item
@@ -40,13 +41,107 @@ pub(super) enum ManageArtifactInputsArgs {
     BindMany {
         artifact_id: String,
         bindings: Vec<BindManyItemInput>,
+        idempotency_key: Option<String>,
     },
     Unbind {
         artifact_id: String,
         port_name: String,
         collection_id: String,
         event_seq: i64,
+        idempotency_key: Option<String>,
     },
+}
+
+impl ManageArtifactInputsArgs {
+    /// The optional idempotency key of a write action; `Read` takes none.
+    fn idempotency_key(&self) -> Option<&str> {
+        match self {
+            Self::Read { .. } => None,
+            Self::Bind {
+                idempotency_key, ..
+            }
+            | Self::BindMany {
+                idempotency_key, ..
+            }
+            | Self::Unbind {
+                idempotency_key, ..
+            } => idempotency_key.as_deref(),
+        }
+    }
+}
+
+/// The `event_seq` of the live binding of `port_name` to `collection_id`: what
+/// an "unchanged" receipt reports. It is served from the current row, as the
+/// first call's was; a replay refuses if the port has been rebound since,
+/// because the receipt's claim would no longer be true.
+async fn live_binding_seq_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    artifact_id: &str,
+    port_name: &str,
+    collection_id: &str,
+) -> Result<i64> {
+    sqlx::query_scalar(
+        "SELECT event_seq FROM artifact_inputs
+          WHERE artifact_id=? AND port_name=? AND collection_id=?",
+    )
+    .bind(artifact_id)
+    .bind(port_name)
+    .bind(collection_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        Error::engine(format!(
+            "manage_artifact_inputs: port '{port_name}' is no longer bound as it was when this idempotent call ran; re-read and retry without the key"
+        ))
+    })
+}
+
+/// Rebuild a keyed `bind` / `bind_many` receipt. A binding the command wrote
+/// reports the seq of its own event; one that was already in place reports the
+/// live row's, exactly as the first call did.
+async fn replay_input_bindings_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    replay: &crate::mcp::tools::keyed_replay::KeyedReplay,
+    artifact_id: &str,
+    items: &[(&str, &str)],
+    plural: bool,
+) -> Result<Value> {
+    let mut bindings = Vec::with_capacity(items.len());
+    for (port_name, collection_id) in items {
+        let written = replay
+            .content()
+            .iter()
+            .find(|output| {
+                output.event_type == "artifact.input_bound"
+                    && output.payload["port_name"].as_str() == Some(port_name)
+            })
+            .map(|output| output.seq);
+        let event_seq = match written {
+            Some(seq) => seq,
+            None => live_binding_seq_in(tx, artifact_id, port_name, collection_id).await?,
+        };
+        bindings.push(json!({
+            "port_name": port_name,
+            "collection_id": collection_id,
+            "event_seq": event_seq,
+        }));
+    }
+    if replay.is_noop() {
+        return Ok(json!({
+            "status": "unchanged", "artifact_id": artifact_id, "bindings": bindings,
+        }));
+    }
+    let previous_seq = replay.previous_seq_in(tx, artifact_id).await?;
+    if plural {
+        echo_act(
+            json!({ "status": "bound", "artifact_id": artifact_id,
+            "previous_seq": previous_seq, "bindings": bindings }),
+            replay.act(),
+        )
+    } else {
+        Ok(json!({ "status": "bound", "artifact_id": artifact_id,
+            "previous_seq": previous_seq }))
+    }
 }
 
 fn validate_bind_many_count(bindings: &[BindManyItemInput]) -> Result<()> {
@@ -116,16 +211,22 @@ enum PreparedBinding {
 
 /// Attestation-independent prefix of one port's bind validation, in the exact
 /// singular-bind precedence: port name, then authorization, then the governed
-/// Collection check. Runs before the artifact source attestation is read so a
+/// Collection lookup. Runs before the artifact source attestation is read so a
 /// bad port or target reports itself rather than being shadowed by a missing
 /// or mismatched attestation row.
+///
+/// The governed-Collection requirement is state, not authority, so it is not
+/// enforced here: the lookup returns `None` for a target that is not one, and
+/// [`require_governed_collection`] refuses. An unkeyed call refuses at once; a
+/// keyed one only after its replay lookup, so a retry is not refused for a
+/// target whose kind changed after the first call committed.
 async fn validate_binding_target_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     caller: &Caller,
     artifact_id: &str,
     port_name: &str,
     collection_id: &str,
-) -> Result<String> {
+) -> Result<Option<String>> {
     const TOOL: &str = "manage_artifact_inputs";
     if port_name == "default" || !valid_port_name(port_name) {
         return Err(Error::engine(
@@ -134,9 +235,25 @@ async fn validate_binding_target_in(
     }
     require_record_in(tx, caller, TOOL, artifact_id, Capability::Edit).await?;
     require_record_in(tx, caller, TOOL, collection_id, Capability::View).await?;
-    collection_kind_in(tx, collection_id).await?.ok_or_else(|| {
+    collection_kind_in(tx, collection_id).await
+}
+
+fn require_governed_collection(kind: Option<String>) -> Result<String> {
+    kind.ok_or_else(|| {
         Error::engine("manage_artifact_inputs: target must be a governed Collection")
     })
+}
+
+/// The artifact-is-live precondition of a keyed write, run after the replay
+/// lookup. An unkeyed call runs it before opening its transaction instead.
+async fn require_live_artifact_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    artifact_id: &str,
+) -> Result<()> {
+    if !live_v2_artifact_in(tx, artifact_id).await? {
+        return Err(Error::engine("manage_artifact_inputs: invalid artifact"));
+    }
+    Ok(())
 }
 
 /// Attestation-dependent remainder of one port's bind validation: port
@@ -211,7 +328,11 @@ pub(super) async fn manage_artifact_inputs(
     arguments: Value,
 ) -> Result<Value> {
     const TOOL: &str = "manage_artifact_inputs";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ManageArtifactInputsArgs = parse_args(TOOL, arguments)?;
+    let keyed =
+        crate::mcp::tools::keyed_replay::idempotency_key(TOOL, args.idempotency_key())?.is_some();
     let artifact_id = match &args {
         ManageArtifactInputsArgs::Read { artifact_id }
         | ManageArtifactInputsArgs::Bind { artifact_id, .. }
@@ -241,7 +362,10 @@ pub(super) async fn manage_artifact_inputs(
             require_record(&db, &caller, TOOL, &artifact_id, Capability::Edit).await?;
         }
     }
-    if !live_v2_artifact(&db, &artifact_id).await? {
+    // A keyed write checks liveness after its replay lookup (below): a retry
+    // must replay a committed call even if the artifact was archived since.
+    let is_read = matches!(args, ManageArtifactInputsArgs::Read { .. });
+    if (is_read || !keyed) && !live_v2_artifact(&db, &artifact_id).await? {
         return Err(Error::engine("manage_artifact_inputs: invalid artifact"));
     }
     match args {
@@ -261,6 +385,42 @@ pub(super) async fn manage_artifact_inputs(
                 &collection_id,
             )
             .await?;
+            let checked_kind = if keyed {
+                None
+            } else {
+                Some(require_governed_collection(collection_kind.clone())?)
+            };
+            // Keyed replay: after the port and authority checks, before the
+            // state checks (artifact live, governed Collection, attestation,
+            // current binding) the first call's own effect or later writes
+            // changed.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt = replay_input_bindings_in(
+                        &mut tx,
+                        &replay,
+                        &artifact_id,
+                        &[(port_name.as_str(), collection_id.as_str())],
+                        false,
+                    )
+                    .await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+                require_live_artifact_in(&mut tx, &artifact_id).await?;
+            }
+            let collection_kind = match checked_kind {
+                Some(kind) => kind,
+                None => require_governed_collection(collection_kind)?,
+            };
             let attestation = binding_attestation_in(&mut tx, &artifact_id).await?;
             match finish_binding_in(
                 &mut tx,
@@ -273,7 +433,13 @@ pub(super) async fn manage_artifact_inputs(
             .await?
             {
                 PreparedBinding::Unchanged { event_seq } => {
-                    tx.rollback().await?;
+                    if keyed {
+                        // Leave the anchor a retry finds and replays as this no-op.
+                        crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                        db.commit_content(tx).await?;
+                    } else {
+                        tx.rollback().await?;
+                    }
                     return Ok(json!({
                         "status": "unchanged", "artifact_id": artifact_id,
                         "bindings": [{ "port_name": port_name,
@@ -334,8 +500,47 @@ pub(super) async fn manage_artifact_inputs(
                 .map_err(|error| {
                     Error::engine(format!("{TOOL}: bind_many item {index}: {error}"))
                 })?;
+                if !keyed {
+                    require_governed_collection(collection_kind.clone()).map_err(|error| {
+                        Error::engine(format!("{TOOL}: bind_many item {index}: {error}"))
+                    })?;
+                }
                 targets.push(collection_kind);
             }
+            // Keyed replay: after every item's port and authority checks,
+            // before the state checks (artifact live, governed Collection,
+            // attestation, current binding).
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let items = bindings
+                        .iter()
+                        .map(|item| (item.port_name.as_str(), item.collection_id.as_str()))
+                        .collect::<Vec<_>>();
+                    let receipt =
+                        replay_input_bindings_in(&mut tx, &replay, &artifact_id, &items, true)
+                            .await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+                require_live_artifact_in(&mut tx, &artifact_id).await?;
+            }
+            let targets = targets
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    require_governed_collection(kind).map_err(|error| {
+                        Error::engine(format!("{TOOL}: bind_many item {index}: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
             let attestation = binding_attestation_in(&mut tx, &artifact_id).await?;
             // Phase two: declaration, relation and current-binding checks.
             // Validate every item before the first event is appended. One
@@ -378,7 +583,12 @@ pub(super) async fn manage_artifact_inputs(
                 }
             }
             if !changed {
-                tx.rollback().await?;
+                if keyed {
+                    crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                    db.commit_content(tx).await?;
+                } else {
+                    tx.rollback().await?;
+                }
                 let bindings = prepared
                     .into_iter()
                     .map(|(port_name, collection_id, outcome)| {
@@ -455,6 +665,29 @@ pub(super) async fn manage_artifact_inputs(
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &artifact_id, Capability::Edit).await?;
+            // Keyed replay: after authorization, before the exact-binding check
+            // the first call's own unbind would now fail.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let previous_seq = replay.previous_seq_in(&mut tx, &artifact_id).await?;
+                    let receipt = echo_act(
+                        json!({ "status": "unbound", "artifact_id": artifact_id,
+                        "previous_seq": previous_seq }),
+                        replay.act(),
+                    )?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+                require_live_artifact_in(&mut tx, &artifact_id).await?;
+            }
             let exact: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM artifact_inputs
                   WHERE artifact_id=? AND port_name=? AND collection_id=? AND event_seq=?)",

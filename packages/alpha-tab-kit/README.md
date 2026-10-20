@@ -22,7 +22,7 @@ needed only for the browser half of the fake host.
 | Digest | `src/digest.mjs`, `alpha-tab-kit digest` | Computes `bundle_sha256`, `declaration_digest` and the install `digest` (`alpha-tab-digest.v1`) byte-for-byte as the engine does. |
 | Validator | `src/validate.mjs`, `alpha-tab-kit validate` | Runs locally every install-time rule found in source. Each failure names the rule and the source line it mirrors. |
 | Fake host | `src/fake-host/`, `alpha-tab-kit serve` | Serves the tab with the **real bridge script** under the real CSP, behind a parent page that behaves like the alpha shell. |
-| Install route | `src/install.mjs`, `alpha-tab-kit install-plan` | Produces the proven chunked, digest-guarded install as exact MCP calls. It can also run them through an MCP client you inject. |
+| Install route | `src/install.mjs`, `alpha-tab-kit install-plan` | Produces a digest-guarded MCP call plan; update presentation steps resolve at run time. It can also run through an MCP client you inject. |
 | Limits | `limits.json`, `alpha-tab-kit limits` | Holds every number the kit enforces, each tied to the Rust symbol, bridge literal or shell literal it mirrors. |
 | Drift guard | `src/mcp/tools/alpha_tab_kit_drift.rs` (engine), `test/drift-js.test.mjs` (shell and bridge) | Fails when the engine moves and the kit does not. |
 
@@ -41,7 +41,7 @@ node packages/alpha-tab-kit/bin/alpha-tab-kit.mjs hosted render.json
 # open the tab in a local host that behaves like /alpha/
 node packages/alpha-tab-kit/bin/alpha-tab-kit.mjs serve my-tab-descriptor.json --fixtures my-tab-fixtures.mjs
 
-# the install, as exact MCP calls (one JSON file per call)
+# the install, as an MCP call plan (one JSON file per step)
 node packages/alpha-tab-kit/bin/alpha-tab-kit.mjs install-plan my-tab-descriptor.json \
   --home <folder id> --reason "Install my tab 0.1.0" --source <task id>="The task this belongs to" --out plan/
 ```
@@ -50,7 +50,7 @@ A descriptor is the install arguments plus the bundle path. It uses the same
 shape the demo tabs use:
 
 ```json
-{ "package": "agent.my-tab", "version": "0.1.0", "bundle": "my-tab.html",
+{ "package": "agent.my-tab", "version": "0.1.0", "title": "My tab", "bundle": "my-tab.html",
   "runtime": "native.html.v1", "declaration": { "needs": [...], "effects": [] },
   "digest_version": "alpha-tab-digest.v1", "bundle_sha256": "…", "declaration_digest": "…", "digest": "sha256:…" }
 ```
@@ -305,8 +305,9 @@ The parent page (`src/fake-host/shell.js`) mirrors the alpha shell,
 - Backend errors map `[code]` to refused or unavailable. The 10 s timeout starts when a read is dispatched. A read that outlives it is answered `unavailable` and only that ticket is retired: the tab's other reads keep going, and a later read is still admitted. The real shell cannot cancel the tool call it gave up on, so the timed-out slot stays charged against `READ_IN_FLIGHT_MAX` until the abandoned call settles or `READ_TIMEOUT_SLOT_GRACE_MS` (15 s) passes, whichever is first; a hung call therefore delays this tab's reads by at most the grace rather than wedging them until Reload, at the cost of briefly running over the cap. (The fake host aborts its own fetch, so its call settles at once and its slot frees immediately; only the answers and slot accounting are mirrored.) A reload answers the old document's accepted reads `tab_reloaded`, once each, on the old port. With no read on the wire the new document is then re-handshaken on the same tab. With one still on the wire it is not: that read cannot be cancelled, so the shell closes the tab with the notice `reloaded_during_read` rather than let the old read's timer, answer or cleanup touch the new document, and **Retry tab** opens a fresh one (which may read while the abandoned call finishes). The fake host mirrors this by retiring the frame. Every terminal path — handshake timeout, unreadable message, reload during a read — goes through one step in both hosts: answer every accepted read once on its own port, then close that port. After that nothing more is dispatched, and a superseded or retired port's messages are ignored.
 - **Snapshot vs on-request:**
   - SQL needs without params arrive in `input.sql[key]` at init.
-  - Needs with params, plus `records.search.v1`, `records.resolve_reference.v1`, `canvas.scene.v1`, `records.changes.v1` and `artifact.render.v1`, are offered as `needs` and read on request (pendingTabs.js:754). The fake host checks their params as the engine does and answers from the `search`, `resolve`, `scene`, `changes` and `render` fixtures.
+  - Needs with params, plus `records.search.v1`, `records.resolve_reference.v1`, `canvas.scene.v1`, `records.changes.v1`, `artifact.render.v1` and `records.body.current.v1`, are offered as `needs` and read on request (pendingTabs.js:754). The fake host checks their params as the engine does and answers from the `search`, `resolve`, `scene`, `changes`, `render` and `bodyCurrent` fixtures.
   - `records.changes.v1` takes `{record_id, limit ≤ 50, cursor?}` and answers one page of the record's changes, newest first: `{version, record_id, order, events, limit, complete, next_cursor}`. Each event is `{event_id, type, created_at, actor, run_key, changed_fields, fields_truncated, reason, reason_truncated, payload_bytes, changes}`. `actor` and `run_key` are null when the viewer may not see who acted. `changes` gives `{field, before, before_known, before_truncated, after, after_truncated, observation_only}` for `name`, `lifecycle`, `maturity`, `kind`, `type` and `facet:<key>` (values cut at 256 characters), and `{field: "body", changed: true, bytes}` for a body. Field names are cut at 256 characters (`fields_truncated`), and an event too large for any page arrives as `{event_id, type, created_at, oversized: true}`. Page on with `next_cursor` until `complete` is true. The cursor is sealed: it only resumes the record and install it came from, and a restart of the host invalidates it (`invalid_params`), so read again from the top. A page can end early, `complete: false`, when the host runs out of its scan budget; before-values it could not find within its look-back say `before_known: false`. An event the host will not process in full arrives as `{event_id, type, created_at, unprocessed: true}`, and values it may have written read `before_known: false`. That happens when its payload needs more than 256 record-access checks for this viewer, or when its stored payload exceeds 8 MiB. The 8 MiB cap measures raw stored bytes, before redaction, so such an event is `unprocessed`, with `created_at: null`, for every viewer: the only fact that discloses is that its raw payload is over 8 MiB. For a processed event, `payload_bytes` is the size of the payload as redacted for this viewer, as `get_history` reports it. Unlike `get_history`, it leaves out `occurrence.bound.v1` events: they bind a unit to an artefact and change no field or body, and whether a viewer may see one depends on access to another record. No sequence number appears anywhere in it.
+  - `records.body.current.v1` takes `{record_id, include_body?}` (`include_body` defaults to `true`; `record_id` may be a short reference, written exactly, which the host resolves among the records the viewer can see) and answers one record's current body together with its digest, read from one snapshot: `{status: "found", record_id, body_digest, body_bytes, body, body_omitted?}`. `body_digest` is the lowercase hex SHA-256 of the body text, exactly what a body save's `expected_body_digest` compares, so save against the digest you read with the text and never pair text and digest from separate reads. `body` is `null` with `body_omitted: "not_requested"` when `include_body` is false (a cheap change probe: equal digests mean an unchanged body), and with `body_omitted: "too_large"` when the body is over 524,288 bytes or would pass 786,432 characters once JSON-escaped (very quote- or backslash-heavy text can do that well under 512 KiB); the digest and size still come back. A record the viewer cannot see, a deleted one and a missing one all answer `{status: "not_found", record_id}`. It carries no sequence or revision counter.
   - `artifact.render.v1` takes `{artifact_id}`, a full record id in canonical lowercase hyphenated form (no short references), and answers the server-rendered safe tree of one `native.mdx.v1` or `native.mdx.v2` artifact, rendered live as the viewer: `{version: "artifact.render.v1", status: "rendered", artifact_id, runtime: {id}, plan: {kind: "safe_tree", version: "1", tree, styles?: {digest, flags}, provenance: {record_id, source_event_id, event_seq, snapshot_event_id, snapshot_event_seq, body_sha256, render_sha256}}}` (provenance members appear when the runtime supplies them). It is display-only: interaction declarations, CAS tokens, editability, the input envelope and the stylesheet `href` are withheld. Every other outcome is an ordinary refused read with a code: `not_found` for a record the viewer cannot see or that does not exist, `not_mdx_artifact` for any other record (HTML tab packages and boards included), `render_failed` when the render does not produce a safe tree, and `too_large` for an answer over 786,432 characters. A short reference is refused `invalid_params`, never resolved. In the fake host, a `render` fixture that throws an `Error` whose message contains `[code]` answers that refusal. Re-read it when the document or its data may have changed.
   - Each SQL result has the engine's shape: `{label, columns, rows ≤ 200, row_count, row_count_complete, truncated, truncation_hint, now_ms_ms, time_dependent}`. `row_count` is the full count, and the result is capped at `query_sql`'s 1,000 rows first, which sets `row_count_complete: false` (`execute_sql_need`, alpha_tabs.rs).
 - **Sample vs live:**
@@ -315,6 +316,7 @@ The parent page (`src/fake-host/shell.js`) mirrors the alpha shell,
   - `pushInput()` sends a new snapshot as an `input` message with an increasing `content_event_seq`, as the shell does (pending.js:381).
 - **Record handoff:** a trusted click on `[data-native-record-id]` reaches the host as `navigation` and is honoured only with host user activation and a printable id of at most 128 characters (`handleNavigation`, pending.js:2874).
 - **`setViewState`** is accepted and logged. The alpha shell drops it; `holdViewState: true` re-delivers it on reload, as the Workbench host does (`mount.ts:1056`).
+- **`native.presentation.setFloatingChat({suppress})`** (host feature `app.presentation.v1`) asks the host to suppress the Desktop floating chat while this app is foreground. A whole-app policy calls once with `suppress: true` at startup; a per-view policy calls `true` on entering the relevant view and `false` on leaving it — the app owns its current view, the host owns document/foreground lifetime, so there are no view or scope keys. It resolves `Promise<boolean>`: `true` means the host accepted and stored the preference, not that the Desktop painted; `false` means refused or unavailable. On a host without the feature (older or web) `native.presentation` is absent — probe before calling. The Desktop applies the preference only while the calling app is the qualified foreground; a separate Desktop bridge (`nativeDesktop.presentation.setFloatingChatPolicy`) carries the host-minted owner, and the read-only pane is untouched.
 - Intents are rejected: `unsupported_host` live, `preview_sample_only` in sample mode. Effects are unwired in this slice.
 
 `audit()` / `expectHealthy()` report reads that were answered `busy` and never
@@ -343,6 +345,7 @@ const tab = await openFakeHost(page, {
     scene: ({ canvas_id, cursor }) => ({ /* one page */ }),     // canvas.scene.v1, if declared
     changes: ({ record_id, cursor }) => ({ /* one page */ }),   // records.changes.v1, if declared
     render: ({ artifact_id }) => ({ /* one answer */ }),        // artifact.render.v1, if declared
+    bodyCurrent: ({ record_id, include_body }) => ({ /* one answer */ }), // records.body.current.v1, if declared
   },
 });
 await tab.frame.locator("button").first().click();   // tab.frame is a FrameLocator
@@ -358,13 +361,24 @@ to simulate a backend refusal.
 The bridge offers `nativeArtifact.onReveal(callback)`, a sibling of
 `onInput`. The callback receives one deep-frozen `{record_id}` — an exact
 persisted id over `[A-Za-z0-9._:-]`, 1–128 chars, matching backend
-admission; never names, bodies, ancestors, installs or sequences — after
-the host's backend admission for a `surface.reveal.v1` install. There is
+admission; never names, bodies, ancestors, installs or sequences. There is
 no ack and no effect authority, and reveal stays off the input
 rows/digest/revision and P7 paths. The shape is checked through the
 captured pristine `RegExp.prototype.exec`, so later author tampering with
 regex or string helpers cannot change the verdict.
 
+- **v1 admission.** The host sends a reveal only to an install that
+  consents to `surface.reveal.v1`, and only after the backend's
+  `admit_reveal_target` has admitted that exact id: the install must be
+  current, the id well formed and visible to the viewer, and the receipt
+  must match the install's pin.
+- **v2 reveal.** A v2 install declares no needs, so it has no
+  `surface.reveal.v1` to consent to and the backend is not asked. The host
+  offers reveal to every healthy v2 frame and checks only the install's
+  health and the id's shape. The id is advisory, not a visibility verdict:
+  the app reads the record with the user's own authority, so an id that
+  does not exist or is not visible simply fails at that read. The same
+  port, epoch and pin fences apply as for v1.
 - A reveal arriving after init but before registration is retained
   latest-one and replayed once to the first subscriber; the slot clears
   before the callback runs, so later registrations cannot re-deliver it.
@@ -397,6 +411,12 @@ app.withnative.ai are not verified by this application-level change.
 
 ### Install route
 
+Set the descriptor's optional `title` to the brief user-facing app name, such
+as `Docs` or `Slack`. Installation uses it as the source record name on both
+routes; `--name` overrides it. Title-less descriptors retain the legacy
+package/version source name. Titles are presentation metadata and do not
+change package identity, bundle digests or capability consent.
+
 `planInstall` creates the complete source artifact in one write by default:
 
 1. `records_write create_record` with `type: "Document"`, `kind: "artifact"`, the complete HTML body (sent as `body_encoding: "gzip+base64"` by default, see below), and `facets: {runtime: "native.html.v1", app_icon?}`. The call includes reason and sources, with no stage `idempotency_key`. The whole document is validated on creation.
@@ -421,6 +441,14 @@ plan-required: `runInstall` prepares it, then executes the returned plan through
 unless you pass `--allow-unbound`; programmatic plans list such ports as
 `unbound_inputs`. `--bind` needs the whole-body route.
 
+**App contract v2.** A package whose declaration is exactly
+`{contract: "native.app.v2", needs: [], effects: []}` is a v2 install: the one
+Adopt in `/alpha/` is the whole consent, and it has no input ports. The
+validator accepts only that shape (any other `contract` value, or a non-empty
+`needs`/`effects`/`sessions` beside it, is refused), `contract` is bound into the
+declaration digest, and `planInstall` emits no `bind-inputs` or `grant-input-*`
+step for it. `--bind` on a v2 package is an error, not silently dropped.
+
 To reinstall after an earlier removal, use
 `install-plan … --after-removal <removal event id>` (programmatically,
 `planInstall({ …, afterRemovalEventId })`). It sets the install's
@@ -434,10 +462,50 @@ re-plan with `--after-removal <install.event_id>`.
 
 Find the current generation with `artifacts_read manage_alpha_tabs.inspect`:
 use `install.event_id` as `install-plan … --update <current install event id>`
-(programmatically, `planInstall({ …, updateInstallEventId })`). The plan stages
-the source, sends one guarded `artifacts_write manage_alpha_tabs.update`, then
-inspects. It also works with `--chunked`. `--update`, `--replace` and
+(programmatically, `planInstall({ …, updateInstallEventId })`). At execution,
+the plan reads the current install matching that event and its artifact's
+presentation, stages a new source, sends one guarded
+`artifacts_write manage_alpha_tabs.update`, then inspects. It also works with
+`--chunked`. `--update`, `--replace` and
 `--after-removal` are mutually exclusive.
+
+Updates preserve the current artifact's name and explicit `app_icon` and
+`app_skin` values, including malformed or unknown values. No other old facets
+are copied. An absent icon uses the new descriptor's icon default; an absent
+skin stays absent. This presentation does not alter the executable bytes,
+source revision calculation, digests, declaration or adoption rules. Pass
+`install-plan … --update <event> --reset-presentation` (programmatically,
+`resetPresentation: true`) to use the new descriptor/`--name` and icon instead,
+with no skin. Reset requires `--update`; `--name` with `--update` requires reset.
+
+Kit installs always write an explicit record name, and a valid descriptor icon
+becomes an explicit `app_icon` facet. These include package defaults, even
+when nobody has customized them. A new package title or icon does not replace
+those stored values on `--update`; use `--reset-presentation` to pick up new
+package presentation. If the descriptor has no valid icon, the kit omits the
+facet; an absent old icon still takes the new descriptor default as above.
+
+Planning remains offline: presentation is captured by `install-run`, not when
+the plan JSON is written. Use `runInstall` to execute the presentation capture,
+seed and comparison annotations; sending step arguments by hand alone does
+not perform those checks or copy the captured values. `runInstall` refuses
+older saved update plans without the initial install-read step: regenerate
+them before executing. Before switching, the plan rechecks the old
+install event and artifact identity, then the captured presentation. If either
+changed, execution stops: rebuild the plan and archive any staged orphan.
+Reset plans recheck the install but need no presentation read.
+If the old artifact is archived, missing or not viewable, preservation stops
+with a message to regenerate the plan using `--reset-presentation`. This
+allows an update to repair that install using package presentation. Failures
+after staging identify the new source record so it can be inspected; archive
+it only if it is an orphan, not if the update already switched successfully.
+
+These reads and the switch are separate operations. A concurrent edit to the
+old artifact after the final presentation read can still be missed; this is
+not atomic preservation. The install event is also guarded by the engine's
+update precondition. This fix covers the kit's new-artifact update route,
+not arbitrary direct update callers or other people's installations. Direct
+same-artifact updates retain presentation already and need no copy.
 
 With the same canonical declaration, adoption carries over from an adopted,
 eligible generation. Any declaration change requires fresh Preview → Adopt at
@@ -454,10 +522,24 @@ There is no automatic fallback. Digest mismatches stop all subsequent calls.
 Retries stage a fresh source record, as in the chunked route. Archive orphaned
 source records left by failed or repeated installs.
 
+**Package bundles over 512 KiB.** An ordinary `native.html.v1` body is limited to
+512 KiB (`html.body_max_bytes`); an installed app package bundle may be up to 1 MiB
+(`html.package_body_max_bytes`). The engine grants the larger limit only to a record
+carrying the facet `app_package: "true"` (`install.package_facet_key` /
+`install.package_facet_value`), and `planInstall` sets it on the bundle record's create
+(on the re-kind for `--chunked`) whenever the bundle is over 512 KiB; smaller bundles'
+plans are unchanged. `validatePackage` validates as a package by default (`package: false`
+opts out), and `validateHtml(html, { package: true })`,
+`completenessFindings(html, sqlNeeds, { package: true })` and
+`completenessAnalysis(html, sqlNeeds, budget, { package: true })` (budget
+`PACKAGE_LINT_BUDGET`) do the same for a single check. Ordinary HTML stays at 512 KiB.
+
 **Encoded body.** JSON escaping can inflate a raw HTML string several-fold against
 the hosted request limit, so the whole-body `create_record` sends `body` as gzip,
 then standard base64, with `body_encoding: "gzip+base64"`. The server decodes at the
-tool boundary, before validation, the 512 KiB limit, `body_digest` and storage, so
+tool boundary, before validation, the applicable body limit (512 KiB for ordinary
+HTML, 1 MiB for an installed package record carrying the marker), `body_digest`
+and storage, so
 the receipt digest still equals the local `bundle_sha256` and `expect.body_bytes` is
 the decoded size. Select another form with `--body-encoding utf8|base64|gzip+base64`
 (programmatically `planInstall({ …, bodyEncoding })`); `--raw-body` is shorthand for
@@ -471,11 +553,14 @@ steps by hand with `arguments`, or `fallback.arguments` against an older server.
 route is always raw. `manage_alpha_tabs` calls carry no source bytes, so they have
 no encoding.
 
-**Size caveat (raw bodies only):** hosted `/mcp` currently applies axum's default request-body
-extraction limit: axum-core `DEFAULT_LIMIT` is 2097152 bytes (**2 MiB encoded
-JSON**). The HTML limit is 512 KiB decoded UTF-8, so a near-512 KiB
-escape-heavy bundle may need the default encoded body (or `--chunked`) until a separate change raises the MCP request
-allowance to 4 MiB. Metadata also counts toward the encoded limit.
+**Size caveat (raw bodies only):** the workbench `/tools/{name}` and
+database-scoped tool routes retain axum's default request-body extraction
+limit: axum-core `DEFAULT_LIMIT` is 2097152 bytes (**2 MiB encoded
+JSON**). Hosted `/mcp` allows request bodies up to 4 MiB, which carries a
+1 MiB package bundle sent as `gzip+base64` comfortably. A near-limit bundle
+sent raw (`utf8`), where JSON escaping can inflate it several-fold, may still
+need the default encoded body (or `--chunked`) on a route with the 2 MiB
+default. Metadata also counts toward the encoded limit.
 
 For constrained servers or clients, explicitly use
 `install-plan … --chunked [--chunk-bytes 8000]` (programmatically,
@@ -509,6 +594,10 @@ decoded in transit (task 1619b59).
    may not have committed: inspect before retrying.
 
 **For an agent with Native MCP tools and no programmatic client:**
+For `--update`, use `runInstall` with an injected client or `install-run` above;
+the step files contain presentation annotations resolved at run time. The
+manual instructions below apply to install plans without `--update`.
+
 1. Run `install-plan --out plan/`.
 2. Execute the files in order, passing each file's `arguments` unchanged. Replace `{{record_id}}` with the create receipt's `id`, and `{{source_revision}}` with its `source_event_id`. For a legacy chunked plan, use `rows[0].id` from its `source-revision` step instead.
 3. Compare every receipt's `body_digest` with the file's `expect.body_digest`. Stop at the first mismatch. An escape decoded in transit, such as a literal `\n` or `￿` in the file, can change the source bytes; never install after that mismatch.
@@ -589,9 +678,10 @@ Default features only, per `AGENTS.md`.
 
 The shell half (`test/drift-js.test.mjs`) checks, when run inside native-ce,
 that every `js_literal` in `limits.json` is still present in the demo shell
-source: the one-dispatch pump, the 8-read queue cap, the 200-row cap, the 10 s
-and 5 s timeouts, and the navigation bound. It also checks that the queue cap
-equals the bridge's pending-read cap. The whole kit suite runs in CI as the "Alpha tab kit" step of
+source: the batched FIFO pump, the 4-read in-flight cap, the 16-read batch
+cap, the 8-read queue cap, the 200-row cap, the 10 s and 5 s timeouts, and the
+navigation bound. It also checks that the queue cap equals the bridge's
+pending-read cap. The whole kit suite runs in CI as the "Alpha tab kit" step of
 the `workbench-fixtures` job.
 
 ## Running the tests
@@ -697,6 +787,24 @@ proof/                      evidence script for the PR (not part of the package)
 - `packages/` holds the standalone Node packages native-ce publishes for use outside the repo (`advisor-runner`, `native-standby`), and this kit is meant to be depended on from another repo.
 - `experiments/` holds harnesses and evidence, which is where the proof packages and the demo shell still live.
 
+
+The SQL relation catalogue also includes `message_reactions` for generic app
+reads (SQLite-local), with `reaction_id`, `message_id`, `emoji`, nullable
+`actor_record_id`/`actor_name`/`executor_kind`, `reacted_at`, `reacted_at_ms`
+and integer `viewer`. A winning history event UUID is the row identity;
+never deduplicate rows by emoji or actor. Hidden attribution preserves the
+row and count. Full visible-history preparation either completes within its
+bounds or errors; caller LIMIT does not truncate the fold. Saved receipts
+are conservative because mutable actor disclosure is not pinned by event
+history. This catalogue addition creates no tab-only need; legacy tab
+installation rules remain unchanged; scoped reaction grants remain refused.
+
+## Agent access from an app
+
+Messaging, starting and asking agents through Native Desktop (`native.agents`, `native.agentSessions`): the features a host
+offers, the confirmation the person sees, the result codes and the timeouts are in
+`docs/app-agent-access.md` in the Native CE repository.
+
 ## Launcher icon authoring
 
 Supply an optional plain PascalCase Lucide name or `brand:<slug>` on the package descriptor:
@@ -773,8 +881,102 @@ package default, or a deterministic package monogram on a contrasting tile.
 Deleting the facet uses `facets: { "app_icon": null }` in `update_record`.
 Malformed explicit record values also render a monogram and block the package default;
 they differ from malformed descriptor values omitted at installation.
+Kit `--update` carries this explicit value, the record name and any `app_skin`
+pointer to its new artifact; `--reset-presentation` opts into package defaults
+(see “Updating an installed tab” above). Skin notes remain separate records;
+the kit copies only the pointer, without validating or rewriting its target.
 Brand marks come only from the host-pinned catalogue above, never from
 app-supplied artwork, URLs or executable code.
+
+### App skins (`app.skin.v1`)
+
+A compatible host resolves the installed artifact's scalar `app_skin` facet as
+an authorized Document/note UUID. The note's JSON body declares exact compatible
+package IDs; no wildcard or alias matching:
+
+```json
+{
+  "schema": "native.app-skin.v1",
+  "packages": ["agent.example"],
+  "display_name": "My presentation",
+  "icon": "BookOpen",
+  "tokens": {"--app-bg": "#112233", "--app-gap": "12px", "--app-font": "system-ui, sans-serif"},
+  "css": "h1{border-radius:4px}",
+  "labels": {"heading": "My heading"}
+}
+```
+
+Only `schema` and `packages` are required. Unknown fields are rejected. Limits:
+16 KiB UTF-8 total JSON; 12 KiB CSS; 1–16 distinct package IDs (1–128 ASCII
+letters/digits/dot/underscore/hyphen, starting with a letter or digit); 128 tokens
+and 128 labels; 512 characters per label/token value; nonblank display name at
+most 128 characters. Token names match `--app-[A-Za-z0-9][A-Za-z0-9-]{0,57}`
+(at most 64 ASCII characters). Values accept hex/named/numeric-function colours and bounded `color-mix()`
+(including `var(--app-*)` colour references),
+numeric CSS lengths, or inert font-family lists of names/quoted words; no CSS
+fragments, escapes, `;`, `{`, `}`, `<`, `@`, `url(` or `expression`. Label keys
+match `[A-Za-z][A-Za-z0-9_.-]{0,63}`. Optional icons use the existing scalar icon
+parser, including unknown bounded names. CSS rejects `@charset` and `@import`
+in raw normalized text as well as escaped/comment-obscured forms. Comment
+scanning respects strings and `url()` tokens; CSS newlines are normalized before
+escape decoding, and escapes inside any at-keyword are rejected. Existing sandbox/CSP
+governs remote loads.
+
+Create the note once, then `update_record` the installed artifact with
+`facets: {"app_skin": "<skin UUID>"}`. Switch by replacing the pointer; edit the
+active note's body to change it live; clear with `facets: {"app_skin": null}`.
+A previously read note can paint from the scope-bound readHub cache before
+revalidation. A new uncached pointer keeps the previous presentation without a
+notice for at most three seconds, ending at its first read or subscription error.
+If it has not answered by then, the host restores built-in presentation with an
+"unreadable" notice; a late successful read can still apply the selected skin.
+With no previous skin to retain, built-in presentation stays quiet until the
+read resolves or reports an error. For a pointer that has already answered, non-terminal errors retain its result
+quietly. Terminal refusals clear it and allow a fresh subscription on the next
+metadata pass. Skin display
+name and icon independently override the artifact's name/`app_icon`, then
+package defaults. Clearing restores those underlying choices. Missing,
+archived, inaccessible, malformed or incompatible notes clear the override
+and show a small host notice. They never hide app data.
+
+The trusted bootstrap appends two owned styles at the end of `<head>`, after
+authored head styles: token properties through CSSOM `setProperty`, then override
+CSS through `textContent`. At equal specificity, a `<style>` placed in `<body>`
+or injected later by app script can win the cascade.
+Apps expose semantic `--app-*` defaults and consume only their known label keys:
+
+```js
+window.nativeArtifact.ready.then(() => {
+  if (!window.native?.skin) return;
+  const unsubscribe = window.native.skin.subscribe(({ labels }) => {
+    // Full replacement; {} on clear. Keep drafts and current views intact.
+    heading.textContent = Object.hasOwn(labels, "heading") ? labels.heading : DEFAULT_LABELS.heading;
+  });
+});
+```
+
+`subscribe` immediately delivers the latest immutable `{labels}` snapshot and
+returns unsubscribe. Keep an inert defaults table such as
+`<script type="application/json" id="native-skin-labels">` in the source. Render
+strings with safe text/attribute setters; unknown keys do nothing. Authors do
+not inject the raw CSS themselves. Feature detection keeps old hosts/apps on
+built-in defaults. Both kit-backed and legacy native exposure support this API.
+
+The host offers `app.skin.v1` in INIT `host_features` and supplies `skin` plus
+`skin_revision`; bootstrap acknowledges in `ready.features`. Subsequent private
+MessagePort messages are `{version:"native.html.bridge.v1",type:"native.skin",
+skin_version:"native.app-skin.v1",revision:<monotonic integer>,skin:{tokens,css,labels}}`.
+Each message completely replaces presentation; `skin:null` resets. Stale
+revisions and old pointers/scopes are ignored. Name, icon and package fit stay
+host-side. CSS/label-only edits deliver directly without a registry revision,
+frame replacement, executable pin change or install-list refetch.
+
+This pointer is shared by installs referencing the same workspace artifact;
+personal overrides are deferred. Skin data is outside HTML, declaration/install
+digests and consent/adoption. The authored token/label hooks and host bridge need
+one normal executable release; later skin edits do not. Kit update preservation
+is separate from this host contract; direct replacement-artifact updates are
+not promised to preserve the pointer.
 
 The provisional `records.body-set.v1` raw UTF-8 ceiling is 512 KiB. Existing
 consented declarations retain their smaller caps until a person adopts a

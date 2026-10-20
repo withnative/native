@@ -3,7 +3,7 @@
 #[tokio::test]
 async fn v2_two_principals_no_person() {
     // The v2 path uses the current frozen engine schema.
-    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 358);
+    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 373);
     assert_eq!(
         crate::schema::ddl_sha256(),
         crate::schema::FROZEN_DDL_SHA256,
@@ -76,7 +76,7 @@ async fn v2_two_principals_no_person() {
             .unwrap();
     assert_eq!(kinds, vec!["account".to_string(), "agent".to_string()]);
 
-    // Log shape: genesis, admin creation, attributed bootstrap, B creation.
+    // Genesis now mints the kernel-reserved transform principal.
     let history: Vec<String> = sqlx::query_scalar("SELECT type FROM content_events ORDER BY seq")
         .fetch_all(db.write_pool())
         .await
@@ -87,6 +87,8 @@ async fn v2_two_principals_no_person() {
             "kernel.root_created.v1",
             "kernel.principal_created.v1",
             "kernel.root_admin_bootstrapped.v1",
+            "kernel.host_transform_created.v1",
+            "kernel.host_import_created.v1",
             "kernel.principal_created.v1",
         ]
     );
@@ -113,7 +115,7 @@ async fn v2_two_principals_no_person() {
     // Replay through the single entry point reproduces all tables exactly.
     let before = crate::kernel::dump_all_kernel_tables(&db).await.unwrap();
     assert_eq!(before.roots.len(), 1);
-    assert_eq!(before.principals.len(), 2);
+    assert_eq!(before.principals.len(), 4);
     assert_eq!(before.bootstrap.len(), 1);
     crate::kernel::replay_all_projections(&db).await.unwrap();
     let after = crate::kernel::dump_all_kernel_tables(&db).await.unwrap();
@@ -697,12 +699,12 @@ async fn v2_specimen_pinned_file_db() {
     use crate::kernel as v2;
 
     // Current frozen statements, digest, prod event types, and v1 roots.
-    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 358);
+    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 373);
     assert_eq!(
         crate::schema::ddl_sha256(),
         crate::schema::FROZEN_DDL_SHA256
     );
-    assert_eq!(crate::events::EVENT_TYPES.len(), 46);
+    assert_eq!(crate::events::EVENT_TYPES.len(), 49);
     let v1 = crate::db::create_database(":memory:").await.unwrap();
     let v1roots: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM records WHERE id IN ('native:root', 'native:unfiled')",
@@ -1248,6 +1250,7 @@ async fn v2_review_content_replay_refuses_tampered_bytes() {
         .unwrap();
     for table in [
         "kernel_links",
+        "kernel_record_metadata",
         "kernel_records",
         "kernel_adoptions",
         "kernel_policy_entries",

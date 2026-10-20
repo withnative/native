@@ -1,6 +1,6 @@
 {
   "family": "native.standard.document",
-  "version": 1,
+  "version": 2,
   "interpreter": "native.defn/3",
   "primary_type": "Document",
   "kinds": [
@@ -10,7 +10,7 @@
       "maturity": "current",
       "identity": { "mode": "record" },
       "fields": [
-        { "name": "title", "type": "text", "required": true, "description": "Short human title." },
+        { "name": "title", "type": "text", "required": false, "description": "Short human title. May be absent: v1 notes are often untitled and no title is invented." },
         { "name": "body", "type": "text", "required": false, "description": "The prose, as Markdown." }
       ],
       "links": [

@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 import { planInstall, runInstall } from "../src/install.mjs";
 import { requestCode, verifyCode, readBearer, createMcpClient, credentialOrigin } from "../src/remote.mjs";
+import { runNode, runNodeAsync } from "./helpers/run-node.mjs";
 
 const origin = "https://native.test";
 const reply = (status, value) => new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
@@ -165,10 +166,7 @@ test("without a terminal, login's completion command keeps --origin and --bearer
   const local = `http://127.0.0.1:${server.address().port}`;
   const bearerFile = join(mkdtempSync(join(tmpdir(), "kit-login-")), "it's here");
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
-  const run = await new Promise((done) => {
-    import("node:child_process").then(({ execFile }) => execFile(process.execPath, [cli, "login", "--email", "p@example.test", "--origin", local, "--bearer-file", bearerFile], (error, stdout) => done({ error, stdout })));
-  });
-  server.close();
+  const run = await runNodeAsync([cli, "login", "--email", "p@example.test", "--origin", local, "--bearer-file", bearerFile]).finally(() => server.close());
   assert.equal(run.error, null);
   assert.match(run.stdout, new RegExp(`--origin '${local}'`));
   assert.ok(run.stdout.includes(`--bearer-file '${bearerFile.replace("'", "'\\''")}'`), run.stdout);
@@ -255,7 +253,6 @@ test("MCP requests default to 120 seconds and reject invalid timeout settings", 
 
 test("install-run passes --timeout-ms and reports a stalled fake server clearly", async () => {
   const { createServer } = await import("node:http");
-  const { execFile } = await import("node:child_process");
   const server = createServer(() => {});
   await new Promise(done => server.listen(0, "127.0.0.1", done));
   const dir = mkdtempSync(join(tmpdir(), "kit-timeout-"));
@@ -265,9 +262,9 @@ test("install-run passes --timeout-ms and reports a stalled fake server clearly"
   writeFileSync(planFile, JSON.stringify({ package: "agent.timeout", version: "0.1.0", steps: [] }));
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
   try {
-    const run = await new Promise(done => execFile(process.execPath,
+    const run = await runNodeAsync(
       [cli, "install-run", planFile, "--origin", `http://127.0.0.1:${server.address().port}`, "--bearer-file", bearerFile, "--timeout-ms", "20"],
-      { timeout: 5000 }, (error, stdout, stderr) => done({ error, stdout, stderr })));
+      { timeoutMs: 5000 });
     assert.equal(run.error?.code, 1);
     assert.equal(run.stderr, "bootstrap: no response after 0.02s\n");
   } finally {
@@ -288,10 +285,9 @@ test("read-only MCP timeouts omit write outcome warnings", async () => {
 });
 
 test("install-run rejects invalid timeout flags with usage before reading credentials", async () => {
-  const { spawnSync } = await import("node:child_process");
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
   for (const values of [[], ["nope"], ["1.5"], ["0"], ["-1"], ["2147483648"], ["--origin", origin]]) {
-    const run = spawnSync(process.execPath, [cli, "install-run", "unused-plan.json", "--timeout-ms", ...values], { encoding: "utf8" });
+    const run = runNode([cli, "install-run", "unused-plan.json", "--timeout-ms", ...values]);
     assert.equal(run.status, 2);
     assert.match(run.stderr, /^--timeout-ms needs a positive integer no greater than 2147483647\n/);
     assert.match(run.stderr, /install-run <plan dir/);
@@ -304,11 +300,9 @@ test("install-run rejects invalid timeout flags with usage before reading creden
 // No browser adoption is simulated: these are server-reported update outcomes.
 test("CLI update plans report carried or required adoption and refuse old servers", async () => {
   const { createServer } = await import("node:http");
-  const { execFile } = await import("node:child_process");
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
   const fixture = fileURLToPath(new URL("fixtures/probe-descriptor.json", import.meta.url));
-  const execute = args => new Promise(done => execFile(process.execPath, [cli, ...args],
-    { timeout: 10000 }, (error, stdout, stderr) => done({ error, stdout, stderr })));
+  const execute = args => runNodeAsync([cli, ...args], { timeoutMs: 10000 });
   const dir = mkdtempSync(join(tmpdir(), "kit-update-"));
   const bearerFile = join(dir, "fake-bearer");
   writeFileSync(bearerFile, "b".repeat(64));
@@ -335,7 +329,7 @@ test("CLI update plans report carried or required adoption and refuse old server
     assert.equal(planned.error, null, planned.stderr);
     writeFileSync(planFile, planned.stdout);
     const plan = JSON.parse(planned.stdout);
-    assert.deepEqual(plan.steps.map(s => s.step), ["create-artifact", "update", "inspect"]);
+    assert.deepEqual(plan.steps.map(s => s.step), ["read-current-install", "read-current-presentation", "create-artifact", "recheck-current-install", "recheck-current-presentation", "update", "inspect"]);
     const calls = [];
     const install = { digest: plan.digests.digest, declaration_digest: plan.digests.declaration_digest, version: plan.version, status: outcome === "disabled" ? "disabled" : "installed" };
     const server = createServer(async (req, res) => {
@@ -348,8 +342,17 @@ test("CLI update plans report carried or required adoption and refuse old server
       else if (request.params.name === "coordination_write") result = {};
       else {
         calls.push(envelope);
-        if (envelope.operation === "create_record") result = { write_receipt: { id: "new-source", source_event_id: "new-body", body_digest: plan.digests.bundle_sha256 } };
-        else if (envelope.operation === "manage_alpha_tabs.update") {
+        if (envelope.operation === "create_record") {
+          assert.equal(envelope.arguments.name, "Workspace app");
+          assert.equal(envelope.arguments.facets.app_icon, "bad icon");
+          assert.equal(envelope.arguments.facets.app_skin, "skin-id");
+          result = { write_receipt: { id: "new-source", source_event_id: "new-body", body_digest: plan.digests.bundle_sha256 } };
+        } else if (envelope.operation === "get_record") {
+          assert.deepEqual(envelope.arguments.ids, ["old-source"]);
+          result = { records: [{ status: "found", id: "old-source", name: "Workspace app", facets: [
+            { key: "app_icon", value: "bad icon" }, { key: "app_skin", value: "skin-id" },
+          ] }] };
+        } else if (envelope.operation === "manage_alpha_tabs.update") {
           assert.equal(envelope.arguments.expected_install_event_id, "current");
           assert.equal(envelope.arguments.artifact_id, "new-source");
           assert.equal(envelope.arguments.source_revision, "new-body");
@@ -363,7 +366,9 @@ test("CLI update plans report carried or required adoption and refuse old server
             decoy: { update_event_id: "fake", adoption_carried: outcome !== "carried", adoption_required: outcome !== "required" } };
         } else {
           assert.equal(envelope.operation, "manage_alpha_tabs.inspect");
-          result = { install };
+          result = { install: calls.some(c => c.operation === "manage_alpha_tabs.update") ? install : {
+            event_id: "current", artifact_id: "old-source", status: "installed",
+          } };
         }
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -376,7 +381,7 @@ test("CLI update plans report carried or required adoption and refuse old server
         assert.equal(run.error?.code, 1);
         assert.match(run.stderr, /Server predates manage_alpha_tabs.update; use --replace explicitly/);
         assert.match(run.stderr, /Staged source record new-source can be archived/);
-        assert.deepEqual(calls.map(c => c.operation), ["create_record", "manage_alpha_tabs.update"]);
+        assert.deepEqual(calls.map(c => c.operation), ["manage_alpha_tabs.inspect", "get_record", "create_record", "manage_alpha_tabs.inspect", "get_record", "manage_alpha_tabs.update"]);
       } else {
         assert.equal(run.error, null, run.stderr);
         assert.match(run.stdout, /"update_event_id": "updated"/);
@@ -391,10 +396,85 @@ test("CLI update plans report carried or required adoption and refuse old server
         assert.ok(run.stdout.includes(`"idempotent_retry": ${outcome === "retry"}`));
         if (outcome === "retry") assert.ok(!run.stdout.includes("Updated;"));
         assert.equal(run.stdout.includes("(tab is disabled; restore it to launch — restore requires fresh Preview → Adopt)"), outcome === "disabled");
-        assert.deepEqual(calls.map(c => c.operation), ["create_record", "manage_alpha_tabs.update", "manage_alpha_tabs.inspect"]);
+        assert.deepEqual(calls.map(c => c.operation), ["manage_alpha_tabs.inspect", "get_record", "create_record", "manage_alpha_tabs.inspect", "get_record", "manage_alpha_tabs.update", "manage_alpha_tabs.inspect"]);
       }
     } finally {
       await new Promise(done => server.close(done));
     }
   }
+});
+
+test("a direct success makes one call and never touches call_executor", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push({ name: body.params.name, args: body.params.arguments });
+    return reply(200, { jsonrpc: "2.0", id: body.id, result: { structuredContent: { ok: true } } });
+  };
+  const client = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl });
+  assert.deepEqual(await client.call("artifacts_write", "manage_alpha_tabs.install", { package: "p" }), { ok: true });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "artifacts_write");
+});
+
+test("a lean refusal retries once through call_executor with the repaired envelope", async () => {
+  const calls = [];
+  const envelope = { operation: "manage_alpha_tabs.inspect", format: "json", arguments: { package: "p" } };
+  const repaired = { executor: "artifacts_read", ...envelope };
+  const refusal = { repair: { code: "call_executor_required", retry_ready: true, next_call: { tool: "call_executor", arguments: repaired } } };
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push({ name: body.params.name, args: body.params.arguments });
+    if (calls.length === 1) {
+      return reply(200, { jsonrpc: "2.0", id: body.id, result: { isError: true, structuredContent: refusal } });
+    }
+    return reply(200, { jsonrpc: "2.0", id: body.id, result: { structuredContent: { install: true } } });
+  };
+  const client = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl });
+  assert.deepEqual(await client.call("artifacts_read", "manage_alpha_tabs.inspect", { package: "p" }), { install: true });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].name, "artifacts_read");
+  assert.equal(calls[1].name, "call_executor");
+  assert.deepEqual(calls[1].args, repaired);
+});
+
+test("a lean refusal without next_call rebuilds the envelope with its executor", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push({ name: body.params.name, args: body.params.arguments });
+    if (calls.length === 1) {
+      const repair = { repair: { code: "call_executor_required", retry_ready: true } };
+      return reply(200, { jsonrpc: "2.0", id: body.id, result: { isError: true, structuredContent: repair } });
+    }
+    return reply(200, { jsonrpc: "2.0", id: body.id, result: { structuredContent: { ok: 1 } } });
+  };
+  const client = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl });
+  assert.deepEqual(await client.call("records_read", "get_record", { ids: ["r"] }), { ok: 1 });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].name, "call_executor");
+  assert.equal(calls[1].args.executor, "records_read");
+  assert.equal(calls[1].args.operation, "get_record");
+});
+
+test("other tool errors never retry, and a refused retry throws once", async () => {
+  const other = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl: async (url, init) =>
+    reply(200, { jsonrpc: "2.0", id: JSON.parse(init.body).id, result: { isError: true, structuredContent: { repair: { code: "nope" } } } }) });
+  let calls = 0;
+  const counting = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl: async (url, init) => {
+    calls += 1;
+    return reply(200, { jsonrpc: "2.0", id: JSON.parse(init.body).id, result: { isError: true, content: [{ type: "text", text: "digest mismatch" }] } });
+  } });
+  await assert.rejects(counting.call("records_write", "update_record", {}), /digest mismatch/);
+  assert.equal(calls, 1);
+  await assert.rejects(other.call("records_write", "update_record", {}), /records_write\.update_record/);
+  const retried = [];
+  const twiceRefused = createMcpClient({ origin, bearer: "b".repeat(64), fetchImpl: async (url, init) => {
+    const body = JSON.parse(init.body);
+    retried.push(body.params.name);
+    const repair = { repair: { code: "call_executor_required", next_call: { tool: "call_executor", arguments: { executor: body.params.name } } } };
+    return reply(200, { jsonrpc: "2.0", id: body.id, result: { isError: true, structuredContent: repair } });
+  } });
+  await assert.rejects(twiceRefused.call("artifacts_write", "manage_alpha_tabs.install", {}), /call_executor/);
+  assert.deepEqual(retried, ["artifacts_write", "call_executor"]);
 });

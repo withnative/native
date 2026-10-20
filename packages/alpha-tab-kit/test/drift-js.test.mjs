@@ -55,6 +55,26 @@ test("the kit offers exactly the shell's on-request host needs", { skip: !inRepo
   assert.deepEqual(Object.keys(shell.ON_REQUEST_NEEDS), LIMIT_SOURCES.reads.on_request_host_needs.value);
 });
 
+test("the shell relays records.body.current.v1 like any consented on-request need", { skip: !inRepo && "not inside native-ce" }, async () => {
+  const shell = await import(new URL("experiments/demo-shell/public/lib/pendingTabs.js", repo));
+  const entry = (needs) => ({
+    package: "agent.docs", event_id: "install-1", status: "installed", adoption: "shell_adopt.v1", target_resolves: true,
+    launch_binding: { verdict: "refused", reason: "launch_request_required" },
+    consented_declaration: { needs, effects: [] },
+  });
+  const consented = entry(["records.body.current.v1"]);
+  const params = { record_id: "a7710000-0000-4000-8000-000000000033", include_body: false };
+  assert.deepEqual(shell.consentNeedItemsOf(consented), [
+    { kind: "on-request", need: "records.body.current.v1", text: shell.ON_REQUEST_NEEDS["records.body.current.v1"] },
+  ]);
+  assert.match(shell.ON_REQUEST_NEEDS["records.body.current.v1"], /^Read the current text of a record you can see/);
+  assert.deepEqual(shell.onRequestNeedsOf(consented), ["records.body.current.v1"]);
+  assert.deepEqual(shell.declaredReadArgsFor(consented, "records.body.current.v1", params), {
+    action: "live_read", package: "agent.docs", expected_install_event_id: "install-1", need: "records.body.current.v1", params,
+  });
+  assert.equal(shell.declaredReadRefusalFor(entry(["records.search.v1"]), "records.body.current.v1", params), "undeclared_need");
+});
+
 test("the shell relays artifact.render.v1 like any consented on-request need", { skip: !inRepo && "not inside native-ce" }, async () => {
   const shell = await import(new URL("experiments/demo-shell/public/lib/pendingTabs.js", repo));
   const entry = (needs) => ({

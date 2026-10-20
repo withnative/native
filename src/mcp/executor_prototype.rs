@@ -11,7 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
@@ -45,10 +45,17 @@ mod plan_store;
 pub use plan_store::{DeploymentPlanKeyring, HostedPlanCatalogue, HostedPlanKeyProvider};
 #[path = "executor_prototype/hosted_runtime.rs"]
 mod hosted_runtime;
+#[path = "executor_prototype/lean.rs"]
+mod lean;
+pub(crate) use lean::unwrap_envelope;
+#[cfg(test)]
+#[path = "executor_prototype/lean_tests.rs"]
+mod lean_tests;
 #[path = "executor_prototype/telemetry.rs"]
 mod telemetry;
 #[doc(hidden)]
 pub use hosted_runtime::{HostedExecutorAdmission, HostedExecutorRuntime};
+use lean::CallRoute;
 pub use telemetry::{
     ExecutorTelemetryContext, ExecutorTelemetryHealth, ExecutorTelemetrySink,
     StructuredLogTelemetrySink, DEFAULT_RETENTION_DAYS,
@@ -83,6 +90,29 @@ pub struct HostedMembershipPreparation {
 /// to the plan claim.
 #[doc(hidden)]
 pub trait HostedExecutorAuthority: HostedPlanCatalogue + Send + Sync {
+    /// Hold current catalog membership stable across a SQL domain write or
+    /// receipt read. The guard must exclude membership/route changes until
+    /// dropped. It is acquired after plan claim and released before completion
+    /// because those lifecycle operations use the same catalog writer.
+    fn acquire_sql_commit_authority<'a>(
+        &'a self,
+        _caller: &'a Caller,
+    ) -> BoxFuture<'a, Result<sqlx::Transaction<'static, sqlx::Sqlite>>> {
+        Box::pin(async { Err(Error::engine("hosted SQL commit authority is unavailable")) })
+    }
+
+    /// Per-process single-flight permit bounding hosted SQL commits.
+    ///
+    /// A hosted SQL commit (and guarded receipt replay) try-acquires one
+    /// permit before revalidation and holds it until the catalog guard is
+    /// released, so concurrent commits refuse immediately with
+    /// `sql_commit_busy` instead of queueing on the shared cross-tenant
+    /// catalog guard. The default is no limit; the hosted authority returns
+    /// its shared semaphore.
+    fn sql_commit_single_flight(&self) -> Option<std::sync::Arc<tokio::sync::Semaphore>> {
+        None
+    }
+
     fn validate_membership_write(&self, arguments: Value) -> Result<()>;
 
     fn prepare_membership_write<'a>(
@@ -238,6 +268,153 @@ struct OperationContract {
 type OperationContracts = BTreeMap<(String, String), OperationContract>;
 type OperationsByExecutor = BTreeMap<String, Vec<String>>;
 
+/// The node's input contracts come from the same registered ordinary surface
+/// as hosted execution and standby operation digests, without opening a DB.
+#[cfg_attr(test, derive(Default))]
+pub(crate) struct NodeOperationContracts {
+    contracts: OperationContracts,
+}
+
+impl NodeOperationContracts {
+    pub(crate) fn digest(&self, executor: &str, operation: &str) -> Option<&str> {
+        self.contracts
+            .get(&(executor.into(), operation.into()))
+            .map(|contract| contract.digest.as_str())
+    }
+    pub(crate) fn local() -> Result<Arc<Self>> {
+        static LOCAL: OnceLock<Arc<NodeOperationContracts>> = OnceLock::new();
+        if let Some(contracts) = LOCAL.get() {
+            return Ok(contracts.clone());
+        }
+        let mut registry = ToolRegistry::new();
+        super::register_builtin_tools(&mut registry)?;
+        super::register_surface_tools(&mut registry)?;
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::registry::EngineKind::Sqlite,
+            false,
+            &ExperimentalExecutors::empty(),
+        )?;
+        let contracts = Arc::new(Self {
+            contracts: catalogue.contracts,
+        });
+        let _ = LOCAL.set(contracts.clone());
+        Ok(LOCAL.get().expect("local contracts initialized").clone())
+    }
+
+    /// `None` means no authoritative local contract, not successful validation.
+    /// The result is the engine's validation-failure/repair tool-result shape.
+    pub(crate) fn validate(
+        &self,
+        executor: &str,
+        operation: &str,
+        envelope: &Value,
+        modern: bool,
+    ) -> Option<std::result::Result<(), Value>> {
+        let contract = self.contracts.get(&(executor.into(), operation.into()))?;
+        let mut envelope = envelope.clone();
+        if let Some(fields) = envelope.as_object_mut() {
+            fields.remove("executor");
+        }
+        let arguments = envelope
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let diagnostic = match ordinary_envelope_validation(contract, &envelope) {
+            Err(error) => Some(error),
+            Ok(()) => match normalized_executor_arguments(operation, &envelope) {
+                Err(error) => Some(error.to_string()),
+                Ok(_) => {
+                    let errors = operation_schema_errors(contract, &arguments);
+                    (!errors.is_empty())
+                        .then(|| operation_schema_diagnostic(contract, &arguments, &errors))
+                }
+            },
+        };
+        Some(match diagnostic {
+            None => Ok(()),
+            Some(diagnostic) => {
+                let mut result = operation_error_result(
+                    "validation_failure",
+                    &diagnostic,
+                    Some(contract),
+                    &envelope,
+                    Value::Null,
+                    None,
+                );
+                if modern {
+                    protocol::add_modern_result_fields(&mut result);
+                }
+                Err(result)
+            }
+        })
+    }
+}
+
+fn ordinary_envelope_validation(
+    contract: &OperationContract,
+    envelope: &Value,
+) -> std::result::Result<(), String> {
+    validate_envelope_fields(
+        envelope,
+        &["operation", "arguments", "run_key", "parent_key", "format"],
+    )
+    .map_err(|error| error.to_string())?;
+    render::take_format(&contract.source_tool, &mut envelope.clone()).map(|_| ())
+}
+
+fn operation_schema_errors(contract: &OperationContract, arguments: &Value) -> Vec<String> {
+    match jsonschema::validator_for(&contract.input_schema) {
+        Ok(validator) => validator
+            .iter_errors(arguments)
+            .map(|error| schema_error_text(&error))
+            .collect(),
+        Err(error) => vec![format!("invalid authoritative contract: {error}")],
+    }
+}
+
+fn operation_schema_diagnostic(
+    contract: &OperationContract,
+    arguments: &Value,
+    errors: &[String],
+) -> String {
+    crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
+        &contract.operation,
+        arguments,
+    )
+    .map(|error| error.to_string())
+    .or_else(|| query_sql_schema_diagnostic(&contract.operation, arguments))
+    .unwrap_or_else(|| {
+        format!(
+            "arguments do not match the authoritative operation contract: {}",
+            errors.join("; ")
+        )
+    })
+}
+
+fn operation_error_result(
+    error_class: &str,
+    diagnostic: &str,
+    contract: Option<&OperationContract>,
+    envelope: &Value,
+    run_context: Value,
+    hosted_authority: Option<&dyn HostedExecutorAuthority>,
+) -> Value {
+    let error = Error::engine(format!("executor prototype {error_class}: {diagnostic}"));
+    let mut result = protocol::call_error_content(&error, run_context, None);
+    if let Some(contract) = contract {
+        attach_repair_result(
+            &mut result,
+            contract,
+            error_class,
+            Some(diagnostic),
+            envelope,
+            hosted_authority,
+        );
+    }
+    result
+}
+
 struct BuiltContracts {
     contracts: OperationContracts,
     operations_by_executor: OperationsByExecutor,
@@ -250,6 +427,12 @@ pub(crate) struct PinnedExecutorCatalogue {
     manifest_digest: String,
     contracts: OperationContracts,
     operations_by_executor: OperationsByExecutor,
+    /// Direct advertisement, tracked per operation and separately from the
+    /// callable indexes above. `None` is the full executor catalogue, where
+    /// every callable operation is advertised directly; `Some` is the lean
+    /// projection, whose descriptors advertise only these pairs plus
+    /// `call_executor`.
+    direct_operations: Option<OperationsByExecutor>,
 }
 
 impl PinnedExecutorCatalogue {
@@ -278,9 +461,9 @@ impl PinnedExecutorCatalogue {
         operation: Option<&str>,
     ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
         let operation = operation?;
-        let contract = self
-            .contracts
-            .get(&(executor.to_string(), operation.to_string()))?;
+        let canonical = resolve_operation_alias(executor, operation, &self.operations_by_executor)
+            .unwrap_or_else(|| operation.to_string());
+        let contract = self.contracts.get(&(executor.to_string(), canonical))?;
         Some((
             DeploymentReadOnlyOperation::registered(format!(
                 "{}.{}",
@@ -288,6 +471,100 @@ impl PinnedExecutorCatalogue {
             )),
             contract.access,
         ))
+    }
+
+    /// Pre-auth classification for one `tools/call` by tool name and raw
+    /// envelope. On a lean catalogue a `call_executor` envelope is unwrapped
+    /// to its target first, so admission classifies the operation that will
+    /// actually dispatch; anything else classifies exactly as
+    /// [`Self::classify_call`].
+    pub(crate) fn classify_tools_call(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Option<(DeploymentReadOnlyOperation, OperationAccess)> {
+        let (executor, operation) = self.call_target(name, arguments)?;
+        self.classify_call(executor, operation)
+    }
+
+    /// The `(executor, operation)` a `tools/call` addresses. `None` for a
+    /// lean `call_executor` envelope without a usable target, which keeps
+    /// the transport's deferred path and its dispatch-time refusal.
+    pub(crate) fn call_target<'a>(
+        &self,
+        name: &'a str,
+        arguments: Option<&'a Value>,
+    ) -> Option<(&'a str, Option<&'a str>)> {
+        if name == lean::CALL_EXECUTOR && self.direct_operations.is_some() {
+            let arguments = arguments?;
+            let executor = lean::target_executor(arguments).ok()?;
+            let operation = arguments.get("operation").and_then(Value::as_str);
+            return Some((executor, operation));
+        }
+        let operation = arguments
+            .and_then(|arguments| arguments.get("operation"))
+            .and_then(Value::as_str);
+        Some((name, operation))
+    }
+
+    pub(crate) fn is_lean(&self) -> bool {
+        self.direct_operations.is_some()
+    }
+
+    /// Lean only: the `(executor, canonical operation)` of a direct
+    /// `tools/call` to a contracted operation this catalogue does not
+    /// advertise directly. `call_executor`, `bootstrap`, `describe_operation`,
+    /// unknown pairs and advertised operations yield `None`. The operation is
+    /// read where dispatch reads it: the envelope, or a nested copy that
+    /// dispatch would hoist.
+    pub(crate) fn lean_hidden_direct_target(
+        &self,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Option<(String, String)> {
+        let direct = self.direct_operations.as_ref()?;
+        if matches!(
+            name,
+            lean::CALL_EXECUTOR | "bootstrap" | "describe_operation"
+        ) {
+            return None;
+        }
+        let mut envelope = arguments?.clone();
+        hoist_nested_envelope_fields(&mut envelope, &["operation"]).ok()?;
+        let operation = envelope.get("operation")?.as_str()?;
+        let canonical = resolve_operation_alias(name, operation, &self.operations_by_executor)?;
+        self.contracts.get(&(name.to_string(), canonical.clone()))?;
+        (!lean::is_directly_advertised(direct, name, &canonical))
+            .then(|| (name.to_string(), canonical))
+    }
+
+    /// The lean direct-call refusal, rendered from the pinned catalogue alone
+    /// so a transport can return it before deployment admission and before
+    /// authentication, exactly as it returns a frozen-contract refusal. No
+    /// run context exists yet, so none is attached; the diagnostic and
+    /// repair are the ones dispatch renders.
+    pub(crate) fn lean_direct_refusal(
+        &self,
+        id: Value,
+        modern: bool,
+        name: &str,
+        arguments: Option<&Value>,
+    ) -> Option<Value> {
+        let (executor, operation) = self.lean_hidden_direct_target(name, arguments)?;
+        let mut envelope = arguments?.clone();
+        hoist_nested_envelope_fields(&mut envelope, &["operation"]).ok()?;
+        envelope["operation"] = json!(operation);
+        let (diagnostic, repair) = lean::direct_refusal(&executor, &operation, &envelope);
+        let error = Error::engine(format!("executor prototype selection_error: {diagnostic}"));
+        let mut result = protocol::call_error_content(&error, Value::Null, None);
+        if modern {
+            protocol::add_modern_result_fields(&mut result);
+        }
+        result["_meta"]["nativeExecutor"] =
+            production_executor_meta("ordinary", &self.manifest_digest, self.descriptor_bytes);
+        let mut body = json!({"jsonrpc":"2.0","id":id,"result":result});
+        lean::attach_direct_refusal_repair(&mut body, repair);
+        Some(body)
     }
 }
 
@@ -314,9 +591,10 @@ impl PinnedLensExecutorCatalogue {
         executor: &str,
         operation: Option<&str>,
     ) -> Option<OperationAccess> {
-        let contract = self
-            .contracts
-            .get(&(executor.to_owned(), operation?.to_owned()))?;
+        let operation = operation?;
+        let canonical = resolve_operation_alias(executor, operation, &self.operations_by_executor)
+            .unwrap_or_else(|| operation.to_string());
+        let contract = self.contracts.get(&(executor.to_owned(), canonical))?;
         Some(contract.access)
     }
 
@@ -395,7 +673,32 @@ fn build_ordinary_catalogue(
     hosted: bool,
     experimental: &ExperimentalExecutors,
 ) -> Result<PinnedExecutorCatalogue> {
-    let audit: Audit = serde_json::from_str(AUDIT)?;
+    build_ordinary_catalogue_projection(registry, engine_kind, hosted, experimental, false)
+}
+
+/// The ordinary catalogue in its full (`lean == false`) or lean projection.
+fn build_ordinary_catalogue_projection(
+    registry: &ToolRegistry,
+    engine_kind: super::registry::EngineKind,
+    hosted: bool,
+    experimental: &ExperimentalExecutors,
+    lean: bool,
+) -> Result<PinnedExecutorCatalogue> {
+    let mut audit: Audit = serde_json::from_str(AUDIT)?;
+    // The default audit deliberately excludes this configured hosted service.
+    // Like other gated sources, it gets a contract only when registered; keep
+    // its row out of default discovery and generated descriptor budgets.
+    if hosted && registry.get("outbox_status").is_some() {
+        audit.audit_rows.push(AuditRow {
+            legacy_tool: "outbox_status".into(),
+            legacy_action: "call".into(),
+            stability: "stable".into(),
+            availability: vec!["ordinary".into()],
+            candidate_executor: "system_read".into(),
+            candidate_operation: "outbox_status".into(),
+            candidate_plan_policy: "direct".into(),
+        });
+    }
     let BuiltContracts {
         contracts,
         operations_by_executor,
@@ -427,9 +730,28 @@ fn build_ordinary_catalogue(
         )?);
     }
     let mut descriptors = executable_descriptors(source_descriptors, &operations_by_executor)?;
-    add_ordinary_executor_format_contracts(&mut descriptors, &contracts)?;
-    add_operation_field_listings(&mut descriptors, &contracts)?;
+    // The lean projection narrows discovery before post-processing, so the
+    // format conditions and field listings describe exactly the directly
+    // advertised operations. Contracts and the callable index stay whole.
+    let direct_operations = lean.then(|| lean::direct_operations(&operations_by_executor));
+    let described_contracts = match &direct_operations {
+        Some(direct) => {
+            descriptors = lean::project_descriptors(descriptors, direct);
+            lean::direct_contracts(&contracts, direct)
+        }
+        None => contracts.clone(),
+    };
+    add_ordinary_executor_format_contracts(&mut descriptors, &described_contracts)?;
+    add_operation_field_listings(&mut descriptors, &described_contracts)?;
     add_sql_read_catalog_card(&mut descriptors);
+    if let Some(direct) = &direct_operations {
+        descriptors.push(lean::call_executor_descriptor(
+            &operations_by_executor,
+            direct,
+        ));
+    }
+    // Bytes and digest are always computed over the served projection: a
+    // surface switch changes the manifest digest, which prepared plans bind.
     let descriptor_bytes = serde_json::to_vec(&descriptors)?.len();
     let manifest_digest = jcs_sha256(&Value::Array(descriptors.clone()))?;
     Ok(PinnedExecutorCatalogue {
@@ -438,6 +760,7 @@ fn build_ordinary_catalogue(
         manifest_digest,
         contracts,
         operations_by_executor,
+        direct_operations,
     })
 }
 
@@ -456,6 +779,63 @@ pub(crate) fn standby_read_only_descriptors(registry: &ToolRegistry) -> Result<V
         &catalogue.operations_by_executor,
     )?
     .0)
+}
+
+/// The node uses the same advertised read projection and operation digests as
+/// the standby dispatcher; no separate safety catalogue is maintained.
+pub(crate) fn standby_operation_rows(registry: &ToolRegistry) -> Result<Value> {
+    let catalogue = build_ordinary_catalogue(
+        registry,
+        super::registry::EngineKind::Sqlite,
+        false,
+        &ExperimentalExecutors::empty(),
+    )?;
+    let (_, advertised) = standby_read_only_discovery(
+        &catalogue.descriptors,
+        &catalogue.contracts,
+        &catalogue.operations_by_executor,
+    )?;
+    let mut rows = serde_json::to_value(project_catalog_operations_snapshot_with_direct(
+        &catalogue.contracts,
+        &catalogue.operations_by_executor,
+        None,
+    ))?;
+    for row in rows.as_array_mut().expect("catalogue array") {
+        let visible = advertised
+            .get(row["executor"].as_str().unwrap_or(""))
+            .is_some_and(|operations| {
+                operations
+                    .iter()
+                    .any(|operation| row["operation"] == operation.as_str())
+            });
+        let mut source_arguments = serde_json::Map::new();
+        if let (Some(field), Some(value)) = (
+            row["selector_field"].as_str(),
+            row["selector_value"].as_str(),
+        ) {
+            source_arguments.insert(field.into(), Value::String(value.into()));
+        }
+        let accepted = registry
+            .admit_standby_call(
+                row["source_tool"].as_str().unwrap_or(""),
+                &Value::Object(source_arguments),
+            )
+            .is_ok();
+        row["offline_advertised"] = Value::Bool(visible && accepted);
+    }
+    Ok(rows)
+}
+
+tokio::task_local! {
+    /// Internal node composition only; public request metadata cannot set it.
+    static NODE_STANDBY_CATALOGUE: crate::query::principal::CatalogOperationsSnapshot;
+}
+
+pub(crate) async fn with_standby_catalogue<F: std::future::Future>(
+    snapshot: crate::query::principal::CatalogOperationsSnapshot,
+    future: F,
+) -> F::Output {
+    NODE_STANDBY_CATALOGUE.scope(snapshot, future).await
 }
 
 /// The connected standby's database-less and serving discovery share one
@@ -533,6 +913,73 @@ fn standby_read_only_discovery(
         }
     }
     Ok((advertised, advertised_operations))
+}
+
+/// Project this server's effective `catalog_operations` snapshot from its
+/// pinned contracts and advertised operation index. Callers must pass the
+/// server's own `operations_by_executor` (full on writable servers,
+/// read-filtered on standby), so rows match exactly what `describe_operation`
+/// answers here, with the same digests. Deterministic `executor, operation`
+/// order. The snapshot is immutable and request-local; nothing is stored on
+/// `Db` or in globals.
+#[cfg(test)]
+fn project_catalog_operations_snapshot(
+    contracts: &OperationContracts,
+    advertised: &OperationsByExecutor,
+) -> crate::query::principal::CatalogOperationsSnapshot {
+    project_catalog_operations_snapshot_with_direct(contracts, advertised, None)
+}
+
+/// The same projection, marking each row `advertised_directly` against a
+/// lean server's direct index (`None`: every served row is direct).
+fn project_catalog_operations_snapshot_with_direct(
+    contracts: &OperationContracts,
+    advertised: &OperationsByExecutor,
+    direct: Option<&OperationsByExecutor>,
+) -> crate::query::principal::CatalogOperationsSnapshot {
+    use crate::query::principal::CatalogOperationRow;
+    let mut rows = Vec::new();
+    for (executor, operations) in advertised {
+        let mut operations = operations.clone();
+        operations.sort();
+        for operation in operations {
+            let Some(contract) = contracts.get(&(executor.clone(), operation.clone())) else {
+                continue;
+            };
+            let plan_required = write_operations::requires_plan(executor, &operation);
+            rows.push(CatalogOperationRow {
+                executor: contract.executor.clone(),
+                operation: contract.operation.clone(),
+                surface: contract.surface.as_str().to_string(),
+                access: match contract.access {
+                    OperationAccess::Read => "read".to_string(),
+                    OperationAccess::Mutation => "mutation".to_string(),
+                },
+                plan_required,
+                direct_execution_enabled: !plan_required,
+                contract_version: CONTRACT_VERSION.to_string(),
+                contract_digest: contract.digest.clone(),
+                source_tool: contract.source_tool.clone(),
+                selector_field: contract
+                    .selector
+                    .as_ref()
+                    .map(|selector| selector.field.clone()),
+                selector_value: contract
+                    .selector
+                    .as_ref()
+                    .map(|selector| selector.value.clone()),
+                // Every served row is advertised directly except on a lean
+                // server, whose rows keep the full callable set.
+                advertised_directly: direct.is_none_or(|direct| {
+                    lean::is_directly_advertised(direct, executor, &operation)
+                }),
+            });
+        }
+    }
+    rows.sort_by(|left, right| {
+        (&left.executor, &left.operation).cmp(&(&right.executor, &right.operation))
+    });
+    std::sync::Arc::new(rows)
 }
 
 impl OperationContract {
@@ -679,7 +1126,14 @@ impl TraceSink {
             .remove(&Self::repair_key(run_key, executor, operation))
     }
 
-    fn record(&self, event: Value) {
+    fn record(&self, mut event: Value) {
+        // Calls unwrapped from `call_executor` are marked; direct calls keep
+        // their historical event shape exactly.
+        if let (Some(telemetry::TelemetryRoute::CallExecutor), Some(fields)) =
+            (telemetry::current_route(), event.as_object_mut())
+        {
+            fields.insert("route".into(), json!(lean::CALL_EXECUTOR));
+        }
         self.events
             .lock()
             .expect("prototype event lock")
@@ -697,6 +1151,11 @@ impl TraceSink {
     }
 }
 
+/// Internal Rust admission only; no caller-supplied plan object is accepted.
+pub(crate) async fn dispatch_admitted_sql_commit(db: crate::Db, caller: Caller) -> Result<Value> {
+    write_operations::sql_commit::dispatch_admitted(db, caller).await
+}
+
 /// The production executor transport over one normal registry.
 pub struct ExecutorPrototypeStdioServer {
     registry: Arc<ToolRegistry>,
@@ -707,6 +1166,9 @@ pub struct ExecutorPrototypeStdioServer {
     manifest_digest: String,
     contracts: OperationContracts,
     operations_by_executor: OperationsByExecutor,
+    /// Lean direct-advertisement index; `None` on full and standby servers.
+    /// Dispatch, aliases and discovery always use the callable indexes.
+    direct_operations: Option<OperationsByExecutor>,
     trace: Arc<TraceSink>,
     telemetry: Option<telemetry::BoundExecutorTelemetry>,
     /// Coherent absence, not a placeholder: `None` means this server holds
@@ -748,6 +1210,9 @@ struct ExecutorConstruction {
     hosted_authority: Option<Arc<dyn HostedExecutorAuthority>>,
     pinned_catalogue: Option<Arc<PinnedExecutorCatalogue>>,
     experimental: ExperimentalExecutors,
+    /// Build the lean projection when no catalogue is pinned. A pinned
+    /// catalogue carries its own projection.
+    lean: bool,
     telemetry: TelemetryConstruction,
     transport: telemetry::TelemetryTransport,
     deployment_mutation_barrier: Option<DeploymentMutationBarrier>,
@@ -764,11 +1229,45 @@ impl ExecutorPrototypeStdioServer {
         registry: &ToolRegistry,
         experimental: &ExperimentalExecutors,
     ) -> Result<Arc<PinnedExecutorCatalogue>> {
-        Ok(Arc::new(build_ordinary_catalogue(
+        Self::pin_hosted_catalogue_for_surface(
             registry,
+            experimental,
+            super::McpSurfaceMode::Executor,
+        )
+    }
+
+    /// Pin the hosted ordinary catalogue for one executor-serving surface:
+    /// the full catalogue, or its lean projection.
+    pub(crate) fn pin_hosted_catalogue_for_surface(
+        registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
+        surface: super::McpSurfaceMode,
+    ) -> Result<Arc<PinnedExecutorCatalogue>> {
+        Self::pin_hosted_catalogue_for_engine(
+            registry,
+            experimental,
+            surface,
             super::registry::EngineKind::Sqlite,
+        )
+    }
+
+    pub(crate) fn pin_hosted_catalogue_for_engine(
+        registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
+        surface: super::McpSurfaceMode,
+        engine: super::registry::EngineKind,
+    ) -> Result<Arc<PinnedExecutorCatalogue>> {
+        if !surface.serves_executors() {
+            return Err(Error::engine(format!(
+                "the {surface} MCP surface has no executor catalogue"
+            )));
+        }
+        Ok(Arc::new(build_ordinary_catalogue_projection(
+            registry,
+            engine,
             true,
             experimental,
+            surface.is_lean(),
         )?))
     }
 
@@ -799,6 +1298,7 @@ impl ExecutorPrototypeStdioServer {
                 hosted_authority: None,
                 pinned_catalogue: None,
                 experimental: ExperimentalExecutors::empty(),
+                lean: false,
                 telemetry: TelemetryConstruction::Disabled,
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
@@ -857,7 +1357,59 @@ impl ExecutorPrototypeStdioServer {
                 hosted_authority: None,
                 pinned_catalogue: None,
                 experimental,
+                lean: false,
                 telemetry: TelemetryConstruction::Local(telemetry),
+                transport: telemetry::TelemetryTransport::Stdio,
+                deployment_mutation_barrier,
+            },
+        )
+        .await
+    }
+
+    /// Build the local executor for one executor-serving surface, with the
+    /// privacy-safe dogfood sink when `telemetry` is supplied. `Executor`
+    /// is exactly [`Self::new_with_telemetry_and_experimental`] (or
+    /// [`Self::new`] without telemetry, plus the allowlist); `Lean` serves
+    /// the lean projection over the same contracts and dispatch.
+    pub async fn new_for_surface(
+        registry: Arc<ToolRegistry>,
+        engine: impl Into<EngineHandle>,
+        caller: Caller,
+        trace_path: Option<&Path>,
+        telemetry: Option<Arc<ExecutorTelemetryContext>>,
+        experimental: ExperimentalExecutors,
+        surface: super::McpSurfaceMode,
+    ) -> Result<Self> {
+        if !surface.serves_executors() {
+            return Err(Error::engine(format!(
+                "the {surface} MCP surface is not an executor surface"
+            )));
+        }
+        let engine = engine.into();
+        let plan_store = match &engine {
+            EngineHandle::Sqlite(db) => plan_store::PlanStore::open_for_database(db.path()).await?,
+            #[allow(unreachable_patterns)]
+            _ => {
+                return Err(Error::engine(
+                    "executor write plans require a qualified shared durable store; this backend is disabled",
+                ))
+            }
+        };
+        let deployment_mutation_barrier = registry.deployment_mutation_barrier().cloned();
+        Self::new_with_plan_store(
+            registry,
+            engine,
+            caller,
+            trace_path,
+            ExecutorConstruction {
+                plan_store: Some(plan_store),
+                hosted_authority: None,
+                pinned_catalogue: None,
+                experimental,
+                lean: surface.is_lean(),
+                telemetry: telemetry
+                    .map(TelemetryConstruction::Local)
+                    .unwrap_or(TelemetryConstruction::Disabled),
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
             },
@@ -907,6 +1459,7 @@ impl ExecutorPrototypeStdioServer {
                 hosted_authority: None,
                 pinned_catalogue: None,
                 experimental: ExperimentalExecutors::empty(),
+                lean: false,
                 telemetry: TelemetryConstruction::Disabled,
                 transport: telemetry::TelemetryTransport::Stdio,
                 deployment_mutation_barrier,
@@ -959,9 +1512,23 @@ impl ExecutorPrototypeStdioServer {
         keys: Arc<dyn HostedPlanKeyProvider>,
         telemetry: Option<Arc<ExecutorTelemetryContext>>,
     ) -> Result<Self> {
-        let catalogue = Self::pin_hosted_catalogue(&registry)?;
+        let engine = engine.into();
+        let catalogue = if engine.kind() == super::registry::EngineKind::Sqlite {
+            Self::pin_hosted_catalogue(&registry)?
+        } else {
+            Self::pin_hosted_catalogue_for_engine(
+                &registry,
+                &ExperimentalExecutors::empty(),
+                super::McpSurfaceMode::Executor,
+                engine.kind(),
+            )?
+        };
         let telemetry = telemetry.map(|context| {
-            context.bind_hosted_manifest(&catalogue.manifest_digest, catalogue.descriptor_bytes)
+            context.bind_hosted_manifest_for_surface(
+                telemetry::TelemetrySurface::for_ordinary_catalogue(catalogue.is_lean()),
+                &catalogue.manifest_digest,
+                catalogue.descriptor_bytes,
+            )
         });
         Self::new_hosted_with_pinned_catalogue(
             registry,
@@ -999,11 +1566,13 @@ impl ExecutorPrototypeStdioServer {
         }
         let plan_store = plan_store::PlanStore::open_for_catalogue_with_ready_keys(
             HostedAuthorityCatalogue(Arc::clone(&authority)),
-            database_id,
+            database_id.clone(),
             keys,
         )
         .await?;
-        let deployment_mutation_barrier = registry.deployment_mutation_barrier().cloned();
+        let deployment_mutation_barrier = registry
+            .deployment_mutation_barrier()
+            .map(|barrier| barrier.for_database(&database_id));
         Self::new_with_plan_store(
             registry,
             engine,
@@ -1014,6 +1583,7 @@ impl ExecutorPrototypeStdioServer {
                 hosted_authority: Some(authority),
                 pinned_catalogue: Some(catalogue),
                 experimental: ExperimentalExecutors::empty(),
+                lean: false,
                 telemetry: telemetry
                     .map(TelemetryConstruction::Hosted)
                     .unwrap_or(TelemetryConstruction::Disabled),
@@ -1036,6 +1606,7 @@ impl ExecutorPrototypeStdioServer {
             hosted_authority,
             pinned_catalogue,
             experimental,
+            lean,
             telemetry: telemetry_construction,
             transport,
             deployment_mutation_barrier,
@@ -1043,13 +1614,21 @@ impl ExecutorPrototypeStdioServer {
         let started = Instant::now();
         let catalogue = match pinned_catalogue {
             Some(catalogue) => catalogue,
-            None => Arc::new(build_ordinary_catalogue(
+            None => Arc::new(build_ordinary_catalogue_projection(
                 &registry,
                 engine.kind(),
                 hosted_authority.is_some(),
                 &experimental,
+                lean,
             )?),
         };
+        // The standby projection is unchanged by the lean surface: it is
+        // built from the full catalogue and never advertises call_executor.
+        if plan_store.is_none() && catalogue.is_lean() {
+            return Err(Error::engine(
+                "the lean MCP surface requires a writable executor; standby keeps its read-only projection",
+            ));
+        }
         // Local stdio construction is a process-start boundary. Hosted
         // construction is per request and must remain observational; hosted
         // catalogue maintenance is performed once by HostedExecutorRuntime.
@@ -1082,6 +1661,12 @@ impl ExecutorPrototypeStdioServer {
                     telemetry::TelemetryEngine::Hosted
                 } else {
                     match engine.kind() {
+                        #[cfg(feature = "v2-kernel-probe")]
+                        super::registry::EngineKind::KernelV2 => {
+                            return Err(Error::engine(
+                                "kernel-v2: use the probe stdio read surface",
+                            ))
+                        }
                         super::registry::EngineKind::Sqlite => telemetry::TelemetryEngine::Sqlite,
                         #[cfg(feature = "postgres")]
                         super::registry::EngineKind::Postgres => {
@@ -1093,7 +1678,8 @@ impl ExecutorPrototypeStdioServer {
                         }
                     }
                 };
-                Some(context.bind(
+                Some(context.bind_for_surface(
+                    telemetry::TelemetrySurface::for_ordinary_catalogue(catalogue.is_lean()),
                     &raw_session_binding,
                     &catalogue.manifest_digest,
                     crate::FULL_GIT_SHA,
@@ -1139,6 +1725,7 @@ impl ExecutorPrototypeStdioServer {
             manifest_digest,
             contracts: catalogue.contracts.clone(),
             operations_by_executor,
+            direct_operations: catalogue.direct_operations.clone(),
             trace: Arc::new(TraceSink::new(trace_path)?),
             telemetry,
             write_runtime: plan_store.map(write_operations::WriteRuntime::new),
@@ -1147,6 +1734,61 @@ impl ExecutorPrototypeStdioServer {
             deployment_mutation_barrier,
             persistence_lease: None,
         })
+    }
+
+    /// Explicit runtime consent for qualified SQLite SQL commit plans. The
+    /// experimental executor allowlist alone never enables commits.
+    pub fn with_local_sql_commit(mut self) -> Result<Self> {
+        if !self
+            .write_runtime
+            .as_ref()
+            .is_some_and(|r| r.store_is_local())
+            || self.hosted_authority.is_some()
+            || self.hosted_membership_plans
+            || self.registry.is_standby_read_only()
+            || self.caller.is_member_copy()
+            || !matches!(&self.engine, EngineHandle::Sqlite(db) if !db.is_enrolled() && db.open_mode() == crate::db::DatabaseOpenMode::ReadWrite)
+        {
+            return Err(Error::engine(
+                "SQL commit requires a writable local, unenrolled SQLite workspace",
+            ));
+        }
+        self.write_runtime
+            .as_mut()
+            .ok_or_else(|| Error::engine("SQL commit requires local write plans"))?
+            .sql_commit_enabled = true;
+        Ok(self)
+    }
+
+    pub(super) fn with_hosted_sql_commit(mut self) -> Result<Self> {
+        if self.hosted_authority.is_none()
+            || !self.hosted_membership_plans
+            || self
+                .write_runtime
+                .as_ref()
+                .is_none_or(|r| r.store_is_local())
+        {
+            return Err(Error::engine("SQL commit requires hosted plan authority"));
+        }
+        self.write_runtime
+            .as_mut()
+            .expect("hosted write runtime")
+            .sql_commit_enabled = true;
+        Ok(self)
+    }
+
+    fn require_sql_commit(&self) -> Result<()> {
+        if !self.write_runtime.as_ref().is_some_and(|r| {
+            r.sql_commit_enabled && (r.store_is_local() == self.hosted_authority.is_none())
+        }) || self.registry.is_standby_read_only()
+            || self.caller.is_member_copy()
+            || !matches!(&self.engine, EngineHandle::Sqlite(db) if !db.is_enrolled() && db.open_mode() == crate::db::DatabaseOpenMode::ReadWrite)
+        {
+            return Err(Error::engine(
+                "SQL commit is unavailable; explicit writable SQLite runtime consent is required",
+            ));
+        }
+        Ok(())
     }
 
     pub fn manifest_digest(&self) -> &str {
@@ -1210,7 +1852,13 @@ impl ExecutorPrototypeStdioServer {
         if let (Some(lease), Some(barrier)) =
             (&self.persistence_lease, &self.deployment_mutation_barrier)
         {
-            return barrier.reuse(lease).map(Some);
+            let operation = DeploymentReadOnlyOperation::registered(format!(
+                "{}.{}",
+                contract.executor, contract.operation
+            ));
+            return barrier
+                .reuse_for_operation(lease, &operation, contract.access)
+                .map(Some);
         }
         self.admit_deployment_operation(contract)
     }
@@ -1293,7 +1941,112 @@ impl ExecutorPrototypeStdioServer {
         }
     }
 
-    pub async fn handle_message(&self, mut message: Value) -> Option<Value> {
+    pub async fn handle_message(&self, message: Value) -> Option<Value> {
+        // Dispatch carries read, write and repair branches. Keep that state off
+        // transport callers' stacks, including repeated calls in one task.
+        let (method, name) = protocol::method_and_name(&message);
+        if method != Some("tools/call") {
+            return Box::pin(self.handle_message_inner(message, CallRoute::Direct, None)).await;
+        }
+        let routed = self.direct_operations.is_some() && name == Some(lean::CALL_EXECUTOR);
+        let scope = telemetry::RequestScope {
+            route: routed.then_some(telemetry::TelemetryRoute::CallExecutor),
+            run_key: telemetry_run_key(&message),
+            account: Some(self.caller.actor().to_string()),
+        };
+        if routed {
+            return telemetry::scope_request(scope, Box::pin(self.handle_call_executor(message)))
+                .await;
+        }
+        telemetry::scope_request(
+            scope,
+            Box::pin(self.handle_message_inner(message, CallRoute::Direct, None)),
+        )
+        .await
+    }
+
+    /// Unwrap one lean `call_executor` request into the exact message a
+    /// direct call to its target executor would be, then enter the one
+    /// governed dispatch path. Nothing here looks up, validates, authorizes,
+    /// admits, prepares or captures: the target executor, operation and
+    /// every remaining envelope field are judged by `handle_message_inner`
+    /// exactly as for a direct call.
+    async fn handle_call_executor(&self, mut message: Value) -> Option<Value> {
+        let modern = protocol::is_modern_request(&message);
+        let id = protocol::request_id(&message);
+        if id.is_null() {
+            return None;
+        }
+        let Some(params) = message.get("params").and_then(Value::as_object) else {
+            return Some(protocol::error_response(
+                id,
+                protocol::INVALID_PARAMS,
+                "invalid params: tools/call params must be an object",
+            ));
+        };
+        let arguments = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let (executor, envelope) = match lean::unwrap_envelope(&arguments) {
+            Ok(target) => target,
+            Err(diagnostic) => {
+                return Some(
+                    self.fixture_error_response(
+                        id,
+                        modern,
+                        lean::CALL_EXECUTOR,
+                        "",
+                        &diagnostic,
+                        None,
+                        &arguments,
+                        "selection_error",
+                        None,
+                        true,
+                    )
+                    .await,
+                );
+            }
+        };
+        let params = message
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .expect("params were checked to be an object");
+        params.insert("name".into(), Value::String(executor));
+        params.insert("arguments".into(), envelope);
+        self.handle_message_inner(message, CallRoute::CallExecutor, None)
+            .await
+    }
+
+    /// Node composition supplies an outage caller for this bootstrap only.
+    /// Request fields cannot opt into this mode; all validation and rendering
+    /// still use the ordinary executor bootstrap path.
+    pub(crate) async fn handle_bootstrap_with_caller(
+        &self,
+        message: Value,
+        caller: Caller,
+    ) -> Option<Value> {
+        if protocol::method_and_name(&message) != (Some("tools/call"), Some("bootstrap")) {
+            return self.handle_message(message).await;
+        }
+        let scope = telemetry::RequestScope {
+            route: None,
+            run_key: telemetry_run_key(&message),
+            account: Some(caller.actor().to_string()),
+        };
+        telemetry::scope_request(
+            scope,
+            Box::pin(self.handle_message_inner(message, CallRoute::Direct, Some(caller))),
+        )
+        .await
+    }
+
+    async fn handle_message_inner(
+        &self,
+        mut message: Value,
+        route: CallRoute,
+        bootstrap_caller: Option<Caller>,
+    ) -> Option<Value> {
         let modern = protocol::is_modern_request(&message);
         let (method, name) = protocol::method_and_name(&message);
         if method == Some("initialize") {
@@ -1385,7 +2138,12 @@ impl ExecutorPrototypeStdioServer {
             };
             let request_id = self.trace.next_request_id();
             let started = Instant::now();
-            let outcome = self.delegate(message).await;
+            let outcome = self
+                .delegate_with_caller(
+                    message,
+                    bootstrap_caller.unwrap_or_else(|| self.caller.clone()),
+                )
+                .await;
             let mut body = outcome_body(outcome)?;
             rewrite_executor_bootstrap(
                 &mut body,
@@ -1393,6 +2151,7 @@ impl ExecutorPrototypeStdioServer {
                 self.executor_surface(),
                 self.descriptors.len(),
                 self.descriptor_bytes,
+                self.lean_exposure(),
             );
             let success = response_succeeded(&body);
             add_executor_meta(&mut body, self.executor_meta());
@@ -1432,9 +2191,10 @@ impl ExecutorPrototypeStdioServer {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let contract = conflicted.as_ref().and_then(|operation| {
-                self.contracts
-                    .get(&(executor.clone(), operation.clone()))
-                    .cloned()
+                let canonical =
+                    resolve_operation_alias(&executor, operation, &self.operations_by_executor)
+                        .unwrap_or_else(|| operation.clone());
+                self.contracts.get(&(executor.clone(), canonical)).cloned()
             });
             return Some(
                 self.fixture_error_response(
@@ -1469,7 +2229,26 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         };
-        let operation = operation.to_string();
+        let mut operation = operation.to_string();
+        if let Some(canonical) =
+            resolve_operation_alias(&executor, &operation, &self.operations_by_executor)
+        {
+            if canonical != operation {
+                operation = canonical.clone();
+                if let Some(envelope) = arguments.as_object_mut() {
+                    envelope.insert("operation".into(), serde_json::Value::String(canonical));
+                }
+            }
+        }
+        let lean_unknown = match (&self.direct_operations, route) {
+            (Some(direct), CallRoute::Direct) => lean::unknown_direct_operation_diagnostic(
+                &executor,
+                &operation,
+                &self.operations_by_executor,
+                direct,
+            ),
+            _ => None,
+        };
         let Some(contract) = self
             .contracts
             .get(&(executor.clone(), operation.clone()))
@@ -1480,7 +2259,9 @@ impl ExecutorPrototypeStdioServer {
                 .get(&executor)
                 .cloned()
                 .unwrap_or_default();
-            let diagnostic = if expected.is_empty() {
+            let diagnostic = if let Some(diagnostic) = lean_unknown {
+                diagnostic
+            } else if expected.is_empty() {
                 format!("unknown executor '{executor}'")
             } else {
                 format!(
@@ -1504,6 +2285,19 @@ impl ExecutorPrototypeStdioServer {
                 .await,
             );
         };
+        // Lean advertises per operation. A direct call to a contracted
+        // operation this server does not advertise directly (a cached full
+        // schema, or a guessed tool) is refused before any validation,
+        // admission, plan or dispatch, with a repair naming the equivalent
+        // call_executor call. The contract itself is unchanged and reachable.
+        if let (Some(direct), CallRoute::Direct) = (&self.direct_operations, route) {
+            if !lean::is_directly_advertised(direct, &executor, &operation) {
+                return Some(
+                    self.lean_direct_refusal(id, modern, &executor, &operation, &arguments)
+                        .await,
+                );
+            }
+        }
         // Hoist `arguments.run_key`/`arguments.parent_key` to the envelope
         // before any run-keyed bookkeeping, so a hoisted key attaches exactly
         // as an envelope key would. Conflicts and non-strings reject here
@@ -1588,32 +2382,7 @@ impl ExecutorPrototypeStdioServer {
         // unknown top-level properties, and a field still nested under
         // `arguments` would otherwise be misread as an unknown operation
         // argument by schema validation.
-        if let Err(error) = validate_envelope_fields(
-            &arguments,
-            &["operation", "arguments", "run_key", "parent_key", "format"],
-        ) {
-            return Some(
-                self.fixture_error_response(
-                    id,
-                    modern,
-                    &executor,
-                    &operation,
-                    &error.to_string(),
-                    Some(&contract),
-                    &arguments,
-                    "validation_failure",
-                    Some(false),
-                    true,
-                )
-                .await,
-            );
-        }
-        // The selector is part of the callable input contract. Validate it
-        // before dispatch so its rejection cannot become a state/auth failure.
-        // Plan-backed operations returned above; fixed-format surfaces have
-        // their own handler and never enter this ordinary direct path.
-        let mut format_arguments = arguments.clone();
-        if let Err(error) = render::take_format(&contract.source_tool, &mut format_arguments) {
+        if let Err(error) = ordinary_envelope_validation(&contract, &arguments) {
             return Some(
                 self.fixture_error_response(
                     id,
@@ -1654,27 +2423,11 @@ impl ExecutorPrototypeStdioServer {
                 )
             }
         };
-        let schema_errors = match jsonschema::validator_for(&contract.input_schema) {
-            Ok(validator) => validator
-                .iter_errors(&operation_arguments)
-                .map(|error| schema_error_text(&error))
-                .collect::<Vec<_>>(),
-            Err(error) => vec![format!("invalid authoritative contract: {error}")],
-        };
+        let schema_errors = operation_schema_errors(&contract, &operation_arguments);
         let schema_valid = schema_errors.is_empty();
         if !schema_valid {
-            let diagnostic = crate::mcp::record_ref::invalid_operation_record_selector_diagnostic(
-                &operation,
-                &operation_arguments,
-            )
-            .map(|error| error.to_string())
-            .or_else(|| query_sql_schema_diagnostic(&operation, &operation_arguments))
-            .unwrap_or_else(|| {
-                format!(
-                    "arguments do not match the authoritative operation contract: {}",
-                    schema_errors.join("; ")
-                )
-            });
+            let diagnostic =
+                operation_schema_diagnostic(&contract, &operation_arguments, &schema_errors);
             return Some(
                 self.fixture_error_response(
                     id,
@@ -1824,10 +2577,33 @@ impl ExecutorPrototypeStdioServer {
             params.insert("name".into(), Value::String(contract.source_tool.clone()));
             params.insert("arguments".into(), legacy_arguments);
         }
+        // Ad-hoc `query_sql` carries this server's effective catalogue as a
+        // trusted request-local snapshot, projected from the same contracts
+        // and advertised index `describe_operation` answers. Every other
+        // operation delegates with the bare caller, so saved SQL, alpha-tab
+        // and direct API executions keep `None` and refuse the relation.
+        let delegate_caller = if contract.source_tool == "query_sql" {
+            let snapshot = if self.registry.is_standby_read_only() {
+                NODE_STANDBY_CATALOGUE.try_with(Clone::clone).ok()
+            } else {
+                None
+            };
+            self.caller
+                .clone()
+                .with_catalog_operations_snapshot(snapshot.unwrap_or_else(|| {
+                    project_catalog_operations_snapshot_with_direct(
+                        &self.contracts,
+                        &self.operations_by_executor,
+                        self.direct_operations.as_ref(),
+                    )
+                }))
+        } else {
+            self.caller.clone()
+        };
         let outcome = self
             .delegate_with_caller_and_persistence(
                 message,
-                self.caller.clone(),
+                delegate_caller,
                 deployment_persistence_lease,
             )
             .await;
@@ -1981,6 +2757,10 @@ impl ExecutorPrototypeStdioServer {
         caller: Caller,
         persistence_lease: Option<DeploymentPersistenceLease>,
     ) -> RpcOutcome {
+        // This facade observes MCP regardless of how the principal was
+        // authenticated. Preserve that principal while stamping the transport
+        // before the governed first-call identity capture.
+        let caller = caller.with_channel(crate::provenance::Channel::Mcp);
         if protocol::is_modern_request(&message) {
             Box::pin(protocol::handle_modern_engine_message_with_persistence(
                 self.registry.clone(),
@@ -2049,10 +2829,17 @@ impl ExecutorPrototypeStdioServer {
             .get("executor")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let operation = arguments
+        let mut operation = arguments
             .get("operation")
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
+        if let Some(canonical) =
+            resolve_operation_alias(executor, &operation, &self.operations_by_executor)
+        {
+            operation = canonical;
+        }
+        let operation = operation.as_str();
         // Standby servers advertise reads only. Withheld mutation and
         // plan-backed contracts stay in the full map so dispatch refuses
         // them with the stable read-only error, but describe follows the
@@ -2172,7 +2959,37 @@ impl ExecutorPrototypeStdioServer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn fixture_error_response(
+    fn fixture_error_response<'a>(
+        &'a self,
+        id: Value,
+        modern: bool,
+        executor: &'a str,
+        operation: &'a str,
+        diagnostic: &'a str,
+        contract: Option<&'a OperationContract>,
+        arguments: &'a Value,
+        error_class: &'a str,
+        schema_valid: Option<bool>,
+        emit_telemetry: bool,
+    ) -> impl std::future::Future<Output = Value> + 'a {
+        // This response is awaited in many validation branches. Keep its
+        // run-context future out of the dispatch state, even on successful calls.
+        Box::pin(self.fixture_error_response_inner(
+            id,
+            modern,
+            executor,
+            operation,
+            diagnostic,
+            contract,
+            arguments,
+            error_class,
+            schema_valid,
+            emit_telemetry,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fixture_error_response_inner(
         &self,
         id: Value,
         modern: bool,
@@ -2192,18 +3009,14 @@ impl ExecutorPrototypeStdioServer {
             .registry
             .run_context_for_engine(&self.engine, self.caller.clone(), arguments)
             .await;
-        let error = Error::engine(format!("executor prototype {error_class}: {diagnostic}"));
-        let mut result = protocol::call_error_content(&error, run_context, None);
-        if let Some(contract) = contract {
-            attach_repair_result(
-                &mut result,
-                contract,
-                error_class,
-                Some(diagnostic),
-                arguments,
-                self.hosted_authority.as_deref(),
-            );
-        }
+        let mut result = operation_error_result(
+            error_class,
+            diagnostic,
+            contract,
+            arguments,
+            run_context,
+            self.hosted_authority.as_deref(),
+        );
         if modern {
             protocol::add_modern_result_fields(&mut result);
         }
@@ -2335,6 +3148,44 @@ impl ExecutorPrototypeStdioServer {
         body
     }
 
+    /// Lean fields for bootstrap's exposure summary; `None` off lean.
+    fn lean_exposure(&self) -> Option<Value> {
+        self.direct_operations.as_ref().map(|direct| {
+            lean::exposure_summary(&self.operations_by_executor, direct, &self.descriptors)
+        })
+    }
+
+    /// Refuse a direct call to an operation this lean server does not
+    /// advertise directly. Rendered through the ordinary selection-error
+    /// response (run context, telemetry, trace), plus a structured repair
+    /// naming the equivalent `call_executor` call.
+    async fn lean_direct_refusal(
+        &self,
+        id: Value,
+        modern: bool,
+        executor: &str,
+        operation: &str,
+        envelope: &Value,
+    ) -> Value {
+        let (diagnostic, repair) = lean::direct_refusal(executor, operation, envelope);
+        let mut body = self
+            .fixture_error_response(
+                id,
+                modern,
+                executor,
+                operation,
+                &diagnostic,
+                None,
+                envelope,
+                "selection_error",
+                None,
+                true,
+            )
+            .await;
+        lean::attach_direct_refusal_repair(&mut body, repair);
+        body
+    }
+
     fn executor_surface(&self) -> &'static str {
         if self.write_runtime.is_none() {
             "standby-read-only"
@@ -2433,7 +3284,11 @@ impl ExecutorPrototypeLensServer {
         })
     }
 
-    pub(crate) async fn handle_message(&self, mut message: Value) -> Option<Value> {
+    pub(crate) async fn handle_message(&self, message: Value) -> Option<Value> {
+        Box::pin(self.handle_message_inner(message)).await
+    }
+
+    async fn handle_message_inner(&self, mut message: Value) -> Option<Value> {
         let modern = protocol::is_modern_request(&message);
         let (method, name) = protocol::method_and_name(&message);
         if method == Some("initialize") {
@@ -2511,6 +3366,7 @@ impl ExecutorPrototypeLensServer {
                 "lens",
                 self.descriptors.len(),
                 self.descriptor_bytes,
+                None,
             );
             add_executor_meta(&mut body, self.executor_meta());
             return Some(body);
@@ -2532,7 +3388,17 @@ impl ExecutorPrototypeLensServer {
                 .await,
             );
         };
-        let operation = operation.to_string();
+        let mut operation = operation.to_string();
+        if let Some(canonical) =
+            resolve_operation_alias(&executor, &operation, &self.operations_by_executor)
+        {
+            if canonical != operation {
+                operation = canonical.clone();
+                if let Some(envelope) = arguments.as_object_mut() {
+                    envelope.insert("operation".into(), serde_json::Value::String(canonical));
+                }
+            }
+        }
         let Some(contract) = self
             .contracts
             .get(&(executor.clone(), operation.clone()))
@@ -2640,13 +3506,7 @@ impl ExecutorPrototypeLensServer {
                 );
             }
         };
-        let schema_errors = match jsonschema::validator_for(&contract.input_schema) {
-            Ok(validator) => validator
-                .iter_errors(&operation_arguments)
-                .map(|error| schema_error_text(&error))
-                .collect::<Vec<_>>(),
-            Err(error) => vec![format!("invalid authoritative contract: {error}")],
-        };
+        let schema_errors = operation_schema_errors(&contract, &operation_arguments);
         if !schema_errors.is_empty() {
             self.emit_validation_failure(
                 telemetry_request.as_ref(),
@@ -2873,10 +3733,20 @@ impl ExecutorPrototypeLensServer {
             .get("executor")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let operation = arguments
+        // Tolerant compatibility only: aliases resolve to the canonical
+        // contract but are never advertised in tools/list. Canonical rule:
+        // bare when legacy_action == "call", else legacy_tool.action.
+        let mut operation = arguments
             .get("operation")
             .and_then(Value::as_str)
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
+        if let Some(canonical) =
+            resolve_operation_alias(executor, &operation, &self.operations_by_executor)
+        {
+            operation = canonical;
+        }
+        let operation = operation.as_str();
         let Some(contract) = self
             .contracts
             .get(&(executor.to_string(), operation.to_string()))
@@ -3013,6 +3883,28 @@ fn build_contracts(
     )
 }
 
+/// The engine's own input schema for one ordinary-surface operation on the
+/// SQLite engine, for tests elsewhere that pin a property of a contract (the
+/// node's list of holdable writes must all accept `idempotency_key`).
+#[cfg(test)]
+pub(crate) fn ordinary_input_schema_for_tests(executor: &str, operation: &str) -> Option<Value> {
+    let mut registry = ToolRegistry::new();
+    super::register_builtin_tools(&mut registry).unwrap();
+    super::register_surface_tools(&mut registry).unwrap();
+    let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+    let built = build_contracts(
+        &registry,
+        super::registry::EngineKind::Sqlite,
+        &audit.audit_rows,
+        ExecutorSurface::Ordinary,
+    )
+    .unwrap();
+    built
+        .contracts
+        .get(&(executor.into(), operation.into()))
+        .map(|contract| contract.input_schema.clone())
+}
+
 fn build_contracts_for_hosting(
     registry: &ToolRegistry,
     engine_kind: super::registry::EngineKind,
@@ -3042,7 +3934,7 @@ fn build_contracts_for_hosting(
         // runtime concern; a broken compatibility mapping is always a build
         // error.
         let contract = operation_contract(
-            &source.input_schema,
+            source.input_schema_for_engine(engine_kind),
             &source.description,
             row,
             surface,
@@ -3315,6 +4207,44 @@ fn operation_has_execution_path_for_hosting(
         }
         ExecutorSurface::Lens => !write_operations::requires_plan(executor, operation),
     }
+}
+
+/// Resolve a caller-supplied operation to its canonical audited name.
+///
+/// Canonical names are unchanged: bare when the legacy tool has one action
+/// (`get_record`), `legacy_tool.action` otherwise (`workspace_read.list`,
+/// `manage_links.list`). Two compatibility aliases are accepted without
+/// weakening validation:
+/// - `"<executor>.<bare>"` strips to `"<bare>"` when the remainder is
+///   canonical (e.g. `records_read.get_record` → `get_record`);
+/// - bare `"<action>"` expands to `"<executor>.<action>"` when that exact
+///   value is canonical (e.g. `list` on `workspace_read` →
+///   `workspace_read.list`).
+///
+/// Anything else (including an ambiguous bare `list` on an executor with
+/// several `.list` operations) returns `None` so the caller keeps the
+/// existing unknown-operation repair.
+fn resolve_operation_alias(
+    executor: &str,
+    operation: &str,
+    operations_by_executor: &OperationsByExecutor,
+) -> Option<String> {
+    let operations = operations_by_executor.get(executor)?;
+    if operations.iter().any(|canonical| canonical == operation) {
+        return Some(operation.to_string());
+    }
+    if let Some(suffix) = operation.strip_prefix(&format!("{executor}.")) {
+        if operations.iter().any(|canonical| canonical == suffix) {
+            return Some(suffix.to_string());
+        }
+    }
+    if !operation.contains('.') {
+        let prefixed = format!("{executor}.{operation}");
+        if operations.iter().any(|canonical| canonical == &prefixed) {
+            return Some(prefixed);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3919,7 +4849,7 @@ fn project_operation_schema(
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_else(|| std::slice::from_ref(schema));
-            candidates
+            let mut selected = candidates
                 .iter()
                 .find(|candidate| {
                     candidate
@@ -3943,7 +4873,52 @@ fn project_operation_schema(
                         "candidate selector {}={} is absent from source schema",
                         selector.field, selector.value
                     ))
-                })?
+                })?;
+            // A selected branch still has to satisfy the common constraints
+            // alongside oneOf (properties, required and closed-object gates).
+            // Keeping their conjunction also preserves branch refinements of
+            // the same property without overwriting either schema.
+            if schema.get("oneOf").is_some() {
+                let mut common = schema.clone();
+                common.as_object_mut().unwrap().remove("oneOf");
+                strip_routing_fields(&mut common, Some(&selector.field), surface);
+                // Under a closed common object, an individually forbidden
+                // branch property is equivalently forbidden by removing it from
+                // both parts. This keeps accepted-name listings honest.
+                if common.get("additionalProperties") == Some(&json!(false)) {
+                    let forbidden = individually_forbidden_properties(&selected);
+                    for name in forbidden {
+                        for part in [&mut common, &mut selected] {
+                            if let Some(properties) =
+                                part.get_mut("properties").and_then(Value::as_object_mut)
+                            {
+                                properties.remove(&name);
+                            }
+                        }
+                    }
+                }
+                let has_common_constraints =
+                    common
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .any(|(key, value)| match key.as_str() {
+                            "properties" => {
+                                value.as_object().is_some_and(|fields| !fields.is_empty())
+                            }
+                            "required" => value.as_array().is_some_and(|fields| !fields.is_empty()),
+                            "type" => selected.get("type") != Some(value),
+                            "description" | "title" | "$schema" => false,
+                            _ => true,
+                        });
+                if has_common_constraints {
+                    json!({"allOf": [common, selected]})
+                } else {
+                    selected
+                }
+            } else {
+                selected
+            }
         }
     };
     strip_routing_fields(
@@ -3952,6 +4927,42 @@ fn project_operation_schema(
         surface,
     );
     Ok(projected)
+}
+
+/// Only unconditional single-name prohibitions. A negated multi-name required
+/// set forbids a combination, so neither constituent can be removed.
+fn individually_forbidden_properties(schema: &Value) -> Vec<String> {
+    let mut names: Vec<String> = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|properties| properties.iter())
+        .filter(|(_, schema)| **schema == json!(false))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let singleton = |node: &Value| {
+        let object = node.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        let required = object.get("required")?.as_array()?;
+        if required.len() != 1 {
+            return None;
+        }
+        required[0].as_str().map(str::to_string)
+    };
+    if let Some(negated) = schema.get("not") {
+        if let Some(name) = singleton(negated) {
+            names.push(name);
+        } else if negated.as_object().is_some_and(|object| object.len() == 1) {
+            if let Some(alternatives) = negated.get("anyOf").and_then(Value::as_array) {
+                names.extend(alternatives.iter().filter_map(singleton));
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn strip_routing_fields(
@@ -5477,12 +6488,22 @@ fn force_json_bootstrap_format(message: &mut Value) -> std::result::Result<rende
     Ok(requested)
 }
 
+#[cfg(test)]
 fn executor_exposure_summary(
     surface: &str,
     descriptor_count: usize,
     descriptor_bytes: usize,
 ) -> Value {
-    json!({
+    executor_exposure_summary_with_lean(surface, descriptor_count, descriptor_bytes, None)
+}
+
+fn executor_exposure_summary_with_lean(
+    surface: &str,
+    descriptor_count: usize,
+    descriptor_bytes: usize,
+    lean: Option<Value>,
+) -> Value {
+    let mut summary = json!({
         "surface": "executor",
         "scope": surface,
         "discovery_semantics": "contract-derived: the catalogue contains only executor descriptors backed by executable operation contracts",
@@ -5490,7 +6511,12 @@ fn executor_exposure_summary(
         "advertised_count": descriptor_count,
         "advertised_bytes": descriptor_bytes,
         "configurable": false,
-    })
+    });
+    if let (Some(Value::Object(lean)), Some(summary)) = (lean, summary.as_object_mut()) {
+        summary.insert("projection".into(), json!("lean"));
+        summary.extend(lean);
+    }
+    summary
 }
 
 fn rewrite_executor_bootstrap(
@@ -5499,6 +6525,7 @@ fn rewrite_executor_bootstrap(
     surface: &str,
     descriptor_count: usize,
     descriptor_bytes: usize,
+    lean: Option<Value>,
 ) {
     if !response_succeeded(body) {
         return;
@@ -5519,7 +6546,8 @@ fn rewrite_executor_bootstrap(
         .get("tool_exposure")
         .and_then(|exposure| exposure.get("runtime"))
         .cloned();
-    let mut exposure = executor_exposure_summary(surface, descriptor_count, descriptor_bytes);
+    let mut exposure =
+        executor_exposure_summary_with_lean(surface, descriptor_count, descriptor_bytes, lean);
     if let (Some(runtime), Some(summary)) = (runtime, exposure.as_object_mut()) {
         summary.insert("runtime".into(), runtime);
     }
@@ -5540,6 +6568,20 @@ fn rewrite_executor_bootstrap(
             .remove("structuredContent");
     } else {
         body["result"]["structuredContent"] = structured;
+    }
+}
+
+/// The shape-valid full run key one `tools/call` carries, read where
+/// dispatch reads it (the envelope, or a nested copy dispatch hoists).
+/// Issuance sentinels and malformed keys yield `None`: they identify no run.
+fn telemetry_run_key(message: &Value) -> Option<String> {
+    let envelope = message.pointer("/params/arguments")?;
+    let raw = envelope
+        .get("run_key")
+        .or_else(|| envelope.pointer("/arguments/run_key"))?;
+    match crate::runkey::validate_value(Some(raw)) {
+        crate::runkey::KeyOutcome::Valid(run_key) => Some(run_key),
+        _ => None,
     }
 }
 
@@ -5646,11 +6688,241 @@ mod tests {
         }
     }
 
-    fn registry() -> Arc<ToolRegistry> {
+    pub(super) fn registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry).unwrap();
         register_surface_tools(&mut registry).unwrap();
         Arc::new(registry)
+    }
+
+    fn ordinary_catalogue(
+        registry: &ToolRegistry,
+        experimental: &ExperimentalExecutors,
+    ) -> PinnedExecutorCatalogue {
+        build_ordinary_catalogue(
+            registry,
+            crate::mcp::registry::EngineKind::Sqlite,
+            false,
+            experimental,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_operations_projection_matches_describe_pairs_and_digests() {
+        let catalogue = ordinary_catalogue(&registry(), &ExperimentalExecutors::empty());
+        let snapshot = project_catalog_operations_snapshot(
+            &catalogue.contracts,
+            &catalogue.operations_by_executor,
+        );
+        assert!(!snapshot.is_empty());
+        let mut expected: Vec<(String, String)> = catalogue
+            .operations_by_executor
+            .iter()
+            .flat_map(|(executor, operations)| {
+                operations
+                    .iter()
+                    .map(|operation| (executor.clone(), operation.clone()))
+            })
+            .collect();
+        expected.sort();
+        let actual: Vec<(String, String)> = snapshot
+            .iter()
+            .map(|row| (row.executor.clone(), row.operation.clone()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "rows are exactly the advertised pairs, sorted"
+        );
+        for row in snapshot.iter() {
+            let contract = catalogue
+                .contracts
+                .get(&(row.executor.clone(), row.operation.clone()))
+                .expect("every row resolves to its contract");
+            assert_eq!(row.contract_digest, contract.digest);
+            assert_eq!(row.contract_version, CONTRACT_VERSION);
+            assert_eq!(row.source_tool, contract.source_tool);
+            assert_eq!(row.surface, contract.surface.as_str());
+            assert!(row.access == "read" || row.access == "mutation");
+            assert_eq!(
+                row.access,
+                match contract.access {
+                    OperationAccess::Read => "read",
+                    OperationAccess::Mutation => "mutation",
+                }
+            );
+            assert_eq!(
+                row.plan_required,
+                write_operations::requires_plan(&row.executor, &row.operation)
+            );
+            assert_eq!(row.direct_execution_enabled, !row.plan_required);
+            assert_eq!(
+                row.selector_field,
+                contract
+                    .selector
+                    .as_ref()
+                    .map(|selector| selector.field.clone())
+            );
+            assert_eq!(
+                row.selector_value,
+                contract
+                    .selector
+                    .as_ref()
+                    .map(|selector| selector.value.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_operations_standby_projection_withholds_writes_and_plans() {
+        let catalogue = ordinary_catalogue(&registry(), &ExperimentalExecutors::empty());
+        let (_advertised, advertised_operations) = standby_read_only_discovery(
+            &catalogue.descriptors,
+            &catalogue.contracts,
+            &catalogue.operations_by_executor,
+        )
+        .unwrap();
+        let snapshot =
+            project_catalog_operations_snapshot(&catalogue.contracts, &advertised_operations);
+        assert!(!snapshot.is_empty());
+        for row in snapshot.iter() {
+            assert_eq!(row.access, "read", "{}/{}", row.executor, row.operation);
+            assert!(!row.plan_required, "{}/{}", row.executor, row.operation);
+        }
+        let withheld: Vec<(String, String)> = catalogue
+            .contracts
+            .keys()
+            .filter(|(executor, operation)| {
+                !advertised_operations
+                    .get(executor)
+                    .is_some_and(|operations| operations.contains(operation))
+            })
+            .cloned()
+            .collect();
+        assert!(
+            !withheld.is_empty(),
+            "the fixture catalogue withholds something on standby"
+        );
+        for (executor, operation) in withheld {
+            assert!(
+                !snapshot
+                    .iter()
+                    .any(|row| row.executor == executor && row.operation == operation),
+                "withheld {executor}/{operation} must not project"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_operations_allowlist_projection_follows_the_executor() {
+        // The freshness executor's contracts need its experimental source
+        // tool registered, so this uses the hosted registry fixture like
+        // the descriptor tests do.
+        let registry = hosted_registry();
+        let allowlisted = ExperimentalExecutors::from_env_value(Some(
+            EXPERIMENTAL_FRESHNESS_EXECUTOR.to_string(),
+        ))
+        .unwrap();
+        let stable = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let stable_snapshot =
+            project_catalog_operations_snapshot(&stable.contracts, &stable.operations_by_executor);
+        assert!(
+            !stable_snapshot
+                .iter()
+                .any(|row| row.executor == EXPERIMENTAL_FRESHNESS_EXECUTOR),
+            "experimental executor stays out of the stable projection"
+        );
+        let experimental = ExecutorPrototypeStdioServer::pin_hosted_catalogue_with_experimental(
+            &registry,
+            &allowlisted,
+        )
+        .unwrap();
+        let experimental_snapshot = project_catalog_operations_snapshot(
+            &experimental.contracts,
+            &experimental.operations_by_executor,
+        );
+        assert!(
+            experimental_snapshot
+                .iter()
+                .any(|row| row.executor == EXPERIMENTAL_FRESHNESS_EXECUTOR),
+            "allowlisted experimental executor projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_operations_dispatch_serves_advertised_pairs_and_digests() {
+        let db = create_database(":memory:").await.unwrap();
+        let server =
+            ExecutorPrototypeStdioServer::new(registry(), db.clone(), Caller::local(), None)
+                .await
+                .unwrap();
+        let (executor, operation) = server
+            .contracts
+            .iter()
+            .find(|(_, contract)| contract.source_tool == "query_sql")
+            .map(|((executor, operation), _)| (executor.clone(), operation.clone()))
+            .expect("one executor operation routes query_sql");
+        let response = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": executor,
+                    "arguments": {
+                        "operation": operation,
+                        "arguments": {
+                            "sql": "SELECT executor, operation, contract_digest FROM catalog_operations ORDER BY executor, operation"
+                        },
+                        "format": "json",
+                        "run_key": "catalog-operations-dispatch-test"
+                    }
+                }
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        let rows = response["result"]["structuredContent"]["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("dispatch serves catalog rows: {response}"));
+        let mut expected: Vec<(String, String, String)> = server
+            .operations_by_executor
+            .iter()
+            .flat_map(|(executor, operations)| {
+                operations.iter().map(|operation| {
+                    let digest = server
+                        .contracts
+                        .get(&(executor.clone(), operation.clone()))
+                        .expect("advertised pair resolves")
+                        .digest
+                        .clone();
+                    (executor.clone(), operation.clone(), digest)
+                })
+            })
+            .collect();
+        expected.sort();
+        let actual: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["executor"].as_str().unwrap_or_default().to_string(),
+                    row["operation"].as_str().unwrap_or_default().to_string(),
+                    row["contract_digest"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "dispatch rows equal advertised pairs and digests"
+        );
+        db.close().await;
     }
 
     async fn call_records_read(
@@ -5735,7 +7007,7 @@ mod tests {
             EXECUTOR_DESCRIPTOR_MAX_BYTES
         );
     }
-    fn hosted_registry() -> Arc<ToolRegistry> {
+    pub(super) fn hosted_registry() -> Arc<ToolRegistry> {
         let mut registry = ToolRegistry::new();
         register_builtin_tools(&mut registry).unwrap();
         register_surface_tools(&mut registry).unwrap();
@@ -6045,6 +7317,222 @@ mod tests {
                 .expect("workspace_read.list must have an ordinary operation contract")
                 .access,
             OperationAccess::Read
+        );
+    }
+
+    #[test]
+    fn operation_aliases_resolve_without_renaming_canonicals() {
+        let mut by_executor: OperationsByExecutor = BTreeMap::new();
+        by_executor.insert("workspace_read".into(), vec!["workspace_read.list".into()]);
+        by_executor.insert(
+            "records_read".into(),
+            vec!["get_record".into(), "manage_links.list".into()],
+        );
+        // Bare `list` expands on workspace_read; canonical stays unchanged.
+        assert_eq!(
+            resolve_operation_alias("workspace_read", "list", &by_executor).as_deref(),
+            Some("workspace_read.list")
+        );
+        // Executor-prefixed bare strips to canonical on records_read.
+        assert_eq!(
+            resolve_operation_alias("records_read", "records_read.get_record", &by_executor)
+                .as_deref(),
+            Some("get_record")
+        );
+        // Ambiguous bare `list` on records_read must not route.
+        assert_eq!(
+            resolve_operation_alias("records_read", "list", &by_executor),
+            None
+        );
+        // Unknown operations still miss.
+        assert_eq!(
+            resolve_operation_alias("records_read", "bogus", &by_executor),
+            None
+        );
+    }
+
+    #[test]
+    fn operation_aliases_hold_on_both_surfaces_without_widening() {
+        // Live pinned catalogues: ordinary (hosted) + lens. Aliases are
+        // tolerant compatibility only; tools/list advertises canonicals.
+        let registry = registry();
+        let ordinary = ExecutorPrototypeStdioServer::pin_hosted_catalogue(&registry).unwrap();
+        let lens = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        for catalogue in [
+            &ordinary.operations_by_executor,
+            &lens.operations_by_executor,
+        ] {
+            let ops = catalogue
+                .get("records_read")
+                .expect("records_read advertised");
+            assert!(ops.contains(&"get_record".to_string()));
+            assert_eq!(
+                resolve_operation_alias("records_read", "records_read.get_record", catalogue)
+                    .as_deref(),
+                Some("get_record")
+            );
+            assert_eq!(
+                resolve_operation_alias("records_read", "list", catalogue),
+                None
+            );
+        }
+        for descriptors in [&ordinary.descriptors, &lens.descriptors] {
+            let tool = descriptors
+                .iter()
+                .find(|d| d["name"] == "records_read")
+                .expect("records_read descriptor");
+            let ops: Vec<String> = tool
+                .pointer("/inputSchema/properties/operation/enum")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            assert!(ops.contains(&"get_record".to_string()));
+            assert!(
+                !ops.contains(&"records_read.get_record".to_string()),
+                "aliases must not be advertised"
+            );
+        }
+        // Classification follows the canonical contract: alias grants nothing.
+        let canonical = ordinary
+            .contracts
+            .get(&("records_read".into(), "get_record".into()))
+            .unwrap();
+        let via_alias = resolve_operation_alias(
+            "records_read",
+            "records_read.get_record",
+            &ordinary.operations_by_executor,
+        )
+        .unwrap();
+        let aliased = ordinary
+            .contracts
+            .get(&("records_read".into(), via_alias))
+            .unwrap();
+        assert_eq!(canonical.digest, aliased.digest);
+        assert_eq!(canonical.access, aliased.access);
+        assert_eq!(
+            write_operations::requires_plan("records_read", &aliased.operation),
+            write_operations::requires_plan("records_read", "get_record")
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_aliases_describe_and_dispatch_on_lens() {
+        // Lens live surface: alias describes the canonical contract and
+        // dispatches through the same dispatcher without permission widening.
+        let registry = registry();
+        let catalogue = ExecutorPrototypeLensServer::pin_catalogue_with_experimental(
+            &registry,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let server = ExecutorPrototypeLensServer::new_with_pinned_catalogue(
+            registry,
+            Arc::new(BootstrapLensDispatch),
+            catalogue,
+            None,
+        )
+        .unwrap();
+        let described = server
+            .handle_message(json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"describe_operation",
+                    "arguments":{"executor":"records_read","operation":"records_read.get_record"}}}))
+            .await
+            .unwrap();
+        assert_eq!(described["result"]["isError"], false, "{described}");
+        assert_eq!(
+            described["result"]["structuredContent"]["operation"],
+            json!("get_record")
+        );
+        let dispatched = server
+            .handle_message(json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                "params":{"name":"records_read",
+                    "arguments":{"operation":"records_read.get_record",
+                        "arguments":{"ids":["native:root"]}}}}))
+            .await
+            .unwrap();
+        assert_eq!(dispatched["result"]["isError"], false, "{dispatched}");
+        let bogus = server
+            .handle_message(json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                "params":{"name":"records_read",
+                    "arguments":{"operation":"list","arguments":{}}}}))
+            .await
+            .unwrap();
+        assert_eq!(bogus["result"]["isError"], true, "{bogus}");
+    }
+
+    #[test]
+    fn comment_reply_contract_fixture_matches_production() {
+        // Bounded generated fixture for desktop (b895e09/845c121 shared):
+        // full contract.payload() per op (input_schema, source description,
+        // version/digest) plus the advertised executor inputSchema
+        // descriptors. Desktop needs nested arguments AND outer envelope
+        // validation; schemas alone miss kind-specific comment rules, so
+        // source.tool_description is preserved. Authority is the
+        // production-derived catalogue, not candidate-audit. Refresh with
+        // COMMENT_REPLY_FIXTURE_UPDATE=1 after triage.
+        const OPS: [(&str, &str); 4] = [
+            ("workspace_read", "workspace_read.list"),
+            ("records_read", "get_record"),
+            ("records_write", "create_record"),
+            ("coordination_write", "set_intent"),
+        ];
+        const EXECUTORS: [&str; 5] = [
+            "bootstrap",
+            "workspace_read",
+            "records_read",
+            "records_write",
+            "coordination_write",
+        ];
+        let registry = hosted_registry();
+        let catalogue = build_ordinary_catalogue(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            true,
+            &ExperimentalExecutors::empty(),
+        )
+        .unwrap();
+        let mut live_contracts = Vec::new();
+        for (executor, operation) in OPS {
+            let contract = catalogue
+                .contracts
+                .get(&(executor.to_string(), operation.to_string()))
+                .unwrap_or_else(|| panic!("missing contract {executor}.{operation}"));
+            live_contracts.push(contract.payload());
+        }
+        let mut live_descriptors = Vec::new();
+        for name in EXECUTORS {
+            let descriptor = catalogue
+                .descriptors
+                .iter()
+                .find(|d| d.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing executor descriptor {name}"));
+            live_descriptors.push(descriptor.clone());
+        }
+        let live = json!({"contracts": live_contracts, "descriptors": live_descriptors});
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/evals/mcp-executors/comment-reply-contracts.generated.json");
+        if std::env::var("COMMENT_REPLY_FIXTURE_UPDATE").is_ok_and(|v| v == "1") {
+            std::fs::write(&path, serde_json::to_string_pretty(&live).unwrap()).unwrap();
+            return;
+        }
+        let stored: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                panic!(
+                    "fixture missing: run with COMMENT_REPLY_FIXTURE_UPDATE=1 to generate {}",
+                    path.display()
+                )
+            }))
+            .unwrap();
+        assert_eq!(
+            stored, live,
+            "fixture drifted; triage then refresh with COMMENT_REPLY_FIXTURE_UPDATE=1"
         );
     }
 
@@ -6483,9 +7971,11 @@ mod tests {
             .unwrap();
         let cue = descriptor["description"].as_str().unwrap();
         for route in [
+            "Build an app: read topic app-builder-1.0.0 (installed apps)",
+            "Dashboards, boards and views:",
             "records_write.create_record",
             "facets.runtime",
-            "compositions",
+            "steps in topic compositions",
         ] {
             assert!(
                 cue.contains(route),
@@ -6558,6 +8048,224 @@ mod tests {
         db.close().await;
     }
 
+    #[tokio::test]
+    async fn persona_participant_operation_contracts_reject_malformed_and_refuse_unknown_speaker_claims(
+    ) {
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        let BuiltContracts { contracts, .. } = build_contracts(
+            &registry(),
+            super::super::registry::EngineKind::Sqlite,
+            &audit.audit_rows,
+            ExecutorSurface::Ordinary,
+        )
+        .unwrap();
+        for (executor, operation, valid, invalid) in [
+            (
+                "messaging_write",
+                "manage_participants.register_persona",
+                json!({"name":"Chief","reason":"register"}),
+                json!({"name":"Chief","record_id":"existing","reason":"register"}),
+            ),
+            (
+                "messaging_write",
+                "manage_participants.retire_persona",
+                json!({"persona_id":"existing","reason":"retire"}),
+                json!({"persona_id":"existing"}),
+            ),
+            (
+                "messaging_read",
+                "manage_participants.list",
+                json!({}),
+                json!({"name":"Chief"}),
+            ),
+        ] {
+            let schema = &contracts[&(executor.into(), operation.into())].input_schema;
+            let validator = jsonschema::validator_for(schema).unwrap();
+            assert!(validator.is_valid(&valid), "{operation}: {schema}");
+            assert!(!validator.is_valid(&invalid), "{operation}: {schema}");
+        }
+        let schema = &contracts[&(
+            "messaging_write".into(),
+            "manage_participants.register_persona".into(),
+        )]
+            .input_schema;
+        assert!(jsonschema::validator_for(schema).unwrap().is_valid(
+            &json!({"record_id":"existing","facets":{"colour":"green"},"reason":"register"})
+        ));
+        let schema =
+            &contracts[&("messaging_write".into(), "manage_messages.send".into())].input_schema;
+        let validator = jsonschema::validator_for(schema).unwrap();
+        let mut arguments = json!({"body":"Ask","origin":{"type":"collection","collection_id":"thread"},"addressed_to":[],"expectation":"none","idempotency_key":"ask","reason":"ask"});
+        for speaker in [
+            Value::Null,
+            json!("malformed"),
+            json!({"persona_id":"unknown","assurance":"forged"}),
+        ] {
+            arguments["speaker"] = speaker;
+            assert!(
+                !validator.is_valid(&arguments),
+                "malformed speaker shape must be rejected: {schema}"
+            );
+        }
+        arguments["speaker"] = json!({"persona_id":"unknown"});
+        assert!(
+            validator.is_valid(&arguments),
+            "well-formed claim: {schema}"
+        );
+
+        // Shape validation cannot establish persona identity. The handler
+        // checks the claim after ordinary permissions and refuses uniformly.
+        let db = create_database(":memory:").await.unwrap();
+        let (thread, _) = super::super::tools::participants::tests::fixture(&db).await;
+        arguments["origin"]["collection_id"] = json!(thread);
+        assert!(validator.is_valid(&arguments));
+        arguments["action"] = json!("send");
+        let error = registry()
+            .call(
+                db.clone(),
+                Caller::authenticated("alice"),
+                "manage_messages",
+                arguments,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.ends_with("manage_messages.send: speaker not found"),
+            "{error}"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM message_speakers")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        db.close().await;
+    }
+
+    #[test]
+    fn account_config_action_projection_preserves_common_constraints() {
+        let registry = registry();
+        let audit: Audit = serde_json::from_str(AUDIT).unwrap();
+        let BuiltContracts { contracts, .. } = build_contracts(
+            &registry,
+            super::super::registry::EngineKind::Sqlite,
+            &audit.audit_rows,
+            ExecutorSurface::Ordinary,
+        )
+        .unwrap();
+        for (executor, action, valid) in [
+            (
+                "records_read",
+                "inspect",
+                json!({"kind":"focus_preferences"}),
+            ),
+            (
+                "records_write",
+                "ensure",
+                json!({"kind":"focus_preferences","reason":"Preference change"}),
+            ),
+            (
+                "records_write",
+                "replace",
+                json!({"kind":"focus_preferences","reason":"Recovery","expected_record_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+            ),
+        ] {
+            let contract =
+                &contracts[&(executor.into(), format!("manage_account_config.{action}"))];
+            let mut names = Vec::new();
+            collect_property_names(&contract.input_schema, &mut names);
+            names.sort();
+            names.dedup();
+            let expected = match action {
+                "inspect" => vec!["kind"],
+                "ensure" => vec!["kind", "reason"],
+                _ => vec!["expected_record_id", "kind", "reason"],
+            };
+            assert_eq!(names, expected, "{action}: accepted names");
+            let validator = jsonschema::validator_for(&contract.input_schema).unwrap();
+            assert!(
+                validator.is_valid(&valid),
+                "{action}: {}",
+                contract.input_schema
+            );
+            let mut missing_kind = valid.clone();
+            missing_kind.as_object_mut().unwrap().remove("kind");
+            assert!(!validator.is_valid(&missing_kind), "{action}: missing kind");
+            let mut wrong_kind = valid.clone();
+            wrong_kind["kind"] = json!("other");
+            assert!(!validator.is_valid(&wrong_kind), "{action}: wrong kind");
+            let mut extra = valid.clone();
+            extra["account_id"] = json!("untrusted");
+            assert!(!validator.is_valid(&extra), "{action}: extra authority");
+            let mut wrong_reason = valid.clone();
+            wrong_reason["reason"] = json!(17);
+            assert!(!validator.is_valid(&wrong_reason), "{action}: wrong reason");
+            if action == "inspect" {
+                let mut forbidden_reason = valid.clone();
+                forbidden_reason["reason"] = json!("Not an inspect argument");
+                assert!(!validator.is_valid(&forbidden_reason));
+            } else {
+                let mut missing_reason = valid.clone();
+                missing_reason.as_object_mut().unwrap().remove("reason");
+                assert!(!validator.is_valid(&missing_reason));
+            }
+            if action == "replace" {
+                let mut missing_id = valid.clone();
+                missing_id
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("expected_record_id");
+                assert!(!validator.is_valid(&missing_id));
+            }
+        }
+    }
+
+    #[test]
+    fn forbidden_argument_projection_preserves_combinations_and_open_objects() {
+        let selector = Selector {
+            field: "action".into(),
+            value: "read".into(),
+        };
+        let source = |closed, prohibition| {
+            json!({
+                "type":"object",
+                "properties":{"action":{"const":"read"},"a":{"type":"string"},"b":{"type":"string"}},
+                "required":["action"],
+                "additionalProperties":closed,
+                "oneOf":[{"properties":{"action":{"const":"read"}},"not":prohibition}]
+            })
+        };
+        for (additional, prohibition) in [
+            (json!(false), json!({"required":["a","b"]})),
+            (json!(true), json!({"required":["a"]})),
+        ] {
+            let projected = project_operation_schema(
+                &source(additional, prohibition),
+                Some(&selector),
+                ExecutorSurface::Ordinary,
+            )
+            .unwrap();
+            let mut names = Vec::new();
+            collect_property_names(&projected, &mut names);
+            names.sort();
+            names.dedup();
+            assert_eq!(names, vec!["a", "b"]);
+            let validator = jsonschema::validator_for(&projected).unwrap();
+            assert!(validator.is_valid(&json!({"b":"yes"})));
+            assert!(!validator.is_valid(&json!({"a":"yes","b":"yes"})));
+        }
+        assert_eq!(
+            individually_forbidden_properties(
+                &json!({"properties":{"a":false},"not":{"anyOf":[{"required":["b"]},{"required":["c","d"]}]}})
+            ),
+            vec!["a", "b"]
+        );
+        assert!(individually_forbidden_properties(
+            &json!({"not":{"required":["a"],"properties":{"a":{"const":"only this value"}}}})
+        )
+        .is_empty());
+    }
+
     #[test]
     fn candidate_manifest_and_read_contracts_are_stable_and_source_derived() {
         let registry = registry();
@@ -6568,7 +8276,7 @@ mod tests {
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            43_360
+            43_840
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -6585,7 +8293,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            49_607
+            50_087
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -8721,7 +10429,11 @@ mod tests {
                 assert_eq!(event["rid"], i["rid"]);
                 assert_eq!(event["actor"], caller.actor());
                 assert_eq!(event["version"], 1);
-                assert_eq!(event["act"], receipt["act"]);
+                // The plan author is not an owner, so the receipt withholds the
+                // act (design 08b4c21 §4 S2a); the durable events still carry
+                // one positive act, shared by the whole write.
+                assert!(receipt.get("act").is_none(), "{receipt}");
+                assert_eq!(event["act"], tail[0]["act"]);
                 assert!(event["act"].as_i64().unwrap() > 0);
                 check_uuid(&event["id"]);
                 assert_eq!(
@@ -10229,7 +11941,17 @@ mod tests {
                 assert!(receipt.get("act").is_none());
                 assert_eq!(content_event_count(&singular_db).await, singular_counts.0);
             } else {
-                assert!(receipt["act"].as_i64().is_some());
+                // Non-owner receipt: no act shown, but the archive event
+                // still stored one (design 08b4c21 §4 S2a).
+                assert!(receipt.get("act").is_none(), "{receipt}");
+                let stored_act: Option<i64> = sqlx::query_scalar(
+                    "SELECT act FROM content_events WHERE record_id = ? ORDER BY seq DESC LIMIT 1",
+                )
+                .bind(TARGET)
+                .fetch_one(singular_db.pool())
+                .await
+                .unwrap();
+                assert!(stored_act.is_some_and(|act| act > 0));
                 assert_eq!(
                     content_event_count(&singular_db).await,
                     singular_counts.0 + 1
@@ -11059,6 +12781,7 @@ mod tests {
                 "target_id".into(),
                 "relationship".into(),
                 "note".into(),
+                "idempotency_key".into(),
             ])
         );
         assert_eq!(
@@ -11067,6 +12790,7 @@ mod tests {
                 "source_id".into(),
                 "target_id".into(),
                 "relationship".into(),
+                "idempotency_key".into(),
             ])
         );
         assert_eq!(
@@ -11533,6 +13257,7 @@ mod tests {
             HashSet::from([
                 "id",
                 "body",
+                "speaker",
                 "preview",
                 "name",
                 "addressed_to",
@@ -13718,6 +15443,111 @@ mod tests {
         db.close().await;
     }
 
+    /// First-call harness over the real executor wire, task c2e2b7d: a first
+    /// direct `records_write.create_record` with a fresh run key and outer
+    /// clientInfo — no bootstrap, no set_intent for that run — admits its own
+    /// run through the modern dispatch arm, and `records_read.get_record`
+    /// surfaces the exact run, client name/version with the client_asserted
+    /// rung, and an honestly absent model.
+    #[tokio::test]
+    async fn executor_first_write_admits_harness_without_bootstrap_or_intent() {
+        let db = create_database(":memory:").await.unwrap();
+        let caller = Caller::local();
+        let server = ExecutorPrototypeStdioServer::new(registry(), db.clone(), caller, None)
+            .await
+            .unwrap();
+        let run_key = "scout-chair-v748b2";
+        let meta = json!({
+            "io.modelcontextprotocol/protocolVersion": crate::mcp::PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "executor-harness-test", "version": "3.1.0"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let created = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_write",
+                    "arguments": {
+                        "operation": "create_record",
+                        "arguments": {
+                            "type": "Document",
+                            "kind": "note",
+                            "name": "Executor first-call write",
+                            "body": "written before any bootstrap or intent",
+                            "reason": "first-call harness executor test"
+                        },
+                        "format": "json",
+                        "run_key": run_key,
+                    },
+                    "_meta": meta,
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(created["result"]["isError"], false, "{created}");
+        let name: Option<Option<String>> =
+            sqlx::query_scalar("SELECT reported_mcp_client_name FROM agent_runs WHERE run_key=?")
+                .bind(run_key)
+                .fetch_optional(db.write_pool())
+                .await
+                .unwrap();
+        let version: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT reported_mcp_client_version FROM agent_runs WHERE run_key=?",
+        )
+        .bind(run_key)
+        .fetch_optional(db.write_pool())
+        .await
+        .unwrap();
+        let model: Option<Option<String>> =
+            sqlx::query_scalar("SELECT reported_model FROM agent_runs WHERE run_key=?")
+                .bind(run_key)
+                .fetch_optional(db.write_pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            name,
+            Some(Some("executor-harness-test".into())),
+            "run admitted"
+        );
+        assert_eq!(version, Some(Some("3.1.0".into())), "version admitted");
+        assert_eq!(model, Some(None), "model honestly absent");
+        let record_id = created["result"]["structuredContent"]["id"]
+            .as_str()
+            .expect("executor create returns the record id")
+            .to_string();
+        let read = server
+            .handle_message(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "records_read",
+                    "arguments": {
+                        "operation": "get_record",
+                        "arguments": {"ids": [record_id]},
+                        "format": "json",
+                        "run_key": run_key,
+                    },
+                    "_meta": meta,
+                },
+            }))
+            .await
+            .unwrap();
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        let run = &read["result"]["structuredContent"]["records"][0]["contribution"]["run"];
+        assert_eq!(run["run_key"], run_key);
+        assert_eq!(run["reported_mcp_client"]["name"], "executor-harness-test");
+        assert_eq!(run["reported_mcp_client"]["version"], "3.1.0");
+        assert_eq!(run["reported_mcp_client"]["assurance"], "client_asserted");
+        assert!(
+            run.get("reported_model").is_none(),
+            "no writer populates the model claim: {run}"
+        );
+        db.close().await;
+    }
+
     /// The guard refusals must never travel as contract repairs. Synthesising
     /// `if_body_digest` from current state would hand the caller a token it
     /// never read and silently reproduce the lost update the guard exists to
@@ -15477,12 +17307,9 @@ mod tests {
             );
         }
         assert!(!default_text.contains("Read scope:"), "{default_text}");
-        let omissions = default_text
-            .lines()
-            .find(|line| line.contains("Additional record fields omitted from text:"))
-            .unwrap();
+        assert!(default_text.contains("Kind governance:"), "{default_text}");
+        assert!(default_text.contains("Contribution:"), "{default_text}");
         for key in ["kind_governance", "contribution"] {
-            assert!(omissions.contains(key), "{default_text}");
             assert!(!default_text.contains(&format!("\"{key}\":")));
         }
 

@@ -417,6 +417,7 @@ fn preflight(
     for message in &wire.messages {
         validate_uuid(&message.message_record_id)?;
         validate_uuid(&message.source_event.id)?;
+        validate_source_event_id_v4(&message.source_event.id)?;
         validate_timestamp(&message.source_event.created_at)?;
         if message.source_event.source_seq <= 0
             || message.source_event.source_seq > MAX_SAFE_INTEGER
@@ -716,6 +717,28 @@ fn validate_uuid(value: &str) -> std::result::Result<(), PreflightFailure> {
     let parsed = Uuid::parse_str(value).map_err(|_| PreflightFailure::Rejected("invalid_uuid"))?;
     if parsed.hyphenated().to_string() != value {
         return Err(PreflightFailure::Rejected("invalid_uuid"));
+    }
+    Ok(())
+}
+
+/// A replicated source event identity must be a canonical lowercase
+/// hyphenated RFC 4122 UUIDv4.
+///
+/// This is deliberately separate from [`validate_uuid`], which keeps the
+/// existing permissive contract for `message_record_id` and arbitrary record
+/// or participant identifiers. Only the portable event identity is narrowed:
+/// a destination resolves a non-owner's position by event id, treating any
+/// non-v4 shape as unknown, so retaining a peer id of another version would
+/// make the event unresolvable to those viewers. The gate refuses the whole
+/// batch in preflight, before any local mutation, and never re-mints the id.
+fn validate_source_event_id_v4(value: &str) -> std::result::Result<(), PreflightFailure> {
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| PreflightFailure::Rejected("invalid_source_event_id"))?;
+    if parsed.hyphenated().to_string() != value
+        || parsed.get_version_num() != 4
+        || parsed.get_variant() != uuid::Variant::RFC4122
+    {
+        return Err(PreflightFailure::Rejected("invalid_source_event_id"));
     }
     Ok(())
 }
@@ -1512,6 +1535,18 @@ fn stable_reference_link_id(message_id: &str, reference_id: &str) -> String {
 pub(crate) async fn export_native_messages(db: &Db, message_ids: &[String]) -> Result<Vec<u8>> {
     if message_ids.is_empty() || message_ids.len() > MAX_MESSAGES {
         return Err(Error::engine("export requires 1..=32 Message ids"));
+    }
+    for message_id in message_ids {
+        let has_speaker: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_speakers WHERE message_id=?)")
+                .bind(message_id)
+                .fetch_one(db.write_pool())
+                .await?;
+        if has_speaker {
+            return Err(Error::engine(
+                "participant_message_not_federatable: persona speaker facts are workspace-local",
+            ));
+        }
     }
     let mut received = 0usize;
     for message_id in message_ids {
@@ -2670,6 +2705,120 @@ mod tests {
             }
             assert!(rebuild_and_diff(&db).await.unwrap().equal);
         }
+    }
+
+    #[tokio::test]
+    async fn replicated_event_id_gate_requires_canonical_v4_in_both_content_versions() {
+        // Shapes that parse as a UUID but are not canonical lowercase RFC 4122
+        // v4, and shapes that are not canonical hyphenated UUID text at all.
+        const REJECTED: [(&str, &str, &str); 6] = [
+            (
+                "uuid-v1",
+                "10000000-0000-1000-8000-00000000002a",
+                "invalid_source_event_id",
+            ),
+            (
+                "uuid-v7",
+                "10000000-0000-7000-8000-00000000002a",
+                "invalid_source_event_id",
+            ),
+            (
+                "nil",
+                "00000000-0000-0000-0000-000000000000",
+                "invalid_source_event_id",
+            ),
+            (
+                "bad-variant",
+                "10000000-0000-4000-c000-00000000002a",
+                "invalid_source_event_id",
+            ),
+            (
+                "uppercase",
+                "10000000-0000-4000-8000-00000000002A",
+                "invalid_uuid",
+            ),
+            (
+                "unhyphenated",
+                "1000000000004000800000000000002a",
+                "invalid_uuid",
+            ),
+        ];
+        for encode in [v1_bytes, bytes] {
+            let accepted = encode(vec![message(1, "canonical v4")]);
+            let db = crate::create_database(":memory:").await.unwrap();
+            let result =
+                ingest_verified_native_message(&db, context(UNFILED_RECORD_ID), &accepted).await;
+            assert_eq!(result.status, IngestStatus::Applied);
+            assert_eq!(result.event_ids, [message(1, "").source_event.id]);
+
+            for (name, bad_id, code) in REJECTED {
+                let db = crate::create_database(":memory:").await.unwrap();
+                let before = ingest_counts(&db).await;
+                let act_before: i64 =
+                    sqlx::query_scalar("SELECT next_act FROM act_state WHERE singleton=1")
+                        .fetch_one(db.write_pool())
+                        .await
+                        .unwrap();
+                let mut bad = message(2, "invalid event identity");
+                bad.source_event.id = bad_id.into();
+                let result = ingest_verified_native_message(
+                    &db,
+                    context(UNFILED_RECORD_ID),
+                    &encode(vec![message(1, "must not be written"), bad]),
+                )
+                .await;
+                assert_eq!(
+                    result.status,
+                    IngestStatus::Rejected,
+                    "{name} must be refused"
+                );
+                assert_eq!(result.code, code, "{name} rejection code");
+                assert_eq!(
+                    ingest_counts(&db).await,
+                    before,
+                    "{name} must refuse the whole batch before any write"
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT next_act FROM act_state WHERE singleton=1"
+                    )
+                    .fetch_one(db.write_pool())
+                    .await
+                    .unwrap(),
+                    act_before,
+                    "{name} must not allocate a workspace act"
+                );
+                assert!(rebuild_and_diff(&db).await.unwrap().equal);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replicated_event_id_gate_leaves_record_ids_permissive() {
+        // `message_record_id` keeps its existing contract: the destination
+        // admits a canonical lowercase UUIDv4 or UUIDv7 record identity
+        // (`store::append`). Only the portable source event identity is
+        // narrowed to v4, so a non-v4 (v7) Message record id still ingests.
+        let db = crate::create_database(":memory:").await.unwrap();
+        let v7_record_id = "20000000-0000-7000-8000-000000000003";
+        let mut input = message(3, "non-v4 record identity");
+        input.message_record_id = v7_record_id.into();
+        let result = ingest_verified_native_message(
+            &db,
+            context(UNFILED_RECORD_ID),
+            &bytes(vec![input.clone()]),
+        )
+        .await;
+        assert_eq!(result.status, IngestStatus::Applied);
+        assert_eq!(result.message_ids, vec![v7_record_id.to_string()]);
+        assert_eq!(result.event_ids, vec![input.source_event.id.clone()]);
+        let stored: String = sqlx::query_scalar("SELECT id FROM records WHERE id=?")
+            .bind(v7_record_id)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(stored, v7_record_id);
+        assert!(rebuild_and_diff(&db).await.unwrap().equal);
     }
 
     #[tokio::test]

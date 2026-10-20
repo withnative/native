@@ -515,12 +515,16 @@ pub struct FacetKey {
     pub key: String,
 }
 
-/// One link delete addressed the way page models key links.
+/// One link delete addressed the way page models key links. `relationship`
+/// is `None` only for a nameless cached row (a `related` pair with no named
+/// edge, which the persisted cache keeps but the database never holds: the
+/// links table requires a non-null relationship). Catch-up deletes always
+/// carry `Some`; resume manifests may name nameless rows to delete them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LinkKey {
     pub source_id: String,
     pub target_id: String,
-    pub relationship: String,
+    pub relationship: Option<String>,
 }
 
 /// Pageable sections of one pinned snapshot.
@@ -916,7 +920,7 @@ impl crate::db::Db {
                 delta.delete_link_keys.push(LinkKey {
                     source_id: row.source_id.clone(),
                     target_id: row.target_id.clone(),
-                    relationship: row.relationship.clone(),
+                    relationship: Some(row.relationship.clone()),
                 });
             }
         }
@@ -946,6 +950,485 @@ pub enum CatchUpOutcome {
     Delta(Box<SnapshotDelta>),
     Restart { reason: &'static str },
     Unavailable,
+}
+
+/// Manifest resume (task 679d792): reconcile a bounded client manifest of
+/// actual cache row keys + content digests against the fresh
+/// current-principal view, returning exact repairs/deletes plus an ordinary
+/// new short-lived pin. The manifest is an untrusted comparison hint, never
+/// authority: every supplied key is compared against the current authorized
+/// projection, claimed old counts/frontiers/fences establish nothing, and
+/// all returned row contents come from the fresh filtered view. Key+digest
+/// manifests never grant access — a key outside the caller's view resolves
+/// to a delete address, never to rows.
+pub const RESUME_MANIFEST_VERSION: u32 = 1;
+/// Pinned profile string: version and shape travel in the manifest so a
+/// future projection change restarts instead of miscomparing.
+pub const RESUME_MANIFEST_PROFILE: &str = "workspace-snapshot-resume/v1";
+/// Serialized manifest cap: 3.5 MiB, safely under the hosted 4 MiB MCP
+/// envelope (`MCP_REQUEST_BODY_LIMIT` in held/hosting/src/http.rs), leaving
+/// room for escaping expansion and MCP metadata. Above it the client takes
+/// the existing full path; the server refuses before allocating typed maps.
+pub const RESUME_MANIFEST_MAX_BYTES: usize = 3_670_016;
+/// Total manifest entries across all three sections. Bounds map allocation
+/// after the byte cap has passed but before any typed vector is built.
+pub const RESUME_MANIFEST_MAX_ENTRIES: usize = 32_768;
+/// Restart reasons for the resume path. All carry no rows, like every other
+/// restart in this module.
+pub const RESUME_RESTART_PROFILE_MISMATCH: &str = "manifest_profile_mismatch";
+pub const RESUME_RESTART_MALFORMED: &str = "manifest_malformed";
+pub const RESUME_RESTART_OVER_CAP: &str = "manifest_over_cap";
+
+/// Digest domain tags: a section marker pinned into every digest so a record
+/// digest can never validate as a facet or link digest (type confusion).
+const RESUME_DIGEST_DOMAIN_RECORD: &[u8] = b"native.ws-resume/v1/record\x00";
+const RESUME_DIGEST_DOMAIN_FACET: &[u8] = b"native.ws-resume/v1/facet\x00";
+const RESUME_DIGEST_DOMAIN_LINK: &[u8] = b"native.ws-resume/v1/link\x00";
+
+/// One string/null field of the fixed digest codec: `0x00` for null or
+/// missing (the two encode identically, by construction), else `0x01`
+/// followed by the big-endian u32 byte length and the raw UTF-8 bytes. No
+/// escaping layer exists, so Rust and JS encoders agree byte for byte as
+/// long as the input is valid Unicode; invalid UTF-8 must never reach this
+/// function (JSON parsing already rejects it).
+fn resume_digest_field(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        None => out.push(0x00),
+        Some(text) => {
+            out.push(0x01);
+            let bytes = text.as_bytes();
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+}
+
+fn resume_digest_hex(domain: &[u8], fields: &[Option<&str>]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    let mut encoded = Vec::new();
+    for field in fields {
+        resume_digest_field(&mut encoded, *field);
+    }
+    hasher.update(&encoded);
+    hex::encode(hasher.finalize())
+}
+
+/// Digest over exactly the cached record projection: the governed-minus-body
+/// public fields the demo-shell cache persists, in this fixed order.
+pub(crate) fn record_resume_digest(row: &SnapshotRecord) -> String {
+    record_resume_digest_fields(&[
+        Some(row.id.as_str()),
+        Some(row.record_type.as_str()),
+        row.kind.as_deref(),
+        Some(row.name.as_str()),
+        row.home_id.as_deref(),
+        row.lifecycle.as_deref(),
+        Some(row.persistence.as_str()),
+        row.maturity.as_deref(),
+        row.summary.as_deref(),
+        row.last_activity_at.as_deref(),
+        Some(row.created_at.as_str()),
+        Some(row.updated_at.as_str()),
+        row.deleted_at.as_deref(),
+    ])
+}
+
+/// Field-level record digest: the 13 cached projection fields in pinned
+/// order. The struct wrapper above is what the server uses; vectors address
+/// this level so permutations (including nulls in required positions) stay
+/// expressible.
+pub(crate) fn record_resume_digest_fields(fields: &[Option<&str>]) -> String {
+    assert_eq!(fields.len(), 13, "record digest pins 13 fields");
+    resume_digest_hex(RESUME_DIGEST_DOMAIN_RECORD, fields)
+}
+
+/// Digest over the cached facet projection `{record_id, key, value}` only.
+/// Raw facet metadata (row id, value_num, vocab_ref, timestamps) is absent
+/// from the cache and stays out of the digest: no float canonicalization.
+pub(crate) fn facet_resume_digest(record_id: &str, key: &str, value: Option<&str>) -> String {
+    resume_digest_hex(
+        RESUME_DIGEST_DOMAIN_FACET,
+        &[Some(record_id), Some(key), value],
+    )
+}
+
+/// Digest over the cached link projection `{source, target, relationship,
+/// note}`: the tuple plus the note, so a note-only change repairs.
+pub(crate) fn link_resume_digest(
+    source_id: &str,
+    target_id: &str,
+    relationship: Option<&str>,
+    note: Option<&str>,
+) -> String {
+    resume_digest_hex(
+        RESUME_DIGEST_DOMAIN_LINK,
+        &[Some(source_id), Some(target_id), relationship, note],
+    )
+}
+
+/// A validated resume manifest: logical keys plus claimed digests. Digests
+/// are comparison hints only; row contents always come from the fresh view.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResumeManifest {
+    records: Vec<(String, String)>,
+    facets: Vec<(String, String, String)>,
+    links: Vec<(String, String, Option<String>, String)>,
+}
+
+fn resume_digest_valid(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Validate a resume manifest before any typed map is built. Counts and
+/// duplicates are checked during the walk so a lying manifest cannot buy
+/// allocation: over-cap restarts before insertion, duplicates and shape
+/// violations restart as malformed.
+pub(crate) fn parse_resume_manifest(
+    manifest: &serde_json::Value,
+) -> std::result::Result<ResumeManifest, &'static str> {
+    let object = manifest.as_object().ok_or(RESUME_RESTART_MALFORMED)?;
+    let version = object
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(RESUME_RESTART_PROFILE_MISMATCH)?;
+    if version != u64::from(RESUME_MANIFEST_VERSION) {
+        return Err(RESUME_RESTART_PROFILE_MISMATCH);
+    }
+    let profile = object
+        .get("profile")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(RESUME_RESTART_PROFILE_MISMATCH)?;
+    if profile != RESUME_MANIFEST_PROFILE {
+        return Err(RESUME_RESTART_PROFILE_MISMATCH);
+    }
+    let record_tuples = object
+        .get("records")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(RESUME_RESTART_MALFORMED)?;
+    let facet_tuples = object
+        .get("facets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(RESUME_RESTART_MALFORMED)?;
+    let link_tuples = object
+        .get("links")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(RESUME_RESTART_MALFORMED)?;
+    // Sum section counts with an overflow guard BEFORE any typed clone or
+    // map is built: a lying manifest cannot buy allocation through entry
+    // count. Duplicate detection below still needs sets, but those are
+    // bounded by this gate.
+    let total_entries = record_tuples
+        .len()
+        .checked_add(facet_tuples.len())
+        .and_then(|sum| sum.checked_add(link_tuples.len()))
+        .ok_or(RESUME_RESTART_MALFORMED)?;
+    if total_entries > RESUME_MANIFEST_MAX_ENTRIES {
+        return Err(RESUME_RESTART_OVER_CAP);
+    }
+    // Measure the re-encoded byte length through a bounded counting sink so
+    // no second copy of an oversized manifest is ever allocated. A
+    // serde_json::Value always serializes, so the only write failure is the
+    // cap itself.
+    {
+        struct ByteCounter {
+            count: usize,
+            limit: usize,
+        }
+        impl std::io::Write for ByteCounter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.count = self.count.saturating_add(bytes.len());
+                if self.count > self.limit {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::QuotaExceeded,
+                        "manifest over cap",
+                    ));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut counter = ByteCounter {
+            count: 0,
+            limit: RESUME_MANIFEST_MAX_BYTES,
+        };
+        if serde_json::to_writer(&mut counter, manifest).is_err() {
+            return Err(RESUME_RESTART_OVER_CAP);
+        }
+    }
+    let mut parsed = ResumeManifest::default();
+    let mut record_keys = std::collections::HashSet::new();
+    let mut facet_keys = std::collections::HashSet::new();
+    let mut link_keys = std::collections::HashSet::new();
+    for tuple in record_tuples {
+        let pair = tuple.as_array().ok_or(RESUME_RESTART_MALFORMED)?;
+        if pair.len() != 2 {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        let id = pair[0].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        let digest = pair[1].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        if id.is_empty() || !resume_digest_valid(digest) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        if !record_keys.insert(id.to_string()) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        parsed.records.push((id.to_string(), digest.to_string()));
+    }
+    for tuple in facet_tuples {
+        let triple = tuple.as_array().ok_or(RESUME_RESTART_MALFORMED)?;
+        if triple.len() != 3 {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        let record_id = triple[0].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        let key = triple[1].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        let digest = triple[2].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        if record_id.is_empty() || key.is_empty() || !resume_digest_valid(digest) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        if !facet_keys.insert((record_id.to_string(), key.to_string())) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        parsed
+            .facets
+            .push((record_id.to_string(), key.to_string(), digest.to_string()));
+    }
+    for tuple in link_tuples {
+        let quad = tuple.as_array().ok_or(RESUME_RESTART_MALFORMED)?;
+        if quad.len() != 4 {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        let source_id = quad[0].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        let target_id = quad[1].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        let relationship = match &quad[2] {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(text) => Some(text.clone()),
+            _ => return Err(RESUME_RESTART_MALFORMED),
+        };
+        let digest = quad[3].as_str().ok_or(RESUME_RESTART_MALFORMED)?;
+        if source_id.is_empty() || target_id.is_empty() || !resume_digest_valid(digest) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        if !link_keys.insert((
+            source_id.to_string(),
+            target_id.to_string(),
+            relationship.clone(),
+        )) {
+            return Err(RESUME_RESTART_MALFORMED);
+        }
+        parsed.links.push((
+            source_id.to_string(),
+            target_id.to_string(),
+            relationship,
+            digest.to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Which fence moved between the fresh view and the live read, if any.
+/// Pure so the race rule is unit-testable without interleaving commits.
+fn resume_fence_race_reason(fresh: (i64, i64, i64), live: (i64, i64, i64)) -> Option<&'static str> {
+    if live.0 != fresh.0 {
+        return Some("authorization_epoch_moved");
+    }
+    if live.1 != fresh.1 {
+        return Some("relationship_seq_moved");
+    }
+    if live.2 != fresh.2 {
+        return Some("unit_seq_moved");
+    }
+    None
+}
+
+impl crate::db::Db {
+    /// Reconcile a client manifest against the fresh current-principal view.
+    ///
+    /// Every supplied key is compared against the current authorized
+    /// projection; claimed old counts, frontiers, and fences establish
+    /// nothing. Missing keys become upserts (which is also how excluded
+    /// Message/Annotation rows and absent lifecycle facets are restored to
+    /// the full model), stale or altered keys become repairs, and manifest
+    /// keys outside the current view become delete addresses — never rows.
+    /// No content-gap limit applies: this is an all-key reconciliation, not
+    /// a windowed tail (the `catch_up` gap is unchanged). A fence that races
+    /// between the fresh view and the answer restarts with no rows; M2
+    /// `None` is the generic unavailable. The new pin is an ordinary
+    /// short-lived token serving later `page`/`catch_up` calls; no old
+    /// token or durable baseline is involved, so a server restart loses
+    /// nothing this call needs.
+    pub async fn resume_workspace_snapshot(
+        &self,
+        principal: QueryPrincipal,
+        manifest_value: &serde_json::Value,
+    ) -> Result<CatchUpOutcome> {
+        let manifest = match parse_resume_manifest(manifest_value) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                return Ok(CatchUpOutcome::Restart { reason });
+            }
+        };
+        let Some(filtered) = self.filtered_workspace_index(principal.clone()).await? else {
+            return Ok(CatchUpOutcome::Unavailable);
+        };
+        let mut delta = SnapshotDelta {
+            token: mint_token(),
+            content_seq: filtered.content_seq,
+            authorization_epoch: filtered.authorization_epoch,
+            relationship_seq: filtered.relationship_seq,
+            fence_moved: false,
+            upsert_records: Vec::new(),
+            delete_record_ids: Vec::new(),
+            upsert_facets: Vec::new(),
+            delete_facet_ids: Vec::new(),
+            delete_facet_keys: Vec::new(),
+            upsert_links: Vec::new(),
+            delete_link_ids: Vec::new(),
+            delete_link_keys: Vec::new(),
+            content_events: filtered
+                .content_events
+                .iter()
+                .map(SnapshotEvent::from_ref)
+                .collect(),
+        };
+        let mut manifest_record_keys = std::collections::HashSet::new();
+        for (id, digest) in &manifest.records {
+            manifest_record_keys.insert(id.clone());
+            match filtered.records.get(id) {
+                None => delta.delete_record_ids.push(id.clone()),
+                Some(head) => {
+                    let row = SnapshotRecord::from_head(head);
+                    if record_resume_digest(&row) != *digest {
+                        delta.upsert_records.push(row);
+                    }
+                }
+            }
+        }
+        for (id, head) in &filtered.records {
+            if !manifest_record_keys.contains(id) {
+                delta.upsert_records.push(SnapshotRecord::from_head(head));
+            }
+        }
+        let mut fresh_facets: std::collections::HashMap<
+            (String, String),
+            &crate::workspace_index::FacetRow,
+        > = std::collections::HashMap::new();
+        for row in filtered.facets.values() {
+            fresh_facets.insert((row.record_id.clone(), row.key.clone()), row);
+        }
+        let mut manifest_facet_keys = std::collections::HashSet::new();
+        for (record_id, key, digest) in &manifest.facets {
+            manifest_facet_keys.insert((record_id.clone(), key.clone()));
+            match fresh_facets.get(&(record_id.clone(), key.clone())) {
+                None => delta.delete_facet_keys.push(FacetKey {
+                    record_id: record_id.clone(),
+                    key: key.clone(),
+                }),
+                Some(row) => {
+                    let projected = SnapshotFacet::from_row(row);
+                    if facet_resume_digest(
+                        &projected.record_id,
+                        &projected.key,
+                        projected.value.as_deref(),
+                    ) != *digest
+                    {
+                        delta.upsert_facets.push(projected);
+                    }
+                }
+            }
+        }
+        for ((record_id, key), row) in &fresh_facets {
+            if !manifest_facet_keys.contains(&(record_id.clone(), key.clone())) {
+                delta.upsert_facets.push(SnapshotFacet::from_row(row));
+            }
+        }
+        let mut fresh_links: std::collections::HashMap<
+            (String, String, Option<String>),
+            &crate::workspace_index::LinkRow,
+        > = std::collections::HashMap::new();
+        for row in filtered.links.values() {
+            fresh_links.insert(
+                (
+                    row.source_id.clone(),
+                    row.target_id.clone(),
+                    Some(row.relationship.clone()),
+                ),
+                row,
+            );
+        }
+        let mut manifest_link_keys = std::collections::HashSet::new();
+        for (source_id, target_id, relationship, digest) in &manifest.links {
+            let key = (source_id.clone(), target_id.clone(), relationship.clone());
+            manifest_link_keys.insert(key.clone());
+            match fresh_links.get(&key) {
+                None => delta.delete_link_keys.push(LinkKey {
+                    source_id: source_id.clone(),
+                    target_id: target_id.clone(),
+                    relationship: relationship.clone(),
+                }),
+                Some(row) => {
+                    let projected = SnapshotLink::from_row(row);
+                    if link_resume_digest(
+                        &projected.source_id,
+                        &projected.target_id,
+                        Some(projected.relationship.as_str()),
+                        projected.note.as_deref(),
+                    ) != *digest
+                    {
+                        // Delete-before-upsert: the client's takeLink keeps
+                        // the first note it saw for a duplicate edge, so a
+                        // bare upsert cannot repair a changed note.
+                        delta.delete_link_keys.push(LinkKey {
+                            source_id: source_id.clone(),
+                            target_id: target_id.clone(),
+                            relationship: relationship.clone(),
+                        });
+                        delta.upsert_links.push(projected);
+                    }
+                }
+            }
+        }
+        for ((source_id, target_id, relationship), row) in &fresh_links {
+            if !manifest_link_keys.contains(&(
+                source_id.clone(),
+                target_id.clone(),
+                relationship.clone(),
+            )) {
+                delta.upsert_links.push(SnapshotLink::from_row(row));
+            }
+        }
+        // A fence that moved while the answer was being built voids it: the
+        // diff above may already describe a revoked world.
+        let (live_epoch, live_relationship, live_unit_seq_max) =
+            self.live_snapshot_fences().await?;
+        if let Some(reason) = resume_fence_race_reason(
+            (
+                filtered.authorization_epoch,
+                filtered.relationship_seq,
+                filtered.unit_seq_max,
+            ),
+            (live_epoch, live_relationship, live_unit_seq_max),
+        ) {
+            return Ok(CatchUpOutcome::Restart { reason });
+        }
+        let fresh = SnapshotEntry::project(&principal, &filtered);
+        {
+            let store = self.workspace_snapshots.clone();
+            let mut guard = store
+                .lock()
+                .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
+            if !guard.insert(delta.token.clone(), fresh) {
+                return Ok(CatchUpOutcome::Unavailable);
+            }
+        }
+        Ok(CatchUpOutcome::Delta(Box::new(delta)))
+    }
 }
 
 #[cfg(test)]
@@ -2190,7 +2673,7 @@ mod tests {
             delta.delete_link_keys.contains(&LinkKey {
                 source_id: ALICE_COMMON_ID.to_string(),
                 target_id: BEA_ONLY_ID.to_string(),
-                relationship: "mentions".to_string(),
+                relationship: Some("mentions".to_string()),
             }),
             "link deletes carry their page key"
         );
@@ -2625,5 +3108,710 @@ mod tests {
         let fresh = open_token(&db, alice()).await;
         assert_eq!(delta.content_seq, fresh.content_seq);
         assert_eq!(model, page_all_records(&db, alice(), &fresh.token).await);
+    }
+
+    fn zero_digest() -> String {
+        "0".repeat(64)
+    }
+
+    fn empty_manifest() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": [],
+            "facets": [],
+            "links": [],
+        })
+    }
+
+    /// An exact manifest for `principal`: page the fresh open and hash every
+    /// row through the resume codec. The correct-digest baseline every
+    /// repair test mutates.
+    async fn exact_manifest(db: &crate::db::Db, principal: QueryPrincipal) -> serde_json::Value {
+        let opened = open_token(db, principal.clone()).await;
+        let records = page_all_records(db, principal.clone(), &opened.token).await;
+        let facet_rows = page_all_section(
+            db,
+            principal.clone(),
+            &opened.token,
+            SnapshotSection::Facets,
+        )
+        .await;
+        let link_rows =
+            page_all_section(db, principal.clone(), &opened.token, SnapshotSection::Links).await;
+        let record_tuples: Vec<serde_json::Value> = records
+            .values()
+            .map(|row| json!([row.id, record_resume_digest(row)]))
+            .collect();
+        let mut facet_tuples = Vec::new();
+        for value in facet_rows {
+            let facet: SnapshotFacet = serde_json::from_value(value).unwrap();
+            facet_tuples.push(json!([
+                facet.record_id,
+                facet.key,
+                facet_resume_digest(&facet.record_id, &facet.key, facet.value.as_deref()),
+            ]));
+        }
+        let mut link_tuples = Vec::new();
+        for value in link_rows {
+            let link: SnapshotLink = serde_json::from_value(value).unwrap();
+            link_tuples.push(json!([
+                link.source_id,
+                link.target_id,
+                link.relationship,
+                link_resume_digest(
+                    &link.source_id,
+                    &link.target_id,
+                    Some(link.relationship.as_str()),
+                    link.note.as_deref(),
+                ),
+            ]));
+        }
+        json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": record_tuples,
+            "facets": facet_tuples,
+            "links": link_tuples,
+        })
+    }
+
+    async fn resume(
+        db: &crate::db::Db,
+        principal: QueryPrincipal,
+        manifest: &serde_json::Value,
+    ) -> CatchUpOutcome {
+        db.resume_workspace_snapshot(principal, manifest)
+            .await
+            .unwrap()
+    }
+
+    /// Shared digest vectors, computed independently in Python and saved for
+    /// both the Rust suite and the forthcoming JS manifest builder: agreement
+    /// proves the wire encoding rather than the helper under test.
+    const RESUME_VECTOR_FIXTURE: &str =
+        include_str!("../tests/fixtures/workspace-snapshot-resume-vectors.json");
+
+    #[tokio::test]
+    async fn resume_codec_matches_shared_vectors() {
+        let fixture: serde_json::Value = serde_json::from_str(RESUME_VECTOR_FIXTURE).unwrap();
+        assert_eq!(
+            fixture["profile"].as_str().unwrap(),
+            RESUME_MANIFEST_PROFILE,
+            "vectors pin the shipped profile"
+        );
+        let mut seen = std::collections::HashMap::new();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        for vector in vectors {
+            let name = vector["name"].as_str().unwrap();
+            let domain = vector["domain"].as_str().unwrap();
+            let fields = vector["fields"].as_array().unwrap();
+            let present = |index: usize| fields[index].as_str();
+            let computed = match domain {
+                "record" => {
+                    assert_eq!(fields.len(), 13, "{name} pins the 13-field record order");
+                    let owned: Vec<Option<String>> = fields
+                        .iter()
+                        .map(|field| field.as_str().map(str::to_string))
+                        .collect();
+                    let borrowed: Vec<Option<&str>> =
+                        owned.iter().map(|field| field.as_deref()).collect();
+                    record_resume_digest_fields(&borrowed)
+                }
+                "facet" => {
+                    assert_eq!(fields.len(), 3, "{name} pins the facet triple");
+                    facet_resume_digest(
+                        fields[0].as_str().unwrap(),
+                        fields[1].as_str().unwrap(),
+                        present(2),
+                    )
+                }
+                "link" => {
+                    assert_eq!(fields.len(), 4, "{name} pins the link quad");
+                    link_resume_digest(
+                        fields[0].as_str().unwrap(),
+                        fields[1].as_str().unwrap(),
+                        present(2),
+                        present(3),
+                    )
+                }
+                other => panic!("unknown vector domain {other}"),
+            };
+            let expected = vector["digest"].as_str().unwrap();
+            assert_eq!(computed, expected, "vector {name}");
+            assert_eq!(computed.len(), 64, "vector {name} is sha256 hex");
+            assert!(
+                computed
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "vector {name} is lowercase hex"
+            );
+            seen.insert(name.to_string(), computed);
+        }
+        assert_eq!(seen.len(), 14, "fixture pins fourteen vectors");
+        // The struct projection the server hashes through agrees with the
+        // vector path on the ascii vector, binding struct field order to the
+        // documented fixture order.
+        let ascii = vectors
+            .iter()
+            .find(|vector| vector["name"] == "record-ascii")
+            .unwrap()["fields"]
+            .as_array()
+            .unwrap();
+        let ascii_opt = |index: usize| ascii[index].as_str().map(str::to_string);
+        assert_eq!(
+            seen["record-ascii"],
+            record_resume_digest(&SnapshotRecord {
+                id: ascii[0].as_str().unwrap().into(),
+                record_type: ascii[1].as_str().unwrap().into(),
+                kind: ascii_opt(2),
+                name: ascii[3].as_str().unwrap().into(),
+                home_id: ascii_opt(4),
+                lifecycle: ascii_opt(5),
+                persistence: ascii[6].as_str().unwrap().into(),
+                maturity: ascii_opt(7),
+                summary: ascii_opt(8),
+                last_activity_at: ascii_opt(9),
+                created_at: ascii[10].as_str().unwrap().into(),
+                updated_at: ascii[11].as_str().unwrap().into(),
+                deleted_at: ascii_opt(12),
+            })
+        );
+        // Order, nullness, and domain separation are observable relations
+        // between independently computed vectors, not self-comparisons.
+        assert_ne!(
+            seen["record-ascii"], seen["record-order-permuted"],
+            "field order is load-bearing"
+        );
+        assert_ne!(
+            seen["record-null-kind"], seen["record-empty-kind"],
+            "null and empty string are distinct claims"
+        );
+        assert_ne!(seen["facet-null-value"], seen["facet-empty-value"]);
+        assert_ne!(seen["link-null-note"], seen["link-empty-note"]);
+        assert_ne!(
+            seen["record-ascii"], seen["facet-value"],
+            "record and facet digests cannot collide"
+        );
+        assert_ne!(
+            seen["facet-value"], seen["link-full"],
+            "facet and link digests cannot collide"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_malformed_duplicate_and_over_cap_manifests() {
+        let db = three_record_fixture().await;
+        for (name, manifest) in [
+            ("non-object", json!("nope")),
+            (
+                "missing-version",
+                json!({"profile": RESUME_MANIFEST_PROFILE, "records": [], "facets": [], "links": []}),
+            ),
+            (
+                "wrong-version",
+                json!({"version": 2, "profile": RESUME_MANIFEST_PROFILE, "records": [], "facets": [], "links": []}),
+            ),
+            (
+                "wrong-profile",
+                json!({"version": 1, "profile": "other", "records": [], "facets": [], "links": []}),
+            ),
+            (
+                "missing-sections",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE}),
+            ),
+            (
+                "bad-arity",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE, "records": [["only-id"]], "facets": [], "links": []}),
+            ),
+            (
+                "short-digest",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE, "records": [[ALICE_COMMON_ID, "abc"]], "facets": [], "links": []}),
+            ),
+            (
+                "uppercase-digest",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE, "records": [[ALICE_COMMON_ID, "A".repeat(64)]], "facets": [], "links": []}),
+            ),
+            (
+                "empty-id",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE, "records": [["", zero_digest()]], "facets": [], "links": []}),
+            ),
+            (
+                "duplicate-keys",
+                json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE,
+                    "records": [[ALICE_COMMON_ID, zero_digest()], [ALICE_COMMON_ID, zero_digest()]],
+                    "facets": [], "links": []}),
+            ),
+        ] {
+            match resume(&db, alice(), &manifest).await {
+                CatchUpOutcome::Restart { reason } => assert!(
+                    reason == RESUME_RESTART_MALFORMED || reason == RESUME_RESTART_PROFILE_MISMATCH,
+                    "{name} restarts, got {reason}"
+                ),
+                other => panic!("{name} must restart with no rows, got {other:?}"),
+            }
+        }
+        // Entry-count cap trips before any typed map is built.
+        let mut many_records = Vec::new();
+        for index in 0..=RESUME_MANIFEST_MAX_ENTRIES {
+            many_records.push(json!([format!("id-{index}"), zero_digest()]));
+        }
+        match resume(
+            &db,
+            alice(),
+            &json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE,
+                "records": many_records, "facets": [], "links": []}),
+        )
+        .await
+        {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, RESUME_RESTART_OVER_CAP)
+            }
+            other => panic!("over-count manifest must restart, got {other:?}"),
+        }
+        // Serialized-size cap trips on one huge claim, not many entries.
+        let huge = json!({"version": 1, "profile": RESUME_MANIFEST_PROFILE,
+            "records": [["x".repeat(RESUME_MANIFEST_MAX_BYTES), zero_digest()]],
+            "facets": [], "links": []});
+        match resume(&db, alice(), &huge).await {
+            CatchUpOutcome::Restart { reason } => {
+                assert_eq!(reason, RESUME_RESTART_OVER_CAP)
+            }
+            other => panic!("over-size manifest must restart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_fence_race_helper_names_the_moved_fence() {
+        assert_eq!(resume_fence_race_reason((1, 2, 3), (1, 2, 3)), None);
+        assert_eq!(
+            resume_fence_race_reason((1, 2, 3), (9, 2, 3)),
+            Some("authorization_epoch_moved")
+        );
+        assert_eq!(
+            resume_fence_race_reason((1, 2, 3), (1, 9, 3)),
+            Some("relationship_seq_moved")
+        );
+        assert_eq!(
+            resume_fence_race_reason((1, 2, 3), (1, 2, 9)),
+            Some("unit_seq_moved")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_empty_manifest_returns_full_model_and_working_pin() {
+        let db = three_record_fixture().await;
+        let delta = match resume(&db, alice(), &empty_manifest()).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("empty manifest must delta, got {other:?}"),
+        };
+        let ids: Vec<&str> = delta
+            .upsert_records
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect();
+        assert!(ids.contains(&ALICE_COMMON_ID) && ids.contains(&ALICE_ONLY_ID));
+        assert!(
+            !ids.contains(&BEA_ONLY_ID),
+            "keys outside the caller view never upsert"
+        );
+        assert!(delta.delete_record_ids.is_empty());
+        assert!(!delta.fence_moved, "resume never sets the fence flag");
+        // The new pin is ordinary: it pages like any opened token.
+        let rows = page_all_records(&db, alice(), &delta.token).await;
+        assert!(rows.contains_key(ALICE_COMMON_ID));
+    }
+
+    #[tokio::test]
+    async fn resume_exact_manifest_returns_empty_delta() {
+        let db = three_record_fixture().await;
+        let manifest = exact_manifest(&db, alice()).await;
+        let delta = match resume(&db, alice(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("exact manifest must delta, got {other:?}"),
+        };
+        assert!(
+            delta.upsert_records.is_empty(),
+            "clean cache repairs nothing"
+        );
+        assert!(delta.delete_record_ids.is_empty());
+        assert!(delta.upsert_facets.is_empty());
+        assert!(delta.delete_facet_keys.is_empty());
+        assert!(delta.upsert_links.is_empty());
+        assert!(delta.delete_link_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_repairs_altered_rows_and_deletes_unknown_keys() {
+        let db = three_record_fixture().await;
+        set_facet(
+            &db,
+            ALICE_COMMON_ID,
+            FacetSetPayload {
+                key: "priority".to_string(),
+                value: Some("high".to_string()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: Some("9e795001-0000-4000-8000-000000000031".to_string()),
+                source_id: ALICE_COMMON_ID.to_string(),
+                target_id: ALICE_ONLY_ID.to_string(),
+                relationship: "mentions".to_string(),
+                note: Some("see also".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let mut manifest = exact_manifest(&db, alice()).await;
+        {
+            let records = manifest["records"].as_array_mut().unwrap();
+            let common = records
+                .iter_mut()
+                .find(|tuple| tuple[0] == ALICE_COMMON_ID)
+                .unwrap();
+            common[1] = json!(zero_digest());
+        }
+        {
+            let facets = manifest["facets"].as_array_mut().unwrap();
+            facets.retain(|tuple| !(tuple[0] == ALICE_COMMON_ID && tuple[1] == "priority"));
+        }
+        {
+            let links = manifest["links"].as_array_mut().unwrap();
+            links.clear();
+        }
+        manifest["records"].as_array_mut().unwrap().push(json!([
+            "9e795001-0000-4000-8000-000000000099",
+            zero_digest()
+        ]));
+        manifest["facets"].as_array_mut().unwrap().push(json!([
+            "9e795001-0000-4000-8000-000000000099",
+            "ghost",
+            zero_digest()
+        ]));
+        manifest["links"].as_array_mut().unwrap().push(json!([
+            ALICE_COMMON_ID,
+            "9e795001-0000-4000-8000-000000000099",
+            "mentions",
+            zero_digest()
+        ]));
+        let delta = match resume(&db, alice(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("repairable manifest must delta, got {other:?}"),
+        };
+        assert!(
+            delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_COMMON_ID),
+            "altered row repairs from the fresh view"
+        );
+        assert!(
+            delta
+                .upsert_facets
+                .iter()
+                .any(|facet| facet.record_id == ALICE_COMMON_ID
+                    && facet.key == "priority"
+                    && facet.value.as_deref() == Some("high")),
+            "dropped facet entry returns with its current value"
+        );
+        assert!(
+            delta
+                .upsert_links
+                .iter()
+                .any(|link| link.source_id == ALICE_COMMON_ID && link.target_id == ALICE_ONLY_ID),
+            "dropped link entry returns"
+        );
+        assert!(
+            delta
+                .delete_record_ids
+                .contains(&"9e795001-0000-4000-8000-000000000099".to_string()),
+            "unknown record key becomes a delete address, never rows"
+        );
+        assert!(
+            delta.delete_facet_keys.iter().any(|key| key.record_id
+                == "9e795001-0000-4000-8000-000000000099"
+                && key.key == "ghost"),
+            "unknown facet key becomes a keyed delete"
+        );
+        assert!(
+            delta
+                .delete_link_keys
+                .iter()
+                .any(|key| key.source_id == ALICE_COMMON_ID
+                    && key.target_id == "9e795001-0000-4000-8000-000000000099"
+                    && key.relationship.as_deref() == Some("mentions")),
+            "unknown link key becomes a keyed delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_repairs_changed_link_note_with_delete_before_upsert() {
+        let db = three_record_fixture().await;
+        add_link(
+            &db,
+            LinkAddedPayload {
+                id: Some("9e795001-0000-4000-8000-000000000032".to_string()),
+                source_id: ALICE_COMMON_ID.to_string(),
+                target_id: ALICE_ONLY_ID.to_string(),
+                relationship: "mentions".to_string(),
+                note: Some("second thought".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        // The manifest claims the stale note; the fresh view holds the new one.
+        let stale_digest = link_resume_digest(
+            ALICE_COMMON_ID,
+            ALICE_ONLY_ID,
+            Some("mentions"),
+            Some("first thought"),
+        );
+        let manifest = json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": [],
+            "facets": [],
+            "links": [[ALICE_COMMON_ID, ALICE_ONLY_ID, "mentions", stale_digest]],
+        });
+        let delta = match resume(&db, alice(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("stale note must delta, got {other:?}"),
+        };
+        let repaired: Vec<_> = delta
+            .upsert_links
+            .iter()
+            .filter(|link| link.source_id == ALICE_COMMON_ID && link.target_id == ALICE_ONLY_ID)
+            .collect();
+        assert_eq!(repaired.len(), 1);
+        assert_eq!(repaired[0].note.as_deref(), Some("second thought"));
+        assert!(
+            delta
+                .delete_link_keys
+                .iter()
+                .any(|key| key.source_id == ALICE_COMMON_ID
+                    && key.target_id == ALICE_ONLY_ID
+                    && key.relationship.as_deref() == Some("mentions")),
+            "changed note emits the delete first so takeLink cannot keep the old note"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_withholds_rows_outside_caller_view_as_deletes() {
+        let db = three_record_fixture().await;
+        // Bea names an alice-only row her view never held, with a wrong digest
+        // for the row she shares: neither may disclose the hidden row.
+        let manifest = json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": [
+                [ALICE_ONLY_ID, zero_digest()],
+                [ALICE_COMMON_ID, zero_digest()],
+            ],
+            "facets": [],
+            "links": [],
+        });
+        let delta = match resume(&db, bea(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("bea manifest must delta, got {other:?}"),
+        };
+        assert!(
+            delta.delete_record_ids.contains(&ALICE_ONLY_ID.to_string()),
+            "unauthorized manifest key becomes a delete, never rows"
+        );
+        assert!(
+            !delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_ONLY_ID),
+            "hidden row must not appear anywhere in the response"
+        );
+        assert!(
+            delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_COMMON_ID),
+            "shared row still repairs"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_purges_revoked_rows_as_deletes_not_restart() {
+        let db = three_record_fixture().await;
+        let manifest = exact_manifest(&db, alice()).await;
+        replace_explicit_policy(
+            &db,
+            "test:narrow",
+            ALICE_ONLY_ID,
+            vec![AllowEntry::account("bea", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let delta = match resume(&db, alice(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("post-revoke resume must delta, got {other:?}"),
+        };
+        assert!(
+            delta.delete_record_ids.contains(&ALICE_ONLY_ID.to_string()),
+            "revoked row purges as a delete"
+        );
+        assert!(
+            !delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_ONLY_ID),
+            "revoked row must not upsert"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_restores_excluded_message_rows_as_missing_key_upserts() {
+        let db = three_record_fixture().await;
+        const MESSAGE_ID: &str = "9e795001-0000-4000-8000-000000000044";
+        create_record(
+            &db,
+            json!({
+                "id": MESSAGE_ID, "type": "Message", "kind": "message",
+                "name": "Cached never", "body": "Body",
+                "home_id": crate::schema::ROOT_RECORD_ID
+            }),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:policy",
+            MESSAGE_ID,
+            vec![AllowEntry::account("alice", Capability::View)],
+        )
+        .await
+        .unwrap();
+        // The cache projection never persists messages, so the manifest —
+        // like dumpIndex — simply omits them.
+        let manifest = exact_manifest(&db, alice()).await;
+        assert!(
+            manifest["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tuple| tuple[0] == MESSAGE_ID),
+            "precondition: fresh open holds the message row"
+        );
+        let pruned = json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": manifest["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tuple| tuple[0] != MESSAGE_ID)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "facets": manifest["facets"],
+            "links": manifest["links"],
+        });
+        let delta = match resume(&db, alice(), &pruned).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("message omission must delta, got {other:?}"),
+        };
+        let restored: Vec<_> = delta
+            .upsert_records
+            .iter()
+            .filter(|row| row.id == MESSAGE_ID)
+            .collect();
+        assert_eq!(restored.len(), 1, "excluded message returns as an upsert");
+        assert_eq!(restored[0].record_type, "Message");
+        assert!(
+            !delta.delete_record_ids.contains(&MESSAGE_ID.to_string()),
+            "a visible omitted row is a repair, not a delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_needs_no_surviving_pin_or_token() {
+        let db = three_record_fixture().await;
+        // Build the manifest first, then churn the token store past its
+        // count cap so every pin — including the one the manifest was paged
+        // from — is evicted: resume must still reconcile, proving no old
+        // snapshot, token, or tombstone is required. A server restart loses
+        // nothing this call needs.
+        let manifest = exact_manifest(&db, alice()).await;
+        for _ in 0..=SNAPSHOT_MAX_TOKENS {
+            open_token(&db, alice()).await;
+        }
+        let delta = match resume(&db, alice(), &manifest).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("post-eviction resume must delta, got {other:?}"),
+        };
+        assert!(delta.upsert_records.is_empty());
+        assert!(delta.delete_record_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_partial_manifest_repairs_everything_unlisted() {
+        let db = three_record_fixture().await;
+        set_facet(
+            &db,
+            ALICE_COMMON_ID,
+            FacetSetPayload {
+                key: "priority".to_string(),
+                value: Some("high".to_string()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+        let full = exact_manifest(&db, alice()).await;
+        // A manifest naming exactly one correct record key and nothing else:
+        // every other fresh key must come back as an upsert, so applying the
+        // delta to that single row rebuilds the full model.
+        let one_record = full["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tuple| tuple[0] == ALICE_COMMON_ID)
+            .unwrap()
+            .clone();
+        let partial = json!({
+            "version": 1,
+            "profile": RESUME_MANIFEST_PROFILE,
+            "records": [one_record],
+            "facets": [],
+            "links": [],
+        });
+        let delta = match resume(&db, alice(), &partial).await {
+            CatchUpOutcome::Delta(delta) => delta,
+            other => panic!("partial manifest must delta, got {other:?}"),
+        };
+        assert!(
+            !delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_COMMON_ID),
+            "the one correct key is already current"
+        );
+        assert!(
+            delta
+                .upsert_records
+                .iter()
+                .any(|row| row.id == ALICE_ONLY_ID),
+            "unlisted fresh records upsert"
+        );
+        assert!(
+            delta
+                .upsert_facets
+                .iter()
+                .any(|facet| facet.record_id == ALICE_COMMON_ID && facet.key == "priority"),
+            "unlisted fresh facets upsert"
+        );
+        assert!(delta.delete_record_ids.is_empty());
     }
 }

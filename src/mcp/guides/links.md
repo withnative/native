@@ -52,7 +52,7 @@ The source is a constituent of the target whole. It is semantic composition, not
 
 The source was produced from the target and should retain that provenance.
 
-Use `manage_links` for atomic add/remove/list operations. Use `query_record` traversal for filtered multi-hop work; traversing a link never changes containment.
+Use `manage_links` for atomic add/remove/list operations. Use `query_record` traversal for filtered multi-hop work; traversing a link never changes containment. On a lean MCP surface, `manage_links.list`, `get_record` and `query_record` are reached through `call_executor` with `{"executor":"records_read","operation":...,"arguments":...}`.
 
 A record an incoming `supersedes` link points at discloses its successors on
 reads: `get_record`, `query_record`, `search`, `get_structure`,

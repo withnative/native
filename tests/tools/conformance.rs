@@ -53,7 +53,7 @@ fn doctored(target: &str, replacement: &str) -> Vec<String> {
 }
 
 const TYPE_CHECK: &str =
-    "CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation'))";
+    "CHECK (type IN ('Document','Program','WorkItem','Outcome','Entity','Collection','Resolution','Conversation','Message','Annotation','Configuration'))";
 const PERSISTENCE_COLUMN: &str =
     "persistence   TEXT NOT NULL DEFAULT 'enduring' CHECK (persistence IN ('enduring','occurrent')),";
 

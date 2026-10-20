@@ -330,26 +330,7 @@ impl PostgresDb {
         };
         let (outcome, error_kind) = match capture.outcome {
             Ok(_) => ("ok", None),
-            Err(error) => (
-                "error",
-                Some(match error {
-                    Error::Engine(_) => "engine",
-                    Error::Conflict(_) => "conflict",
-                    Error::NotHeld(_) => "not_held",
-                    Error::Auth(_) => "auth",
-                    Error::UnavailableOffline { .. } => "unavailable_offline",
-                    Error::CopyLocked { .. } => "copy_locked",
-                    Error::CopyUnavailable => "copy_unavailable",
-                    Error::CopyRemoved { .. } => "copy_removed",
-                    Error::StandbyReadOnly { .. } => "standby_read_only",
-                    Error::Delivery(_) => "delivery",
-                    Error::DeploymentReadOnly(_) => "deployment_read_only",
-                    Error::DeploymentDraining(_) => "deployment_draining",
-                    Error::Sqlx(_) => "database",
-                    Error::Json(_) => "json",
-                    Error::Io(_) => "io",
-                }),
-            ),
+            Err(error) => ("error", Some(crate::mcp::interactions::error_kind(error))),
         };
         let _ = sqlx::query(&format!(
             "INSERT INTO {table}(id,tool,actor,run_key,parent_key,arguments,outcome,error_kind,run_context,started_at,ended_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11::timestamptz)"
@@ -387,17 +368,31 @@ impl PostgresDb {
     /// Append and synchronously fold one meta event. The cursor row is updated
     /// in the same transaction, so rollback cannot leave a visible gap.
     pub async fn append_meta_event(&self, event: PostgresMetaEvent) -> Result<i64> {
+        let mut tx = self.pool.begin().await?;
+        let seq = self.append_meta_event_in(&mut tx, event).await?;
+        tx.commit().await?;
+        self.complete_realtime_commit();
+        Ok(seq)
+    }
+
+    /// [`Self::append_meta_event`] inside a caller-owned transaction, for
+    /// edges that must commit an event with other writes. The caller commits
+    /// and completes the realtime commit.
+    pub(super) async fn append_meta_event_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        event: PostgresMetaEvent,
+    ) -> Result<i64> {
         validate_nonempty("meta event id", &event.id)?;
         validate_nonempty("meta event subject_id", &event.subject_id)?;
         validate_nonempty("meta event type", &event.event_type)?;
-        let mut tx = self.pool.begin().await?;
         let seq = self
-            .allocate_log_position(&mut tx, PostgresLogKind::Meta)
+            .allocate_log_position(tx, PostgresLogKind::Meta)
             .await?;
         let events = self.qualified_table("meta_events")?;
         let act = match event.act {
             Some(act) => act,
-            None => super::allocate_act_in(self, &mut tx).await?,
+            None => super::allocate_act_in(self, tx).await?,
         };
         sqlx::query(&format!(
             "INSERT INTO {events}(seq,id,subject_id,type,payload,actor,created_at,act) VALUES($1,$2,$3,$4,$5,$6,$7::timestamptz,$8)"
@@ -410,11 +405,9 @@ impl PostgresDb {
         .bind(&event.actor)
         .bind(&event.created_at)
         .bind(act)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        self.project_meta_event(&mut tx, &event).await?;
-        tx.commit().await?;
-        self.complete_realtime_commit();
+        self.project_meta_event(tx, &event).await?;
         Ok(seq)
     }
 

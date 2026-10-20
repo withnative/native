@@ -203,6 +203,7 @@ export function lintSql(sql, params = [], where = "sql") {
     const args = inner.length === 0 ? 0 : 1 + inner.filter((t) => t.type === "punct" && t.value === "," && t.depth === token.depth + 1).length;
     if (name === "round" && args >= 2) fail("sql.function-arity", `${CQ}:3340`, "two-argument round is not portable — CAST the value to the catalog numeric type first");
     if (name === "now_ms" && args !== 0) fail("sql.function-arity", `${CQ}:3365`, "now_ms() takes no arguments");
+    if (name === "current_principal" && args !== 0) fail("sql.function-arity", `${CQ} CURRENT_PRINCIPAL_ARITY_REPAIR`, "current_principal() takes no arguments");
     if (name === "utc_date_label" && args !== 1) fail("sql.function-arity", `${CQ}:3519`, "utc_date_label takes exactly one argument");
   });
 
@@ -232,6 +233,12 @@ export function lintSql(sql, params = [], where = "sql") {
       }
       if (!relations.has(name) && !ctes.has(name)) {
         fail("sql.relation", `${CQ}:60 LOGICAL_RELATIONS (authorize_strict, src/query/sql.rs:1197)`, `'${name}' is not a logical relation (${S.relations.join(", ")})`);
+      }
+      // `catalog_operations` rows resolve only in online executor ad-hoc
+      // query_sql from the serving snapshot, which an alpha-tab need
+      // execution never carries. A same-named CTE is not a relation read.
+      if (name === "catalog_operations" && !ctes.has(name)) {
+        fail("sql.catalog-operations", "src/query/sql.rs resolve_catalog_operations_snapshot; src/mcp/tools/alpha_tabs.rs parse_sql_need_entry", "'catalog_operations' resolves only in online executor ad-hoc query_sql; alpha-tab needs refuse it");
       }
       expectTable = "after";
       return;

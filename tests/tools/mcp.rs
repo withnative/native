@@ -306,3 +306,99 @@ async fn read_guide_is_verbatim_and_text_only_in_both_stdio_eras() {
         assert!(text.contains("Run context:"), "{text}");
     }
 }
+
+/// First-call harness capture over real stdio framing, task c2e2b7d: a modern
+/// direct write without set_intent carries clientInfo into the contribution
+/// run block, while a legacy write without _meta records honest absence.
+#[tokio::test]
+async fn first_call_harness_reaches_contribution_in_both_stdio_eras() {
+    let registry = public_registry();
+    let db = native_ce::create_database(":memory:").await.unwrap();
+    let modern_record = "c0de0000-0000-4000-8000-000000000031";
+    let legacy_record = "c0de0000-0000-4000-8000-000000000032";
+    let legacy_run = "scout-chair-a748b2";
+    let bootstrapped = drive_stdio(
+        registry,
+        db.clone(),
+        &[modern_message(
+            1,
+            "tools/call",
+            json!({ "name": "bootstrap", "arguments": {"format": "json"} }),
+        )],
+    )
+    .await;
+    let boot = &bootstrapped[0]["result"];
+    assert_eq!(boot["isError"], false, "{boot}");
+    let run_key = boot["structuredContent"]["run"]["run_key"]
+        .as_str()
+        .expect("bootstrap issues a run key")
+        .to_string();
+
+    let responses = drive_stdio(
+        public_registry(),
+        db.clone(),
+        &[
+            modern_message(
+                2,
+                "tools/call",
+                json!({
+                    "name": "create_record",
+                    "arguments": {
+                        "id": modern_record, "type": "Document", "kind": "note",
+                        "name": "modern first-call write", "body": "body",
+                        "reason": "first-call harness stdio test",
+                        "run_key": run_key,
+                    },
+                }),
+            ),
+            rpc(
+                3,
+                "tools/call",
+                json!({
+                    "name": "create_record",
+                    "arguments": {
+                        "id": legacy_record, "type": "Document", "kind": "note",
+                        "name": "legacy first-call write", "body": "body",
+                        "reason": "first-call harness stdio test",
+                        "run_key": legacy_run,
+                    },
+                }),
+            ),
+            modern_message(
+                4,
+                "tools/call",
+                json!({
+                    "name": "get_record",
+                    "arguments": {"ids": [modern_record], "format": "json"},
+                }),
+            ),
+            rpc(
+                5,
+                "tools/call",
+                json!({
+                    "name": "get_record",
+                    "arguments": {"ids": [legacy_record], "format": "json"},
+                }),
+            ),
+        ],
+    )
+    .await;
+    db.close().await;
+
+    assert_eq!(responses[0]["result"]["isError"], false, "{}", responses[0]);
+    assert_eq!(responses[1]["result"]["isError"], false, "{}", responses[1]);
+    let fetched = &responses[2]["result"];
+    assert_eq!(fetched["isError"], false, "{fetched}");
+    let run = &fetched["structuredContent"]["records"][0]["contribution"]["run"];
+    assert_eq!(run["reported_mcp_client"]["name"], "native-ce-test");
+    assert_eq!(run["reported_mcp_client"]["version"], "1.0.0");
+    assert_eq!(run["reported_mcp_client"]["assurance"], "client_asserted");
+
+    let legacy = &responses[3]["result"];
+    assert_eq!(legacy["isError"], false, "{legacy}");
+    let legacy_run_block = &legacy["structuredContent"]["records"][0]["contribution"]["run"];
+    assert!(
+        legacy_run_block.get("reported_mcp_client").is_none(),
+        "legacy absence reads as absence: {legacy_run_block}"
+    );
+}

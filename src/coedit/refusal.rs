@@ -15,6 +15,9 @@ pub enum RefusalCode {
     BadDocShape,
     RateLimited,
     AccessLost,
+    LiveSessionChanged,
+    InvalidRequest,
+    Unavailable,
 }
 
 impl RefusalCode {
@@ -32,9 +35,13 @@ impl RefusalCode {
             // TODO(increment 4): rate limiting is not enforced yet; the
             // variant exists so the code surface is stable when it lands.
             Self::RateLimited => "rate_limited",
-            // TODO(increment 4): access-loss tracking is not enforced yet;
-            // same stability note as above.
             Self::AccessLost => "access_lost",
+            Self::LiveSessionChanged => "live_session_changed",
+            // Malformed request, e.g. a blank version reason.
+            Self::InvalidRequest => "invalid_request",
+            // The engine could not complete the operation (storage error,
+            // unsupported storage); retryable, never a client fault.
+            Self::Unavailable => "unavailable",
         }
     }
 }

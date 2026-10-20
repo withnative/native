@@ -6,7 +6,9 @@ use std::io::Write;
 
 use base64::Engine as _;
 use flate2::{write::GzEncoder, Compression};
-use native_ce::artifact_html::BODY_LIMIT;
+use native_ce::artifact_html::{
+    BODY_LIMIT, PACKAGE_BODY_LIMIT, PACKAGE_FACET_KEY, PACKAGE_FACET_VALUE,
+};
 use native_ce::mcp::{register_surface_tools, Caller, ToolRegistry};
 use native_ce::{create_database, Db};
 use serde_json::{json, Value};
@@ -344,5 +346,210 @@ async fn create_many_rejects_body_encoding_items() {
             .await
             .unwrap();
     assert_eq!(created, 0, "the refusal precedes every write");
+    db.close().await;
+}
+
+fn package_create_args(id: &str, body: &str, encoding: Option<&str>) -> Value {
+    let mut args = create_args(id, body, encoding);
+    args["facets"][PACKAGE_FACET_KEY] = json!(PACKAGE_FACET_VALUE);
+    args
+}
+
+#[tokio::test]
+async fn package_marker_allows_a_body_up_to_one_mebibyte_and_no_more() {
+    let (db, registry) = fixture().await;
+    // A 600 KB package body (over the ordinary limit) is accepted raw and encoded.
+    for (n, (encoding, id)) in [
+        (None, "a7720000-0000-4000-8000-000000000401"),
+        (Some("gzip+base64"), "a7720000-0000-4000-8000-000000000402"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = padded_document(600_000 + n);
+        let sent = match encoding {
+            Some("gzip+base64") => gzip_b64(body.as_bytes()),
+            _ => body.clone(),
+        };
+        let created = try_call(
+            &registry,
+            &db,
+            "create_record",
+            package_create_args(id, &sent, encoding),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created["html_body_write"]["utf8_bytes"], body.len());
+    }
+    // Exactly at the package limit is accepted; one byte over is refused.
+    let at_limit = padded_document(PACKAGE_BODY_LIMIT);
+    let created = try_call(
+        &registry,
+        &db,
+        "create_record",
+        package_create_args(
+            "a7720000-0000-4000-8000-000000000403",
+            &gzip_b64(at_limit.as_bytes()),
+            Some("gzip+base64"),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created["html_body_write"]["utf8_bytes"], PACKAGE_BODY_LIMIT);
+    let over = padded_document(PACKAGE_BODY_LIMIT + 1);
+    let id = "a7720000-0000-4000-8000-000000000404";
+    let error = try_call(
+        &registry,
+        &db,
+        "create_record",
+        package_create_args(id, &over, None),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("html_source_too_large"), "{error}");
+    let error = try_call(
+        &registry,
+        &db,
+        "create_record",
+        package_create_args(id, &gzip_b64(over.as_bytes()), Some("gzip+base64")),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("body_encoding_too_large"), "{error}");
+    assert_eq!(record_count(&db, id).await, 0);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn ordinary_html_over_the_ordinary_limit_is_still_refused() {
+    let (db, registry) = fixture().await;
+    let body = padded_document(600_000);
+    for (n, (encoding, sent)) in [
+        (None, body.clone()),
+        (Some("gzip+base64"), gzip_b64(body.as_bytes())),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("a7720000-0000-4000-8000-00000000050{n}");
+        let error = try_call(
+            &registry,
+            &db,
+            "create_record",
+            create_args(&id, &sent, encoding),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("html_source_too_large") || error.contains("body_encoding_too_large"),
+            "{error}"
+        );
+        assert_eq!(record_count(&db, &id).await, 0);
+    }
+    // Another facet value is not the marker.
+    let mut args = create_args("a7720000-0000-4000-8000-000000000510", &body, None);
+    args["facets"][PACKAGE_FACET_KEY] = json!("false");
+    let error = try_call(&registry, &db, "create_record", args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("html_source_too_large"), "{error}");
+    db.close().await;
+}
+
+#[tokio::test]
+async fn chunked_install_route_keeps_the_marker_through_the_rekind() {
+    // The kit's chunked route stages a note, appends chunks, then re-kinds to
+    // an artifact with the facets: the marker must be on that update.
+    let (db, registry) = fixture().await;
+    let body = padded_document(600_000);
+    for (id, facets, accepted) in [
+        (
+            "a7720000-0000-4000-8000-000000000601",
+            json!({"runtime": "native.html.v1", PACKAGE_FACET_KEY: PACKAGE_FACET_VALUE}),
+            true,
+        ),
+        (
+            "a7720000-0000-4000-8000-000000000602",
+            json!({"runtime": "native.html.v1"}),
+            false,
+        ),
+    ] {
+        try_call(
+            &registry,
+            &db,
+            "create_record",
+            json!({"id": id, "type": "Document", "kind": "note", "name": id, "body": "", "reason": "stage"}),
+        )
+        .await
+        .unwrap();
+        let mut staged = String::new();
+        for chunk in body.as_bytes().chunks(8000) {
+            let chunk = std::str::from_utf8(chunk).unwrap();
+            let mut args = json!({"id": id, "body_append": chunk, "reason": "chunk"});
+            if !staged.is_empty() {
+                args["if_body_digest"] = json!(digest(&staged));
+            }
+            try_call(&registry, &db, "update_record", args)
+                .await
+                .unwrap();
+            staged.push_str(chunk);
+        }
+        let result = try_call(
+            &registry,
+            &db,
+            "update_record",
+            json!({"id": id, "kind": "artifact", "facets": facets, "if_body_digest": digest(&body), "reason": "rekind"}),
+        )
+        .await;
+        match (accepted, result) {
+            (true, Ok(_)) => {}
+            (false, Err(error)) => assert!(
+                error.to_string().contains("html_source_too_large"),
+                "{error}"
+            ),
+            (accepted, other) => panic!("accepted={accepted}: {other:?}"),
+        }
+    }
+    db.close().await;
+}
+
+#[tokio::test]
+async fn marker_wrapper_is_read_the_same_at_decode_and_write_and_only_for_html_artifacts() {
+    let (db, registry) = fixture().await;
+    let body = padded_document(600_000);
+    // A { "value": "true" } wrapper is the marker, encoded and raw.
+    for (n, encoding) in [None, Some("gzip+base64")].into_iter().enumerate() {
+        let sent = match encoding {
+            Some(_) => gzip_b64(body.as_bytes()),
+            None => body.clone(),
+        };
+        let mut args = create_args(
+            &format!("a7720000-0000-4000-8000-00000000070{n}"),
+            &sent,
+            encoding,
+        );
+        args["facets"][PACKAGE_FACET_KEY] = json!({ "value": PACKAGE_FACET_VALUE });
+        try_call(&registry, &db, "create_record", args)
+            .await
+            .unwrap();
+    }
+    // The marker does not widen the decode limit for a note.
+    let id = "a7720000-0000-4000-8000-000000000710";
+    let args = json!({
+        "id": id, "type": "Document", "kind": "note", "name": id,
+        "body": gzip_b64(body.as_bytes()), "body_encoding": "gzip+base64",
+        "facets": { PACKAGE_FACET_KEY: PACKAGE_FACET_VALUE },
+        "reason": "A note cannot claim the package limit."
+    });
+    let error = try_call(&registry, &db, "create_record", args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("body_encoding_too_large"), "{error}");
+    assert_eq!(record_count(&db, id).await, 0);
     db.close().await;
 }

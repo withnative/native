@@ -2,6 +2,12 @@
 
 This guide contains only non-obvious focused-profile recipes whose limitations matter. It is not an exhaustive history of tool names or a promise that every hidden or retired capability has a faithful composition.
 
+When the person asks to build an **app**, use installed apps: read
+`guidance_read.read_guide` topic `app-builder-1.0.0` first. It covers the supplied
+Preact kit (`app-kit-core-1.1.0`), `artifacts_read.manage_alpha_tabs.prepare_install`,
+and the person's Preview/Adopt boundary. Use the artifact recipe below for
+dashboards, boards and views inside Native.
+
 ## Author a live artifact from scratch
 
 A board or dashboard is a `Document` record with `kind:"artifact"`, authored
@@ -26,9 +32,43 @@ establish semantic placement, where HTML returns only an isolated launch
 descriptor. `verify_artifact` serves both, differently: a bounded attested
 screen/print matrix for HTML, one advisory canonical-screen observation for
 MDX v2. HTML's isolated runtime has no module
-imports, no host theming and no ambient network, so a consistent look across
-many HTML artifacts is an authoring discipline rather than something the host
-supplies. Existing
+imports or ambient network. Compatible installed-app hosts support
+`app.skin.v1`: presentation data in a Document/note body with schema
+`native.app-skin.v1`, selected by the installed artifact's scalar `app_skin`
+facet. Skins name exact compatible packages and may replace bounded `--app-*`
+colour/length/font-family tokens, frame-local CSS (no `@import` or `@charset`), label strings,
+and optional display name/icon. Create a note, attach its UUID with
+`update_record` facets `{ "app_skin": "<skin UUID>" }`, edit its JSON body live,
+or clear with `{ "app_skin": null }`. This is shared presentation for installs
+referencing that artifact; personal overrides are deferred.
+
+The host reads the note as the signed-in person, validates it, and sends full
+replacements on the authenticated frame port. It owns style insertion and
+appends its token and override styles, in that order, at the end of `<head>`
+after authored head styles. Equal-specificity `<style>` elements in `<body>`
+or styles injected later by app script can win the cascade. It
+exposes `window.native.skin.subscribe(cb)` after `nativeArtifact.ready`; the
+callback receives an immutable `{labels}` snapshot immediately and on changes,
+and returns unsubscribe. Authors retain built-in token/label defaults, ignore
+unknown labels, and apply known strings through safe text/attribute rendering.
+A missing, archived, inaccessible, malformed or incompatible note clears the
+override and shows a host notice; it never hides workspace data. Cached skins
+paint immediately before revalidation. A new pointer keeps the previous skin
+without a notice for at most three seconds or until its first read/subscription
+error, then restores built-in presentation with an unreadable notice. A late
+success can still apply that pointer. With no skin to retain, built-in
+presentation waits quietly for the read to resolve or report an error.
+Once it has answered, non-terminal errors
+retain its result quietly; terminal errors clear it and allow re-subscription
+on the next metadata pass. Skin name
+and icon independently precede artifact name/`app_icon`, then package defaults.
+Skins stay outside executable source, install/digest/consent/adoption pins;
+body edits and pointer changes preserve frames and drafts without an install
+list refetch. The existing sandbox/CSP still blocks remote loads. Older hosts
+and apps retain authored defaults. Ordinary HTML artifacts still need authored
+styles; this contract applies to installed app frames. For the practical
+recipe (find an app's tokens and labels, write and attach a skin) read the
+`app-skins` guide. Existing
 `native.board.v1` and `native.mdx.v1` artifacts have their own
 contracts; do not assume they accept a v2 manifest. A runtime name alone does
 not adapt a static file into a live view.

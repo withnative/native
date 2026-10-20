@@ -132,13 +132,14 @@ impl ExecutorTelemetryContext {
 
     pub(crate) fn observe_hosted_authorization_denied(
         &self,
+        surface: TelemetrySurface,
         manifest_sha256: Option<&str>,
         server_revision: &str,
     ) {
         let denied_attempt = Uuid::new_v4().to_string();
         let session = SessionContext {
             correlation: self.correlation("session", &denied_attempt),
-            surface: TelemetrySurface::Executor,
+            surface,
             manifest_sha256: manifest_sha256
                 .filter(|digest| valid_sha256(digest))
                 .map(str::to_owned),
@@ -157,8 +158,31 @@ impl ExecutorTelemetryContext {
         );
     }
 
+    /// An executor-surface session; production binds through
+    /// [`Self::bind_for_surface`] so the lean catalogue is marked.
+    #[cfg(test)]
     pub(super) fn bind(
         self: &Arc<Self>,
+        raw_session_binding: &str,
+        manifest_sha256: &str,
+        server_revision: &str,
+        engine: TelemetryEngine,
+        transport: TelemetryTransport,
+    ) -> BoundExecutorTelemetry {
+        self.bind_for_surface(
+            TelemetrySurface::Executor,
+            raw_session_binding,
+            manifest_sha256,
+            server_revision,
+            engine,
+            transport,
+        )
+    }
+
+    /// Bind one session to the product surface whose manifest it serves.
+    pub(super) fn bind_for_surface(
+        self: &Arc<Self>,
+        surface: TelemetrySurface,
         raw_session_binding: &str,
         manifest_sha256: &str,
         server_revision: &str,
@@ -169,7 +193,7 @@ impl ExecutorTelemetryContext {
             context: self.clone(),
             session: SessionContext {
                 correlation: self.correlation("session", raw_session_binding),
-                surface: TelemetrySurface::Executor,
+                surface,
                 manifest_sha256: valid_sha256(manifest_sha256).then(|| manifest_sha256.to_owned()),
                 server_revision: normalize_revision(server_revision),
                 engine,
@@ -186,8 +210,24 @@ impl ExecutorTelemetryContext {
         manifest_sha256: &str,
         manifest_bytes: usize,
     ) -> BoundExecutorTelemetry {
+        self.bind_hosted_manifest_for_surface(
+            TelemetrySurface::Executor,
+            manifest_sha256,
+            manifest_bytes,
+        )
+    }
+
+    /// [`Self::bind_hosted_manifest`] for an explicit product surface: the
+    /// lean ordinary catalogue binds `lean`, everything else `executor`.
+    pub(crate) fn bind_hosted_manifest_for_surface(
+        self: &Arc<Self>,
+        surface: TelemetrySurface,
+        manifest_sha256: &str,
+        manifest_bytes: usize,
+    ) -> BoundExecutorTelemetry {
         let binding = format!("hosted-manifest:{manifest_sha256}");
-        let telemetry = self.bind(
+        let telemetry = self.bind_for_surface(
+            surface,
             &binding,
             manifest_sha256,
             crate::FULL_GIT_SHA,
@@ -345,10 +385,72 @@ pub enum TelemetryTransport {
     Http,
 }
 
+/// How a request reached the governed dispatch path. Absent on the wire
+/// means a direct executor call; only the lean surface's generic entry point
+/// is marked, so every pre-existing event stays byte-identical.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum TelemetrySurface {
+pub(super) enum TelemetryRoute {
+    CallExecutor,
+}
+
+/// Attribution for every request-scoped event one `tools/call` emits.
+///
+/// The raw run key and account live only in this task-local, in memory, for
+/// the duration of one dispatch. Events never carry them: `request()` turns
+/// them into domain-separated correlations under the process HMAC key, the
+/// same treatment as the session and plan correlations, so they are stable
+/// within one process and unlinkable across restarts.
+#[derive(Clone, Debug, Default)]
+pub(super) struct RequestScope {
+    /// Set only for requests unwrapped from `call_executor`.
+    pub route: Option<TelemetryRoute>,
+    /// A shape-valid full run key the caller supplied, if any. Issuance
+    /// sentinels (`new`, `new:<agent>`) and malformed keys are absent.
+    pub run_key: Option<String>,
+    /// The authenticated account the request acts for.
+    pub account: Option<String>,
+}
+
+tokio::task_local! {
+    /// Set for the whole dispatch of one request, so every request-scoped
+    /// event it emits — selection, validation and repair, plan preparation
+    /// and execution, dispatch — carries its route and correlations without
+    /// threading them through each emit site.
+    static REQUEST_SCOPE: RequestScope;
+}
+
+/// Run one dispatch future under its attribution scope.
+pub(super) async fn scope_request<F: std::future::Future>(
+    scope: RequestScope,
+    future: F,
+) -> F::Output {
+    REQUEST_SCOPE.scope(scope, future).await
+}
+
+/// The route marker of the dispatch running on this task, if any.
+pub(super) fn current_route() -> Option<TelemetryRoute> {
+    REQUEST_SCOPE.try_with(|scope| scope.route).ok().flatten()
+}
+
+/// The product surface a session's manifest belongs to. `Lean` marks only
+/// the lean projection of the ordinary catalogue, so a log export can select
+/// lean traffic exactly; lens catalogues served beside it stay `Executor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TelemetrySurface {
     Executor,
+    Lean,
+}
+
+impl TelemetrySurface {
+    pub(crate) fn for_ordinary_catalogue(lean: bool) -> Self {
+        if lean {
+            Self::Lean
+        } else {
+            Self::Executor
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -467,11 +569,25 @@ impl BoundExecutorTelemetry {
         operation: Option<&str>,
         raw_plan_id: Option<&str>,
     ) -> TelemetryRequest {
+        let scope = REQUEST_SCOPE.try_with(Clone::clone).unwrap_or_default();
         TelemetryRequest {
             correlation: self.context.next_request_correlation(),
             plan_correlation: raw_plan_id.map(|plan_id| self.context.correlation("plan", plan_id)),
             executor: canonical_name(executor, false),
             operation: canonical_name(operation, true),
+            route: scope.route,
+            run_correlation: scope
+                .run_key
+                .as_deref()
+                .map(|run_key| self.context.correlation("run", run_key)),
+            agent_correlation: scope.run_key.as_deref().map(|run_key| {
+                self.context
+                    .correlation("agent", crate::runkey::agent_key_of(run_key))
+            }),
+            account_correlation: scope
+                .account
+                .as_deref()
+                .map(|account| self.context.correlation("account", account)),
         }
     }
 
@@ -510,6 +626,19 @@ pub(super) struct TelemetryRequest {
     plan_correlation: Option<String>,
     executor: String,
     operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<TelemetryRoute>,
+    /// Keyed hash of the caller's run key: groups one agent run's requests
+    /// across HTTP requests, so an error and its retry pair offline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_correlation: Option<String>,
+    /// Keyed hash of the run key's agent key (its stable `adjective-noun`
+    /// prefix): groups one agent's runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_correlation: Option<String>,
+    /// Keyed hash of the authenticated account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    account_correlation: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

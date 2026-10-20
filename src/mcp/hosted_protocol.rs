@@ -180,6 +180,76 @@ pub fn add_modern_result_fields(result: &mut Value) {
     protocol::add_modern_result_fields(result);
 }
 
+/// Validate a hosted outbox tools/call before any speculative write. Invalid
+/// messages fall through to the ordinary protocol error path. The outbox's
+/// custody contract treats an explicit null id as a request.
+pub fn valid_outbox_tool_call(message: &Value) -> bool {
+    if message["jsonrpc"] != "2.0" || message["method"] != "tools/call" {
+        return false;
+    }
+    match message.get("id") {
+        Some(Value::Null | Value::String(_)) => {}
+        Some(Value::Number(n)) if n.is_i64() || n.is_u64() => {}
+        _ => return false,
+    }
+    let Some(params) = message.get("params").and_then(Value::as_object) else {
+        return false;
+    };
+    if protocol::validate_method_params("tools/call", params).is_err()
+        || params.contains_key("inputResponses")
+    {
+        return false;
+    }
+    if !protocol::is_modern_request(message) {
+        return true;
+    }
+    let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
+        return false;
+    };
+    if meta
+        .get("io.modelcontextprotocol/protocolVersion")
+        .and_then(Value::as_str)
+        != Some(PROTOCOL_VERSION)
+    {
+        return false;
+    }
+    let Some(caps) = meta.get("io.modelcontextprotocol/clientCapabilities") else {
+        return false;
+    };
+    if protocol::validate_client_capabilities(caps).is_err() {
+        return false;
+    }
+    if meta
+        .get("io.modelcontextprotocol/clientInfo")
+        .is_some_and(|v| protocol::validate_implementation(v).is_err())
+    {
+        return false;
+    }
+    if meta
+        .get("progressToken")
+        .is_some_and(|v| !v.is_string() && !v.is_number())
+    {
+        return false;
+    }
+    !meta
+        .get("io.modelcontextprotocol/logLevel")
+        .is_some_and(|v| {
+            !matches!(
+                v.as_str(),
+                Some(
+                    "alert"
+                        | "critical"
+                        | "debug"
+                        | "emergency"
+                        | "error"
+                        | "info"
+                        | "notice"
+                        | "warning"
+                )
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

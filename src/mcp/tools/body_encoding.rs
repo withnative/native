@@ -6,7 +6,7 @@
 //! lets a caller send the same bytes as base64, or gzip then base64. The
 //! decode runs at the tool boundary, before anything else reads the body, and
 //! rewrites the arguments in place: everything downstream (validation,
-//! `BODY_LIMIT`, storage, `body_digest`, source events, idempotency digests)
+//! body limit, storage, `body_digest`, source events, idempotency digests)
 //! sees only the decoded text, so an encoded and a raw submission of the same
 //! body are indistinguishable.
 
@@ -21,7 +21,7 @@ use crate::error::{Error, Result};
 
 pub(crate) const FIELD: &str = "body_encoding";
 const ACCEPTED: &str = "utf8, base64, gzip+base64";
-/// Slack over `BODY_LIMIT` for gzip framing on incompressible input, so the
+/// Slack over the body limit for gzip framing on incompressible input, so the
 /// pre-decode length check never refuses a stream a real compressor produced
 /// from a body at the limit.
 const GZIP_OVERHEAD: usize = 1024;
@@ -107,22 +107,55 @@ pub(crate) fn decode_arguments(
             ),
         ));
     };
+    let limit = body_limit_for(tool, object);
     let encoded = object[key]
         .as_str()
         .expect("body key was checked as a string");
-    let decoded = decode(tool, key, encoding, encoded)?;
+    let decoded = decode(tool, key, encoding, encoded, limit)?;
     object.insert(key.into(), Value::String(decoded));
     Ok(())
 }
 
-fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<String> {
+/// The decode limit for this call: the package limit only for an HTML
+/// artifact write (`Document` / `artifact` / `native.html.v1`) that carries the
+/// package marker, read exactly as write validation reads it. `update_record`
+/// does not carry the record type, so it must restate `kind: artifact` and the
+/// runtime, as the kit's chunked re-kind does; write validation then still
+/// requires a `Document`. Everything else keeps the ordinary limit.
+fn body_limit_for(tool: &str, object: &serde_json::Map<String, Value>) -> usize {
+    let facets = object.get("facets");
+    let runtime = facets
+        .and_then(|facets| facets.get("runtime"))
+        .and_then(|value| {
+            crate::domain_transaction::parse_facet_write_value(tool, "runtime", value).ok()
+        })
+        .map(|write| write.stored_value());
+    let shape = object.get("kind").and_then(Value::as_str) == Some("artifact")
+        && runtime.as_deref() == Some(crate::artifact_html::RUNTIME_ID)
+        && (tool != "create_record"
+            || object.get("type").and_then(Value::as_str) == Some("Document"));
+    let marker = crate::mcp::tools::artifacts::package_marker_of_facets_arg(tool, facets);
+    if shape {
+        crate::artifact_html::body_limit_for_package_marker(marker.as_deref())
+    } else {
+        BODY_LIMIT
+    }
+}
+
+fn decode(
+    tool: &str,
+    key: &str,
+    encoding: Encoding,
+    encoded: &str,
+    limit: usize,
+) -> Result<String> {
     let name = if encoding == Encoding::GzipBase64 {
         "gzip+base64"
     } else {
         "base64"
     };
     // Refuse an obviously oversized string before spending any work on it.
-    let max_raw = BODY_LIMIT
+    let max_raw = limit
         + if encoding == Encoding::GzipBase64 {
             GZIP_OVERHEAD
         } else {
@@ -134,7 +167,7 @@ fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<St
             tool,
             "body_encoding_too_large",
             format!(
-                "'{key}' is {} characters of {name}, over the {max_encoded}-character maximum for a {BODY_LIMIT}-byte body; shrink the source",
+                "'{key}' is {} characters of {name}, over the {max_encoded}-character maximum for a {limit}-byte body; shrink the source",
                 encoded.len(),
             ),
         ));
@@ -155,7 +188,7 @@ fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<St
         let mut input = bytes.as_slice();
         let mut member = GzDecoder::new(&mut input);
         (&mut member)
-            .take(BODY_LIMIT as u64 + 1)
+            .take(limit as u64 + 1)
             .read_to_end(&mut inflated)
             .map_err(|error| {
                 refuse(
@@ -168,7 +201,7 @@ fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<St
         // A bufread decoder consumes exactly one member. Anything left is a
         // second member or trailing bytes, which would otherwise be dropped
         // silently, so a concatenated stream cannot be quietly truncated.
-        if inflated.len() <= BODY_LIMIT && !input.is_empty() {
+        if inflated.len() <= limit && !input.is_empty() {
             return Err(refuse(
                 tool,
                 "body_encoding_invalid_gzip",
@@ -178,12 +211,12 @@ fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<St
                 ),
             ));
         }
-        if inflated.len() > BODY_LIMIT {
+        if inflated.len() > limit {
             return Err(refuse(
                 tool,
                 "body_encoding_too_large",
                 format!(
-                    "'{key}' decompresses to more than the {BODY_LIMIT}-byte body limit (decompression stopped at the limit); shrink the source"
+                    "'{key}' decompresses to more than the {limit}-byte body limit (decompression stopped at the limit); shrink the source"
                 ),
             ));
         }
@@ -191,12 +224,12 @@ fn decode(tool: &str, key: &str, encoding: Encoding, encoded: &str) -> Result<St
     } else {
         bytes
     };
-    if bytes.len() > BODY_LIMIT {
+    if bytes.len() > limit {
         return Err(refuse(
             tool,
             "body_encoding_too_large",
             format!(
-                "'{key}' decodes to {} bytes, over the {BODY_LIMIT}-byte body limit; shrink the source",
+                "'{key}' decodes to {} bytes, over the {limit}-byte body limit; shrink the source",
                 bytes.len(),
             ),
         ));
@@ -369,6 +402,125 @@ mod tests {
             text.contains("body_encoding_too_large") && text.contains("524288"),
             "{text}"
         );
+    }
+
+    use crate::artifact_html::{PACKAGE_BODY_LIMIT, PACKAGE_FACET_KEY, PACKAGE_FACET_VALUE};
+
+    /// A `create_record` argument set; `shape` is (type, kind, runtime facet).
+    fn run_shaped(
+        tool: &str,
+        encoding: &str,
+        body: &str,
+        shape: (&str, &str, Option<&str>),
+        marker: Option<Value>,
+    ) -> Result<Value> {
+        let mut facets = serde_json::Map::new();
+        if let Some(runtime) = shape.2 {
+            facets.insert("runtime".into(), json!(runtime));
+        }
+        if let Some(marker) = marker {
+            facets.insert(PACKAGE_FACET_KEY.into(), marker);
+        }
+        let mut arguments = json!({"body": body, "body_encoding": encoding, "type": shape.0,
+            "kind": shape.1, "facets": facets, "reason": "r"});
+        decode_arguments(tool, &mut arguments, &["body"])?;
+        Ok(arguments)
+    }
+
+    const HTML_SHAPE: (&str, &str, Option<&str>) = ("Document", "artifact", Some("native.html.v1"));
+
+    #[test]
+    fn package_marker_raises_the_decoded_limit_to_one_mebibyte_and_no_further() {
+        let plain = json!(PACKAGE_FACET_VALUE);
+        let wrapped = json!({ "value": PACKAGE_FACET_VALUE });
+        let at_limit = "a".repeat(PACKAGE_BODY_LIMIT);
+        let over = "a".repeat(PACKAGE_BODY_LIMIT + 1);
+        for (encoding, encode) in [
+            ("base64", b64 as fn(&[u8]) -> String),
+            ("gzip+base64", |bytes: &[u8]| gzip_b64(bytes)),
+        ] {
+            // A plain string and a { value } wrapper are the same marker.
+            for marker in [&plain, &wrapped] {
+                assert_eq!(
+                    run_shaped(
+                        "create_record",
+                        encoding,
+                        &encode(at_limit.as_bytes()),
+                        HTML_SHAPE,
+                        Some(marker.clone())
+                    )
+                    .unwrap()["body"],
+                    at_limit
+                );
+                let text = message(run_shaped(
+                    "create_record",
+                    encoding,
+                    &encode(over.as_bytes()),
+                    HTML_SHAPE,
+                    Some(marker.clone()),
+                ));
+                assert!(
+                    text.contains("body_encoding_too_large") && text.contains("1048576"),
+                    "{text}"
+                );
+            }
+            // The same bytes keep the ordinary limit without the marker, with
+            // another marker value, or outside the HTML artifact shape.
+            let six = encode("a".repeat(600_000).as_bytes());
+            let refused = |tool: &str, shape: (&str, &str, Option<&str>), marker: Option<Value>| {
+                let text = message(run_shaped(tool, encoding, &six, shape, marker));
+                assert!(
+                    text.contains("body_encoding_too_large") && text.contains("524288"),
+                    "{text}"
+                );
+            };
+            refused("create_record", HTML_SHAPE, None);
+            refused("create_record", HTML_SHAPE, Some(json!("false")));
+            refused(
+                "create_record",
+                HTML_SHAPE,
+                Some(json!({ "value": "false" })),
+            );
+            refused(
+                "create_record",
+                ("Message", "artifact", Some("native.html.v1")),
+                Some(plain.clone()),
+            );
+            refused(
+                "create_record",
+                ("Document", "note", Some("native.html.v1")),
+                Some(plain.clone()),
+            );
+            refused(
+                "create_record",
+                ("Document", "artifact", Some("native.mdx.v2")),
+                Some(plain.clone()),
+            );
+            refused(
+                "create_record",
+                ("Document", "artifact", None),
+                Some(plain.clone()),
+            );
+            refused(
+                "create_record",
+                ("Document", "note", None),
+                Some(plain.clone()),
+            );
+            // update_record carries no type: it must restate kind and runtime.
+            refused(
+                "update_record",
+                ("Document", "note", Some("native.html.v1")),
+                Some(plain.clone()),
+            );
+            assert!(run_shaped(
+                "update_record",
+                encoding,
+                &encode(at_limit.as_bytes()),
+                HTML_SHAPE,
+                Some(plain.clone())
+            )
+            .is_ok());
+        }
     }
 
     #[test]

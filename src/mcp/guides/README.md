@@ -33,6 +33,8 @@ authoritative in implementation, typed operation schemas, and tests.
 - [Messaging](messaging.md)
 - [Attachments](attachment.md)
 - [Compositions](compositions.md)
+- [MCP-only app builder 1.0.0](app-builder-1.0.0.md)
+- [App skins](app-skins.md)
 - [Interpretive claims](interpretive-claims.md)
 - [Change summaries](change-summaries.md)
 

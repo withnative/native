@@ -71,6 +71,11 @@ export async function openFakeHost(page, options) {
     events,
     pushInput: () => page.evaluate(() => window.__alphaTabHost.pushInput()),
     reload: () => page.evaluate(() => window.__alphaTabHost.reload()),
+    subscriptions: () => page.evaluate(() => window.__alphaTabHost.subscriptions()),
+    pushSubscription: (id, result, options) => page.evaluate(([i, r, o]) => window.__alphaTabHost.pushSubscription(i, r, o), [id, result, options]),
+    failSubscription: (id, code, message, terminal) => page.evaluate(([i, c, m, t]) => window.__alphaTabHost.failSubscription(i, c, m, t), [id, code, message, terminal]),
+    pushAgentStatus: (status) => page.evaluate((body) => window.__alphaTabHost.pushAgentStatus(body), status),
+    sessionPost: (requestId, frame) => page.evaluate(([id, body]) => window.__alphaTabHost.sessionPost(id, body), [requestId, frame]),
     async audit() { return audit(await events()); },
     async expectHealthy() {
       const summary = audit(await events());

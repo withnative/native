@@ -762,3 +762,356 @@ async fn malformed_arguments_never_cost_an_outbound_request() {
     assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM blobs").await, 0);
     db.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Keyed attach_from_url (task 8bef361, slice A2): a replay never fetches
+// ---------------------------------------------------------------------------
+
+/// A server that counts every request it answers.
+async fn counting_server(body: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_in = hits.clone();
+    let addr = serve(move |_| {
+        hits_in.fetch_add(1, Ordering::SeqCst);
+        ok_response(body, "text/plain")
+    })
+    .await;
+    (addr, hits)
+}
+
+fn attachment_registry() -> Arc<ToolRegistry> {
+    let mut registry = ToolRegistry::new();
+    register_attachment_tools_with(&mut registry, loopback_config()).unwrap();
+    Arc::new(registry)
+}
+
+async fn attachment_footprint(db: &Db) -> (i64, i64, i64) {
+    (
+        count(db, "SELECT COUNT(*) AS n FROM content_events").await,
+        count(db, "SELECT COUNT(*) AS n FROM blobs").await,
+        count(
+            db,
+            "SELECT COUNT(*) AS n FROM provenance_action_attestations",
+        )
+        .await,
+    )
+}
+
+#[tokio::test]
+async fn keyed_attach_from_url_replays_and_conflicts_without_fetching_again() {
+    let (addr, hits) = counting_server("captured once").await;
+    let registry = attachment_registry();
+    let db = db().await;
+    let home = create_record(
+        &db,
+        json!({ "type": "Collection", "kind": "folder", "name": "Home" }),
+    )
+    .await
+    .unwrap();
+    let url = format!("http://127.0.0.1:{}/notes.txt", addr.port());
+    let args = json!({ "record_id": home, "url": url, "idempotency_key": "capture" });
+
+    let first = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(first["url"], json!(url));
+    assert!(first.get("final_url").is_none(), "{first}");
+    assert!(first.get("redirects").is_none(), "{first}");
+    let footprint = attachment_footprint(&db).await;
+
+    let replay = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.to_string(),
+        first.to_string(),
+        "byte-identical replay"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a replay must not fetch");
+    assert_eq!(attachment_footprint(&db).await, footprint);
+
+    // A conflicting reuse is refused before any network I/O too.
+    let mut conflicting = args;
+    conflicting["name"] = json!("Another name");
+    let error = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", conflicting)
+        .await
+        .unwrap_err();
+    assert!(error.is_idempotency_conflict(), "{error}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a conflict must not fetch");
+    assert_eq!(attachment_footprint(&db).await, footprint);
+    db.close().await;
+}
+
+/// The liveness check follows the replay lookup, so a fresh key on a
+/// tombstoned bearer is refused by it before it spends a fetch. A retry of a
+/// committed attach is not refused by liveness at all: the replay re-checks
+/// View on the bearer its receipt names, and a tombstone is not viewable, so it
+/// is refused there. Neither case fetches or writes.
+#[tokio::test]
+async fn keyed_attach_from_url_on_a_tombstoned_bearer_is_refused_without_a_fetch() {
+    let (addr, hits) = counting_server("captured before the delete").await;
+    let registry = attachment_registry();
+    let db = db().await;
+    let home = create_record(
+        &db,
+        json!({ "type": "Document", "kind": "note", "name": "Bearer" }),
+    )
+    .await
+    .unwrap();
+    let url = format!("http://127.0.0.1:{}/notes.txt", addr.port());
+    let args = json!({ "record_id": home, "url": url, "idempotency_key": "tombstoned" });
+    registry
+        .call(db.clone(), Caller::local(), "attach_from_url", args.clone())
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    native_ce::store::delete_record(&db, &home).await.unwrap();
+    let footprint = attachment_footprint(&db).await;
+    let retry = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", args.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    let mut fresh_args = args;
+    fresh_args["idempotency_key"] = json!("never-used");
+    let fresh = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", fresh_args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(retry.contains("does not exist"), "{retry}");
+    assert!(fresh.contains("is deleted (tombstoned)"), "{fresh}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a refusal must not fetch");
+    assert_eq!(attachment_footprint(&db).await, footprint);
+    db.close().await;
+}
+
+/// Same-key calls that all miss before any of them commits each fetch, but
+/// only one attaches: the others find its row in their commit transaction and
+/// replay it, rolling back their tentative blob. Later retries never fetch.
+#[tokio::test]
+async fn keyed_attach_from_url_concurrent_calls_attach_once() {
+    let (addr, hits) = counting_server("raced").await;
+    let registry = attachment_registry();
+    let db = db().await;
+    let home = create_record(
+        &db,
+        json!({ "type": "Collection", "kind": "folder", "name": "Home" }),
+    )
+    .await
+    .unwrap();
+    let args = json!({
+        "record_id": home,
+        "url": format!("http://127.0.0.1:{}/race.txt", addr.port()),
+        "idempotency_key": "race",
+    });
+    let created = "SELECT COUNT(*) AS n FROM content_events WHERE type = 'record.created'";
+    let before = count(&db, created).await;
+    let calls = (0..4).map(|_| {
+        let registry = registry.clone();
+        let db = db.clone();
+        let args = args.clone();
+        tokio::spawn(async move {
+            registry
+                .call(db, Caller::local(), "attach_from_url", args)
+                .await
+        })
+    });
+    let receipts = futures::future::join_all(calls)
+        .await
+        .into_iter()
+        .map(|joined| joined.unwrap().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(receipts.iter().all(|receipt| *receipt == receipts[0]));
+    assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM blobs").await, 1);
+    assert_eq!(count(&db, created).await, before + 1, "one attachment");
+    let fetched = hits.load(Ordering::SeqCst);
+    let replay = registry
+        .call(db.clone(), Caller::local(), "attach_from_url", args)
+        .await
+        .unwrap();
+    assert_eq!(replay.to_string(), receipts[0]);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        fetched,
+        "a replay must not fetch"
+    );
+    db.close().await;
+}
+
+/// A server that answers nothing until `count` requests are in flight, so
+/// every caller has passed the pre-fetch lookup before anyone commits.
+async fn barrier_server(body: &'static str, count: usize) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_in = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let mut waiting = Vec::new();
+            while waiting.len() < count {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = socket.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                hits_in.fetch_add(1, Ordering::SeqCst);
+                waiting.push(socket);
+            }
+            for mut socket in waiting {
+                let _ = socket
+                    .write_all(ok_response(body, "text/plain").as_bytes())
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        }
+    });
+    (addr, hits)
+}
+
+/// The commit-step replay, made deterministic: both same-key calls miss the
+/// pre-fetch lookup and fetch (the server holds both requests), so the one
+/// that commits second must replay the first's attachment inside its commit
+/// transaction. Two fetches, one blob and one attachment prove that path ran.
+#[tokio::test]
+async fn keyed_attach_from_url_commit_step_replays_a_call_that_committed_during_the_fetch() {
+    let (addr, hits) = barrier_server("held", 2).await;
+    let registry = attachment_registry();
+    let db = db().await;
+    let home = create_record(
+        &db,
+        json!({ "type": "Collection", "kind": "folder", "name": "Home" }),
+    )
+    .await
+    .unwrap();
+    let args = json!({
+        "record_id": home,
+        "url": format!("http://127.0.0.1:{}/held.txt", addr.port()),
+        "idempotency_key": "commit-step",
+    });
+    let created = "SELECT COUNT(*) AS n FROM content_events WHERE type = 'record.created'";
+    let before = count(&db, created).await;
+    let calls = (0..2).map(|_| {
+        let registry = registry.clone();
+        let db = db.clone();
+        let args = args.clone();
+        tokio::spawn(async move {
+            registry
+                .call(db, Caller::local(), "attach_from_url", args)
+                .await
+        })
+    });
+    let receipts = futures::future::join_all(calls)
+        .await
+        .into_iter()
+        .map(|joined| joined.unwrap().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        receipts[0], receipts[1],
+        "both answer with the one attachment"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "both passed the pre-fetch lookup"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM blobs").await, 1);
+    assert_eq!(count(&db, created).await, before + 1, "one attachment");
+    db.close().await;
+}
+
+/// The lookup runs only after the Edit check: a caller who lost Edit on the
+/// bearer gets the denial a fresh key gets, nothing is fetched, and the
+/// attachment the first call created is not disclosed.
+#[tokio::test]
+async fn keyed_attach_from_url_after_lost_access_matches_a_fresh_key() {
+    use native_ce::authorization::{replace_explicit_policy, AllowEntry, Capability};
+
+    let (addr, hits) = counting_server("private").await;
+    let registry = attachment_registry();
+    let db = db().await;
+    let home = create_record(
+        &db,
+        json!({ "type": "Collection", "kind": "folder", "name": "Home" }),
+    )
+    .await
+    .unwrap();
+    replace_explicit_policy(
+        &db,
+        "attach:test",
+        &home,
+        vec![
+            AllowEntry::account("acct:owner", Capability::Manage),
+            AllowEntry::account("acct:alice", Capability::Edit),
+        ],
+    )
+    .await
+    .unwrap();
+    let person = create_record(
+        &db,
+        json!({ "type": "Entity", "kind": "person", "name": "Alice" }),
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO bindings (record_id, system, identifier, is_canonical)
+         VALUES (?, 'account', 'acct:alice', 1)",
+    )
+    .bind(&person)
+    .execute(&crate::common::fixture_write_pool(&db).await)
+    .await
+    .unwrap();
+    let alice = Caller::authenticated("acct:alice");
+    let args = json!({
+        "record_id": home,
+        "url": format!("http://127.0.0.1:{}/private.txt", addr.port()),
+        "idempotency_key": "lost",
+    });
+    let first = registry
+        .call(db.clone(), alice.clone(), "attach_from_url", args.clone())
+        .await
+        .unwrap();
+    replace_explicit_policy(
+        &db,
+        "attach:test",
+        &home,
+        vec![AllowEntry::account("acct:owner", Capability::Manage)],
+    )
+    .await
+    .unwrap();
+    let footprint = attachment_footprint(&db).await;
+    let denied = registry
+        .call(db.clone(), alice.clone(), "attach_from_url", args.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    let mut fresh = args;
+    fresh["idempotency_key"] = json!("never-used");
+    let fresh = registry
+        .call(db.clone(), alice, "attach_from_url", fresh)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(denied, fresh);
+    assert!(
+        !denied.contains(first["attachment_id"].as_str().unwrap()),
+        "{denied}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(attachment_footprint(&db).await, footprint);
+    db.close().await;
+}

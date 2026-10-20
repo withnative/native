@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import { planInstall, runInstall, chunkUtf8, encodeBody } from "../src/install.mjs";
 import { computeDigests } from "../src/digest.mjs";
+import { runNode } from "./helpers/run-node.mjs";
 
 const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
 const descriptor = JSON.parse(readFileSync(new URL("fixtures/probe-descriptor.json", import.meta.url), "utf8"));
@@ -14,17 +15,20 @@ const plan = (options = {}) => planInstall({ descriptor, html, homeId: "c59dffa3
 // A stand-in for the Native tools, enforcing what the real ones enforce on
 // this route: the if_body_digest guard, and whole-document validation only
 // once the record is an artifact with the runtime facet.
-function fakeNative({ corruptChunk, adoptionCarried = true } = {}) {
+function fakeNative({ corruptChunk, adoptionCarried = true, presentation = { name: "Workspace app", facets: [] } } = {}) {
   const calls = [];
   const record = { id: "a0000000-0000-4000-8000-000000000001", body: "", kind: null, events: [] };
-  let install = null;
+  let install = { event_id: "current", artifact_id: "old-artifact", status: "adopted" };
   return {
     calls,
     record,
+    presentation,
     async call(executor, operation, args) {
       calls.push({ executor, operation, args });
       if (operation === "create_record") {
         record.kind = args.kind;
+        record.name = args.name;
+        record.facets = { ...args.facets };
         // The server decodes body_encoding at the tool boundary, before anything else.
         const bytes = args.body_encoding === "gzip+base64" ? gunzipSync(Buffer.from(args.body, "base64"))
           : args.body_encoding === "base64" ? Buffer.from(args.body, "base64") : null;
@@ -44,6 +48,7 @@ function fakeNative({ corruptChunk, adoptionCarried = true } = {}) {
           record.kind = args.kind;
           record.events.push({ id: `e${record.events.length}`, type: "record.updated" }, { id: `e${record.events.length + 1}`, type: "artifact.source_attested" });
         }
+        Object.assign(record.facets, args.facets);
         return { id: record.id, body_digest: sha256(record.body) };
       }
       if (operation === "query_sql") {
@@ -56,6 +61,7 @@ function fakeNative({ corruptChunk, adoptionCarried = true } = {}) {
         return { changed: true, install, ...(operation === "manage_alpha_tabs.update" ? { idempotent_retry: false, update_event_id: "updated", adoption_carried: adoptionCarried, adoption_required: !adoptionCarried } : {}) };
       }
       if (operation === "manage_alpha_tabs.inspect") return { install };
+      if (operation === "get_record") return { records: [{ id: "old-artifact", status: "found", ...structuredClone(presentation) }] };
       throw new Error(`unexpected ${operation}`);
     },
   };
@@ -105,6 +111,21 @@ test("a transport-altered chunk stops the route before the next write", async ()
 
 test("a package that does not validate cannot be planned", () => {
   assert.throws(() => planInstall({ descriptor: { ...descriptor, version: "1.0" }, html, homeId: "x", reason: "r" }), /does not validate/);
+});
+
+test("authored display titles survive both install routes without changing package identity or consent", () => {
+  const baseline = plan();
+  for (const chunked of [false, true]) {
+    const titled = plan({ descriptor: { ...descriptor, title: " Slack " }, chunked });
+    assert.equal(titled.steps[0].arguments.name, "Slack");
+    assert.equal(titled.package, descriptor.package);
+    assert.deepEqual(titled.digests, baseline.digests);
+    assert.equal(plan({ descriptor: { ...descriptor, title: "Slack" }, name: "Team chat", chunked }).steps[0].arguments.name, "Team chat");
+    for (const title of [undefined, "", "   ", null, 42]) {
+      assert.equal(plan({ descriptor: { ...descriptor, title }, chunked }).steps[0].arguments.name,
+        `${descriptor.package} ${descriptor.version} (alpha tab source)`);
+    }
+  }
 });
 
 
@@ -232,23 +253,22 @@ test("a saved legacy plan still runs without a create source_event_id", async ()
 });
 
 test("CLI defaults to whole-body and --chunked explicitly selects the old route", async () => {
-  const { spawnSync } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
   const fixture = fileURLToPath(new URL("fixtures/probe-descriptor.json", import.meta.url));
   const bundle = fileURLToPath(new URL("fixtures/probe-queued.html", import.meta.url));
   const args = [cli, "install-plan", fixture, "--html", bundle, "--home", "home", "--reason", "CLI test", "--chunk-bytes", "700"];
-  const wholeRun = spawnSync(process.execPath, args, { encoding: "utf8" });
+  const wholeRun = runNode(args);
   assert.equal(wholeRun.status, 0);
   assert.match(wholeRun.stderr, /--chunk-bytes is ignored without --chunked/);
   const whole = JSON.parse(wholeRun.stdout);
   assert.deepEqual(whole, plan({ homeId: "home", reason: "CLI test" }));
-  const chunkedRun = spawnSync(process.execPath, [...args, "--chunked"], { encoding: "utf8" });
+  const chunkedRun = runNode([...args, "--chunked"]);
   assert.equal(chunkedRun.status, 0);
   assert.equal(chunkedRun.stderr, "");
   const chunked = JSON.parse(chunkedRun.stdout);
   assert.deepEqual(chunked, plan({ homeId: "home", reason: "CLI test", chunked: true }));
-  const rawRun = spawnSync(process.execPath, [...args.slice(0, -2), "--raw-body"], { encoding: "utf8" });
+  const rawRun = runNode([...args.slice(0, -2), "--raw-body"]);
   assert.equal(rawRun.status, 0);
   assert.deepEqual(JSON.parse(rawRun.stdout), plan({ homeId: "home", reason: "CLI test", bodyEncoding: "utf8" }));
 });
@@ -303,17 +323,16 @@ test("after-removal chains install from the removal without removing again", asy
 });
 
 test("CLI plans after-removal and refuses combining it with replace", async () => {
-  const { spawnSync } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
   const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
   const fixture = fileURLToPath(new URL("fixtures/probe-descriptor.json", import.meta.url));
   const args = [cli, "install-plan", fixture, "--home", "home", "--reason", "Reinstall", "--after-removal", "removed"];
-  const run = spawnSync(process.execPath, args, { encoding: "utf8" });
+  const run = runNode(args);
   assert.equal(run.status, 0);
   const p = JSON.parse(run.stdout);
   assert.equal(p.steps.some(s => s.operation === "manage_alpha_tabs.remove"), false);
   assert.equal(p.steps.find(s => s.step === "install").arguments.expected_install_event_id, "removed");
-  const refused = spawnSync(process.execPath, [...args, "--replace", "previous"], { encoding: "utf8" });
+  const refused = runNode([...args, "--replace", "previous"]);
   assert.equal(refused.status, 1);
   assert.match(refused.stderr, /--replace and --after-removal are mutually exclusive/);
   assert.equal(refused.stdout, "");
@@ -395,7 +414,7 @@ test("missing or inconsistent top-level update receipt fields stop before inspec
       return result;
     };
     await assert.rejects(runInstall(plan({ updateInstallEventId: "current" }), native), /top-level/);
-    assert.equal(native.calls.length, 2);
+    assert.equal(native.calls.length, 6);
   }
 });
 
@@ -408,7 +427,7 @@ test("unsupported update stops without inspect or destructive fallback", async (
       if (args[1] === "manage_alpha_tabs.update") throw new Error(message);
       return native.call(...args);
     } }), /Server predates manage_alpha_tabs.update; use --replace explicitly.*Staged source record a0000000-0000-4000-8000-000000000001 can be archived/);
-    assert.deepEqual(calls, ["create_record", "manage_alpha_tabs.update"]);
+    assert.deepEqual(calls, ["manage_alpha_tabs.inspect", "get_record", "create_record", "manage_alpha_tabs.inspect", "get_record", "manage_alpha_tabs.update"]);
   }
 });
 
@@ -422,7 +441,7 @@ test("ordinary update refusals preserve the original error without replacement a
       if (args[1] === "manage_alpha_tabs.update") throw original;
       return native.call(...args);
     } }), error => error === original);
-    assert.deepEqual(calls, ["create_record", "manage_alpha_tabs.update"]);
+    assert.deepEqual(calls, ["manage_alpha_tabs.inspect", "get_record", "create_record", "manage_alpha_tabs.inspect", "get_record", "manage_alpha_tabs.update"]);
   }
 });
 
@@ -441,22 +460,22 @@ test("update expects pins only at the receipt install path, including wrapped re
     };
     if (missing) {
       await assert.rejects(runInstall(p, native), /update: (?:declaration_)?digest is undefined/);
-      assert.equal(native.calls.length, 2);
+      assert.equal(native.calls.length, 6);
     } else {
       const result = await runInstall(p, native);
       assert.equal(result.update_event_id, "updated");
-      assert.equal(native.calls.length, 3);
+      assert.equal(native.calls.length, 7);
     }
   }
 });
 
 test("update routes retain every digest fence", async () => {
   for (const chunked of [false, true]) {
-    const native = fakeNative({ corruptChunk: chunked ? 2 : undefined });
+    const native = fakeNative({ corruptChunk: chunked ? 4 : undefined });
     const call = native.call;
     if (!chunked) native.call = async (...args) => ({ ...await call(...args), body_digest: "wrong" });
     await assert.rejects(runInstall(plan({ updateInstallEventId: "current", chunked }), native), /body_digest/);
-    assert.equal(native.calls.length, chunked ? 2 : 1);
+    assert.equal(native.calls.length, chunked ? 4 : 3);
   }
   const native = fakeNative();
   const call = native.call;
@@ -466,7 +485,7 @@ test("update routes retain every digest fence", async () => {
     return result;
   };
   await assert.rejects(runInstall(plan({ updateInstallEventId: "current" }), native), /update: digest/);
-  assert.equal(native.calls.length, 2);
+  assert.equal(native.calls.length, 6);
 });
 
 test("whole-body plans send gzip+base64 by default and the server-side decode matches the local digest", async () => {
@@ -605,4 +624,288 @@ test("a grant step stops before install when the client cannot execute a prepare
   native.call = async (executor, operation, args) => (operation === "manage_artifact_inputs.bind_many" ? { status: "bound" } : base(executor, operation, args));
   await assert.rejects(runInstall(boundPlan({ bindings: [{ port: "pages", collection_id: "c1" }] }), native), /client\.execute is missing/);
   assert.equal(native.calls.some((call) => call.operation === "manage_alpha_tabs.install"), false);
+});
+
+test("updates carry only current name, icon and skin to a new artifact without changing executable pins", async () => {
+  for (const chunked of [false, true]) {
+    for (const [icon, skin] of [["brand:discord", "skin-id"], ["bad icon {{record_id}}", "unknown:skin"], ["FutureIcon", "{malformed}"]]) {
+      const presentation = { name: "Team {{record_id}}", facets: [
+        { key: "app_icon", value: icon }, { key: "app_skin", value: skin },
+        { key: "runtime", value: "wrong-runtime" }, { key: "unrelated", value: "private" },
+      ] };
+      const native = fakeNative({ presentation });
+      const p = JSON.parse(JSON.stringify(plan({ updateInstallEventId: "current", chunked,
+        descriptor: { ...descriptor, title: "Package name", icon: "BookOpen" } })));
+      const baseline = fakeNative();
+      const baselineResult = await runInstall(plan({ chunked }), baseline);
+      const result = await runInstall(p, native);
+      assert.notEqual(result.record_id, result.previous_artifact_id);
+      assert.equal(native.record.name, presentation.name);
+      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_icon: icon, app_skin: skin });
+      assert.equal(native.record.body, html);
+      assert.deepEqual(p.digests, plan({ chunked }).digests);
+      assert.equal(result.source_revision, baselineResult.source_revision);
+      const update = native.calls.find(c => c.operation === "manage_alpha_tabs.update").args;
+      assert.equal(update.artifact_id, native.record.id);
+      assert.equal(update.source_revision, baselineResult.source_revision);
+      assert.equal(update.digest, p.digests.digest);
+      assert.deepEqual(update.declaration, descriptor.declaration);
+      const bodyEvents = native.record.events.filter(e => e.type.startsWith("record."));
+      assert.equal(update.source_revision, chunked ? bodyEvents.at(-2).id : bodyEvents[0].id);
+      assert.equal(native.calls.filter(c => c.operation === "update_record").some(c => c.args.id === "old-artifact"), false);
+    }
+  }
+});
+
+test("absent presentation facets retain the descriptor icon and leave skin absent; reset uses package presentation", async () => {
+  for (const chunked of [false, true]) {
+    for (const resetPresentation of [false, true]) {
+      const native = fakeNative({ presentation: { name: "Workspace name", facets: resetPresentation ? [
+        { key: "app_icon", value: "brand:discord" }, { key: "app_skin", value: "skin-id" },
+      ] : [] } });
+      await runInstall(plan({ descriptor: { ...descriptor, title: "Package name", icon: "BookOpen" },
+        updateInstallEventId: "current", chunked, resetPresentation }), native);
+      assert.equal(native.record.name, resetPresentation ? "Package name" : "Workspace name");
+      assert.deepEqual(native.record.facets, { runtime: "native.html.v1", app_icon: "BookOpen" });
+      assert.equal(native.calls.some(c => c.operation === "get_record"), !resetPresentation);
+    }
+  }
+  assert.throws(() => plan({ resetPresentation: true }), /requires --update/);
+});
+
+test("stale install events reject before staging and when rechecked, including reset plans", async () => {
+  for (const chunked of [false, true]) for (const resetPresentation of [false, true]) {
+    for (const changeAt of [1, 2]) {
+      const native = fakeNative();
+      const call = native.call;
+      let reads = 0;
+      native.call = async (...args) => {
+        const result = await call(...args);
+        if (args[1] === "manage_alpha_tabs.inspect" && ++reads === changeAt) result.install.event_id = "changed";
+        return result;
+      };
+      await assert.rejects(runInstall(plan({ updateInstallEventId: "current", chunked, resetPresentation }), native), error => {
+        assert.match(error.message, /current install changed.*rebuild/);
+        assert.equal(error.message.includes(`Staged source record ${native.record.id}`), changeAt === 2);
+        return true;
+      });
+      assert.equal(native.calls.some(c => c.operation === "create_record"), changeAt === 2);
+      assert.equal(native.calls.some(c => c.operation === "manage_alpha_tabs.update"), false);
+    }
+  }
+});
+
+test("presentation changes reject before switching, including added or removed explicit values", async () => {
+  for (const chunked of [false, true]) {
+    for (const change of [p => { p.name = "New name"; }, p => { p.facets[0].value = "FutureIcon"; },
+      p => { p.facets[1].value = "new-skin"; }, p => { p.facets.pop(); },
+      p => { p.facets.shift(); }]) {
+      const native = fakeNative({ presentation: { name: "App", facets: [
+        { key: "app_icon", value: "BookOpen" }, { key: "app_skin", value: "skin" },
+      ] } });
+      const call = native.call;
+      let reads = 0;
+      native.call = async (...args) => {
+        if (args[1] === "get_record" && ++reads === 2) change(native.presentation);
+        return call(...args);
+      };
+      await assert.rejects(runInstall(plan({ updateInstallEventId: "current", chunked }), native), /current presentation changed.*rebuild/);
+      assert.equal(native.calls.some(c => c.operation === "manage_alpha_tabs.update"), false);
+    }
+  }
+});
+
+test("unrelated metadata changes do not invalidate the presentation snapshot", async () => {
+  const native = fakeNative();
+  const call = native.call;
+  let reads = 0;
+  native.call = async (...args) => {
+    if (args[1] === "get_record" && ++reads === 2) native.presentation.facets.push({ key: "priority", value: "high" });
+    return call(...args);
+  };
+  await runInstall(plan({ updateInstallEventId: "current" }), native);
+  assert.equal(Object.hasOwn(native.record.facets, "priority"), false);
+});
+
+test("encoded create fallback preserves presentation too", async () => {
+  const native = fakeNative({ presentation: { name: "Workspace name", facets: [{ key: "app_skin", value: "skin" }] } });
+  const call = native.call;
+  native.call = async (...args) => {
+    if (args[2].body_encoding) throw new Error("unknown field body_encoding");
+    return call(...args);
+  };
+  const result = await runInstall(plan({ updateInstallEventId: "current" }), native, { onNotice() {} });
+  assert.equal(native.record.name, "Workspace name");
+  assert.equal(native.record.facets.app_skin, "skin");
+  assert.equal(result.source_revision, "e0");
+});
+
+test("CLI reset-presentation is explicit and only valid on updates", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const args = [fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url)), "install-plan",
+    fileURLToPath(new URL("fixtures/probe-descriptor.json", import.meta.url)), "--html",
+    fileURLToPath(new URL("fixtures/probe-queued.html", import.meta.url)), "--home", "home", "--reason", "CLI test"];
+  const reset = runNode([...args, "--update", "current", "--reset-presentation"]);
+  assert.equal(reset.status, 0);
+  assert.deepEqual(JSON.parse(reset.stdout), plan({ homeId: "home", reason: "CLI test", updateInstallEventId: "current", resetPresentation: true }));
+  const invalid = runNode([...args, "--reset-presentation"]);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /requires --update/);
+});
+
+test("unavailable old artifacts recommend reset and identify any staged source", async () => {
+  for (const unavailable of [[], [{ status: "not_found", id: "old-artifact" }],
+    [{ status: "found", id: "old-artifact", archived: true, name: "App", facets: [] }]]) {
+    for (const changeAt of [1, 2]) {
+      const native = fakeNative();
+      const call = native.call;
+      let reads = 0;
+      native.call = async (...args) => {
+        const result = await call(...args);
+        return args[1] === "get_record" && ++reads === changeAt ? { records: unavailable } : result;
+      };
+      await assert.rejects(runInstall(plan({ updateInstallEventId: "current" }), native), error => {
+        assert.match(error.message, /old artifact old-artifact is (?:archived|not found or not viewable).*--reset-presentation/);
+        assert.doesNotMatch(error.message, /rebuild the plan/);
+        assert.equal(error.message.includes(`Staged source record ${native.record.id}`), changeAt === 2);
+        return true;
+      });
+      assert.equal(native.calls.some(c => c.operation === "create_record"), changeAt === 2);
+      assert.equal(native.calls.some(c => c.operation === "manage_alpha_tabs.update"), false);
+    }
+  }
+});
+
+test("a newly explicit icon or skin invalidates an absent snapshot", async () => {
+  for (const key of ["app_icon", "app_skin"]) {
+    const native = fakeNative();
+    const call = native.call;
+    let reads = 0;
+    native.call = async (...args) => {
+      if (args[1] === "get_record" && ++reads === 2) native.presentation.facets.push({ key, value: "unknown" });
+      return call(...args);
+    };
+    await assert.rejects(runInstall(plan({ updateInstallEventId: "current" }), native), /current presentation changed.*rebuild/);
+    assert.equal(native.calls.some(c => c.operation === "manage_alpha_tabs.update"), false);
+  }
+});
+
+test("legacy whole-body and chunked update plans refuse before any call; reset plans still run", async () => {
+  for (const chunked of [false, true]) {
+    const legacy = plan({ updateInstallEventId: "current", chunked });
+    legacy.steps = legacy.steps.filter(s => !s.presentation || s.presentation.action === "seed");
+    for (const step of legacy.steps) delete step.presentation;
+    const native = fakeNative();
+    await assert.rejects(runInstall(JSON.parse(JSON.stringify(legacy)), native), /regenerate this plan/);
+    assert.equal(native.calls.length, 0);
+    await runInstall(plan({ updateInstallEventId: "current", chunked, resetPresentation: true }), native);
+    assert.ok(native.calls.some(c => c.operation === "manage_alpha_tabs.update"));
+  }
+});
+
+test("a name override on update requires reset, for both routes", async () => {
+  for (const chunked of [false, true]) {
+    assert.throws(() => plan({ updateInstallEventId: "current", name: "New title", chunked }), /--name with --update requires --reset-presentation/);
+    const native = fakeNative();
+    await runInstall(plan({ updateInstallEventId: "current", name: "New title", chunked, resetPresentation: true }), native);
+    assert.equal(native.record.name, "New title");
+  }
+});
+
+test("reset repairs installs without reading unavailable old artifacts", async () => {
+  for (const chunked of [false, true]) {
+    const native = fakeNative();
+    const call = native.call;
+    native.call = async (...args) => {
+      if (args[1] === "get_record") throw new Error("old artifact is not viewable");
+      return call(...args);
+    };
+    await runInstall(plan({ updateInstallEventId: "current", chunked, resetPresentation: true }), native);
+    assert.ok(native.calls.some(c => c.operation === "manage_alpha_tabs.update"));
+    assert.equal(native.calls.some(c => c.operation === "get_record"), false);
+  }
+});
+
+test("transport failures after staging name the source, including the second presentation read", async () => {
+  for (const operation of ["manage_alpha_tabs.inspect", "get_record", "manage_alpha_tabs.update", "update_record"]) {
+    const native = fakeNative();
+    const call = native.call;
+    const original = new Error("read or write refused");
+    native.call = async (...args) => {
+      if (args[1] === operation && native.record.kind) throw original;
+      return call(...args);
+    };
+    await assert.rejects(runInstall(plan({ updateInstallEventId: "current", chunked: operation === "update_record" }), native), error => {
+      assert.equal(error, original);
+      assert.match(error.message, /read or write refused/);
+      assert.ok(error.message.includes(`Staged source record ${native.record.id}`));
+      return true;
+    });
+  }
+});
+
+test("CLI names require reset and saved update step files disclose runtime resolution", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const args = [fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url)), "install-plan",
+    fileURLToPath(new URL("fixtures/probe-descriptor.json", import.meta.url)), "--html",
+    fileURLToPath(new URL("fixtures/probe-queued.html", import.meta.url)), "--home", "home", "--reason", "CLI test", "--update", "current"];
+  const refused = runNode([...args, "--name", "New title"]);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /--name with --update requires --reset-presentation/);
+  const bareName = runNode([...args, "--name"]);
+  assert.equal(bareName.status, 1);
+  assert.match(bareName.stderr, /--name with --update requires --reset-presentation/);
+  const reset = runNode([...args, "--name", "New title", "--reset-presentation"]);
+  assert.equal(reset.status, 0);
+  assert.equal(JSON.parse(reset.stdout).steps.find(s => s.step === "create-artifact").arguments.name, "New title");
+  const dir = mkdtempSync(join(tmpdir(), "kit-update-steps-"));
+  try {
+    const saved = runNode([...args, "--out", dir]);
+    assert.equal(saved.status, 0);
+    assert.match(saved.stdout, /plan steps written/);
+    assert.match(saved.stdout, /presentation steps resolve at run time through install-run/);
+    const step = JSON.parse(readFileSync(join(dir, "03-create-artifact.json"), "utf8"));
+    assert.match(step.note, /run time.*not a resolved MCP call/);
+  } finally {
+    rmSync(dir, { recursive: true });
+  }
+  const help = runNode([args[0]]);
+  assert.match(help.stdout, /presentation steps resolve at run time/);
+  assert.doesNotMatch(help.stdout, /the exact MCP calls/);
+});
+
+test("failures after successful install or update identify the source as live", async () => {
+  for (const chunked of [false, true]) {
+    for (const updateInstallEventId of [undefined, "current"]) {
+      for (const failureAt of ["receipt", "inspect-digest", "inspect-transport"]) {
+        const native = fakeNative();
+        const call = native.call;
+        let installed = false;
+        native.call = async (...args) => {
+          const operation = args[1];
+          if (installed && operation === "manage_alpha_tabs.inspect" && failureAt === "inspect-transport") {
+            throw new Error("inspect unavailable");
+          }
+          const result = await call(...args);
+          if (["manage_alpha_tabs.install", "manage_alpha_tabs.update"].includes(operation)) {
+            installed = true;
+            if (failureAt === "receipt") result.install.digest = "wrong";
+          } else if (installed && operation === "manage_alpha_tabs.inspect" && failureAt === "inspect-digest") {
+            result.install.digest = "wrong";
+          }
+          return result;
+        };
+        await assert.rejects(runInstall(plan({ chunked, updateInstallEventId }), native), error => {
+          assert.match(error.message, failureAt === "inspect-transport" ? /inspect unavailable/ : /digest is wrong/);
+          assert.ok(error.message.includes(`Installed source record ${native.record.id} (live; do not archive)`));
+          assert.doesNotMatch(error.message, /Staged source record|can be archived/);
+          return true;
+        });
+        assert.equal(installed, true);
+      }
+    }
+  }
 });

@@ -1,0 +1,120 @@
+# Native core app kit 1.0.0
+
+Real and packaged fake HTML hosts deliver this admitted release when author
+source opts in with the inert policy below. The host installs frozen
+`window.native.kit` synchronously before the first author script. Major 1 defaults
+to 1.0.0. An unavailable requested major refuses `kit_major_unavailable` before
+publication; use a major admitted by the host.
+
+```html
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+```
+
+Selection belongs to the host. Each prepared document retains its exact release;
+a fresh launch or reload uses the host's current compatible selection. Restoring
+author source restores its policy, independently of host release history.
+Documents without opt-in keep the legacy bridge and have no supplied kit.
+
+## Prepare an install from Native MCP alone
+
+Create the complete HTML as a `Document/artifact` with runtime `native.html.v1`.
+Use its write receipt's `body_digest` (or body-carrying `source_event_id`) to call
+`artifacts_read.manage_alpha_tabs.prepare_install` through `call_executor`:
+
+```json
+{"executor":"artifacts_read","operation":"manage_alpha_tabs.prepare_install","arguments":{"artifact_id":"<source id>","expected_body_digest":"<body_digest>","package":"agent.my-app","version":"1.0.0","declaration":{"needs":[],"effects":[]},"reason":"Install my authored app"}}
+```
+
+Include your actual consent declaration, including each SQL snapshot need.
+When `ready` is true, pass the returned `next_call` to `call_executor`, adding
+your `run_key`. It contains the server-computed digests, source revision and
+install/update event precondition; no shell, hash computation or build is needed.
+When false, read the bounded findings, fix the source/declaration and prepare again.
+Malformed package/version/reason/request/guard arguments and authority failures
+are normal API errors, rather than `ready:false` findings. Preparation caps the
+echoed declaration at 65,536 serialized JSON bytes; `require_declaration` has
+entry limits but no total byte cap. An optional `request` is validated and passed
+through, including a reinstall over a removed tab; updates must preserve it.
+Kit availability is advisory against the packaged default; delivery checks its
+own selection. Preparation grants nothing, installs nothing and locks nothing.
+The returned revision pins historical bytes; later source edits do not silently
+replace them. Re-prepare after edits. Current update CAS and consent rules still
+apply. `ready:true` means prepared, not usable. Read `adoption`: when it is
+`requires_person_preview_adopt`, tell the signed-in person to Preview/Adopt after
+install/update; MCP cannot mint that authority. `carried` means the update can
+carry proven adoption for an unchanged canonical declaration. An unadopted
+predecessor still requires Preview/Adopt even when the declaration is unchanged.
+
+Alpha tabs pin a package/version/digest, a viewable live `Document/artifact`, its
+source revision and consented needs/effects. Updates check exact bytes/digest and
+event CAS, preserving status/request. Keyed retries return the original receipt
+and current install without reapplying. Disable/restore/remove use event CAS;
+disabled or removed tabs stop reads/actions. Target resolution fails closed;
+inspect `target_resolves`. List before reorder: reorder replaces the strip order,
+appends omitted installs, and refuses unknown/removed/duplicate entries. Without
+a saved order, the strip uses agents/folders/tasks/graph/installs.
+
+Preview checks exact source/digest and returns sample HTML with an expiring
+account/pin/session receipt; it writes nothing. Preview/adopt/adopt_authored
+require a hosted cookie and trusted Origin, never Bearer credentials. Adopt
+checks the receipt, pin, event and attestation. Launch checks adoption, event,
+View and source; its one-use URL delivers sample input only, without live rows.
+`live_read` returns only the caller's authorized consented inputs:
+`attention.query.v1` at `input.records`, up to eight `sql.snapshot.v1` SELECT/WITH
+needs with 200 rows each at `input.sql[key]`. `params[0]` binds `?1`; omitted
+optional parameters bind NULL. Use `live_read.need` to request a consented `records.search.v1` with
+`params:{query,limit}` (`limit` at most 30), `records.resolve_reference.v1` with
+`params:{reference}`, or a SQL need by key with its declared parameter schema.
+Omit `need` for the snapshot. Subscriptions are connection-bound; use the stream-frame token;
+subscriptions and `if_revision` apply only to snapshot reads. An `if_revision`
+equal to `revision_digest` returns `unchanged:true` with pins/revision and no rows.
+Use `if_revision` to resynchronize. Revision information includes `id` and
+`time_dependent`; `now_ms()` uses `as_of_ms`. `subscribe_refused` includes the
+read. `live_unsubscribe` is idempotent and connection-scoped.
+`admit_reveal_target` checks consented `surface.reveal.v1` and one visible
+canonical target/pin; delivery is push-only, never via `live_read`.
+Supply the full record id or a reserved id such as `native:root`; prefixes refuse.
+
+Apps own their DOM and CSS. Declare each exact param-less `sql.snapshot.v1` need
+in the app policy. The kit reads only delivered declared snapshots; it adds no
+data grant and offers no parameterized reads, watches, writes, Body/editor,
+rendering, network, or session capability. Link helpers return attributes; the
+host validates navigation and requires trusted user activation.
+
+Release metadata identifies the reviewed JS and types. These hashes are package
+custody identities, not app permission or consent digests. The catalog retains
+admitted releases; a separate bounded host selector chooses an exact release
+for each requested major. No runtime download or author-supplied release path
+is used. After admission these versioned bytes must be retained; changes require
+a new reviewed release.
+
+The exact types below retain their admitted SHA-256 identity, including the
+historical preparation-era comment saying hosted delivery was unavailable.
+That comment is release provenance; this guide describes current delivery.
+`Host.kit` remains optional because unhosted and non-opted-in documents lack it.
+Negotiated v2 methods can coexist on `window.native`, but are unavailable before
+host negotiation and are outside this core kit's type/capability contract.
+
+```js
+const kit = window.native?.kit;
+if (!kit) throw new Error('Native core kit is unavailable');
+await kit.ready;
+const count = document.querySelector('#count');
+const status = document.querySelector('#status');
+const stop = kit.subscribe('records.recent', feed => {
+  if (feed.status === 'ready' && count) {
+    count.textContent = kit.countLabel(feed.result);
+    // Render rows with DOM/textContent and app-owned styling.
+  } else if (feed.status === 'error' && status) {
+    status.textContent = kit.errorText(feed.error);
+    // feed.last can remain visible, explicitly marked as last-good.
+  }
+});
+addEventListener('pagehide', stop, { once: true });
+```
+
+`ready` rejects on bridge readiness failure. A missing declared key refuses
+`undeclared`; malformed results refuse `malformed`. Each valid replacement may
+notify. Subscriptions emit loading, then ready/error, retaining last-good data
+on errors. Cleanup is idempotent and prevents further callbacks. There is no
+app-facing lifecycle disposal or registration capability.

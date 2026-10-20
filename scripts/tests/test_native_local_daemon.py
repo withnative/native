@@ -268,6 +268,22 @@ class MetadataTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["refresh"]["download_bytes"], 12345)
                 self.assertEqual(self.writer.requests[-1]["params"]["name"], "records_read")
 
+    async def test_deferred_refresh_state_reports_why_it_changed_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = Path(directory) / "refresh.json"
+            status.write_text(json.dumps({"state": "deferred",
+                "deferred_reason": "reader_not_upgraded",
+                "full_refresh_reason": "audit_failed",
+                "next_full_due_at": "2026-10-04T16:00:00Z"}))
+            status.chmod(0o600)
+            self.engine.refresh_status = str(status)
+            for name in ("bootstrap", "standby_status"):
+                refresh = (await self.call(name))["result"]["structuredContent"]["refresh"]
+                self.assertEqual(refresh["state"], "deferred")
+                self.assertEqual(refresh["deferred_reason"], "reader_not_upgraded")
+                self.assertEqual(refresh["full_refresh_reason"], "audit_failed")
+                self.assertEqual(refresh["next_full_due_at"], "2026-10-04T16:00:00Z")
+
     async def test_broken_refresh_status_cannot_hide_old_reader_age(self):
         with tempfile.TemporaryDirectory() as directory:
             status = Path(directory) / "refresh.json"

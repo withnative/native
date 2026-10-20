@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 43360,
+        "descriptor_bytes": 43840,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -129,7 +129,7 @@
           {
             "name": "guidance_read",
             "title": "Guidance read",
-            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration. Build an app: read_guide topic app-builder-1.0.0 (installed apps).",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -239,6 +239,8 @@
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
+                    "get_workspace_snapshot.resume",
+                    "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -303,6 +305,8 @@
                     "create_exploration",
                     "create_many",
                     "create_record",
+                    "manage_account_config.ensure",
+                    "manage_account_config.replace",
                     "manage_attributions.add_evidence",
                     "manage_attributions.retract",
                     "manage_citations.reanchor",
@@ -362,6 +366,8 @@
                         "create_exploration",
                         "create_many",
                         "create_record",
+                        "manage_account_config.ensure",
+                        "manage_account_config.replace",
                         "manage_attributions.add_evidence",
                         "manage_attributions.retract",
                         "manage_citations.reanchor",
@@ -1552,7 +1558,8 @@
                     "manage_messages.list_message_state",
                     "manage_messages.list_my_conversations",
                     "manage_messages.list_notification_candidates",
-                    "manage_messages.list_unclassified"
+                    "manage_messages.list_unclassified",
+                    "manage_participants.list"
                   ]
                 },
                 "arguments": {
@@ -1592,6 +1599,7 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
                     "manage_messages.remove_reaction",
@@ -1602,7 +1610,10 @@
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
-                    "manage_messages.unclassify"
+                    "manage_messages.unclassify",
+                    "manage_messages.unmark_no_longer_relevant",
+                    "manage_participants.register_persona",
+                    "manage_participants.retire_persona"
                   ]
                 },
                 "arguments": {
@@ -1642,6 +1653,7 @@
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.prepare_install",
                     "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
@@ -1721,7 +1733,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Build an app: read topic app-builder-1.0.0 (installed apps). Dashboards, boards and views: author with records_write.create_record (Document, kind artifact, facets.runtime); steps in topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -2432,7 +2444,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 49607,
+        "descriptor_bytes": 50087,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -2564,7 +2576,7 @@
           {
             "name": "guidance_read",
             "title": "Guidance read",
-            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration. Build an app: read_guide topic app-builder-1.0.0 (installed apps).",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -2690,6 +2702,8 @@
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
+                    "get_workspace_snapshot.resume",
+                    "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -2766,6 +2780,8 @@
                     "create_exploration",
                     "create_many",
                     "create_record",
+                    "manage_account_config.ensure",
+                    "manage_account_config.replace",
                     "manage_attributions.add_evidence",
                     "manage_attributions.retract",
                     "manage_citations.reanchor",
@@ -2829,6 +2845,8 @@
                         "create_exploration",
                         "create_many",
                         "create_record",
+                        "manage_account_config.ensure",
+                        "manage_account_config.replace",
                         "manage_attributions.add_evidence",
                         "manage_attributions.retract",
                         "manage_citations.reanchor",
@@ -4164,7 +4182,8 @@
                     "manage_messages.list_message_state",
                     "manage_messages.list_my_conversations",
                     "manage_messages.list_notification_candidates",
-                    "manage_messages.list_unclassified"
+                    "manage_messages.list_unclassified",
+                    "manage_participants.list"
                   ]
                 },
                 "arguments": {
@@ -4216,6 +4235,7 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
                     "manage_messages.remove_reaction",
@@ -4226,7 +4246,10 @@
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
-                    "manage_messages.unclassify"
+                    "manage_messages.unclassify",
+                    "manage_messages.unmark_no_longer_relevant",
+                    "manage_participants.register_persona",
+                    "manage_participants.retire_persona"
                   ]
                 },
                 "arguments": {
@@ -4270,6 +4293,7 @@
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.prepare_install",
                     "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
@@ -4365,7 +4389,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Build an app: read topic app-builder-1.0.0 (installed apps). Dashboards, boards and views: author with records_write.create_record (Document, kind artifact, facets.runtime); steps in topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -5082,7 +5106,7 @@
     },
     "build_enabled_experimental": {
       "ordinary": {
-        "descriptor_bytes": 46450,
+        "descriptor_bytes": 46930,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -5205,7 +5229,7 @@
           {
             "name": "guidance_read",
             "title": "Guidance read",
-            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration. Build an app: read_guide topic app-builder-1.0.0 (installed apps).",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -5315,6 +5339,8 @@
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
+                    "get_workspace_snapshot.resume",
+                    "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -5379,6 +5405,8 @@
                     "create_exploration",
                     "create_many",
                     "create_record",
+                    "manage_account_config.ensure",
+                    "manage_account_config.replace",
                     "manage_attributions.add_evidence",
                     "manage_attributions.retract",
                     "manage_citations.reanchor",
@@ -5438,6 +5466,8 @@
                         "create_exploration",
                         "create_many",
                         "create_record",
+                        "manage_account_config.ensure",
+                        "manage_account_config.replace",
                         "manage_attributions.add_evidence",
                         "manage_attributions.retract",
                         "manage_citations.reanchor",
@@ -6628,7 +6658,8 @@
                     "manage_messages.list_message_state",
                     "manage_messages.list_my_conversations",
                     "manage_messages.list_notification_candidates",
-                    "manage_messages.list_unclassified"
+                    "manage_messages.list_unclassified",
+                    "manage_participants.list"
                   ]
                 },
                 "arguments": {
@@ -6668,6 +6699,7 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
                     "manage_messages.remove_reaction",
@@ -6678,7 +6710,10 @@
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
-                    "manage_messages.unclassify"
+                    "manage_messages.unclassify",
+                    "manage_messages.unmark_no_longer_relevant",
+                    "manage_participants.register_persona",
+                    "manage_participants.retire_persona"
                   ]
                 },
                 "arguments": {
@@ -6718,6 +6753,7 @@
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.prepare_install",
                     "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
@@ -6797,7 +6833,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Build an app: read topic app-builder-1.0.0 (installed apps). Dashboards, boards and views: author with records_write.create_record (Document, kind artifact, facets.runtime); steps in topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -7683,7 +7719,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 53229,
+        "descriptor_bytes": 53709,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -7816,7 +7852,7 @@
           {
             "name": "guidance_read",
             "title": "Guidance read",
-            "description": "Read product guidance, quickstart, instructions and onboarding configuration.",
+            "description": "Read product guidance, quickstart, instructions and onboarding configuration. Build an app: read_guide topic app-builder-1.0.0 (installed apps).",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -7942,6 +7978,8 @@
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
+                    "get_workspace_snapshot.resume",
+                    "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
                     "manage_facet_observations.list",
@@ -8018,6 +8056,8 @@
                     "create_exploration",
                     "create_many",
                     "create_record",
+                    "manage_account_config.ensure",
+                    "manage_account_config.replace",
                     "manage_attributions.add_evidence",
                     "manage_attributions.retract",
                     "manage_citations.reanchor",
@@ -8081,6 +8121,8 @@
                         "create_exploration",
                         "create_many",
                         "create_record",
+                        "manage_account_config.ensure",
+                        "manage_account_config.replace",
                         "manage_attributions.add_evidence",
                         "manage_attributions.retract",
                         "manage_citations.reanchor",
@@ -9416,7 +9458,8 @@
                     "manage_messages.list_message_state",
                     "manage_messages.list_my_conversations",
                     "manage_messages.list_notification_candidates",
-                    "manage_messages.list_unclassified"
+                    "manage_messages.list_unclassified",
+                    "manage_participants.list"
                   ]
                 },
                 "arguments": {
@@ -9468,6 +9511,7 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
                     "manage_messages.remove_reaction",
@@ -9478,7 +9522,10 @@
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
-                    "manage_messages.unclassify"
+                    "manage_messages.unclassify",
+                    "manage_messages.unmark_no_longer_relevant",
+                    "manage_participants.register_persona",
+                    "manage_participants.retire_persona"
                   ]
                 },
                 "arguments": {
@@ -9522,6 +9569,7 @@
                     "manage_alpha_tabs.inspect",
                     "manage_alpha_tabs.list",
                     "manage_alpha_tabs.live_read",
+                    "manage_alpha_tabs.prepare_install",
                     "manage_alpha_tabs.preview",
                     "manage_artifact_inputs.read",
                     "manage_change_summaries.inspect",
@@ -9617,7 +9665,7 @@
           {
             "name": "artifacts_write",
             "title": "Artifacts write",
-            "description": "Copy, bind or publish artifacts and manage change-summary state. Author from scratch with records_write.create_record: type Document, kind artifact, facets.runtime. For runtime choice and create/bind/grant/render steps, read guidance_read.read_guide topic compositions. instantiate_artifact copies an existing source.",
+            "description": "Copy, bind or publish artifacts and manage change-summary state. Build an app: read topic app-builder-1.0.0 (installed apps). Dashboards, boards and views: author with records_write.create_record (Document, kind artifact, facets.runtime); steps in topic compositions. instantiate_artifact copies an existing source.",
             "inputSchema": {
               "type": "object",
               "properties": {
@@ -10994,6 +11042,42 @@
       "candidate_plan_policy": "plan_required"
     },
     {
+      "legacy_tool": "manage_account_config",
+      "legacy_action": "ensure",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "manage_account_config.ensure",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_account_config",
+      "legacy_action": "inspect",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "manage_account_config.inspect",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_account_config",
+      "legacy_action": "replace",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "manage_account_config.replace",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "manage_instructions",
       "legacy_action": "apply_seeded_default",
       "stability": "stable",
@@ -11535,6 +11619,18 @@
     },
     {
       "legacy_tool": "manage_messages",
+      "legacy_action": "mark_no_longer_relevant",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_messages.mark_no_longer_relevant",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
       "legacy_action": "move",
       "stability": "stable",
       "availability": [
@@ -11663,6 +11759,54 @@
       ],
       "candidate_executor": "messaging_write",
       "candidate_operation": "manage_messages.unclassify",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
+      "legacy_action": "unmark_no_longer_relevant",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_messages.unmark_no_longer_relevant",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_participants",
+      "legacy_action": "list",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_read",
+      "candidate_operation": "manage_participants.list",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_participants",
+      "legacy_action": "register_persona",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_participants.register_persona",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_participants",
+      "legacy_action": "retire_persona",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_participants.retire_persona",
       "candidate_plan_policy": "direct"
     },
     {
@@ -12123,6 +12267,18 @@
     },
     {
       "legacy_tool": "manage_alpha_tabs",
+      "legacy_action": "prepare_install",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "artifacts_read",
+      "candidate_operation": "manage_alpha_tabs.prepare_install",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_alpha_tabs",
       "legacy_action": "preview",
       "stability": "stable",
       "availability": [
@@ -12347,6 +12503,18 @@
       ],
       "candidate_executor": "records_read",
       "candidate_operation": "get_workspace_snapshot.page",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "get_workspace_snapshot",
+      "legacy_action": "resume",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_workspace_snapshot.resume",
       "candidate_plan_policy": "direct"
     },
     {

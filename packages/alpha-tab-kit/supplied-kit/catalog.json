@@ -1,0 +1,17 @@
+{
+  "schema": "native.app-kit.catalog.v1",
+  "releases": [
+    {
+      "version": "1.0.0",
+      "major": 1,
+      "manifest": "1.0.0/manifest.json",
+      "manifest_sha256": "70591dc285de2a8e640543c5bc892b760517957c755b52263ce546d839ebfcc6"
+    },
+    {
+      "version": "1.1.0",
+      "major": 1,
+      "manifest": "1.1.0/manifest.json",
+      "manifest_sha256": "59ea2f4a6c0fd7d6afc72a5b5f7b7a6c380813e2ac9c87dc457bd156d0d2f090"
+    }
+  ]
+}

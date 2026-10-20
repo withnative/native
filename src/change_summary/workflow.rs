@@ -679,18 +679,9 @@ async fn snapshot_evidence(
         if !audience_can_view(tx, audience, record_id).await? {
             return Err(Error::engine("change-summary input is unavailable"));
         }
-        let row = sqlx::query(
-            "SELECT r.type,r.kind,r.deleted_at,e.id AS body_event_id,
-                    json_extract(e.payload,'$.body') AS body
-               FROM records r JOIN content_events e ON e.id=(
-                    SELECT id FROM content_events WHERE record_id=r.id
-                     AND json_type(payload,'$.body')='text' ORDER BY seq DESC LIMIT 1)
-              WHERE r.id=?",
-        )
-        .bind(record_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| Error::engine("change-summary input is unavailable"))?;
+        let row = crate::record_body::context::exact_context_head_on(&mut **tx, record_id)
+            .await?
+            .ok_or_else(|| Error::engine("change-summary input is unavailable"))?;
         let record_type: String = row.try_get("type")?;
         let record_kind: String = row.try_get("kind")?;
         let body: String = row.try_get("body")?;
@@ -1575,18 +1566,9 @@ impl CurrentRevisionBasisResolver for ChangeSummaryCurrentBasis {
             }
             let mut scope_heads = Vec::with_capacity(scope.context_record_ids.len());
             for record_id in &scope.context_record_ids {
-                let row = sqlx::query(
-                    "SELECT r.type,r.kind,r.deleted_at,e.id,
-                            json_extract(e.payload,'$.body') AS body
-                       FROM records r JOIN content_events e ON e.id=(
-                            SELECT id FROM content_events WHERE record_id=r.id
-                             AND json_type(payload,'$.body')='text'
-                            ORDER BY seq DESC LIMIT 1)
-                      WHERE r.id=?",
-                )
-                .bind(record_id)
-                .fetch_optional(&mut **snapshot)
-                .await?;
+                let row =
+                    crate::record_body::context::exact_context_head_on(&mut **snapshot, record_id)
+                        .await?;
                 let Some(row) = row else { return Ok(None) };
                 let body: String = row.try_get("body")?;
                 let record_type: String = row.try_get("type")?;
@@ -1595,7 +1577,7 @@ impl CurrentRevisionBasisResolver for ChangeSummaryCurrentBasis {
                 let is_realised = record_type == "Outcome" && record_kind == "impact";
                 scope_heads.push(json!({
                     "record_id":record_id,
-                    "portable_id":row.try_get::<String,_>("id")?,
+                    "portable_id":row.try_get::<String,_>("body_event_id")?,
                     "sha256":format!("{:x}",Sha256::digest(body.as_bytes())),
                     "record_type":record_type,
                     "record_kind":record_kind,
@@ -1902,6 +1884,278 @@ mod tests {
             }]
         });
         (pin, source_event_ids, context_record_ids, result)
+    }
+
+    async fn insert_context_event(db: &Db, record_id: &str, payload: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES (?,?,'unit.revision.recorded.v1',?,1,'legacy_unknown')")
+            .bind(&id).bind(record_id).bind(payload)
+            .execute(db.write_pool()).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn context_head_preserves_text_selection_duplicates_and_metadata_pairing() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record_with_run(
+            &db,
+            json!({"type":"Outcome","kind":"impact","name":"context","body":"projected bytes"}),
+            None,
+        )
+        .await;
+        let selected =
+            insert_context_event(&db, &id, r#"{"body":"first é\u0000","body":"second"}"#).await;
+        for payload in [
+            "{}",
+            r#"{"body":null}"#,
+            r#"{"body":42}"#,
+            r#"{"body":false}"#,
+            r#"{"body":[]}"#,
+            r#"{"body":{}}"#,
+            r#"{"body":null,"body":"later duplicate"}"#,
+        ] {
+            insert_context_event(&db, &id, payload).await;
+        }
+        // Metadata-only changes must pair with the selected event, not the
+        // projected body or the latest event's identity.
+        crate::store::update_record(&db, &id, json!({"kind":"milestone"}))
+            .await
+            .unwrap();
+        let audience = audience(ACTOR, true, "unused").unwrap().0;
+        let mut tx = db.pool().begin().await.unwrap();
+        let evidence = snapshot_evidence(&mut tx, &audience, &[], std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let context = &evidence.contexts[&id];
+        assert_eq!(context.current_body_event_id, selected);
+        assert_eq!(
+            context.current_body_sha256,
+            format!("{:x}", Sha256::digest("first é\0".as_bytes()))
+        );
+        assert_eq!(context.record_type, "Outcome");
+        assert_eq!(context.record_kind, "milestone");
+        assert!(context.record_is_live);
+        assert!(!context.is_realised);
+        tx.rollback().await.unwrap();
+        crate::store::delete_record(&db, &id).await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        let row = crate::record_body::context::exact_context_head_on(&mut *tx, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String, _>("body_event_id").unwrap(), selected);
+        assert_eq!(row.try_get::<String, _>("type").unwrap(), "Outcome");
+        assert_eq!(row.try_get::<String, _>("kind").unwrap(), "milestone");
+        assert!(row
+            .try_get::<Option<String>, _>("deleted_at")
+            .unwrap()
+            .is_some());
+        assert_eq!(row.try_get::<String, _>("body").unwrap(), "first é\0");
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_head_missing_text_keeps_inner_join_and_unavailable_mapping() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record_with_run(
+            &db,
+            json!({"type":"Document","kind":"note","name":"bodyless"}),
+            None,
+        )
+        .await;
+        for payload in ["{}", r#"{"body":null}"#, r#"{"body":123}"#] {
+            insert_context_event(&db, &id, payload).await;
+        }
+        let audience = audience(ACTOR, true, "unused").unwrap().0;
+        let mut tx = db.pool().begin().await.unwrap();
+        let missing = "c8a70000-0000-4000-8000-000000000099";
+        for record_id in [&id, missing] {
+            assert!(
+                crate::record_body::context::exact_context_head_on(&mut *tx, record_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let error = snapshot_evidence(&mut tx, &audience, &[], std::slice::from_ref(&id))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("input is unavailable"));
+        // A nonexistent record fails authorization before body lookup; retain
+        // that diagnostic rather than translating it into no-head availability.
+        let authorization_error = audience_can_view(&mut tx, &audience, missing)
+            .await
+            .err()
+            .unwrap();
+        let error = snapshot_evidence(&mut tx, &audience, &[], &[missing.to_owned()])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), authorization_error.to_string());
+        tx.rollback().await.unwrap();
+        // Empty text is a real head, distinct from no text.
+        let empty = insert_context_event(&db, &id, r#"{"body":""}"#).await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let evidence = snapshot_evidence(&mut tx, &audience, &[], std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        assert_eq!(evidence.contexts[&id].current_body_event_id, empty);
+        assert_eq!(
+            evidence.contexts[&id].current_body_sha256,
+            format!("{:x}", Sha256::digest(b""))
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_head_authorizes_entire_audience_before_malformed_sql_refusal() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let id = create_record_with_run(
+            &db,
+            json!({"type":"Document","kind":"note","name":"context","body":"older valid body"}),
+            None,
+        )
+        .await;
+        // Insert exactly one malformed historical row in this disposable DB.
+        // Restore metadata admission before committing; append-only guards stay.
+        let mut fixture = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let trigger: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='content_event_claim_meta_insert'").fetch_one(&mut *fixture).await.unwrap();
+        sqlx::query("DROP TRIGGER content_event_claim_meta_insert")
+            .persistent(false)
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES ('malformed-context',?,'unit.revision.recorded.v1','{',1,'legacy_unknown')").bind(&id).execute(&mut *fixture).await.unwrap();
+        sqlx::query(&trigger)
+            .persistent(false)
+            .execute(&mut *fixture)
+            .await
+            .unwrap();
+        fixture.commit().await.unwrap();
+        crate::authorization::replace_explicit_policy(
+            &db,
+            ACTOR,
+            &id,
+            vec![AllowEntry::account(ACTOR, Capability::Manage)],
+        )
+        .await
+        .unwrap();
+        let mut restricted = audience(ACTOR, true, "unused").unwrap().0;
+        let denied = audience("acct:denied", true, "unused").unwrap().0;
+        restricted.principals.extend(denied.principals);
+        let mut tx = db.pool().begin().await.unwrap();
+        let error = snapshot_evidence(&mut tx, &restricted, &[], std::slice::from_ref(&id))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("input is unavailable"));
+        assert!(!error.to_string().contains("malformed JSON"));
+        let allowed = audience(ACTOR, true, "unused").unwrap().0;
+        let error = snapshot_evidence(&mut tx, &allowed, &[], std::slice::from_ref(&id))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("malformed JSON"));
+        let error = crate::record_body::context::exact_context_head_on(&mut *tx, &id)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("malformed JSON"));
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_bytes_newer_context_head_invalidates_revision_currentness() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let principal = Principal::bound(ACTOR, true);
+        let (pin, source_event_ids, context_record_ids, result) = fixture(&db, principal).await;
+        create_or_reuse_change_summary(
+            &db,
+            principal,
+            ChangeSummaryCreateRequest {
+                workflow_key: "same-bytes".into(),
+                name: "Same bytes".into(),
+                recipe: pin.clone(),
+                actor: ACTOR.into(),
+                run_key: Some("scout-chair-000030".into()),
+                reason: "test context pins".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let request = request_change_summary(
+            &db,
+            principal,
+            ChangeSummaryRequest {
+                workflow_key: "same-bytes".into(),
+                source_event_ids,
+                context_record_ids: context_record_ids.clone(),
+                structured_result: result,
+                expected_recipe_status_event_seq: pin.expected_status_event_seq,
+                actor: ACTOR.into(),
+                run_key: Some("scout-chair-000031".into()),
+                reason: "derive".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let revision = request.revision_id.unwrap();
+        confirm_change_summary(
+            &db,
+            principal,
+            "same-bytes",
+            &revision,
+            ACTOR,
+            Some("scout-chair-000032".into()),
+            "confirm",
+        )
+        .await
+        .unwrap();
+        let policy = audience(ACTOR, true, "unused").unwrap().0;
+        let mut tx = db.pool().begin().await.unwrap();
+        assert!(
+            revision_is_current_for_principal(&mut tx, principal, &revision)
+                .await
+                .unwrap()
+        );
+        let before = snapshot_evidence(&mut tx, &policy, &[], &context_record_ids)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let new_pin = insert_context_event(
+            &db,
+            &context_record_ids[0],
+            r#"{"body":"Explicit confirmation."}"#,
+        )
+        .await;
+        let mut tx = db.pool().begin().await.unwrap();
+        let after = snapshot_evidence(&mut tx, &policy, &[], &context_record_ids)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.contexts[&context_record_ids[0]].current_body_sha256,
+            before.contexts[&context_record_ids[0]].current_body_sha256
+        );
+        assert_ne!(
+            after.contexts[&context_record_ids[0]].current_body_event_id,
+            before.contexts[&context_record_ids[0]].current_body_event_id
+        );
+        assert_eq!(
+            after.contexts[&context_record_ids[0]].current_body_event_id,
+            new_pin
+        );
+        assert!(
+            !revision_is_current_for_principal(&mut tx, principal, &revision)
+                .await
+                .unwrap()
+        );
+        tx.rollback().await.unwrap();
+        assert!(query_change_summaries(&db, principal, None, 10, 10)
+            .await
+            .unwrap()
+            .items
+            .is_empty());
     }
 
     #[tokio::test]

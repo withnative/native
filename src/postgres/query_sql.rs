@@ -1492,10 +1492,11 @@ pub(crate) fn projection_statements(db: &PostgresDb) -> Result<Vec<String>> {
     ];
     // Served catalog views, generated from LOGICAL_RELATIONS so Postgres
     // returns the same rows every other engine serves. Static metadata
-    // needs no security barrier and no collation override: agents order by
-    // the integer `column_position`, and equality filters are
-    // collation-neutral.
-    statements.extend(sql_contract::catalog_view_statements(false));
+    // needs no security barrier, but every text column selects with
+    // COLLATE "C": callers ORDER BY text (not just `column_position`),
+    // and the database locale would otherwise order rows differently
+    // from SQLite/Turso BINARY ordering. Integer columns take none.
+    statements.extend(sql_contract::catalog_view_statements(false, true));
     Ok(statements)
 }
 
@@ -1951,22 +1952,34 @@ async fn execute_qualified(
         &classified,
         &format!("?{hidden_index}"),
     )?;
-    // The caller-text check is needed only when adding the hidden bind.
-    // Clock-free statements retain validate()'s existing PostgreSQL `$n`
+    let time_dependent = now_ms_uses > 0;
+    // `current_principal()` takes the next hidden slot after the clock.
+    let principal_index = hidden_index + usize::from(time_dependent);
+    let (rewritten, principal_uses) = sql_contract::rewrite_current_principal_calls(
+        sql_contract::QuerySqlProfile::PostgresServer,
+        &rewritten,
+        &format!("?{principal_index}"),
+    )?;
+    // The caller-text check is needed only when adding a hidden bind.
+    // Statements without one retain validate()'s existing PostgreSQL `$n`
     // mismatch repair, which is part of that adapter's public contract.
-    if now_ms_uses > 0 {
+    if now_ms_uses > 0 || principal_uses > 0 {
         sql_contract::check_positional_arguments(
             sql_contract::QuerySqlProfile::PostgresServer,
             &classified,
             request.parameters.len(),
         )?;
     }
-    let time_dependent = now_ms_uses > 0;
     let now_ms_ms: Option<i64> = time_dependent.then(|| chrono::Utc::now().timestamp_millis());
     let mut effective_parameters = request.parameters.clone();
     if let Some(now_ms) = now_ms_ms {
         effective_parameters.push(sql_contract::QuerySqlParameter::Integer {
             value: Some(now_ms.to_string()),
+        });
+    }
+    if principal_uses > 0 {
+        effective_parameters.push(sql_contract::QuerySqlParameter::Text {
+            value: Some(principal.credential().to_string()),
         });
     }
     let request = QuerySqlRequest {
@@ -2627,6 +2640,33 @@ mod tests {
             .to_string();
             assert!(error.contains(repair), "unexpected refusal: {error}");
         }
+    }
+
+    #[test]
+    fn current_principal_is_admitted_without_arguments() {
+        for sql in [
+            "SELECT current_principal() AS p FROM records",
+            "SELECT id FROM content_events WHERE actor = current_principal() ORDER BY id",
+        ] {
+            validate(&request(sql)).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert!(
+                sql_contract::statement_uses_current_principal(
+                    sql_contract::QuerySqlProfile::PostgresServer,
+                    sql
+                )
+                .unwrap(),
+                "{sql}"
+            );
+        }
+        let error = validate(&request(
+            "SELECT current_principal('acct_other') FROM records",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("current_principal() takes no arguments"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3370,6 +3410,9 @@ mod tests {
             !mapped.contains("effective_relationship_endpoints"),
             "{mapped}"
         );
+        assert!(!mapped.contains("facet_value_json_nodes"), "{mapped}");
+        assert!(!mapped.contains("facet_observation_json_nodes"), "{mapped}");
+        assert!(!mapped.contains("record_body_json_nodes"), "{mapped}");
         assert!(
             mapped.contains("Queryable relations on postgres-server:"),
             "{mapped}"
@@ -3477,6 +3520,9 @@ mod tests {
         for relation in [
             "body_block_headings",
             "effective_relationship_endpoints",
+            "facet_value_json_nodes",
+            "facet_observation_json_nodes",
+            "record_body_json_nodes",
             "agent_activity",
             "agent_activity_claims",
             "messages_awaiting_reply",
@@ -4068,6 +4114,11 @@ mod tests {
     ///   views synthesize `fv:`/`fo:`-prefixed ids, which never match the
     ///   cases' `conf:` id filters. Needs a corpus id-filter convention or
     ///   a PG id-synthesis decision.
+    /// - `facet_history`: the seeded observations, timestamps and
+    ///   sequences differ between the profiles (SQLite seeds physical
+    ///   observation rows; here facet state lives in `content_events`),
+    ///   so the shared expectation cannot pin both. Same follow-on as
+    ///   above.
     /// - `worked_recent_history_of_one_record`: facet state lives in
     ///   `content_events` on this path, so the `facet.set` rows join the
     ///   history and the verbatim two-row expectation is SQLite-shape.
@@ -4096,6 +4147,12 @@ mod tests {
             "records_archived_currency_orthogonal",
             "records_archived_does_not_disclose_hidden_rows",
             "links_require_both_endpoints_visible",
+            "links_of_record",
+            "record_body",
+            "record_body_hidden",
+            "record_currency_superseded",
+            "record_currency_current",
+            "record_currency_hidden",
             "hidden_row_not_counted",
             "hidden_row_direct_lookup_empty",
             "timestamp_ms_integer_arithmetic",
@@ -4127,6 +4184,7 @@ mod tests {
             "body_task_items_hidden_direct_lookup_empty",
             "vocabularies_are_caller_independent",
             "vocabulary_values_join_vocabularies",
+            "vocabulary_values",
             "schema_config_null_scope_visible",
             "scalar_min_max_agree",
             "computed_booleans_encode_as_zero_one",

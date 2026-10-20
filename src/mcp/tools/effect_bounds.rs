@@ -566,6 +566,25 @@ pub struct CommentCreateBound {
 /// Thread positions one comment bound may admit.
 pub(crate) const COMMENT_CREATE_POSITIONS: [&str; 2] = ["reply", "root"];
 
+/// Consent for passage-anchored root comments: a bare effect string beside
+/// the `comment.create.v1` bound. A separate string, not a new bound key, so
+/// every existing declaration, digest and the frozen body-admission v1
+/// parser stay byte-identical. A comment entry that declares an `anchor`
+/// input is admitted only when the consented declaration names it.
+pub const COMMENT_PASSAGE_ANCHOR_EFFECT: &str = "comment.passage-anchor.v1";
+
+/// Whether a consented declaration admits passage anchors on comment roots.
+pub(crate) fn consents_passage_anchors(declaration: &Value) -> bool {
+    declaration
+        .get("effects")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.as_str() == Some(COMMENT_PASSAGE_ANCHOR_EFFECT))
+        })
+}
+
 /// Parse one comment.create object effect entry. Pure; every refusal fails
 /// the declaration (or the stored consent) closed — an invalid object never
 /// digests as absent and never silently narrows to its bare name.
@@ -1075,6 +1094,22 @@ pub(crate) fn admit(
                 };
                 let (bound, need) = comment_admission(declaration, &entry.id, position)
                     .map_err(|(code, message)| AdmissionRefusal::NoUsableBound { code, message })?;
+                // An entry that can carry a passage anchor needs its own consent,
+                // whether or not this invocation sends one.
+                if entry
+                    .comment
+                    .as_ref()
+                    .is_some_and(|comment| comment.anchor.is_some())
+                    && !consents_passage_anchors(declaration)
+                {
+                    return Err(AdmissionRefusal::NoUsableBound {
+                        code: "alpha_guard_effect_unconsented".to_string(),
+                        message: format!(
+                            "the personal alpha install does not consent to passage anchors for entry '{}' (declare '{COMMENT_PASSAGE_ANCHOR_EFFECT}'); a declared interaction alone is never effect consent",
+                            entry.id
+                        ),
+                    });
+                }
                 Ok(Admitted::Comment { bound, need })
             }
             TabEffectArm::MessageReact => {
@@ -1189,6 +1224,7 @@ mod admission_tests {
                 input: "text".into(),
                 max_bytes: 500,
             },
+            anchor: None,
         });
         e
     }

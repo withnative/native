@@ -237,6 +237,10 @@ struct DispatchFacts {
     action_digest: String,
     command_identity_digest: Option<String>,
     intent_digest: Option<String>,
+    /// Host-asserted v2 app (task `50f5aca`), copied from the private
+    /// `Caller` slot. Recorded in `provenance_action_app_attributions` beside
+    /// each attestation; it never enters the attestation row or its digests.
+    app: Option<Arc<crate::mcp::app_attribution::AppAttribution>>,
 }
 
 #[derive(Default, Debug)]
@@ -562,9 +566,49 @@ pub(crate) fn current_dispatch() -> Option<ProvenanceDispatch> {
     TRUSTED_PROVENANCE.try_with(Clone::clone).ok()
 }
 
+/// The host assertion attached to this source-tool dispatch. This is a claim,
+/// never a cached permission: native adapters must re-admit it on the actual
+/// read/mutation connection before returning data or replaying a receipt.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn current_app_claim(
+) -> Option<(String, Arc<crate::mcp::app_attribution::AppAttribution>)> {
+    TRUSTED_PROVENANCE
+        .try_with(|dispatch| {
+            dispatch
+                .facts
+                .app
+                .as_ref()
+                .map(|app| (dispatch.facts.principal.clone(), app.clone()))
+        })
+        .ok()
+        .flatten()
+}
+
 pub(crate) fn digest_json(value: &Value) -> String {
     crate::canonical_json::digest_json(value)
 }
+
+/// Record-scoped writes keyed by slice A1. Like `manage_links`, none gives a
+/// meaning to an explicit null: it parses to the same absent option as an
+/// omitted field, so it must not make a retry conflict.
+const KEYED_RECORD_SCOPED_WRITES: &[&str] = &[
+    "manage_facet_observations",
+    "archive_record",
+    "claim_unowned_record",
+    "manage_citations",
+    "manage_attributions",
+    "resolve_suggestions",
+    "manage_participants",
+    "manage_renderer_binding",
+    "manage_artifact_inputs",
+    "manage_mdx_modules",
+    "manage_surface_bindings",
+];
+
+/// Writes keyed by slice A2. Their top-level fields give no meaning to an
+/// explicit null either; `create_many`'s records are left byte-exact.
+const KEYED_MULTI_OUTPUT_WRITES: &[&str] =
+    &["create_many", "instantiate_artifact", "attach_from_url"];
 
 fn action_arguments(operation: &str, arguments: &Value) -> Value {
     let mut value = arguments.clone();
@@ -572,10 +616,36 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
         for key in ["run_key", "parent_key", "agent_key"] {
             object.remove(key);
         }
+        if operation == "manage_messages"
+            && object.get("action").and_then(Value::as_str) == Some("send")
+        {
+            // Advisory message identity cannot make a keyed retry conflict.
+            // The output event-set commitment still covers any speaker fact.
+            object.remove("speaker");
+        }
+        // The keyed classification actions (slice A1b) take the same two
+        // cosmetic normalizations as the other record-scoped writes; the other
+        // manage_messages actions keep their shipped digests untouched.
+        if operation == "manage_messages"
+            && matches!(
+                object.get("action").and_then(Value::as_str),
+                Some("classify" | "unclassify" | "move")
+            )
+        {
+            if let Some(key) = object.get_mut("idempotency_key") {
+                if let Some(value) = key.as_str() {
+                    *key = Value::String(value.trim().to_string());
+                }
+            }
+            object.retain(|_, value| !value.is_null());
+        }
         // Response shaping is presentation-only. It must not change the
         // governed action identity or make an idempotent create conflict when
         // a retry asks for the other representation.
-        if operation == "create_record" || operation == "update_record" {
+        if operation == "create_record"
+            || operation == "update_record"
+            || operation == "create_many"
+        {
             object.remove("response_mode");
         }
         if operation == "manage_relationships" {
@@ -600,9 +670,22 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
                 }
             }
         }
+        // The keyed-replay seam (`mcp::tools::keyed_replay`) trims the key
+        // for lookup, so the digest compares it trimmed too. `update_record`
+        // keeps explicit nulls: there a null means "clear", not "absent".
+        if operation == "update_record" {
+            if let Some(key) = object.get_mut("idempotency_key") {
+                if let Some(value) = key.as_str() {
+                    *key = Value::String(value.trim().to_string());
+                }
+            }
+        }
         if operation == "create_record"
             || operation == "create_exploration"
             || operation == "attach_text"
+            || operation == "manage_links"
+            || KEYED_RECORD_SCOPED_WRITES.contains(&operation)
+            || KEYED_MULTI_OUTPUT_WRITES.contains(&operation)
         {
             // Same two cosmetic normalizations the conflict detector needs and
             // nothing more: the caller key is lookup-scoped trimmed, so the
@@ -624,6 +707,60 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
     }
     value
 }
+
+/// Recover the argument spelling of an already committed keyed create, for
+/// internal speculative execution. This is not authorization or a receipt:
+/// the ordinary handler must still authorize and replay the command itself.
+/// Only the trusted caller's principal is queried; no raw arguments are stored.
+#[doc(hidden)]
+pub async fn existing_create_replay_arguments(
+    db: &Db,
+    principal: &str,
+    arguments: &Value,
+) -> Result<Option<(String, Value)>> {
+    let Some(command) = command_identity_digest(arguments) else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT a.id,a.action_digest FROM provenance_action_attestations a
+        JOIN provenance_local_attestation_authority l ON l.attestation_id=a.id
+        WHERE a.principal=? AND a.operation='create_record' AND a.command_identity_digest=?",
+    )
+    .bind(principal)
+    .bind(command)
+    .fetch_optional(db.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: String = sqlx::query_scalar(
+        "SELECT DISTINCT e.record_id FROM provenance_action_outputs o
+        JOIN content_events e ON e.id=o.output_event_id
+        WHERE o.action_attestation_id=? AND o.output_domain='content' AND e.type='record.created'",
+    )
+    .bind(row.try_get::<String, _>("id")?)
+    .fetch_one(db.pool())
+    .await?;
+    let digest: String = row.try_get("action_digest")?;
+    if digest == action_digest("create_record", arguments) {
+        return Ok(Some((id, arguments.clone())));
+    }
+    let mut with_id = arguments.clone();
+    with_id["id"] = json!(id);
+    if digest == action_digest("create_record", &with_id) {
+        return Ok(Some((id, with_id)));
+    }
+    Err(Error::engine(IDEMPOTENCY_CONFLICTING_INPUT))
+}
+
+/// Refusal for a reused idempotency key whose normalized action differs.
+/// Callers read the machine code `idempotency_conflict` from
+/// [`Error::is_idempotency_conflict`]; the text is unchanged since it shipped.
+pub(crate) const IDEMPOTENCY_CONFLICTING_INPUT: &str =
+    "idempotency command identity was reused with conflicting action input";
+/// Refusal for a reused idempotency key under a different resolved intent.
+pub(crate) const IDEMPOTENCY_DIFFERENT_INTENT: &str =
+    "idempotency command identity was reused under a different resolved intent";
 
 fn action_commitment(operation: &str, arguments: &Value) -> Value {
     json!({
@@ -657,7 +794,8 @@ fn commitment_is_exact(canonical: &Value, operation: &str, digest: &str) -> bool
     is_sha256_hex(arguments_digest) && is_sha256_hex(digest) && digest_json(canonical) == digest
 }
 
-pub(crate) fn action_digest(operation: &str, arguments: &Value) -> String {
+#[doc(hidden)]
+pub fn action_digest(operation: &str, arguments: &Value) -> String {
     digest_json(&action_commitment(operation, arguments))
 }
 
@@ -749,7 +887,9 @@ impl ExecutorIdentitySnapshot {
 
 /// Derive executor attribution strictly from the `Caller`'s verified slots.
 /// Channel, public tool arguments, and asserted run keys never participate.
-fn verified_executor_attribution(caller: &Caller) -> (String, Option<String>, Option<String>) {
+pub(crate) fn verified_executor_attribution(
+    caller: &Caller,
+) -> (String, Option<String>, Option<String>) {
     if let Some(executor) = caller.verified_delegated_service() {
         (
             "delegated_service".to_string(),
@@ -849,6 +989,7 @@ impl ProvenanceDispatch {
                 action_digest: accepted_digest,
                 command_identity_digest: command_identity_digest(arguments),
                 intent_digest: intent.map(|value| digest_json(&json!(value))),
+                app: caller.host_asserted_app_shared(),
             }),
             state: Arc::new(Mutex::new(DispatchState::default())),
         }
@@ -856,6 +997,21 @@ impl ProvenanceDispatch {
 
     pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
         TRUSTED_PROVENANCE.scope(self.clone(), future).await
+    }
+
+    /// The same dispatch under another command identity, sharing its output
+    /// and receipt state. `create_many` commits each item in its own
+    /// transaction, so each item's attestation carries its own identity
+    /// derived from the call's key; one shared identity would collide on the
+    /// authority index at the second item.
+    pub(crate) fn with_command_identity(&self, command_identity_digest: Option<String>) -> Self {
+        Self {
+            facts: Arc::new(DispatchFacts {
+                command_identity_digest,
+                ..(*self.facts).clone()
+            }),
+            state: Arc::clone(&self.state),
+        }
     }
 
     pub(crate) fn receipt_ids(&self) -> Vec<String> {
@@ -1032,8 +1188,92 @@ pub(crate) async fn issue_empty_command_attestation_in(
     .bind(&issued_at)
     .execute(&mut **tx)
     .await?;
+    record_app_attribution_in(tx, &draft).await?;
     note_pending_attestation(draft.id.clone());
     Ok(draft.id)
+}
+
+/// Anchor a keyed command that is about to commit without any governed output.
+///
+/// A keyed write that changes nothing still has to leave the row its key
+/// lookup finds, or a retry would miss and might write after all. Call this
+/// in the handler's own write transaction immediately before commit. It is a
+/// no-op unless the dispatch carries an idempotency key and this transaction
+/// will otherwise attest nothing: no still-unclaimed output exists in `tx`
+/// and no attestation issued earlier in it is visible. Outputs left behind by
+/// an earlier rolled-back attempt in the same dispatch do not count, because
+/// they are not in `tx`.
+pub(crate) async fn issue_keyed_noop_anchor_in(
+    tx: &mut Transaction<'static, Sqlite>,
+) -> Result<Option<String>> {
+    let Ok(dispatch) = TRUSTED_PROVENANCE.try_with(Clone::clone) else {
+        return Ok(None);
+    };
+    if dispatch.facts.command_identity_digest.is_none() {
+        return Ok(None);
+    }
+    let candidates = dispatch
+        .state
+        .lock()
+        .expect("provenance dispatch lock")
+        .appended_outputs
+        .clone();
+    for output in candidates {
+        let present: bool = match output.domain {
+            OutputDomain::Content => {
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE id=?)")
+                    .bind(&output.event_id)
+                    .fetch_one(&mut **tx)
+                    .await?
+            }
+            OutputDomain::Relationship => {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM relationship_events WHERE id=? AND issuer_origin_db_id=(SELECT origin_db_id FROM database_identity WHERE singleton=1))",
+                )
+                .bind(&output.event_id)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+        };
+        if present {
+            return Ok(None);
+        }
+    }
+    if !pending_attestations_visible_in(tx).await?.is_empty() {
+        return Ok(None);
+    }
+    issue_empty_command_attestation_in(tx).await.map(Some)
+}
+
+/// True when `error` is the UNIQUE `(principal, operation, key digest)`
+/// authority index refusing a second keyed commit. Under SQLite's single
+/// writer a handler that looks its key up inside its own `BEGIN IMMEDIATE`
+/// transaction cannot reach this; it is the backstop the keyed-replay seam
+/// turns into one replay attempt.
+pub(crate) fn is_command_identity_race(error: &Error) -> bool {
+    let message = match error {
+        Error::Sqlx(sqlx::Error::Database(database)) => database.message().to_string(),
+        Error::Engine(message) => message.clone(),
+        _ => return false,
+    };
+    message.contains("UNIQUE")
+        && message.contains("provenance_local_attestation_authority.command_identity_digest")
+}
+
+/// Write the host-asserted app beside a just-inserted attestation, when the
+/// dispatch carries one. A separate row keeps the attestation and its
+/// digests byte-identical to an unattributed call.
+async fn record_app_attribution_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    draft: &ActionAttestationDraft,
+) -> Result<()> {
+    // `record_in` boxes its own future, so this frame holds only a pointer.
+    match &draft.facts.app {
+        Some(app) => {
+            crate::mcp::app_attribution::record_in(tx, &draft.id, &draft.facts.principal, app).await
+        }
+        None => Ok(()),
+    }
 }
 
 async fn upsert_interaction_receipt_in(
@@ -1203,6 +1443,7 @@ pub(crate) async fn issue_action_attestation_outputs_in(
     .bind(&issued_at)
     .execute(&mut **tx)
     .await?;
+    record_app_attribution_in(tx, &draft).await?;
     for (ordinal, output) in outputs.iter().enumerate() {
         sqlx::query(
             "INSERT INTO provenance_action_outputs
@@ -1371,6 +1612,21 @@ pub(crate) async fn lookup_authorized_command_attestation_in(
     let Some(command) = command_identity_digest(arguments) else {
         return Ok(None);
     };
+    lookup_authorized_command_identity_in(tx, principal, operation, &command, arguments, intent)
+        .await
+}
+
+/// [`lookup_authorized_command_attestation_in`] for a command identity the
+/// handler derived itself (a `create_many` item), rather than the plain key
+/// digest. The action and intent comparisons are the same.
+pub(crate) async fn lookup_authorized_command_identity_in(
+    tx: &mut Transaction<'_, Sqlite>,
+    principal: &str,
+    operation: &str,
+    command: &str,
+    arguments: &Value,
+    intent: Option<&str>,
+) -> Result<Option<String>> {
     let row = sqlx::query(
         "SELECT a.id,a.action_digest,a.intent_digest
            FROM provenance_action_attestations a
@@ -1386,17 +1642,34 @@ pub(crate) async fn lookup_authorized_command_attestation_in(
         return Ok(None);
     };
     if row.try_get::<String, _>("action_digest")? != action_digest(operation, arguments) {
-        return Err(Error::engine(
-            "idempotency command identity was reused with conflicting action input",
-        ));
+        return Err(Error::engine(IDEMPOTENCY_CONFLICTING_INPUT));
     }
     let expected_intent = intent.map(|value| digest_json(&json!(value)));
     if row.try_get::<Option<String>, _>("intent_digest")? != expected_intent {
-        return Err(Error::engine(
-            "idempotency command identity was reused under a different resolved intent",
-        ));
+        return Err(Error::engine(IDEMPOTENCY_DIFFERENT_INTENT));
     }
     Ok(Some(row.try_get("id")?))
+}
+
+/// Internal lookup-only recovery for a signed deferred command. This acquires
+/// the SQLite writer lock to serialize with an ambiguous commit, but executes
+/// no command or event write. The caller must authenticate the signed envelope
+/// and keep this result on the private coordinator transport.
+#[doc(hidden)]
+pub async fn reconcile_deferred_command(
+    db: &Db,
+    principal: &str,
+    operation: &str,
+    arguments: &Value,
+    intent: Option<&str>,
+) -> Result<Option<String>> {
+    let mut connection = db.write_pool().acquire().await?;
+    let mut tx = sqlx::Connection::begin_with(&mut *connection, "BEGIN IMMEDIATE").await?;
+    let result =
+        lookup_authorized_command_attestation_in(&mut tx, principal, operation, arguments, intent)
+            .await;
+    tx.rollback().await?;
+    result
 }
 
 /// Look up the original attestation only after the operation handler has
@@ -1427,15 +1700,11 @@ pub(crate) async fn lookup_authorized_command_attestation(
         return Ok(None);
     };
     if row.try_get::<String, _>("action_digest")? != action_digest(operation, arguments) {
-        return Err(Error::engine(
-            "idempotency command identity was reused with conflicting action input",
-        ));
+        return Err(Error::engine(IDEMPOTENCY_CONFLICTING_INPUT));
     }
     let expected_intent = intent.map(|value| digest_json(&json!(value)));
     if row.try_get::<Option<String>, _>("intent_digest")? != expected_intent {
-        return Err(Error::engine(
-            "idempotency command identity was reused under a different resolved intent",
-        ));
+        return Err(Error::engine(IDEMPOTENCY_DIFFERENT_INTENT));
     }
     Ok(Some(row.try_get("id")?))
 }
@@ -1569,6 +1838,12 @@ pub struct VerifiedInteractionEvidenceView {
     pub sealed_reference_recorded: bool,
 }
 
+/// Bind an admitted qualified preparation using the same encoder on issuance
+/// and conformance, separately from the selector's frozen evidence encoding.
+pub(crate) fn sql_write_preparation_digest(preparation: &Value) -> String {
+    digest_json(&json!({"format":"native.sql-write-preparation.v1","preparation":preparation}))
+}
+
 /// Validate the immutable provenance substrate independently of bundle/file
 /// hashes. Canonical interchange and conformance call this after foreign-key
 /// validation so a self-consistent but semantically forged bundle fails closed.
@@ -1597,7 +1872,7 @@ fn is_empty_batch_anchor_shape(
     stored_digest: &str,
 ) -> bool {
     schema_version == ACTION_ATTESTATION_SCHEMA_VERSION
-        && operation == "batch_write"
+        && matches!(operation, "batch_write" | "sql_write")
         && issuer == ISSUER
         && command_digest.is_some_and(is_sha256_hex)
         && stored_digest == ordered_output_set_digest(&[])
@@ -1612,6 +1887,55 @@ async fn state_violations_on(connection: &mut sqlx::SqliteConnection) -> Result<
     .fetch_all(&mut *connection)
     .await?;
     let mut violations = Vec::new();
+    // SQL receipts are immutable canonical adjuncts, not reconstructed state.
+    // Verify their envelope digest, admitted command identity and exact outputs.
+    for row in sqlx::query("SELECT r.*,a.principal AS anchor_principal,a.operation,a.command_identity_digest,a.action_digest AS anchor_action_digest FROM sql_write_receipts r JOIN provenance_action_attestations a ON a.id=r.anchor_id ORDER BY r.principal,r.plan_id").fetch_all(&mut *connection).await? {
+        let text: String = row.try_get("envelope")?;
+        let value: Value = serde_json::from_str(&text)?;
+        let principal: String = row.try_get("principal")?;
+        let plan_id: String = row.try_get("plan_id")?;
+        let anchor: String = row.try_get("anchor_id")?;
+        let expected_outputs: Vec<ActionOutput> = serde_json::from_value(value["outputs"].clone())?;
+        let mut actual = Vec::new();
+        let item_ids = value["receipt"]["item_attestation_ids"].as_array().ok_or_else(|| Error::engine("SQL receipt has no item attestation set"))?;
+        if item_ids.len() > 25 { return Err(Error::engine("SQL receipt exceeds its item bound")); }
+        let mut seen = std::collections::BTreeSet::new();
+        for item_id in item_ids {
+            let id = item_id.as_str().ok_or_else(|| Error::engine("invalid SQL item attestation ID"))?;
+            let facts = sqlx::query("SELECT principal,operation,action_digest,command_identity_digest FROM provenance_action_attestations WHERE id=?").bind(id).fetch_one(&mut *connection).await?;
+            if !seen.insert(id) || facts.try_get::<String,_>("principal")? != principal
+                || facts.try_get::<String,_>("operation")? != "sql_write"
+                || facts.try_get::<String,_>("action_digest")? != row.try_get::<String,_>("anchor_action_digest")?
+                || facts.try_get::<Option<String>,_>("command_identity_digest")?.is_some() {
+                violations.push(format!("SQL receipt {anchor} has an unrelated item attestation"));
+            }
+            let members = sqlx::query("SELECT output_domain,output_event_id FROM provenance_action_outputs WHERE action_attestation_id=? ORDER BY ordinal").bind(id).fetch_all(&mut *connection).await?;
+            if members.is_empty() { violations.push(format!("SQL receipt {anchor} has an empty item attestation")); }
+            for member in members { actual.push(json!({"domain":member.try_get::<String,_>("output_domain")?,"event_id":member.try_get::<String,_>("output_event_id")?})); }
+        }
+        let anchor_outputs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provenance_action_outputs WHERE action_attestation_id=?").bind(&anchor).fetch_one(&mut *connection).await?;
+        let prepared = &value["preparation"];
+        let prepared_digest = sql_write_preparation_digest(prepared);
+        if row.try_get::<String,_>("envelope_digest")? != digest_json(&value)
+            || value["format"] != "native.sql-write-receipt.v1"
+            || value["plan_id"] != plan_id || value["receipt"]["plan_id"] != plan_id
+            || value["receipt"]["anchor_id"] != anchor
+            || value["receipt"]["act"] != row.try_get::<i64,_>("act")?
+            || value["prepared_digest"] != row.try_get::<String,_>("prepared_digest")?
+            || prepared_digest != row.try_get::<String,_>("prepared_digest")?
+            || value["profile"] != row.try_get::<String,_>("profile")?
+            || principal != row.try_get::<String,_>("anchor_principal")?
+            || row.try_get::<String,_>("operation")? != "sql_write"
+            || row.try_get::<Option<String>,_>("command_identity_digest")? != Some(digest_json(&json!(plan_id)))
+            || row.try_get::<String,_>("anchor_action_digest")? != action_digest("sql_write", &json!({"plan_id":plan_id,"profile":value["profile"],"prepared_digest":value["prepared_digest"],"idempotency_key":plan_id}))
+            || anchor_outputs != 0
+            || serde_json::to_value(expected_outputs)? != json!(actual) {
+            violations.push(format!("SQL batch receipt {anchor} disagrees with its immutable envelope or command attestation"));
+        }
+    }
+    for orphan in sqlx::query_scalar::<_,String>("SELECT id FROM provenance_action_attestations WHERE operation='sql_write' AND command_identity_digest IS NOT NULL AND NOT EXISTS(SELECT 1 FROM sql_write_receipts r WHERE r.anchor_id=provenance_action_attestations.id)").fetch_all(&mut *connection).await? {
+        violations.push(format!("SQL command anchor {orphan} has no durable batch envelope"));
+    }
     for row in rows {
         let id: String = row.try_get("id")?;
         let canonical_text: String = row.try_get("action_commitment")?;
@@ -2272,6 +2596,22 @@ mod tests {
         assert_eq!(
             dispatch.facts.delegation_ref.as_deref(),
             Some("webhook-credential:credential-1")
+        );
+    }
+
+    #[test]
+    fn persona_speaker_does_not_change_send_action_identity_or_hide_content_changes() {
+        let plain = json!({"action":"send","body":"Ask","idempotency_key":"ask"});
+        let mut claimed = plain.clone();
+        claimed["speaker"] = json!({"persona_id":"persona"});
+        assert_eq!(
+            action_digest("manage_messages", &plain),
+            action_digest("manage_messages", &claimed)
+        );
+        claimed["body"] = json!("Different ask");
+        assert_ne!(
+            action_digest("manage_messages", &plain),
+            action_digest("manage_messages", &claimed)
         );
     }
 
@@ -3765,6 +4105,7 @@ mod tests {
             action_digest: action_digest("create_record", &arguments),
             command_identity_digest: None,
             intent_digest: None,
+            app: None,
         };
         (facts, receipt)
     }

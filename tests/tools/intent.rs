@@ -2351,10 +2351,14 @@ async fn set_intent_bootstrap_names_declared_model_guidance() {
     db.drain_captures_for_tests().await;
     let guidance = &bootstrap["intentful_sessions"]["declared_model"];
     assert!(
+        guidance["how"].as_str().unwrap().contains("set_intent"),
+        "{guidance}"
+    );
+    assert!(
         guidance["how"]
             .as_str()
             .unwrap()
-            .contains("first set_intent"),
+            .contains("while the run still records none"),
         "{guidance}"
     );
     assert!(
@@ -2926,5 +2930,104 @@ async fn episode_sources_deduplicate_and_stay_bounded() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), ids.len(), "no duplicate items: {ids:?}");
+    db.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// First-call harness identity, task c2e2b7d: late model fill and concurrent
+// first declarations on the qualified declaration path.
+// ---------------------------------------------------------------------------
+
+/// A later set_intent fills an honestly absent model: first present wins, and
+/// the committed confirmation reports the fill rather than a refusal.
+#[tokio::test]
+async fn set_intent_late_model_declaration_fills_absent_slot() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-s748b2";
+    let first = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:test").with_channel(Channel::Mcp),
+            "set_intent",
+            crate::common::with_test_reason(
+                "set_intent",
+                json!({ "intent": "Start modeless.", "run_key": run }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["declared_model"]["refused"], false);
+    assert_eq!(first["declared_model"]["recorded"], Value::Null);
+    let later = registry
+        .call(
+            db.clone(),
+            Caller::authenticated("acct:test").with_channel(Channel::Mcp),
+            "set_intent",
+            crate::common::with_test_reason(
+                "set_intent",
+                json!({ "intent": "Still going.", "model": "late-model", "run_key": run }),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(later["declared_model"]["declared"], "late-model");
+    assert_eq!(later["declared_model"]["recorded"], "late-model");
+    assert_eq!(later["declared_model"]["refused"], false);
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT reported_model FROM agent_runs WHERE run_key=?")
+            .bind(run)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some("late-model"));
+    db.close().await;
+}
+
+/// Two concurrent first declarations on one new key: exactly one commits
+/// first and the loser is corrected to refused from the committed stored
+/// result, while both intents land.
+#[tokio::test]
+async fn set_intent_concurrent_first_declarations_report_honestly() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = registry();
+    let run = "scout-chair-t748b2";
+    let declare = |model: &'static str| {
+        let registry = &registry;
+        let db = &db;
+        async move {
+            registry
+                .call(
+                    db.clone(),
+                    Caller::authenticated("acct:test").with_channel(Channel::Mcp),
+                    "set_intent",
+                    crate::common::with_test_reason(
+                        "set_intent",
+                        json!({ "intent": "Race to declare.", "model": model, "run_key": run }),
+                    ),
+                )
+                .await
+                .unwrap()
+        }
+    };
+    let (first, second) = tokio::join!(declare("race-model-a"), declare("race-model-b"));
+    let blocks = [&first["declared_model"], &second["declared_model"]];
+    let winners: Vec<&&Value> = blocks
+        .iter()
+        .filter(|block| block["refused"] == false)
+        .collect();
+    assert_eq!(winners.len(), 1, "exactly one declaration commits first");
+    let recorded = winners[0]["recorded"].as_str().unwrap();
+    assert!(recorded == "race-model-a" || recorded == "race-model-b");
+    for block in blocks {
+        assert_eq!(block["recorded"], recorded, "loser names the winner");
+    }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT reported_model FROM agent_runs WHERE run_key=?")
+            .bind(run)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some(recorded));
     db.close().await;
 }

@@ -23,7 +23,10 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn literal_options(path: &Path) -> Result<(PathBuf, SqliteConnectOptions)> {
+fn literal_options(
+    path: &Path,
+    require_retained_wal: bool,
+) -> Result<(PathBuf, SqliteConnectOptions)> {
     // SQLx enables SQLITE_OPEN_URI even with filename(). An absolute filename
     // cannot start with 'file:', so relative file: names cannot become URIs.
     // Never strip a prefix, percent-decode or use a lossy path conversion.
@@ -45,8 +48,10 @@ fn literal_options(path: &Path) -> Result<(PathBuf, SqliteConnectOptions)> {
             // SHM still participates in SQLite's reader coordination; it is
             // not promised byte-immutable. The owner must retain all files
             // and prevent replacement/journal changes throughout handle use.
-            readable_regular_file(&sidecar(&path, "-wal"))?;
-            readable_regular_file(&sidecar(&path, "-shm"))?;
+            if require_retained_wal {
+                readable_regular_file(&sidecar(&path, "-wal"))?;
+                readable_regular_file(&sidecar(&path, "-shm"))?;
+            }
         }
         _ => return Err(refusal("unsupported SQLite journal header")),
     }
@@ -65,6 +70,7 @@ async fn validate_snapshot(options: &SqliteConnectOptions) -> Result<()> {
     let mut connection = SqliteConnection::connect_with(options).await?;
     let validation: Result<()> = async {
         let mut snapshot = connection.begin().await?;
+        super::refuse_v2_database(&mut snapshot).await?;
         let version: i64 = sqlx::query_scalar("PRAGMA user_version")
             .fetch_one(&mut *snapshot)
             .await?;
@@ -161,8 +167,73 @@ async fn validate_state(db: &Db) -> Result<()> {
 /// constructor must continuously retain candidate/users/catalog authority,
 /// validate journals and conformance, and enforce fresh outgoing custody.
 pub async fn open_current_database_wal_read_only_at(path: &Path) -> Result<Db> {
-    let (path, options) = literal_options(path)?;
+    open_current_read_only(path, true).await
+}
+
+/// Open an existing current-engine file for ordinary hosted read requests.
+/// All pools are physically read-only, without CREATE, migrations, repairs,
+/// seed reconciliation, capture workers or realtime/index schedulers. Current
+/// version, structural shape and state are validated before returning a handle.
+///
+/// Unlike the stricter candidate observer, ordinary SQLite reader coordination
+/// may create WAL/SHM sidecars in a writable directory for a closed WAL file.
+/// This does not change database row content. Normal WAL locking and visibility
+/// are retained: this is never an immutable open of a live hosted database.
+pub async fn open_current_database_read_only_at(path: &Path) -> Result<Db> {
+    open_current_read_only(path, false).await
+}
+
+async fn open_current_read_only(path: &Path, require_retained_wal: bool) -> Result<Db> {
+    let (path, options) = literal_options(path, require_retained_wal)?;
     validate_snapshot(&options).await?;
+    let db = open_read_only_handle(path, options).await?;
+    if let Err(error) = validate_state(&db).await {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
+/// Physically read-only pools for a prepared kernel file. This is ordinary
+/// request custody, not standby admission or permission to provision a file.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub async fn open_marked_v2_database_read_only_at(path: &Path) -> Result<Db> {
+    let (path, options) = literal_options(path, false)?;
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    let marker: Result<i64> = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(Into::into);
+    let closed = connection.close().await;
+    let marker = marker?;
+    closed?;
+    if marker != super::V2_APPLICATION_ID {
+        return Err(refusal(
+            "read-only kernel open requires a prepared marked v2 database",
+        ));
+    }
+    let db = open_read_only_handle(path, options).await?;
+    let checked = async {
+        crate::kernel::verify_v2_ready(&db).await?;
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(db.pool())
+            .await?;
+        if marker != super::V2_APPLICATION_ID {
+            return Err(refusal(
+                "kernel engine marker changed during read-only open",
+            ));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = checked {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
+async fn open_read_only_handle(path: PathBuf, options: SqliteConnectOptions) -> Result<Db> {
     let write_pool = open_pool(&options).await?;
     let read_pool = match open_pool(&options).await {
         Ok(pool) => pool,
@@ -213,12 +284,9 @@ pub async fn open_current_database_wal_read_only_at(path: &Path) -> Result<Db> {
         portability_policy_gate: Arc::new(tokio::sync::RwLock::new(())),
         capture_queue: crate::mcp::interactions::CaptureQueue::inert(),
         database_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+        live_session_key: Arc::new(std::sync::OnceLock::new()),
         _tmp: None,
     };
-    if let Err(error) = validate_state(&db).await {
-        db.close().await;
-        return Err(error);
-    }
     Ok(db)
 }
 

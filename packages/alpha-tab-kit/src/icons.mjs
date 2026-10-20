@@ -62,12 +62,13 @@ export const DEFAULT_APP_ICONS = Object.freeze({
   "agent.roadmap-base": { kind: "brand", name: "airtable" },
   "agent.salesforce-crm": { kind: "brand", name: "salesforce" },
   "agent.slack-workspace": { kind: "brand", name: "slack" },
+  "agent.slack-workspace-v2": { kind: "brand", name: "slack" },
   "agent.task-invaders": "Gamepad2",
   "agent.task-reader-v4": "ListTodo",
   "agent.tracker": "CircleCheck",
   "agent.zendesk-queue": { kind: "brand", name: "zendesk" },
   "agent.messages": "MessagesSquare",
-  "agent.hello-records": "ListTodo",
+  "agent.template": "ListTodo",
 });
 // The outer freeze does not reach the descriptor objects, so freeze them too;
 // an importer cannot mutate a shared curated default.

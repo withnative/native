@@ -21,9 +21,10 @@ pub const EXPERIMENTAL_EXECUTORS_ENV: &str = "NATIVE_CE_EXPERIMENTAL_EXECUTORS";
 /// build-enabled legacy tool `experimental_freshness_agent_intent`.
 pub const EXPERIMENTAL_FRESHNESS_EXECUTOR: &str = "experimental_freshness";
 
-/// Preview-only SQL-selected record edits (E4 M1), backed by the
+/// SQL-selected record edits (preview by default), backed by the
 /// build-enabled legacy tool `sql_write`. Direct calls always refuse without
 /// mutation; preview is plan-required and admitted only under this allowlist.
+/// Qualified SQLite commits require additional runtime and signed preparation consent.
 pub const EXPERIMENTAL_SQL_WRITE_EXECUTOR: &str = "sql_write";
 
 /// Parsed value of [`EXPERIMENTAL_EXECUTORS_ENV`]. Prefer this over passing
@@ -86,6 +87,10 @@ pub enum McpSurfaceMode {
     Executor,
     /// Hidden emergency rollback to the original tool registry surface.
     Legacy,
+    /// The executor catalogue projected onto a small directly advertised set
+    /// plus `call_executor`, which reaches every other contracted operation
+    /// through the same governed dispatch. Opt-in; never the default.
+    Lean,
 }
 
 impl McpSurfaceMode {
@@ -93,7 +98,20 @@ impl McpSurfaceMode {
         match self {
             Self::Executor => "executor",
             Self::Legacy => "legacy",
+            Self::Lean => "lean",
         }
+    }
+
+    /// Whether this surface serves the executor catalogue (in full or lean
+    /// projection) and therefore needs every executor-only startup
+    /// dependency: the plan keyring, executor routers and admission.
+    pub const fn serves_executors(self) -> bool {
+        matches!(self, Self::Executor | Self::Lean)
+    }
+
+    /// Whether the ordinary executor catalogue is the lean projection.
+    pub const fn is_lean(self) -> bool {
+        matches!(self, Self::Lean)
     }
 }
 
@@ -110,7 +128,8 @@ impl FromStr for McpSurfaceMode {
         match value {
             "executor" => Ok(Self::Executor),
             "legacy" => Ok(Self::Legacy),
-            _ => Err("expected executor or legacy"),
+            "lean" => Ok(Self::Lean),
+            _ => Err("expected executor, lean or legacy"),
         }
     }
 }
@@ -124,7 +143,14 @@ mod tests {
         assert_eq!(McpSurfaceMode::default(), McpSurfaceMode::Executor);
         assert_eq!("executor".parse(), Ok(McpSurfaceMode::Executor));
         assert_eq!("legacy".parse(), Ok(McpSurfaceMode::Legacy));
-        for invalid in ["", "complete", "focused", "EXECUTOR", " legacy"] {
+        assert_eq!("lean".parse(), Ok(McpSurfaceMode::Lean));
+        assert_eq!(McpSurfaceMode::Lean.as_str(), "lean");
+        assert!(McpSurfaceMode::Lean.serves_executors());
+        assert!(McpSurfaceMode::Executor.serves_executors());
+        assert!(!McpSurfaceMode::Legacy.serves_executors());
+        for invalid in [
+            "", "complete", "focused", "EXECUTOR", " legacy", "LEAN", "lean ",
+        ] {
             assert!(invalid.parse::<McpSurfaceMode>().is_err(), "{invalid}");
         }
     }

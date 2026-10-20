@@ -339,10 +339,12 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         K::ResolveCitation
         | K::RenderSuggestionReview
         | K::ManageMessages
+        | K::ManageParticipants
         | K::ReadCanvas
         | K::RenderArtifact
         | K::VerifyArtifact
         | K::ManageRecordPolicy
+        | K::ManageAccountConfig
         | K::ManageBindings
         | K::ManageVocabularies
         | K::ManageSchemaConfig
@@ -358,7 +360,8 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         | K::ManageAlphaTabs
         | K::StartWork => UnavailableOffline,
         // §2.3(b) catalog or hosting state (HostOwner-only or roster).
-        K::ManageMemberships
+        K::OutboxStatus
+        | K::ManageMemberships
         | K::WorkspaceRead
         | K::ReachRead
         | K::AuthorityActHead
@@ -419,8 +422,8 @@ mod tests {
             "ToolKind::ALL must not repeat a tool"
         );
         // The match has no wildcard arm, so a new ToolKind fails the build;
-        // this pins the current 87 and that no name repeats.
-        assert_eq!(ToolKind::ALL.len(), 87);
+        // this pins the current 88 and that no name repeats.
+        assert_eq!(ToolKind::ALL.len(), 90);
     }
 
     #[test]
@@ -454,6 +457,7 @@ mod tests {
         // exemption: it is Mutation, so it refuses as a write (§2.3(c))
         // before its history reason could apply.
         let unavailable = [
+            ToolKind::OutboxStatus,
             ToolKind::GetHistory,
             ToolKind::WhatsChanged,
             ToolKind::GetEventContext,
@@ -469,10 +473,12 @@ mod tests {
             ToolKind::ResolveCitation,
             ToolKind::RenderSuggestionReview,
             ToolKind::ManageMessages,
+            ToolKind::ManageParticipants,
             ToolKind::ReadCanvas,
             ToolKind::RenderArtifact,
             ToolKind::VerifyArtifact,
             ToolKind::ManageRecordPolicy,
+            ToolKind::ManageAccountConfig,
             ToolKind::ManageBindings,
             ToolKind::ManageVocabularies,
             ToolKind::ManageSchemaConfig,
@@ -493,7 +499,7 @@ mod tests {
             ToolKind::AuthorityActHead,
             ToolKind::AuthorityActDelta,
         ];
-        assert_eq!(unavailable.len(), 38);
+        assert_eq!(unavailable.len(), 41);
         for kind in unavailable {
             assert_eq!(
                 scope(kind),
@@ -816,6 +822,8 @@ mod tests {
         for refused in [
             "content_events",
             "facet_observations",
+            "facet_value_json_nodes",
+            "facet_observation_json_nodes",
             "actors",
             "agent_activity",
             "agent_activity_claims",

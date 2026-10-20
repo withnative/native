@@ -18,9 +18,27 @@ use super::{
 use crate::error::{Error, Result};
 use crate::export::{ExportCoordinator, LocalSnapshotSource};
 use crate::standby::{
-    ActivatedGeneration, GenerationStore, StandbyRuntimeConfig, StandbyStatusProvider,
+    ActivatedGeneration, GenerationStore, StandbyRuntimeConfig, StandbyStartupOutcome,
+    StandbyStatusOnly, StandbyStatusProvider,
 };
 use crate::standby_snapshot::ObservedInstalledConsumerIdentity;
+
+/// Database-less status while readiness is pending, or the recovery path's
+/// actual refusal reason and candidate counts when no generation is usable.
+pub fn standby_startup_status(startup: &StandbyStartupOutcome) -> StandbyStatusOnly {
+    match startup {
+        StandbyStartupOutcome::Serving(_) => StandbyStatusOnly {
+            reason: "startup_readiness_pending".into(),
+            candidate_count: 0,
+            unusable_candidate_count: 0,
+        },
+        StandbyStartupOutcome::StatusOnly(status) => StandbyStatusOnly {
+            reason: status.reason.into(),
+            candidate_count: status.candidate_count,
+            unusable_candidate_count: status.unusable_candidate_count,
+        },
+    }
+}
 
 /// Fixed composition configuration, shared by startup and every hot candidate.
 pub struct StandbySessionConfig {
@@ -151,6 +169,157 @@ impl Drop for WorkerShutdown {
     }
 }
 
+/// Owns verification, observation and retirement independently of connections.
+/// Start one supervisor per session/workspace. Keep it for the owner's lifetime;
+/// dropping it requests cancellation, while `shutdown` also waits for drain.
+/// `start_with_startup` also runs cold recovery before watching hot candidates.
+pub struct StandbySupervisor {
+    stop: WorkerShutdown,
+    stopped: tokio::sync::oneshot::Receiver<()>,
+    worker: std::thread::JoinHandle<std::io::Result<()>>,
+}
+
+impl StandbySupervisor {
+    pub fn start(session: Arc<StandbyStdioSession>) -> Result<Self> {
+        Self::start_inner(session, false, None)
+    }
+
+    /// Return a dispatcher immediately; recover and activate on the worker's
+    /// runtime, which owns opened pools and their retirement through shutdown.
+    pub fn start_with_startup(session: Arc<StandbyStdioSession>) -> Result<Self> {
+        Self::start_inner(session, true, None)
+    }
+
+    /// Internal node seam: notify refresh after cold recovery has completed,
+    /// including status-only outcomes that need a first usable generation.
+    pub(crate) fn start_with_startup_notifier(
+        session: Arc<StandbyStdioSession>,
+        startup_ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Self> {
+        Self::start_inner(session, true, Some(startup_ready))
+    }
+
+    fn start_inner(
+        session: Arc<StandbyStdioSession>,
+        recover_startup: bool,
+        startup_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<Self> {
+        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let (stopped, stopped_rx) = tokio::sync::oneshot::channel();
+        let stop = WorkerShutdown {
+            session: session.clone(),
+            cancellation,
+            shutdown,
+        };
+        let worker_session = session.clone();
+        // mcp-stdio uses a current-thread runtime. Full byte hashing and
+        // rebuilding must never run on its dispatch thread, even via spawn.
+        // This dedicated runtime also stays alive through pool retirement.
+        let worker = std::thread::Builder::new()
+            .name("standby-handoff".into())
+            // Full debug verifier/catalogue futures exceed Rust's default
+            // worker stack. Reserve the same bound used by repository tests.
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                crate::standby::generation_store::with_verification_cancellation(
+                    worker_cancellation,
+                    || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        worker_session
+                            .retirements
+                            .own_runtime(runtime.handle().clone());
+                        runtime.block_on(async {
+                            if recover_startup && worker_session.recover_startup().await.is_err() {
+                                tracing::warn!(target: "native_ce::standby::verification",
+                                    "standby startup recovery failed; retaining status-only");
+                            }
+                            if let Some(startup_ready) = startup_ready {
+                                let _ = startup_ready.send(());
+                            }
+                            // Never drop a pinned full-verification future at
+                            // an arbitrary SQL await: finish its current phase
+                            // and cleanup before releasing its pathname lease.
+                            let vault_shutdown = shutdown_rx.clone();
+                            tokio::join!(
+                                worker_session.watch_accepted(&mut shutdown_rx),
+                                worker_session.project_vault(vault_shutdown)
+                            );
+                            worker_session.retire_serving();
+                            // This supervisor survives a dropped serve future.
+                            // Keep driving cleanup until the final request Arc
+                            // and candidate pool have actually retired.
+                            worker_session.retirements.drain_all().await;
+                        });
+                        *worker_session
+                            .retirements
+                            .owner
+                            .lock()
+                            .expect("standby retirement owner") = None;
+                        runtime.shutdown_timeout(Duration::from_secs(5));
+                        let _ = stopped.send(());
+                        Ok::<_, std::io::Error>(())
+                    },
+                )
+            })?;
+        Ok(Self {
+            stop,
+            stopped: stopped_rx,
+            worker,
+        })
+    }
+
+    /// Clones share request state, but never own cancellation or retirement.
+    pub fn dispatcher(&self) -> StandbyDispatcher {
+        StandbyDispatcher {
+            session: self.stop.session.clone(),
+        }
+    }
+
+    /// Stop observation and drain all captured requests and candidate pools.
+    /// Dropping this future still signals cancellation; the worker owns cleanup.
+    pub async fn shutdown(self) -> Result<()> {
+        self.stop.cancel();
+        let _ = self.stopped.await;
+        tokio::task::spawn_blocking(move || self.worker.join())
+            .await
+            .map_err(|_| Error::engine("standby handoff worker join failed"))?
+            .map_err(|_| Error::engine("standby handoff worker panicked"))??;
+        Ok(())
+    }
+}
+
+/// A connection-independent request handle. Dropping a clone or finishing a
+/// connection does not stop the supervisor or retire its serving generation.
+#[derive(Clone)]
+pub struct StandbyDispatcher {
+    session: Arc<StandbyStdioSession>,
+}
+
+impl StandbyDispatcher {
+    pub async fn handle_message(&self, message: Value) -> Option<Value> {
+        self.session.handle_message(message).await
+    }
+
+    /// Internal node-only outage composition. The override is scoped to one
+    /// bootstrap and never changes the caller of the shared serving generation.
+    pub(crate) async fn handle_outage_bootstrap(&self, message: Value) -> Option<Value> {
+        self.session.handle_message_with_outage(message, true).await
+    }
+
+    /// Serve one newline-framed connection without owning supervisor shutdown.
+    pub async fn serve_connection<R, W>(&self, reader: R, writer: W) -> Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        self.session.transport(reader, writer).await
+    }
+}
+
 /// Also guards preparation failures/cancellation after a pool has opened.
 struct GenerationResources {
     db: crate::Db,
@@ -183,12 +352,15 @@ struct ServedGeneration {
     account: String,
     dispatcher: ServedDispatcher,
     status: StandbyStatusProvider,
+    /// Shared `.reader.lock`, held while this generation is served so that
+    /// deltas can tell the build marker belongs to a live reader.
+    reader_lock: Option<std::fs::File>,
     #[cfg(test)]
     dispatch_pause: Option<DispatchPause>,
 }
 
 impl ServedGeneration {
-    async fn dispatch(&self, message: Value) -> Option<Value> {
+    async fn dispatch(&self, message: Value, outage_bootstrap: bool) -> Option<Value> {
         #[cfg(test)]
         if let Some((id, entered, resume)) = &self.dispatch_pause {
             if message["id"].as_i64() == Some(*id) {
@@ -196,12 +368,18 @@ impl ServedGeneration {
                 resume.notified().await;
             }
         }
+        let outage_bootstrap = outage_bootstrap
+            && protocol::method_and_name(&message) == (Some("tools/call"), Some("bootstrap"));
         match &self.dispatcher {
             ServedDispatcher::Legacy { registry, caller } => {
                 dispatch_engine_message(
                     registry.clone(),
                     EngineHandle::Sqlite(self.resources.db.clone()),
-                    caller.clone(),
+                    if outage_bootstrap {
+                        caller.clone().with_outage_bootstrap()
+                    } else {
+                        caller.clone()
+                    },
                     message,
                 )
                 .await
@@ -222,6 +400,13 @@ impl ServedGeneration {
                         message,
                     )
                     .await
+                } else if outage_bootstrap {
+                    server
+                        .handle_bootstrap_with_caller(
+                            message,
+                            caller.clone().with_outage_bootstrap(),
+                        )
+                        .await
                 } else {
                     server.handle_message(message).await
                 }
@@ -246,6 +431,10 @@ type DispatchPause = (i64, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 /// newer hints are coalesced by rereading the accepted descriptor afterwards.
 pub struct StandbyStdioSession {
     config: StandbySessionConfig,
+    #[cfg(unix)]
+    markdown_folder: Option<std::path::PathBuf>,
+    #[cfg(all(test, unix))]
+    vault_tick_interval: Duration,
     state: Mutex<SessionSnapshot>,
     retirements: Arc<Retirements>,
     catalogue: Vec<Value>,
@@ -258,7 +447,235 @@ pub struct StandbyStdioSession {
 }
 
 impl StandbyStdioSession {
-    pub fn new(config: StandbySessionConfig, provider: StandbyStatusProvider) -> Result<Self> {
+    #[cfg(not(unix))]
+    async fn project_vault(&self, _shutdown: tokio::sync::watch::Receiver<bool>) {}
+    #[cfg(unix)]
+    pub(crate) fn with_markdown_folder(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.markdown_folder = path;
+        self
+    }
+
+    #[cfg(unix)]
+    async fn project_vault(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let Some(path) = &self.markdown_folder else {
+            return;
+        };
+        let vault_path = path.clone();
+        // First-write notice: a fresh vault has no ownership state yet, so a
+        // successful open below creates the directory. Say so once, with the
+        // off switch, before the publisher takes the writer lock.
+        let fresh = !vault_path.join(".native").join("state.json").exists();
+        let publisher = match tokio::task::spawn_blocking(move || {
+            crate::markdown_vault::Publisher::open(&vault_path)
+        })
+        .await
+        .expect("vault initialization worker")
+        {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::error!(target: "native_ce::standby::vault", error = %crate::markdown_vault::diag_field(&error, crate::markdown_vault::DIAG_ERROR_MAX),"vault initialization failed");
+                return;
+            }
+        };
+        if fresh {
+            tracing::info!(
+                target: "native_ce::standby::vault",
+                path = %crate::markdown_vault::diag_field(&path.display(), crate::markdown_vault::DIAG_PATH_MAX),
+                "created read-only markdown vault; to turn it off set \"markdown_folder\": false in node.json",
+            );
+        }
+        let mut publisher = Some(publisher);
+        let mut last: Option<crate::markdown_vault::SourceSnapshot> = None;
+        let mut conflicts = Vec::new();
+        let mut last_check = std::time::Instant::now();
+        #[cfg(test)]
+        let tick_interval = self.vault_tick_interval;
+        #[cfg(not(test))]
+        let tick_interval = Duration::from_secs(5);
+        let mut interval = tokio::time::interval(tick_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {_=shutdown.changed()=>break,_=interval.tick()=>{}}
+            let snapshot = self.state.lock().expect("standby state").clone();
+            let SessionSnapshot::Serving(served) = snapshot else {
+                let mut writer = publisher.take().unwrap();
+                let (writer, result) = tokio::task::spawn_blocking(move || {
+                    let result = writer.unavailable("no authorized serving generation");
+                    (writer, result)
+                })
+                .await
+                .expect("vault status worker");
+                publisher = Some(writer);
+                if let Err(error) = result {
+                    tracing::warn!(target: "native_ce::standby::vault", error = %crate::markdown_vault::diag_field(&error, crate::markdown_vault::DIAG_ERROR_MAX),"vault update failed");
+                }
+                continue;
+            };
+            let result: Result<()> = async {
+                let db = &served.resources.db;
+                let mut connection = db.pool().acquire().await?;
+                let head = crate::act::current_act(&mut connection).await?;
+                drop(connection);
+                let status = serde_json::to_value(served.status.status().await)?;
+                if !crate::markdown_vault::needs_projection(
+                    last.as_ref(),
+                    head,
+                    &served.resources.active.generation.id,
+                    last_check.elapsed(),
+                ) {
+                    let source = last.as_mut().unwrap();
+                    source.freshness = status;
+                    let mut writer = publisher.take().unwrap();
+                    let source_copy = source.status_only();
+                    let issues = conflicts.clone();
+                    let (writer, result) = tokio::task::spawn_blocking(move || {
+                        let result = writer.status(&source_copy, &issues);
+                        (writer, result)
+                    })
+                    .await
+                    .map_err(|_| Error::engine("vault publisher worker failed"))?;
+                    publisher = Some(writer);
+                    result?;
+                } else {
+                    let caller = match &served.dispatcher {
+                        ServedDispatcher::Legacy { caller, .. } => caller,
+                        #[cfg(feature = "mcp-executor-prototype")]
+                        ServedDispatcher::Executor { caller, .. } => caller,
+                    };
+                    let started = std::time::Instant::now();
+                    let mut source =
+                        crate::query::sql::projection_snapshot(db, caller.into()).await?;
+                    tracing::debug!(
+                        snapshot_millis = started.elapsed().as_millis(),
+                        "vault source transaction released"
+                    );
+                    source.origin = served
+                        .resources
+                        .active
+                        .generation
+                        .manifest
+                        .origin_database_id
+                        .clone();
+                    source.generation = served.resources.active.generation.id.clone();
+                    source.freshness = status;
+                    let mut writer = publisher.take().unwrap();
+                    let (writer, source, result) = tokio::task::spawn_blocking(move || {
+                        let result = writer.cycle(&source);
+                        (writer, source.status_only(), result)
+                    })
+                    .await
+                    .map_err(|_| Error::engine("vault publisher worker failed"))?;
+                    publisher = Some(writer);
+                    conflicts = result?;
+                    last = Some(source);
+                    last_check = std::time::Instant::now();
+                }
+                Ok(())
+            }
+            .await;
+            if publisher.is_none() {
+                tracing::warn!(target: "native_ce::standby::vault", error = %"vault publisher worker terminated","vault update failed");
+                return;
+            }
+            if let Err(error) = result {
+                tracing::warn!(target: "native_ce::standby::vault", error = %crate::markdown_vault::diag_field(&error, crate::markdown_vault::DIAG_ERROR_MAX),"vault update failed");
+                let mut writer = publisher.take().unwrap();
+                let (writer, result) = tokio::task::spawn_blocking(move || {
+                    let result = writer.unavailable("cycle failed; inspect node diagnostics");
+                    (writer, result)
+                })
+                .await
+                .expect("vault failure status worker");
+                publisher = Some(writer);
+                if let Err(error) = result {
+                    tracing::warn!(target: "native_ce::standby::vault", error = %crate::markdown_vault::diag_field(&error, crate::markdown_vault::DIAG_ERROR_MAX),"vault update failed");
+                }
+            }
+        }
+    }
+
+    /// Shared cold-start path for stdio and the node. Recovery repairs an
+    /// interrupted promotion and selects an accepted generation before open
+    /// and authorised-read readiness. No request can see an unchecked reader.
+    pub async fn recover_startup(&self) -> Result<()> {
+        match self
+            .config
+            .store
+            .activate_for_startup(&self.config.observed)
+            .await
+        {
+            Ok(startup) => {
+                self.install_startup_outcome(startup).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.publish_startup_status(StandbyStatusOnly {
+                    reason: "startup_recovery_failed".into(),
+                    candidate_count: 0,
+                    unusable_candidate_count: 0,
+                });
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply the cold recovery result using the same publication and refusal
+    /// semantics on both stdio and the node's dedicated supervisor runtime.
+    pub async fn install_startup_outcome(&self, startup: StandbyStartupOutcome) {
+        match startup {
+            StandbyStartupOutcome::Serving(active) => {
+                if active.startup_reason.is_some() {
+                    tracing::info!(target: "native_ce::standby::verification",
+                        "standby startup recovered with a fallback");
+                }
+                if !active.retention_warnings.is_empty() {
+                    tracing::warn!(target: "native_ce::standby::verification",
+                        "standby retention warnings present");
+                }
+                if self.install_startup(*active).await.is_err() {
+                    self.publish_startup_status(StandbyStatusOnly {
+                        reason: "startup_readiness_unavailable".into(),
+                        candidate_count: 0,
+                        unusable_candidate_count: 0,
+                    });
+                    tracing::warn!(target: "native_ce::standby::verification",
+                        "standby startup readiness unavailable; retaining status-only");
+                }
+            }
+            StandbyStartupOutcome::StatusOnly(status) => {
+                self.publish_startup_status(standby_startup_status(
+                    &StandbyStartupOutcome::StatusOnly(status),
+                ));
+            }
+        }
+    }
+
+    fn publish_startup_status(&self, status: StandbyStatusOnly) {
+        let provider = StandbyStatusProvider::for_status_only_reason(
+            self.config.runtime.clone(),
+            self.config.store.clone(),
+            Some(self.config.observed.clone()),
+            status,
+            self.config.refresh_configured,
+            self.config.refresh_available,
+        )
+        .with_connected_handoff();
+        *self.state.lock().expect("standby state lock") =
+            SessionSnapshot::StatusOnly(Arc::new(StatusOnlyStdioServer::with_provider(provider)));
+    }
+
+    #[cfg(feature = "mcp-executor-prototype")]
+    pub(crate) fn operation_rows(&self, provider: StandbyStatusProvider) -> Result<Value> {
+        let registry = Self::registry(&self.config, provider)?;
+        super::executor_prototype::standby_operation_rows(&registry)
+    }
+    pub fn new(mut config: StandbySessionConfig, provider: StandbyStatusProvider) -> Result<Self> {
+        // The standby read-only projection is unchanged by the lean surface:
+        // lean narrows the writable ordinary catalogue only, so a standby
+        // configured `lean` serves exactly the executor standby projection.
+        if config.surface == McpSurfaceMode::Lean {
+            config.surface = McpSurfaceMode::Executor;
+        }
         let registry = Self::registry(&config, provider.clone().with_connected_handoff())?;
         let mut catalogue: Vec<Value> = match config.surface {
             McpSurfaceMode::Legacy => registry
@@ -266,7 +683,7 @@ impl StandbyStdioSession {
                 .into_iter()
                 .map(|tool| tool.descriptor)
                 .collect(),
-            McpSurfaceMode::Executor => {
+            McpSurfaceMode::Executor | McpSurfaceMode::Lean => {
                 #[cfg(feature = "mcp-executor-prototype")]
                 {
                     super::executor_prototype::standby_read_only_descriptors(&registry)?
@@ -310,6 +727,10 @@ impl StandbyStdioSession {
         };
         Ok(Self {
             config,
+            #[cfg(unix)]
+            markdown_folder: None,
+            #[cfg(all(test, unix))]
+            vault_tick_interval: Duration::from_secs(5),
             state: Mutex::new(SessionSnapshot::StatusOnly(Arc::new(
                 StatusOnlyStdioServer::with_provider(provider.with_connected_handoff()),
             ))),
@@ -349,7 +770,17 @@ impl StandbyStdioSession {
         self.state.lock().expect("standby state lock").clone()
     }
 
-    async fn prepare(
+    fn prepare<'a>(
+        &'a self,
+        active: ActivatedGeneration,
+        account: Option<&'a str>,
+    ) -> impl std::future::Future<Output = Result<ServedGeneration>> + 'a {
+        // Readiness constructs an executor and dispatches authorised reads.
+        // Keep that state off startup, refresh and publication callers' stacks.
+        Box::pin(self.prepare_inner(active, account))
+    }
+
+    async fn prepare_inner(
         &self,
         active: ActivatedGeneration,
         account: Option<&str>,
@@ -402,11 +833,11 @@ impl StandbyStdioSession {
         )
         .with_connected_handoff();
         let registry = Self::registry(&self.config, provider.clone())?;
-        let caller =
-            Caller::authenticated(account.clone()).with_channel(crate::provenance::Channel::Mcp);
+        let caller = standby_owner_caller(account.clone());
         let dispatcher = match self.config.surface {
             McpSurfaceMode::Legacy => ServedDispatcher::Legacy { registry, caller },
-            McpSurfaceMode::Executor => {
+            // `new` normalised Lean to Executor; both serve the standby projection.
+            McpSurfaceMode::Executor | McpSurfaceMode::Lean => {
                 #[cfg(feature = "mcp-executor-prototype")]
                 {
                     ServedDispatcher::Executor {
@@ -434,6 +865,7 @@ impl StandbyStdioSession {
             account,
             dispatcher,
             status: provider,
+            reader_lock: None,
             #[cfg(test)]
             dispatch_pause: self.dispatch_pause.lock().unwrap().clone(),
         };
@@ -451,7 +883,7 @@ impl StandbyStdioSession {
                 serde_json::json!({"operation":"get_record","arguments":{"ids":["native:root"]},"format":"json"}),
             ),
         };
-        let response = prepared.dispatch(serde_json::json!({"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await
+        let response = prepared.dispatch(serde_json::json!({"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":name,"arguments":arguments}}), false).await
             .ok_or_else(|| Error::engine("standby authorised readiness unavailable"))?;
         let value = &response["result"]["structuredContent"];
         let context = &value["standby_context"];
@@ -482,19 +914,47 @@ impl StandbyStdioSession {
         self.publish(prepared)
     }
 
-    fn publish(&self, prepared: ServedGeneration) -> Result<()> {
+    fn publish(&self, mut prepared: ServedGeneration) -> Result<()> {
+        // Deltas are refused until this build is serving the generation: an
+        // older build would read the file as immutable while deltas rewrite
+        // it. The lock is taken before the swap and the marker written after
+        // it, so a cancelled or crashed publish leaves no marker for a reader
+        // that is not serving. A missing lock or marker only defers deltas, so
+        // it never blocks serving.
+        let generation_id = prepared.resources.active.generation.id.clone();
+        prepared.reader_lock = self.config.store.hold_serving_reader(&generation_id).ok();
         let old = {
             let mut state = self.state.lock().expect("standby state lock");
             crate::standby::generation_store::check_verification_cancellation()?;
             std::mem::replace(&mut *state, SessionSnapshot::Serving(Arc::new(prepared)))
         };
+        if self
+            .config
+            .store
+            .record_serving_reader(&generation_id, &self.config.observed)
+            .is_err()
+        {
+            tracing::warn!(target: "native_ce::standby::verification",
+                "standby serving build marker unavailable; deltas stay deferred");
+        }
         // Dropping outside the request lock may enqueue pool retirement, but
         // never closes the shared pool of an in-flight captured generation.
         drop(old);
+        self.config
+            .store
+            .schedule_maintenance(&self.config.observed);
         Ok(())
     }
 
     pub async fn handle_message(&self, message: Value) -> Option<Value> {
+        self.handle_message_with_outage(message, false).await
+    }
+
+    async fn handle_message_with_outage(
+        &self,
+        message: Value,
+        outage_bootstrap: bool,
+    ) -> Option<Value> {
         let snapshot = self.capture();
         let listing = message["method"] == "tools/list";
         let orientation = matches!(
@@ -503,7 +963,7 @@ impl StandbyStdioSession {
         );
         let mut response = match &snapshot {
             SessionSnapshot::StatusOnly(server) => server.handle_message(message).await,
-            SessionSnapshot::Serving(served) => served.dispatch(message).await,
+            SessionSnapshot::Serving(served) => served.dispatch(message, outage_bootstrap).await,
         };
         // Executor mutations can refuse before delegating to the registry.
         // Bind those refusals to the captured bundle too, without an audit.
@@ -638,61 +1098,12 @@ impl StandbyStdioSession {
         R: AsyncBufRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker_cancellation = cancellation.clone();
-        let (stopped, stopped_rx) = tokio::sync::oneshot::channel();
-        let stop = WorkerShutdown {
-            session: self.clone(),
-            cancellation,
-            shutdown,
-        };
-        let session = self.clone();
-        // mcp-stdio uses a current-thread runtime. Full byte hashing and
-        // rebuilding must never run on its dispatch thread, even via spawn.
-        // This dedicated runtime also stays alive through pool retirement.
-        let worker = std::thread::Builder::new()
-            .name("standby-handoff".into())
-            // Full debug verifier/catalogue futures exceed Rust's default
-            // worker stack. Reserve the same bound used by repository tests.
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                crate::standby::generation_store::with_verification_cancellation(
-                    worker_cancellation,
-                    || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()?;
-                        session.retirements.own_runtime(runtime.handle().clone());
-                        runtime.block_on(async {
-                            // Never drop a pinned full-verification future at
-                            // an arbitrary SQL await: finish its current phase
-                            // and cleanup before releasing its pathname lease.
-                            session.watch_accepted(&mut shutdown_rx).await;
-                            session.retire_serving();
-                            // This supervisor survives a dropped serve future.
-                            // Keep driving cleanup until the final request Arc
-                            // and candidate pool have actually retired.
-                            session.retirements.drain_all().await;
-                        });
-                        *session
-                            .retirements
-                            .owner
-                            .lock()
-                            .expect("standby retirement owner") = None;
-                        runtime.shutdown_timeout(Duration::from_secs(5));
-                        let _ = stopped.send(());
-                        Ok::<_, std::io::Error>(())
-                    },
-                )
-            })?;
-        let outcome = self.transport(reader, writer).await;
-        stop.cancel();
-        let _ = stopped_rx.await;
-        tokio::task::spawn_blocking(move || worker.join())
-            .await
-            .map_err(|_| Error::engine("standby handoff worker join failed"))?
-            .map_err(|_| Error::engine("standby handoff worker panicked"))??;
+        let supervisor = StandbySupervisor::start(self.clone())?;
+        let outcome = supervisor
+            .dispatcher()
+            .serve_connection(reader, writer)
+            .await;
+        supervisor.shutdown().await?;
         outcome
     }
 
@@ -819,6 +1230,14 @@ pub async fn resolve_standby_account_identity(
     }
 }
 
+/// The caller for the owner standby. The standby is the owner's own copy of
+/// their database, inside the owner's trust boundary (design 1e5d802), so it
+/// carries the narrow local-owner marker (owner counter footing only); it is
+/// not `trusted_local`.
+fn standby_owner_caller(account: String) -> Caller {
+    Caller::local_owner(account).with_channel(crate::provenance::Channel::Mcp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +1247,84 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     const RECORD: &str = "70110000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn owner_standby_caller_keeps_owner_counter_footing_without_trusted_local() {
+        let caller = standby_owner_caller("acct:owner".to_string());
+        assert!(caller.counter_footing().is_owner());
+        assert!(!caller.is_member_copy());
+        assert_eq!(caller.credential(), "acct:owner");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_markdown_vault_opt_in_tracks_serving_generations_and_drains() {
+        fn find(root: &std::path::Path, needle: &str) -> Option<std::path::PathBuf> {
+            for entry in std::fs::read_dir(root).ok()? {
+                let path = entry.ok()?.path();
+                if path.is_dir() {
+                    if let Some(found) = find(&path, needle) {
+                        return Some(found);
+                    }
+                } else if std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle)) {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        async fn wait(root: &std::path::Path, needle: &str) -> std::path::PathBuf {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if let Some(path) = find(root, needle) {
+                        return path;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("vault did not publish {needle}"))
+        }
+        let (dir, db, session) = fixture_for_surface(McpSurfaceMode::Executor).await;
+        let mut session = Arc::try_unwrap(session).unwrap_or_else(|_| panic!("unshared fixture"));
+        let vault = std::fs::canonicalize(dir.path()).unwrap().join("vault");
+        session.markdown_folder = Some(vault.clone());
+        session.vault_tick_interval = Duration::from_millis(25);
+        let session = Arc::new(session);
+        crate::store::update_record(&db, RECORD, json!({"body":"vault smoke first"}))
+            .await
+            .unwrap();
+        let first = accept(&session, &db, "vault-first").await;
+        session
+            .install_startup(activate(&session).await)
+            .await
+            .unwrap();
+        let supervisor = StandbySupervisor::start(session.clone()).unwrap();
+        let first_path = wait(&vault, "vault smoke first").await;
+        wait(&vault, &format!("Generation: {first}")).await;
+        crate::store::update_record(
+            &db,
+            RECORD,
+            json!({"name":"second","body":"vault smoke second"}),
+        )
+        .await
+        .unwrap();
+        let second = accept(&session, &db, "vault-second").await;
+        let second_path = wait(&vault, "vault smoke second").await;
+        wait(&vault, &format!("Generation: {second}")).await;
+        assert_ne!(first_path, second_path);
+        assert!(!first_path.exists());
+        let served_db = match session.capture() {
+            SessionSnapshot::Serving(served) => served.resources.db.clone(),
+            _ => panic!("serving"),
+        };
+        tokio::time::timeout(Duration::from_secs(10), supervisor.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(served_db.pool().is_closed());
+        // Shutdown released the publisher lock as well as the engine bundle.
+        drop(crate::markdown_vault::Publisher::open(&vault).unwrap());
+    }
 
     async fn fixture() -> (tempfile::TempDir, crate::Db, Arc<StandbyStdioSession>) {
         fixture_for_surface(McpSurfaceMode::Legacy).await
@@ -926,9 +1423,268 @@ mod tests {
     fn surface_read(surface: McpSurfaceMode, id: i64) -> Value {
         match surface {
             McpSurfaceMode::Legacy => read(id),
-            McpSurfaceMode::Executor => {
+            McpSurfaceMode::Executor | McpSurfaceMode::Lean => {
                 json!({"jsonrpc":"2.0", "id":id,"method":"tools/call", "params":{"name":"records_read","arguments":{"operation":"get_record","arguments":{"ids":[RECORD]},"format":"json"}}})
             }
+        }
+    }
+
+    async fn install_app(db: &crate::Db, account: &str) -> String {
+        use crate::control::{
+            append_control_event, AlphaTabAdoptPayload, AlphaTabStatePayload, ControlEventPayload,
+            NewControlEvent,
+        };
+        let declaration = json!({"contract":"native.app.v2","needs":[],"effects":[]});
+        let pin = AlphaTabStatePayload {
+            account_id: account.into(),
+            package: "offline.test".into(),
+            version: "1".into(),
+            digest: format!("sha256:{}", "a".repeat(64)),
+            artifact_id: RECORD.into(),
+            consented_source_revision: "source-1".into(),
+            declaration_digest: crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(
+                &declaration,
+            )
+            .unwrap(),
+            consented_declaration: declaration,
+            adoption: "caller_asserted".into(),
+            request: None,
+            previous_event_id: None,
+        };
+        let installed = append_control_event(
+            db,
+            NewControlEvent::authored(
+                uuid::Uuid::new_v4().to_string(),
+                crate::control::alpha_tab_aggregate_id(account, "offline.test"),
+                account,
+                None,
+                "offline app fixture",
+                ControlEventPayload::AlphaTabInstalled(pin.clone()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .id;
+        append_control_event(
+            db,
+            NewControlEvent::authored(
+                uuid::Uuid::new_v4().to_string(),
+                crate::control::alpha_tab_aggregate_id(account, "offline.test"),
+                account,
+                None,
+                "offline app adoption fixture",
+                ControlEventPayload::AlphaTabAdopted(AlphaTabAdoptPayload {
+                    account_id: pin.account_id,
+                    package: pin.package,
+                    version: pin.version,
+                    digest: pin.digest,
+                    artifact_id: pin.artifact_id,
+                    consented_source_revision: pin.consented_source_revision,
+                    declaration_digest: pin.declaration_digest,
+                    consented_declaration: pin.consented_declaration,
+                    adoption: "shell_adopt.v1".into(),
+                    previous_event_id: installed,
+                    receipt_id: Some("receipt".into()),
+                    preview_session: Some("session".into()),
+                    launch_id: None,
+                    authored_run_key: None,
+                    request: None,
+                }),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_carrier_preserves_installed_user_reads_and_standby_refusals() {
+        let mut surfaces = vec![McpSurfaceMode::Legacy];
+        #[cfg(feature = "mcp-executor-prototype")]
+        surfaces.push(McpSurfaceMode::Executor);
+        for (surface, modern_era) in surfaces
+            .into_iter()
+            .flat_map(|surface| [(surface, false), (surface, true)])
+        {
+            let (_dir, db, session) = fixture_for_surface(surface).await;
+            let account = crate::identity::resolve_stdio_account_identity(&db, None)
+                .await
+                .unwrap();
+            let install = install_app(&db, &account).await;
+            let foreign_install = install_app(&db, "acct_foreign").await;
+            accept(&session, &db, "app").await;
+            session
+                .install_startup(activate(&session).await)
+                .await
+                .unwrap();
+            let mut read = surface_read(surface, 1);
+            read["params"]["_meta"] = if modern_era {
+                json!({"io.modelcontextprotocol/protocolVersion":protocol::PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities":{},
+                    "io.modelcontextprotocol/clientInfo":{"name":"desktop-test","version":"1"}})
+            } else {
+                json!({})
+            };
+            let plain = session.handle_message(read.clone()).await.unwrap();
+            let mut attributed = read;
+            attributed["params"]["_meta"]["native/app"] =
+                json!(format!("offline.test@1; install={install}"));
+            let admitted = session.handle_message(attributed.clone()).await.unwrap();
+            assert_eq!(admitted["result"]["isError"], false, "{admitted}");
+            // The two reads are taken moments apart, so a whole-second
+            // freshness age can tick between them; compare everything else.
+            fn without_age(mut value: Value) -> Value {
+                match &mut value {
+                    Value::Object(map) => {
+                        map.remove("age_seconds");
+                        for child in map.values_mut() {
+                            *child = without_age(child.take());
+                        }
+                    }
+                    Value::Array(items) => {
+                        for child in items.iter_mut() {
+                            *child = without_age(child.take());
+                        }
+                    }
+                    _ => {}
+                }
+                value
+            }
+            assert_eq!(
+                without_age(admitted["result"]["structuredContent"].clone()),
+                without_age(plain["result"]["structuredContent"].clone())
+            );
+            for identity in [
+                format!("offline.test@2; install={install}"),
+                "offline.test@1; install=missing".into(),
+                format!("foreign.app@1; install={install}"),
+                format!("offline.test@1; install={foreign_install}"),
+            ] {
+                attributed["params"]["_meta"]["native/app"] = json!(identity);
+                let refused = session.handle_message(attributed.clone()).await.unwrap();
+                assert_eq!(refused["result"]["isError"], true, "{refused}");
+                assert!(
+                    refused.get("error").is_none(),
+                    "install refusal is a tool result: {refused}"
+                );
+                assert!(
+                    refused["result"]["structuredContent"]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("app_install_unknown"),
+                    "{refused}"
+                );
+            }
+            attributed["params"]["_meta"]["native/app"] =
+                json!(format!("offline.test@1; install={install}"));
+            let sql = |sql: &str| match surface {
+                McpSurfaceMode::Legacy => {
+                    json!({"name":"query_sql","arguments":{"sql":sql,"format":"json"}})
+                }
+                _ => {
+                    json!({"name":"sql_read","arguments":{"operation":"query_sql","arguments":{"sql":sql},"format":"json"}})
+                }
+            };
+            for (query, succeeds) in [
+                ("SELECT id FROM records LIMIT 1", true),
+                ("SELECT * FROM alpha_tab_installs", false),
+            ] {
+                let mut request = attributed.clone();
+                let meta = request["params"]["_meta"].clone();
+                request["params"] = sql(query);
+                request["params"]["_meta"] = meta;
+                let result = session.handle_message(request).await.unwrap();
+                assert_eq!(result["result"]["isError"], !succeeds, "{result}");
+            }
+            for (tool, args, expected) in [
+                (
+                    "create_record",
+                    json!({"type":"Document","name":"never"}),
+                    "STANDBY_READ_ONLY",
+                ),
+                (
+                    "manage_alpha_tabs",
+                    json!({"action":"list"}),
+                    "app_operation_refused",
+                ),
+            ] {
+                let mut request = attributed.clone();
+                if surface == McpSurfaceMode::Legacy {
+                    request["params"]["name"] = json!(tool);
+                    request["params"]["arguments"] = args;
+                } else {
+                    request["params"]["name"] = json!(if tool == "create_record" {
+                        "records_write"
+                    } else {
+                        "artifacts_read"
+                    });
+                    request["params"]["arguments"] = json!({"operation":if tool == "create_record" { "create_record" } else { "manage_alpha_tabs.list" },"arguments":if tool == "create_record" { args } else { json!({}) }});
+                }
+                let refused = session.handle_message(request).await.unwrap();
+                assert_eq!(refused["result"]["isError"], true, "{refused}");
+                assert!(refused.get("error").is_none(), "{refused}");
+                let structured = &refused["result"]["structuredContent"];
+                if tool == "create_record" {
+                    assert_eq!(structured["error_code"], expected, "{refused}");
+                    assert!(structured["error"].is_string(), "{refused}");
+                } else {
+                    assert!(
+                        structured["error"].as_str().unwrap().contains(expected),
+                        "{refused}"
+                    );
+                }
+                if tool == "manage_alpha_tabs" {
+                    // The launcher's first-party registry read is available;
+                    // app approval remains refused even for action=list.
+                    let mut registry_read = attributed.clone();
+                    registry_read["params"]["name"] = json!(if surface == McpSurfaceMode::Legacy {
+                        "manage_alpha_tabs"
+                    } else {
+                        "artifacts_read"
+                    });
+                    registry_read["params"]["arguments"] = if surface == McpSurfaceMode::Legacy {
+                        json!({"action":"list"})
+                    } else {
+                        json!({"operation":"manage_alpha_tabs.list","arguments":{}})
+                    };
+                    registry_read["params"]["_meta"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("native/app");
+                    let listed = session.handle_message(registry_read).await.unwrap();
+                    assert_eq!(listed["result"]["isError"], false, "{listed}");
+                    assert!(
+                        listed["result"]["structuredContent"]
+                            .to_string()
+                            .contains("offline.test"),
+                        "{listed}"
+                    );
+                }
+            }
+            let mut preferences = attributed;
+            preferences["params"]["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove("native/app");
+            preferences["params"]["name"] = json!(if surface == McpSurfaceMode::Legacy {
+                "manage_account_config"
+            } else {
+                "records_read"
+            });
+            preferences["params"]["arguments"] = if surface == McpSurfaceMode::Legacy {
+                json!({"action":"inspect","kind":"focus_preferences"})
+            } else {
+                json!({"operation":"manage_account_config.inspect","arguments":{"kind":"focus_preferences"}})
+            };
+            let unavailable = session.handle_message(preferences).await.unwrap();
+            assert_eq!(unavailable["result"]["isError"], true, "{unavailable}");
+            assert!(
+                unavailable.to_string().contains("unavailable_offline"),
+                "{unavailable}"
+            );
+            db.close().await;
         }
     }
 
@@ -1041,28 +1797,15 @@ mod tests {
                     .block_on(store.prune_retention(&observed()))
                     .unwrap()
             });
-            let promotion = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(
-                    session
-                        .config
-                        .runtime
-                        .replica_root
-                        .join("accepted/promotion.lock"),
-                )
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(120), async {
-                loop {
-                    if fs2::FileExt::try_lock_exclusive(&promotion).is_err() {
-                        break;
-                    }
-                    fs2::FileExt::unlock(&promotion).unwrap();
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
+            // Two generations need no retention checks. Pruning must finish
+            // while warmup is pinned, rather than holding promotion across a
+            // device check. Polling for that old long-held lock misses the
+            // short discovery section and waits forever for obsolete behavior.
+            assert!(tokio::time::timeout(Duration::from_secs(120), pruning)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty());
             *gate.0.lock().unwrap() = true;
             gate.1.notify_all();
             tokio::time::timeout(Duration::from_secs(120), async {
@@ -1076,7 +1819,6 @@ mod tests {
                 fs2::FileExt::try_lock_exclusive(&old_lease).is_err(),
                 "held real request retains G1 lease after watcher publishes G2"
             );
-            assert!(pruning.await.unwrap().is_empty());
             let mut newer = Vec::new();
             for name in ["third", "fourth"] {
                 crate::store::update_record(&db, RECORD, json!({"name":name}))
@@ -1315,6 +2057,118 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn shared_supervisor_connection_eof_preserves_other_dispatcher_generation() {
+        let mut surfaces = vec![McpSurfaceMode::Legacy];
+        #[cfg(feature = "mcp-executor-prototype")]
+        surfaces.push(McpSurfaceMode::Executor);
+        for surface in surfaces {
+            let (_dir, db, session) = fixture_for_surface(surface).await;
+            let first = accept(&session, &db, "first").await;
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            *session.dispatch_pause.lock().unwrap() = Some((1, entered.clone(), resume.clone()));
+            session
+                .install_startup(activate(&session).await)
+                .await
+                .unwrap();
+            let served_db = match session.capture() {
+                SessionSnapshot::Serving(served) => served.resources.db.clone(),
+                _ => panic!("serving"),
+            };
+            let protected = lease(&session, &first);
+            let supervisor = StandbySupervisor::start(session.clone()).unwrap();
+            let held_dispatcher = supervisor.dispatcher();
+            let finishing_dispatcher = held_dispatcher.clone();
+            let (held_client, held_server) = tokio::io::duplex(65536);
+            let (held_receive, mut held_send) = tokio::io::split(held_client);
+            let (held_reader, held_writer) = tokio::io::split(held_server);
+            let held = tokio::spawn(async move {
+                held_dispatcher
+                    .serve_connection(BufReader::new(held_reader), held_writer)
+                    .await
+            });
+            held_send
+                .write_all(format!("{}\n", surface_read(surface, 1)).as_bytes())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+
+            let (client, server) = tokio::io::duplex(65536);
+            let (receive, mut send) = tokio::io::split(client);
+            let (reader, writer) = tokio::io::split(server);
+            let finishing = tokio::spawn(async move {
+                finishing_dispatcher
+                    .serve_connection(BufReader::new(reader), writer)
+                    .await
+            });
+            send.write_all(format!("{}\n", surface_read(surface, 2)).as_bytes())
+                .await
+                .unwrap();
+            send.shutdown().await.unwrap();
+            let response = BufReader::new(receive)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                generation(&serde_json::from_str::<Value>(&response).unwrap()),
+                first
+            );
+            finishing.await.unwrap().unwrap();
+            // EOF dropped one dispatcher while the other retained its bundle.
+            assert!(!held.is_finished());
+            assert!(!served_db.pool().is_closed());
+            assert!(fs2::FileExt::try_lock_exclusive(&protected).is_err());
+            assert!(matches!(session.capture(), SessionSnapshot::Serving(served)
+                if served.resources.active.generation.id == first));
+            let fresh = supervisor
+                .dispatcher()
+                .handle_message(surface_read(surface, 3))
+                .await
+                .unwrap();
+            assert_eq!(generation(&fresh), first);
+            assert_eq!(fresh["result"]["isError"], false);
+
+            // Owner shutdown removes serving state but waits for captured work.
+            let shutdown = tokio::spawn(supervisor.shutdown());
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while matches!(session.capture(), SessionSnapshot::Serving(_)) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!shutdown.is_finished());
+            assert!(!served_db.pool().is_closed());
+            assert!(fs2::FileExt::try_lock_exclusive(&protected).is_err());
+            resume.notify_one();
+            let response = BufReader::new(held_receive)
+                .lines()
+                .next_line()
+                .await
+                .unwrap()
+                .unwrap();
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(generation(&response), first);
+            assert_eq!(response["result"]["isError"], false);
+            held_send.shutdown().await.unwrap();
+            held.await.unwrap().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(served_db.pool().is_closed());
+            fs2::FileExt::try_lock_exclusive(&protected).unwrap();
+            fs2::FileExt::unlock(&protected).unwrap();
+            db.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn captured_dispatch_keeps_old_context_pool_and_lease_until_completion() {
         let (_dir, db, session) = fixture().await;
         let first = accept(&session, &db, "first").await;
@@ -1420,7 +2274,9 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut wrong_consumer = observed();
-        wrong_consumer.artifact_sha256 = "d".repeat(64);
+        // A same-format artifact change is now eligible for re-admission;
+        // this refusal must exercise an incompatible consumer instead.
+        wrong_consumer.ddl_sha256 = "d".repeat(64);
         assert!(session
             .config
             .store
@@ -1504,7 +2360,7 @@ mod tests {
             .await;
         assert!(
             matches!(refused, Err(ref error) if error.to_string().contains("authorised readiness refused")),
-            "full-valid candidate must refuse at actual authorised root readiness"
+            "device-valid candidate must refuse at actual authorised root readiness"
         );
         assert_eq!(
             generation(&session.handle_message(read(4)).await.unwrap()),
@@ -1518,6 +2374,7 @@ mod tests {
     async fn failed_or_cancelled_publication_cannot_seed_candidate_proof_reuse() {
         use crate::standby::generation_store::{test_diagnostics, with_verification_cancellation};
         use tracing::instrument::WithSubscriber;
+        let _capture_guard = test_diagnostics::LOG_CAPTURE_LOCK.lock().await;
         let (_dir, db, session) = fixture().await;
         let first = accept(&session, &db, "first").await;
         session
@@ -1542,17 +2399,25 @@ mod tests {
             generation(&session.handle_message(read(1)).await.unwrap()),
             first
         );
+        // Device verification ran (not skipped): no conformance suite, and
+        // the candidate snapshot check finished successfully.
         assert_eq!(
             logs.output()
                 .lines()
                 .filter(|line| line.contains("standby suite started"))
                 .count(),
-            1
+            0
+        );
+        assert!(
+            logs.output().lines().any(|line| line
+                .contains("phase=\"startup-snapshot\"")
+                && line.contains("ok=true")),
+            "failed warmup still device-verified the candidate"
         );
         *session.warmup_hook.lock().unwrap() = None;
 
-        // FULL succeeded, but cancellation under the publication lock must
-        // drop the private prepared witness rather than attach it to serving.
+        // Device verification succeeded, but cancellation under the publication lock must
+        // drop the prepared serving state rather than attach it to serving.
         let logs = test_diagnostics::Capture::default();
         let prepared = async {
             let active = activate(&session).await;
@@ -1568,8 +2433,14 @@ mod tests {
                 .lines()
                 .filter(|line| line.contains("standby suite started"))
                 .count(),
-            1,
+            0,
             "failed preparation did not cache the candidate"
+        );
+        assert!(
+            logs.output().lines().any(|line| line
+                .contains("phase=\"startup-snapshot\"")
+                && line.contains("ok=true")),
+            "failed preparation still device-verified the candidate"
         );
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
         assert!(with_verification_cancellation(flag, || session.publish(prepared)).is_err());
@@ -1590,8 +2461,14 @@ mod tests {
                 .lines()
                 .filter(|line| line.contains("standby suite started"))
                 .count(),
-            1,
+            0,
             "cancelled publication did not cache the candidate"
+        );
+        assert!(
+            logs.output().lines().any(|line| line
+                .contains("phase=\"startup-snapshot\"")
+                && line.contains("ok=true")),
+            "post-cancellation activation re-verified the candidate"
         );
         assert_eq!(
             generation(&session.handle_message(read(3)).await.unwrap()),
@@ -1725,7 +2602,10 @@ mod tests {
         let SessionSnapshot::Serving(old) = &captured else {
             panic!("captured generation")
         };
-        assert_eq!(generation(&old.dispatch(read(1)).await.unwrap()), first);
+        assert_eq!(
+            generation(&old.dispatch(read(1), false).await.unwrap()),
+            first
+        );
         drop(captured);
         tokio::time::timeout(Duration::from_secs(10), transport)
             .await

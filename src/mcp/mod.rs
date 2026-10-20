@@ -47,9 +47,12 @@
 
 pub mod action_evidence;
 pub mod advisors;
+pub mod app_attribution;
 pub mod apps;
 pub mod authority_act;
 pub mod builtin;
+pub mod counter_fence;
+pub mod database_freeze;
 pub(crate) mod deployment_read_only;
 pub mod evidence;
 #[cfg(feature = "mcp-executor-prototype")]
@@ -74,6 +77,10 @@ pub(crate) mod member_serving;
 pub mod member_stdio;
 pub mod product_model;
 mod protocol;
+#[cfg(unix)]
+pub(crate) use protocol::is_modern_request;
+#[cfg(feature = "v2-kernel-probe")]
+pub mod kernel_v2;
 pub(crate) mod record_ref;
 pub mod registry;
 pub mod render;
@@ -90,9 +97,11 @@ pub mod tools;
 pub use authority_act::{AuthorityActDeltaRequest, AuthorityActSource, AuthorityActSourceRef};
 pub use builtin::{register_builtin_tools, register_standby_status_tool};
 pub use deployment_read_only::{
-    DeploymentAdmission, DeploymentFreezeLease, DeploymentMutationBarrier,
-    DeploymentPersistenceLease, OperationAccess, DEPLOYMENT_DRAINING_ERROR,
-    DEPLOYMENT_DRAINING_RECOVERY, DEPLOYMENT_READ_ONLY_ERROR,
+    scope_database_persistence, DeploymentAdmission, DeploymentFreezeLease,
+    DeploymentMutationBarrier, DeploymentPersistenceLease, OperationAccess,
+    DEPLOYMENT_DRAINING_ERROR, DEPLOYMENT_DRAINING_RECOVERY, DEPLOYMENT_READ_ONLY_ERROR,
+    DEPLOYMENT_READ_ONLY_RECOVERY, DEPLOYMENT_READ_ONLY_RETRY_AFTER_HEADER,
+    DEPLOYMENT_READ_ONLY_RETRY_AFTER_SECS,
 };
 pub use evidence::{EvidenceKind, EvidenceStoreOptions, ToolResult, TransientEvidence};
 #[cfg(feature = "mcp-executor-prototype")]

@@ -38,7 +38,7 @@ use crate::schema::DDL_STATEMENTS;
 
 use super::error::contract_violation;
 
-const CONTROLLED_ACCESSORS: [&str; 47] = [
+const CONTROLLED_ACCESSORS: [&str; 55] = [
     "_query_sql_bearer_walk",
     "_query_sql_authorization_subjects",
     "_query_sql_visible_records",
@@ -49,7 +49,11 @@ const CONTROLLED_ACCESSORS: [&str; 47] = [
     "body_block_headings",
     "links",
     "facet_values",
+    "facet_value_json_nodes",
+    "content_event_apps",
     "facet_observations",
+    "facet_observation_json_nodes",
+    "record_body_json_nodes",
     "bindings",
     "blobs",
     "vocabularies",
@@ -77,7 +81,11 @@ const CONTROLLED_ACCESSORS: [&str; 47] = [
     "facet_times",
     "_query_sql_my_person",
     "my_message_state",
+    "my_participants",
+    "message_speakers",
     "my_mentions",
+    "comment_anchors",
+    "message_reactions",
     "_query_sql_mention_visible",
     "_query_sql_mention_self",
     "_query_sql_mention_prefix",
@@ -93,6 +101,17 @@ const MAX_ROWS: i64 = sql_contract::MAX_ROWS as i64;
 /// visible set before SQL execution. Refuse larger dependent snapshots until
 /// a keyed/lazy projection can preserve the same governance semantics.
 const MAX_LIFECYCLE_VISIBLE_RECORDS: i64 = 20_000;
+// Engineering admission bounds, not product-ratified limits. The borrowed
+// freshness budget counts ALL visible records and inspected source events,
+// independently of the reaction-only window budget below.
+const MAX_REACTION_HEAD_RECORDS: usize = 20_000;
+const MAX_REACTION_HEAD_EVENTS: i64 = 100_000;
+/// Reaction-only admission, distinct from the all-record freshness budget.
+/// Only viewer-visible live Messages and their reaction history count.
+const MAX_REACTION_MESSAGES: i64 = 20_000;
+const MAX_REACTION_SOURCE_EVENTS: i64 = 100_000;
+const MAX_REACTION_METADATA_BYTES: i64 = 16 * 1024 * 1024;
+const MAX_REACTION_WINNERS: i64 = 20_000;
 /// Longest declared intent `run_intents` returns as text. A declaration over
 /// it reads as NULL, so one oversized `set_intent` cannot fail a statement at
 /// the caller value ceiling. Well under the cell cap even after worst-case
@@ -271,6 +290,7 @@ fn build_member_preflight_validator(gate_schema_config: bool) -> Result<rusqlite
     }
     register_regexp_function(&conn)?;
     register_now_ms_stub(&conn)?;
+    register_current_principal_stub(&conn)?;
     register_utc_date_label_stub(&conn)?;
     Ok(conn)
 }
@@ -478,15 +498,9 @@ pub(crate) async fn workspace_visible_set(
     principal: QueryPrincipal,
 ) -> Result<WorkspaceVisibleSet> {
     let mut connection = db.governed_pool().acquire().await?;
-    for statement in temp_contract()
-        .split(';')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if let Err(error) = sqlx::query(statement).execute(&mut *connection).await {
-            connection.close_on_drop();
-            return Err(error.into());
-        }
+    if let Err(error) = install_temp_contract(&mut connection).await {
+        connection.close_on_drop();
+        return Err(error.into());
     }
     // Clearing outside the transaction prevents rollback from restoring an
     // earlier principal on a reused governed connection.
@@ -617,8 +631,11 @@ pub(crate) async fn install_visible_records_in(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     principal: QueryPrincipal,
 ) -> Result<()> {
-    let contract = temp_contract();
-    for stmt in contract.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+    for stmt in frozen_temp_contract_batch()
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         // `contains`, not `starts_with`: the bearer-walk chunk carries its
         // leading `--` comment block, so the CREATE is not first. The
         // CREATE-prefixed literals occur only in TEMP_CONTRACT, so no
@@ -799,6 +816,42 @@ CREATE TEMP TABLE IF NOT EXISTS _query_sql_disclosable_actors (
 CREATE TEMP TABLE IF NOT EXISTS _query_sql_visible_ids (
   id TEXT PRIMARY KEY
 );
+-- Exact winning additions, populated once only for a resolved dependency.
+-- event_seq and actor never become public columns. NULL legacy partitions
+-- are preserved by the metadata-only window before this stage is filled.
+CREATE TEMP TABLE IF NOT EXISTS _query_sql_reaction_winners (
+  event_seq INTEGER PRIMARY KEY,
+  message_id TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  emoji TEXT NOT NULL,
+  executor_kind TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE TEMP VIEW IF NOT EXISTS message_reactions AS
+SELECT identity.id AS reaction_id, winner.message_id, winner.emoji,
+       visible_actor.id AS actor_record_id, person.name AS actor_name,
+       CASE WHEN principal.trusted_local_bypass = 1
+                  OR winner.actor = principal.account_id
+                  OR visible_actor.id IS NOT NULL
+            THEN winner.executor_kind ELSE NULL END AS executor_kind,
+       strftime('%Y-%m-%dT%H:%M:%fZ', winner.created_at) AS reacted_at,
+       CAST(strftime('%s', winner.created_at) AS INTEGER) * 1000
+         + CAST(substr(strftime('%f', winner.created_at), 4, 3) AS INTEGER) AS reacted_at_ms,
+       winner.actor = principal.account_id AS viewer
+  FROM temp._query_sql_reaction_winners AS winner
+  CROSS JOIN main.content_events AS identity
+  CROSS JOIN temp._query_sql_principal AS principal
+  LEFT JOIN main.bindings AS actor_binding
+    ON actor_binding.system = 'account' AND actor_binding.identifier = winner.actor
+  LEFT JOIN temp._query_sql_visible_ids AS visible_actor
+    ON visible_actor.id = actor_binding.record_id
+  LEFT JOIN main.records AS person ON person.id = visible_actor.id
+ -- Keep these narrow reads in the controlled accessor even for COUNT(*).
+ -- Both columns are stored NOT NULL TEXT, so these predicates also retain
+ -- empty and Unicode values without excluding a winning row.
+ WHERE identity.seq = winner.event_seq
+   AND length(identity.id) >= 0 AND length(principal.account_id) >= 0;
+
 -- Derived artifacts do not carry independent visibility in v1. Each live
 -- record resolves through a chain of exactly-one outgoing part_of links until
 -- the first ordinary live bearer. Missing/multiple bearers, tombstones,
@@ -1017,6 +1070,31 @@ WHERE e.type NOT IN (
     'reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1'
 );
 
+-- App contract v2 attribution (task 50f5aca): one row per visible content
+-- event produced by a call a host-asserted v2 app made. Content-only:
+-- relationship outputs have no caller-visible event relation here, so the
+-- engine-side selector app_attribution::app_action_outputs covers both
+-- domains for undo. It is driven from the
+-- caller-filtered content_events view, and only where that view discloses the
+-- actor, so which app someone used travels exactly as far as who they are.
+-- An invalidated attestation attributes nothing.
+CREATE TEMP VIEW IF NOT EXISTS content_event_apps AS
+SELECT e.id AS event_id, e.record_id, app.package, app.version,
+       app.install_event_id, app.assertion
+FROM main.provenance_action_app_attributions AS app
+JOIN main.provenance_action_outputs AS o
+  ON o.action_attestation_id = app.action_attestation_id
+ AND o.output_domain = 'content'
+JOIN temp.content_events AS e ON e.id = o.output_event_id
+WHERE e.actor IS NOT NULL
+  AND NOT EXISTS (
+        SELECT 1 FROM main.provenance_attestation_validity_events AS v
+         WHERE v.attestation_id = app.action_attestation_id
+           AND v.status = 'invalidated'
+           AND v.ordinal = (SELECT MAX(v2.ordinal)
+                              FROM main.provenance_attestation_validity_events AS v2
+                             WHERE v2.attestation_id = v.attestation_id));
+
 -- The physical projection carries the exact source event for replay, but
 -- caller SQL receives only current content chunks. Record visibility uses
 -- the same staged snapshot as `records`, so deleted and hidden bodies stay out.
@@ -1050,6 +1128,28 @@ JOIN temp._query_sql_visible_ids AS source_visible
 JOIN temp._query_sql_visible_ids AS target_visible
   ON target_visible.id = l.target_id;
 
+-- Passage anchors of comment roots, under the comments' own visibility: a
+-- comment is a derived artifact visible exactly when its bearer is, and the
+-- anchor names that bearer, so both ends must be visible (as for `links`).
+-- Body anchors only. The scoped capture provenance travels with the row:
+-- `source_event_seq` is the stored content-events MAX at capture (metadata
+-- included) and `source_sha256` the captured body digest, so a later live
+-- reopen can prove the same recorded range (stored body seq at or before the
+-- capture seq with equal SHA) while any later body write invalidates it,
+-- even an equal-bytes restore. No other sequence travels here.
+CREATE TEMP VIEW IF NOT EXISTS comment_anchors AS
+SELECT t.annotation_id, t.target_record_id, t.purpose, t.selectors, t.source_event_seq, t.source_sha256
+FROM main.annotation_targets AS t
+JOIN temp._query_sql_visible_ids AS comment_visible
+  ON comment_visible.id = t.annotation_id
+JOIN temp._query_sql_visible_ids AS bearer_visible
+  ON bearer_visible.id = t.target_record_id
+JOIN main.records AS comment
+  ON comment.id = t.annotation_id
+WHERE t.source_slot = 'body'
+  AND comment.type = 'Annotation' AND comment.kind = 'comment'
+  AND comment.deleted_at IS NULL;
+
 CREATE TEMP VIEW IF NOT EXISTS facet_values AS
 SELECT f.id, f.record_id, f.key, f.value, f.value_num, f.vocab_ref,
        strftime('%Y-%m-%dT%H:%M:%fZ', f.created_at) AS created_at,
@@ -1065,6 +1165,50 @@ SELECT f.id, f.record_id, f.key, f.value, f.op, f.vocab_ref,
        f.event_seq
 FROM main.facet_observations AS f
 JOIN temp._query_sql_visible_ids AS visible ON visible.id = f.record_id;
+
+-- Occurrence nodes for facet values whose stored text parses as a JSON object
+-- or array. Joining main.facet_value_json_nodes to the caller-filtered
+-- temp.facet_values view inherits that view's visibility fence exactly: a node
+-- is visible iff its facet row is. `interpretation` is the constant
+-- `parsed_text_candidate` because stored text records syntax, not authored type.
+CREATE TEMP VIEW IF NOT EXISTS facet_value_json_nodes AS
+SELECT n.facet_id, n.ordinal, n.path, n.parent_path, n.parent_ordinal,
+       n.member_key, n.array_index, n.depth, n.node_type,
+       n.text_value, n.number_text, n.bool_value,
+       'parsed_text_candidate' AS interpretation
+FROM main.facet_value_json_nodes AS n
+JOIN temp.facet_values AS f ON f.id = n.facet_id;
+
+-- Occurrence nodes for facet observations whose stored text parses as a JSON
+-- object or array. Joining main.facet_observation_json_nodes to the
+-- caller-filtered temp.facet_observations view inherits that view's visibility
+-- fence exactly: a node is visible iff its observation row is. The joining
+-- observation's identifying `record_id`, `key` and `as_of` are projected onto
+-- every node. `interpretation` is the constant `parsed_text_candidate` because
+-- stored text records syntax, not authored type.
+CREATE TEMP VIEW IF NOT EXISTS facet_observation_json_nodes AS
+SELECT n.observation_id, o.record_id, o.key, o.as_of,
+       n.ordinal, n.path, n.parent_path, n.parent_ordinal,
+       n.member_key, n.array_index, n.depth, n.node_type,
+       n.text_value, n.number_text, n.bool_value,
+       'parsed_text_candidate' AS interpretation
+FROM main.facet_observation_json_nodes AS n
+JOIN temp.facet_observations AS o ON o.id = n.observation_id;
+
+-- Occurrence nodes for record bodies whose stored text parses as a JSON
+-- object or array. Joining main.record_body_json_nodes to the caller-filtered
+-- temp.records view inherits that view's visibility fence exactly: a node is
+-- visible iff its record is, so hidden and tombstoned records contribute no
+-- rows even though their nodes are retained physically. `interpretation` is
+-- the constant `parsed_text_candidate` because stored text records syntax,
+-- not authored type.
+CREATE TEMP VIEW IF NOT EXISTS record_body_json_nodes AS
+SELECT n.record_id, n.ordinal, n.path, n.parent_path, n.parent_ordinal,
+       n.member_key, n.array_index, n.depth, n.node_type,
+       n.text_value, n.number_text, n.bool_value,
+       'parsed_text_candidate' AS interpretation
+FROM main.record_body_json_nodes AS n
+JOIN temp.records AS r ON r.id = n.record_id;
 
 -- Account/email bindings are caller-owned. No non-identity system has yet
 -- completed the explicit exposure audit, so unknown systems fail closed.
@@ -1528,9 +1672,9 @@ SELECT (SELECT account.record_id
 -- can reach another viewer's state. Work is driven by the visible Messages
 -- and scales with nothing the caller cannot see.
 -- `stage` is the human lane (`unsurfaced` when the caller has none).
--- `unread` is 1 until the caller opens or acknowledges a Message they did
--- not write and have not archived. `is_own` compares the Message owner with
--- the caller's person. `mentioned` is an effective principal @-mention of
+-- `unread` is 1 until the caller opens or acknowledges an unarchived Message
+-- whose speaker is not the caller. `is_own` requires the caller's owner Person
+-- and no separate speaker fact. `mentioned` is an effective principal @-mention of
 -- the caller, the same predicate the inbox uses, read by the mention primary
 -- key for this Message alone (the unary plus keeps the planner off the target
 -- index, whose leading column would visit every principal mention in the
@@ -1538,14 +1682,31 @@ SELECT (SELECT account.record_id
 -- federated Message, which cannot take reactions. The account is read
 -- through scalar subqueries rather than a joined principal row, so every
 -- joined table keeps a column in use in every statement shape (`count(*)`).
+CREATE TEMP VIEW IF NOT EXISTS my_participants AS
+SELECT 'persona:' || p.persona_id AS participant_address, 'persona' AS kind,
+       p.persona_id, r.name AS display_name, p.state
+  FROM main.personas p
+  JOIN main.records r ON r.id=p.persona_id
+  JOIN temp._query_sql_visible_ids visible ON visible.id=p.persona_id
+ WHERE p.owner_person_id=(SELECT person_id FROM temp._query_sql_my_person) AND r.deleted_at IS NULL;
+
+CREATE TEMP VIEW IF NOT EXISTS message_speakers AS
+SELECT s.message_id, s.speaker_kind, 'persona:' || s.persona_id AS speaker_address,
+       r.name AS display_name, s.assurance
+  FROM temp._query_sql_visible_ids visible
+  JOIN main.message_speakers s ON s.message_id=visible.id
+  JOIN main.records message ON message.id=s.message_id AND message.type='Message' AND message.deleted_at IS NULL
+  LEFT JOIN main.records r ON r.id=s.persona_id;
+
 CREATE TEMP VIEW IF NOT EXISTS my_message_state AS
 SELECT message.id AS message_id,
        COALESCE(awareness.stage, 'unsurfaced') AS stage,
-       CASE WHEN awareness.stage IN ('opened', 'acknowledged') THEN 0
-            WHEN message.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me) THEN 0
+       CASE WHEN message.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me) AND NOT EXISTS(SELECT 1 FROM main.message_speakers s WHERE s.message_id=message.id) THEN 0
             WHEN preference.archived = 1 THEN 0
+            WHEN preference.unread_override IS NOT NULL THEN preference.unread_override
+            WHEN awareness.stage IN ('opened', 'acknowledged') THEN 0
             ELSE 1 END AS unread,
-       CASE WHEN message.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me)
+       CASE WHEN message.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me) AND NOT EXISTS(SELECT 1 FROM main.message_speakers s WHERE s.message_id=message.id)
             THEN 1 ELSE 0 END AS is_own,
        EXISTS (SELECT 1
                  FROM main.message_mentions AS mention
@@ -1590,18 +1751,23 @@ SELECT message.id AS message_id,
 -- `mentioned_at` is the Message's creation, or the body version that wrote
 -- the reference (the `record_id` term on that read is load-bearing, as in
 -- `run_intents`). Both arms are driven from the caller-visible set, which is
--- materialized once and kept outermost by CROSS JOIN (otherwise the planner
+-- already materialized in the indexed TEMP visible-id table and kept
+-- outermost by CROSS JOIN (otherwise the planner
 -- may start from every Message and test visibility last, visiting a hidden
 -- Message's mentions first): mentions are read per visible source by index, and
 -- rival candidates for a prefix come from the visible set alone, so hidden
 -- sources, hidden mentions and hidden look-alike ids are never visited.
+-- The visible CTE stays NOT MATERIALIZED: copying the indexed TEMP table
+-- into an unindexed CTE forces correlated page probes to scan every visible
+-- id once per row. The underlying table already freezes visibility for the
+-- request, while its primary key lets source-id predicates stay selective.
 -- The final WHERE term is load-bearing, as in `actors`: the two arms form a
 -- compound that SQLite cannot flatten into an aggregate (`count(*)`), and a
 -- FROM item none of whose columns is used is authorized outside this view's
 -- accessor context, so the outer select keeps a column of it in use.
 CREATE TEMP VIEW IF NOT EXISTS my_mentions AS
 WITH RECURSIVE
-_query_sql_mention_visible(id) AS MATERIALIZED (
+_query_sql_mention_visible(id) AS NOT MATERIALIZED (
   SELECT id FROM temp._query_sql_visible_ids
 ),
 _query_sql_mention_self(person_id) AS MATERIALIZED (
@@ -1655,6 +1821,7 @@ SELECT message.id AS source_id,
        'message' AS source_kind,
        'principal' AS via,
        CASE WHEN message.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me)
+                 AND NOT EXISTS(SELECT 1 FROM main.message_speakers s WHERE s.message_id=message.id)
             THEN 1 ELSE 0 END AS own_source,
        strftime('%Y-%m-%dT%H:%M:%fZ', message.created_at) AS mentioned_at,
        CAST(strftime('%s', message.created_at) AS INTEGER) * 1000 + CAST(substr(strftime('%f', message.created_at), 4, 3) AS INTEGER) AS mentioned_at_ms,
@@ -1681,6 +1848,7 @@ SELECT source.id AS source_id,
        CASE WHEN source.type = 'Message' THEN 'message' ELSE 'record' END AS source_kind,
        'reference' AS via,
        CASE WHEN source.owner_id = (SELECT me.person_id FROM temp._query_sql_my_person AS me)
+                 AND (source.type <> 'Message' OR NOT EXISTS(SELECT 1 FROM main.message_speakers s WHERE s.message_id=source.id))
             THEN 1 ELSE 0 END AS own_source,
        strftime('%Y-%m-%dT%H:%M:%fZ', written.created_at) AS mentioned_at,
        CAST(strftime('%s', written.created_at) AS INTEGER) * 1000 + CAST(substr(strftime('%f', written.created_at), 4, 3) AS INTEGER) AS mentioned_at_ms,
@@ -1705,6 +1873,20 @@ SELECT t.record_id, t.item_index, t.marker, t.checked, t.in_quote,
        t.start_offset, t.end_offset
 FROM main.body_task_items AS t
 JOIN temp._query_sql_visible_ids AS visible ON visible.id = t.record_id;
+
+-- Serving executor catalogue rows for catalog_operations. Populated once
+-- per execution from the trusted request snapshot (ad-hoc online executor
+-- query_sql only). Every other entry point refuses the relation before
+-- reading it, so an empty table here is never served as an empty success.
+-- A table (not a view) so every read shape fires a table-read callback.
+-- Named-column reads observe and populate, while column-less aggregates
+-- meet the same validator refusal as the other staged temp tables.
+CREATE TEMP TABLE IF NOT EXISTS catalog_operations (
+  executor TEXT, operation TEXT, surface TEXT, access TEXT,
+  plan_required INTEGER, direct_execution_enabled INTEGER,
+  contract_version TEXT, contract_digest TEXT, source_tool TEXT,
+  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER
+);
 "#;
 
 /// GLOB pattern matching exactly `record_ref::is_canonical_uuid`: 36 bytes,
@@ -1730,11 +1912,177 @@ fn temp_contract() -> String {
         .replace("__CANONICAL_UUID_GLOB__", &canonical_uuid_glob());
     // The served catalog is generated from LOGICAL_RELATIONS (E2 I-2), so
     // the rows an agent reads always match the admission catalog.
-    for statement in sql_contract::catalog_view_statements(true) {
+    for statement in sql_contract::catalog_view_statements(true, false) {
         contract.push_str(&statement);
         contract.push_str(";\n");
     }
     contract
+}
+
+/// Install the governed TEMP contract as one script rather than one call per
+/// statement (task `9be4011`). SQLite prepares and runs the statements one at
+/// a time, in order, and stops at the first failure, so a failed install has
+/// applied exactly the statements before the failing one, as the call-per-
+/// statement loop did. One script spares 88 separate prepares, statement-cache
+/// entries and connection round trips, which measured as most of a governed
+/// read's cost.
+async fn install_temp_contract(connection: &mut sqlx::SqliteConnection) -> sqlx::Result<()> {
+    sqlx::query(frozen_temp_contract_batch())
+        .persistent(false)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+/// How one governed execution in a caller's transaction treats the TEMP
+/// contract.
+#[derive(Clone, Copy)]
+enum ContractMode<'db> {
+    /// Install before the statement and drop after it (every caller except
+    /// a [`GovernedSqlSession`]).
+    PerCall,
+    /// Already installed by a [`GovernedSqlSession`], which drops it once.
+    Session(&'db Db),
+}
+
+/// Every table of the TEMP contract, emptied at the start of each execution
+/// in a session. A per-call install starts from freshly created, empty
+/// tables; a session's later executions must start from the same state.
+const SESSION_EXECUTION_RESET: &str = "\
+DELETE FROM temp._query_sql_principal;
+DELETE FROM temp.catalog_operations;
+DELETE FROM temp._query_sql_visible_ids;
+DELETE FROM temp._query_sql_messages_awaiting_reply;
+DELETE FROM temp._query_sql_lifecycle_interpretations;
+DELETE FROM temp._query_sql_activity_members;
+DELETE FROM temp._query_sql_activity_observations;
+DELETE FROM temp._query_sql_activity_capture;
+DELETE FROM temp._query_sql_claim_candidates;
+DELETE FROM temp._query_sql_claim_releases;
+DELETE FROM temp._query_sql_disclosable_actors;
+DELETE FROM temp._query_sql_reaction_winners;
+";
+
+/// One governed transaction running several SQL executions under a single
+/// TEMP contract install (task `9be4011`). Installing and dropping the
+/// contract is most of a governed execution's cost, so a caller with
+/// several statements for one snapshot pays it once.
+///
+/// The contract's views shadow main table names for unqualified SQL, so
+/// while it is installed no domain read may run on the transaction. The
+/// session enforces that by owning the transaction: nothing but
+/// [`execute`](Self::execute) can reach it until [`finish`](Self::finish)
+/// drops the contract and hands it back. Run gate and other domain reads
+/// before [`begin`](Self::begin) or after `finish`.
+///
+/// If the session is dropped instead (an error or a cancelled future), the
+/// transaction rolls back, which undoes the contract's in-transaction
+/// creation, and the governed pool's release hook drops anything left on
+/// the connection before it is reused.
+pub(crate) struct GovernedSqlSession<'db, 't> {
+    db: &'db Db,
+    transaction: sqlx::Transaction<'t, Sqlite>,
+}
+
+impl<'db, 't> GovernedSqlSession<'db, 't> {
+    /// Install the contract on `transaction` and take it over.
+    pub(crate) async fn begin(
+        db: &'db Db,
+        mut transaction: sqlx::Transaction<'t, Sqlite>,
+    ) -> Result<Self> {
+        install_temp_contract(&mut transaction).await?;
+        Ok(Self { db, transaction })
+    }
+
+    /// One governed execution, exactly as
+    /// [`query_sql_request_in_with_row_limit_observed`] runs it, without
+    /// installing or dropping the contract.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute(
+        &mut self,
+        principal: QueryPrincipal,
+        request: QuerySqlRequest,
+        row_limit: i64,
+        allowance: sql_contract::FunctionAllowance,
+        replay_clock: Option<i64>,
+        vm_callbacks: Option<Arc<AtomicU64>>,
+        apply_default_order: bool,
+    ) -> Result<(SqlResult, GovernedSqlObservation)> {
+        query_sql_request_in_with_row_limit_scoped(
+            &mut self.transaction,
+            principal,
+            request,
+            row_limit,
+            allowance,
+            replay_clock,
+            vm_callbacks,
+            apply_default_order,
+            &[],
+            ContractMode::Session(self.db),
+        )
+        .await
+    }
+
+    /// Drop the contract and hand the transaction back for ordinary reads.
+    pub(crate) async fn finish(mut self) -> Result<sqlx::Transaction<'t, Sqlite>> {
+        cleanup_query_sql_temp_contract(&mut self.transaction).await?;
+        Ok(self.transaction)
+    }
+
+    /// End the transaction without reading through it again, after an
+    /// execution failed. The rollback undoes the contract's creation, which
+    /// happened inside this transaction; the release hook covers the rest.
+    pub(crate) async fn abandon(self) {
+        let _ = self.transaction.rollback().await;
+    }
+
+    /// The transaction with the contract installed, for tests that show
+    /// what an unqualified read would see during a session.
+    #[cfg(test)]
+    pub(crate) fn transaction_for_test(&mut self) -> &mut sqlx::Transaction<'t, Sqlite> {
+        &mut self.transaction
+    }
+}
+
+/// [`cleanup_query_sql_temp_contract`]'s drops, in its order, as one script.
+fn temp_contract_teardown_script() -> &'static str {
+    static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SCRIPT.get_or_init(|| {
+        // `catalog_operations` stages per-execution snapshot rows in a
+        // table (so column-less shapes meet the staged-table refusal
+        // instead of constant-folding past observation); dropping it as a
+        // view would fail, so it is excluded from the view loop and
+        // dropped with the tables below.
+        let views = sql_contract::LOGICAL_RELATIONS
+            .iter()
+            .rev()
+            .map(|relation| relation.name)
+            .filter(|name| *name != "catalog_operations")
+            .chain([
+                "_query_sql_my_person",
+                "_query_sql_run_principals",
+                "_query_sql_disclosable_persons",
+                "_query_sql_visible_records",
+                "_query_sql_authorization_subjects",
+            ])
+            .map(|name| format!("DROP VIEW IF EXISTS temp.{name};\n"));
+        let tables = [
+            "catalog_operations",
+            "_query_sql_messages_awaiting_reply",
+            "_query_sql_lifecycle_interpretations",
+            "_query_sql_principal",
+            "_query_sql_activity_observations",
+            "_query_sql_activity_capture",
+            "_query_sql_activity_members",
+            "_query_sql_claim_candidates",
+            "_query_sql_claim_releases",
+            "_query_sql_disclosable_actors",
+            "_query_sql_visible_ids",
+            "_query_sql_reaction_winners",
+        ]
+        .map(|name| format!("DROP TABLE IF EXISTS temp.{name};\n"));
+        views.chain(tables).collect()
+    })
 }
 
 /// Populate caller-relative lifecycle meaning from the same pinned SQLite
@@ -1869,38 +2217,12 @@ async fn populate_lifecycle_interpretations(
 async fn cleanup_query_sql_temp_contract(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
 ) -> Result<()> {
-    for relation in sql_contract::LOGICAL_RELATIONS.iter().rev() {
-        sqlx::query(&format!("DROP VIEW IF EXISTS temp.{}", relation.name))
-            .execute(&mut **transaction)
-            .await?;
-    }
-    for name in [
-        "_query_sql_my_person",
-        "_query_sql_run_principals",
-        "_query_sql_disclosable_persons",
-        "_query_sql_visible_records",
-        "_query_sql_authorization_subjects",
-    ] {
-        sqlx::query(&format!("DROP VIEW IF EXISTS temp.{name}"))
-            .execute(&mut **transaction)
-            .await?;
-    }
-    for name in [
-        "_query_sql_messages_awaiting_reply",
-        "_query_sql_lifecycle_interpretations",
-        "_query_sql_principal",
-        "_query_sql_activity_observations",
-        "_query_sql_activity_capture",
-        "_query_sql_activity_members",
-        "_query_sql_claim_candidates",
-        "_query_sql_claim_releases",
-        "_query_sql_disclosable_actors",
-        "_query_sql_visible_ids",
-    ] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS temp.{name}"))
-            .execute(&mut **transaction)
-            .await?;
-    }
+    // One script, stopping at the first failure like the old per-statement
+    // loop (see `install_temp_contract`).
+    sqlx::query(temp_contract_teardown_script())
+        .persistent(false)
+        .execute(&mut **transaction)
+        .await?;
     Ok(())
 }
 
@@ -1927,6 +2249,10 @@ CREATE TEMP TABLE content_events (
   actor TEXT, run_key TEXT, parent_key TEXT, channel_kind TEXT,
   created_at TEXT, created_at_ms INTEGER
 );
+CREATE TEMP TABLE content_event_apps (
+  event_id TEXT, record_id TEXT, package TEXT, version TEXT,
+  install_event_id TEXT, assertion TEXT
+);
 CREATE TEMP TABLE body_blocks (
   record_id TEXT, block_index INTEGER, chunk_index INTEGER, chunk_count INTEGER,
   heading_path TEXT, block_kind TEXT, text TEXT,
@@ -1947,6 +2273,24 @@ CREATE TEMP TABLE facet_values (
 CREATE TEMP TABLE facet_observations (
   id TEXT, record_id TEXT, key TEXT, value TEXT, op TEXT, vocab_ref TEXT,
   as_of TEXT, observed_at TEXT, observed_at_ms INTEGER, event_seq INTEGER
+);
+CREATE TEMP TABLE facet_value_json_nodes (
+  facet_id TEXT, ordinal INTEGER, path TEXT, parent_path TEXT,
+  parent_ordinal INTEGER, member_key TEXT, array_index INTEGER, depth INTEGER,
+  node_type TEXT, text_value TEXT, number_text TEXT, bool_value INTEGER,
+  interpretation TEXT
+);
+CREATE TEMP TABLE facet_observation_json_nodes (
+  observation_id TEXT, record_id TEXT, key TEXT, as_of TEXT, ordinal INTEGER,
+  path TEXT, parent_path TEXT, parent_ordinal INTEGER, member_key TEXT,
+  array_index INTEGER, depth INTEGER, node_type TEXT, text_value TEXT,
+  number_text TEXT, bool_value INTEGER, interpretation TEXT
+);
+CREATE TEMP TABLE record_body_json_nodes (
+  record_id TEXT, ordinal INTEGER, path TEXT, parent_path TEXT,
+  parent_ordinal INTEGER, member_key TEXT, array_index INTEGER, depth INTEGER,
+  node_type TEXT, text_value TEXT, number_text TEXT, bool_value INTEGER,
+  interpretation TEXT
 );
 CREATE TEMP TABLE bindings (
   record_id TEXT, system TEXT, identifier TEXT, is_canonical INTEGER,
@@ -2016,6 +2360,8 @@ CREATE TEMP TABLE run_intents (
   run_key TEXT, ordinal INTEGER, intent TEXT, declared_at_ms INTEGER
 );
 CREATE TEMP TABLE messages_awaiting_reply (message_id TEXT);
+CREATE TEMP TABLE my_participants (participant_address TEXT, kind TEXT, persona_id TEXT, display_name TEXT, state TEXT);
+CREATE TEMP TABLE message_speakers (message_id TEXT, speaker_kind TEXT, speaker_address TEXT, display_name TEXT, assurance TEXT);
 CREATE TEMP TABLE my_message_state (
   message_id TEXT, stage TEXT, unread INTEGER, is_own INTEGER,
   mentioned INTEGER, flagged INTEGER, muted INTEGER, archived INTEGER,
@@ -2024,6 +2370,15 @@ CREATE TEMP TABLE my_message_state (
 CREATE TEMP TABLE my_mentions (
   source_id TEXT, source_kind TEXT, via TEXT, own_source INTEGER,
   mentioned_at TEXT, mentioned_at_ms INTEGER, seen INTEGER
+);
+CREATE TEMP TABLE comment_anchors (
+  annotation_id TEXT, target_record_id TEXT, purpose TEXT,
+  selectors TEXT, source_event_seq INTEGER, source_sha256 TEXT
+);
+CREATE TEMP TABLE message_reactions (
+  reaction_id TEXT, message_id TEXT, emoji TEXT, actor_record_id TEXT,
+  actor_name TEXT, executor_kind TEXT, reacted_at TEXT, reacted_at_ms INTEGER,
+  viewer INTEGER
 );
 CREATE TEMP TABLE facet_times (
   record_id TEXT, key TEXT, kind TEXT, all_day INTEGER,
@@ -2040,6 +2395,12 @@ CREATE TEMP TABLE catalog_relations (
 );
 CREATE TEMP TABLE catalog_columns (
   relation_name TEXT, column_name TEXT, column_position INTEGER
+);
+CREATE TEMP TABLE catalog_operations (
+  executor TEXT, operation TEXT, surface TEXT, access TEXT,
+  plan_required INTEGER, direct_execution_enabled INTEGER,
+  contract_version TEXT, contract_digest TEXT, source_tool TEXT,
+  selector_field TEXT, selector_value TEXT, advertised_directly INTEGER
 );
 "#;
 
@@ -2197,6 +2558,316 @@ async fn prepare_claim_candidates(transaction: &mut sqlx::Transaction<'_, Sqlite
     Ok(())
 }
 
+/// The complete fold reads metadata only. Emitted emoji is not the legacy
+/// partition key: serde sequence payloads all share a NULL key per actor.
+const REACTION_WINNER_SQL: &str = r#"
+INSERT INTO temp._query_sql_reaction_winners
+       (event_seq,message_id,actor,emoji,executor_kind,created_at)
+WITH ranked AS MATERIALIZED (
+  SELECT meta.event_seq, meta.record_id AS message_id, meta.actor, meta.emoji,
+         meta.executor_kind, meta.created_at, meta.reaction_class,
+         row_number() OVER (PARTITION BY meta.record_id,meta.actor,meta.legacy_emoji
+                            ORDER BY meta.event_seq DESC) AS position
+    FROM temp._query_sql_visible_ids AS visible
+    CROSS JOIN main.records AS message
+    CROSS JOIN main.content_event_reaction_meta AS meta INDEXED BY idx_content_event_reaction_meta_record
+   WHERE message.id = visible.id AND message.type = 'Message'
+     AND message.deleted_at IS NULL AND meta.record_id = message.id
+)
+SELECT event_seq,message_id,actor,emoji,executor_kind,created_at
+  FROM ranked WHERE position = 1 AND reaction_class = 'added'
+ LIMIT ?
+"#;
+
+// Same global envelope as MAX(seq), with a non-filtering stored-column
+// read so SQLite preparation never reports a column-less source read.
+// record_id is NOT NULL TEXT, including empty/Unicode/NUL values. The
+// min/max optimization still inspects only the rightmost source event.
+const REACTION_BORROWED_ENVELOPE_SQL: &str =
+    "SELECT COALESCE(MAX(seq), 0) FROM main.content_events WHERE length(record_id)>=0";
+
+/// Reverse walks use the full record index: the partial record_changes
+/// index also excludes occurrence.bound.v1, which belongs in the old head.
+const REACTION_HEAD_EVENTS_SQL: &str = "SELECT event.seq,event.type
+    FROM main.content_events AS event INDEXED BY idx_content_events_record
+    WHERE event.record_id=? ORDER BY event.seq DESC LIMIT 1";
+const REACTION_HEAD_PREVIOUS_EVENT_SQL: &str = "SELECT event.seq,event.type
+    FROM main.content_events AS event INDEXED BY idx_content_events_record
+    WHERE event.record_id=? AND event.seq<? ORDER BY event.seq DESC LIMIT 1";
+
+/// One request-local absolute deadline. Production uses exactly std::Instant;
+/// the private test clock is captured once, then shared with the VM callback.
+#[derive(Clone)]
+struct ReactionDeadline {
+    absolute: Instant,
+    #[cfg(test)]
+    clock: Option<Arc<ReactionTestClock>>,
+}
+
+impl ReactionDeadline {
+    fn new(started: Instant) -> Self {
+        #[cfg(test)]
+        let clock = REACTION_TEST_CLOCK.try_with(Arc::clone).ok();
+        #[cfg(test)]
+        let started = clock.as_ref().map_or(started, |clock| clock.now());
+        Self {
+            absolute: started + QUERY_DEADLINE,
+            #[cfg(test)]
+            clock,
+        }
+    }
+
+    #[cfg(test)]
+    fn at(absolute: Instant) -> Self {
+        Self {
+            absolute,
+            clock: None,
+        }
+    }
+
+    fn expired(&self) -> bool {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return clock.now() >= self.absolute;
+        }
+        Instant::now() >= self.absolute
+    }
+}
+
+#[cfg(test)]
+struct ReactionTestClock {
+    origin: Instant,
+    nanos: AtomicU64,
+    reads: AtomicU64,
+}
+
+#[cfg(test)]
+impl ReactionTestClock {
+    fn new() -> Self {
+        Self {
+            origin: Instant::now(),
+            nanos: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+        }
+    }
+    fn now(&self) -> Instant {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.origin
+            .checked_add(Duration::from_nanos(self.nanos.load(Ordering::Acquire)))
+            .expect("test clock advance is checked")
+    }
+    fn advance(&self, delta: Duration) {
+        let nanos = u64::try_from(delta.as_nanos()).expect("test clock delta fits");
+        self.nanos
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                let next = previous.checked_add(nanos)?;
+                self.origin
+                    .checked_add(Duration::from_nanos(next))
+                    .map(|_| next)
+            })
+            .expect("test clock must not wrap or move backwards");
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static REACTION_TEST_CLOCK: Arc<ReactionTestClock>;
+}
+
+// Owned queries start their budget at the first VM callback. Only explicitly
+// scoped reaction tests substitute a clock; production keeps std::Instant.
+#[cfg(test)]
+fn reaction_test_budget_alive(clock: &ReactionTestClock, started: &mut Option<Instant>) -> bool {
+    let now = clock.now();
+    now.duration_since(*started.get_or_insert(now)) < QUERY_DEADLINE
+}
+
+/// Small indexed seeks may never reach SQLite's progress callback interval.
+fn ensure_reaction_deadline(deadline: &ReactionDeadline) -> Result<()> {
+    if deadline.expired() {
+        return Err(sql_contract::categorized_error(
+            QuerySqlErrorCategory::Timeout,
+            "message_reactions shared deadline exceeded; no partial read or receipt returned",
+        ));
+    }
+    Ok(())
+}
+
+/// Exact equivalent of max(local_seq) over the visible content_events view.
+/// Admission and every reverse walk share the caller's absolute deadline/value
+/// scope. Exhaustion cannot produce a partial maximum/receipt.
+async fn bounded_reaction_visible_head(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    deadline: &ReactionDeadline,
+) -> Result<i64> {
+    bounded_reaction_visible_head_with_bounds(
+        transaction,
+        MAX_REACTION_HEAD_RECORDS,
+        MAX_REACTION_HEAD_EVENTS,
+        deadline,
+    )
+    .await
+}
+
+async fn bounded_reaction_visible_head_with_bounds(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    record_bound: usize,
+    event_bound: i64,
+    deadline: &ReactionDeadline,
+) -> Result<i64> {
+    ensure_reaction_deadline(deadline)?;
+    let bound_error =
+        |message| sql_contract::categorized_error(QuerySqlErrorCategory::ResultTooLarge, message);
+    let mut records = Vec::new();
+    let mut bytes = 0_usize;
+    let mut visible = sqlx::query("SELECT id FROM temp._query_sql_visible_ids ORDER BY id LIMIT ?")
+        .bind((record_bound + 1) as i64)
+        .fetch(&mut **transaction);
+    while let Some(row) = visible.try_next().await.map_err(map_stream_error)? {
+        ensure_reaction_deadline(deadline)?;
+        if records.len() == record_bound {
+            return Err(bound_error("message_reactions visible freshness record bound exceeded; no partial read or receipt returned"));
+        }
+        let id: String = row.try_get(0)?;
+        bytes += id.len();
+        if bytes > MAX_REACTION_METADATA_BYTES as usize {
+            return Err(bound_error("message_reactions visible freshness identifier byte bound exceeded; no partial read or receipt returned"));
+        }
+        records.push(id);
+    }
+    drop(visible);
+    let mut inspected = 0_i64;
+    // None means no eligible event, NOT sequence zero. Negative heads remain
+    // negative; only the empty eligible set has the old coalesce-to-zero.
+    let mut head: Option<i64> = None;
+    for record in records {
+        let mut before = None;
+        loop {
+            ensure_reaction_deadline(deadline)?;
+            // One-row keyset steps avoid SQLx stream prefetch doing an
+            // uncounted excluded-tail scan after a winning row is found.
+            let row = if let Some(seq) = before {
+                sqlx::query(REACTION_HEAD_PREVIOUS_EVENT_SQL)
+                    .bind(&record)
+                    .bind(seq)
+                    .fetch_optional(&mut **transaction)
+                    .await
+            } else {
+                sqlx::query(REACTION_HEAD_EVENTS_SQL)
+                    .bind(&record)
+                    .fetch_optional(&mut **transaction)
+                    .await
+            }
+            .map_err(map_stream_error)?;
+            let Some(row) = row else { break };
+            inspected += 1;
+            if inspected > event_bound {
+                return Err(bound_error("message_reactions visible freshness history bound exceeded; no partial read or receipt returned"));
+            }
+            let seq: i64 = row.try_get(0)?;
+            let event_type: String = row.try_get(1)?;
+            if !matches!(
+                event_type.as_str(),
+                "reconciliation.recorded.v1"
+                    | "unit.superseded.v1"
+                    | "receipt.dependency_audited.v1"
+            ) {
+                head = Some(head.map_or(seq, |previous| previous.max(seq)));
+                break;
+            }
+            before = Some(seq);
+        }
+    }
+    ensure_reaction_deadline(deadline)?;
+    Ok(head.unwrap_or(0))
+}
+
+async fn reaction_visible_authorization_boundary(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    principal: &QueryPrincipal,
+    relation_dependencies: &std::collections::BTreeSet<String>,
+    deadline: &ReactionDeadline,
+) -> Result<String> {
+    // Same existing digest, deferred with the head for reaction-dependent
+    // reads so an oversized visible set cannot be hashed before admission.
+    let mut digest = Sha256::new();
+    let prefix = serde_json::to_vec(&(
+        principal.credential(),
+        principal.trusted_local_bypass(),
+        relation_dependencies.iter().cloned().collect::<Vec<_>>(),
+    ))?;
+    digest.update((prefix.len() as u64).to_be_bytes());
+    digest.update(prefix);
+    let mut visible = sqlx::query("SELECT id FROM temp._query_sql_visible_ids ORDER BY id")
+        .fetch(&mut **transaction);
+    while let Some(row) = visible.try_next().await.map_err(map_stream_error)? {
+        ensure_reaction_deadline(deadline)?;
+        let id: String = row.try_get(0)?;
+        digest.update((id.len() as u64).to_be_bytes());
+        digest.update(id.as_bytes());
+    }
+    ensure_reaction_deadline(deadline)?;
+    Ok(format!(
+        "native.authorization-snapshot.v1.{:x}",
+        digest.finalize()
+    ))
+}
+
+async fn populate_reaction_winners(transaction: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+    // Admission is full-snapshot and cap+1, independent of caller predicates,
+    // output LIMIT, COUNT or the number of references to the public relation.
+    // All three statements run under the same value ceiling and deadline.
+    let messages: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (
+           SELECT message.id FROM temp._query_sql_visible_ids AS visible
+           CROSS JOIN main.records AS message
+           WHERE message.id=visible.id AND message.type='Message' AND message.deleted_at IS NULL
+           LIMIT ?)",
+    )
+    .bind(MAX_REACTION_MESSAGES + 1)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(map_stream_error)?;
+    if messages > MAX_REACTION_MESSAGES {
+        return Err(sql_contract::categorized_error(QuerySqlErrorCategory::ResultTooLarge,
+            "message_reactions visible Message candidate bound exceeded; no partial relation returned"));
+    }
+    let (history, metadata_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT count(*),coalesce(sum(bytes),0) FROM (
+           SELECT 128 + octet_length(meta.record_id) + octet_length(meta.actor)
+                      + coalesce(octet_length(meta.legacy_emoji),0) + octet_length(meta.emoji)
+                      + octet_length(meta.executor_kind) + octet_length(meta.created_at) AS bytes
+             FROM temp._query_sql_visible_ids AS visible
+             CROSS JOIN main.records AS message
+             CROSS JOIN main.content_event_reaction_meta AS meta INDEXED BY idx_content_event_reaction_meta_record
+            WHERE message.id=visible.id AND message.type='Message' AND message.deleted_at IS NULL
+              AND meta.record_id=message.id LIMIT ?)",
+    ).bind(MAX_REACTION_SOURCE_EVENTS + 1).fetch_one(&mut **transaction).await.map_err(map_stream_error)?;
+    if history > MAX_REACTION_SOURCE_EVENTS {
+        return Err(sql_contract::categorized_error(QuerySqlErrorCategory::ResultTooLarge,
+            "message_reactions visible reaction history bound exceeded; no partial relation returned"));
+    }
+    if metadata_bytes > MAX_REACTION_METADATA_BYTES {
+        return Err(sql_contract::categorized_error(
+            QuerySqlErrorCategory::ResultTooLarge,
+            "message_reactions visible metadata byte bound exceeded; no partial relation returned",
+        ));
+    }
+    let winners = sqlx::query(REACTION_WINNER_SQL)
+        .bind(MAX_REACTION_WINNERS + 1)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_stream_error)?
+        .rows_affected();
+    if winners > MAX_REACTION_WINNERS as u64 {
+        return Err(sql_contract::categorized_error(
+            QuerySqlErrorCategory::ResultTooLarge,
+            "message_reactions winning row bound exceeded; no partial relation returned",
+        ));
+    }
+    Ok(())
+}
+
 async fn prepare_disclosable_actors(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
     with_persons: bool,
@@ -2249,6 +2920,9 @@ async fn prepare_disclosable_actors(
 /// is not a dependency but still expands the view. A mention costs one
 /// catalog lookup, and the swap itself happens only when the log or its run
 /// index is absent.
+/// In a [`GovernedSqlSession`] a `temp.run_intents` replacement made here
+/// persists into the session's later executions by design: it depends only
+/// on the schema, and every statement re-runs this guard anyway.
 async fn guard_run_intents_source(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
     sql: &str,
@@ -2369,7 +3043,19 @@ fn is_claim_meta_side_table(context: &AuthContext<'_>, table_name: &str) -> bool
 fn authorize_view_expansion_legacy_saved_sql(context: AuthContext<'_>) -> Authorization {
     match context.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
-        AuthAction::Read { table_name, .. } => {
+        AuthAction::Read {
+            table_name,
+            column_name,
+        } => {
+            // A reaction winner may acquire its public history UUID, never
+            // decode the source payload or read its type/actor after the fold.
+            if context.database_name == Some("main")
+                && table_name == "content_events"
+                && context.accessor == Some("message_reactions")
+                && !matches!(column_name, "id" | "seq")
+            {
+                return Authorization::Deny;
+            }
             let public_temp = context.database_name == Some("temp")
                 && sql_contract::is_logical_relation(table_name);
             let through_controlled = context
@@ -2397,10 +3083,73 @@ fn authorize_view_expansion_legacy_saved_sql(context: AuthContext<'_>) -> Author
     }
 }
 
+fn portable_function_allowed(function_name: &str) -> bool {
+    sql_contract::is_portable_function(function_name) || function_name.eq_ignore_ascii_case("like")
+}
+
+fn no_table_functions(_: &str) -> bool {
+    false
+}
+
 fn authorize_view_expansion(context: AuthContext<'_>) -> Authorization {
+    authorize_view_expansion_with(context, portable_function_allowed, no_table_functions)
+}
+
+/// Ad-hoc online sqlite-local SQL (Native 702de73): the same view-expansion
+/// rules with the ad-hoc function allowlist. Table reads are unchanged, so
+/// `json_each`/`json_tree` open no relation the caller cannot already read.
+fn authorize_view_expansion_ad_hoc(context: AuthContext<'_>) -> Authorization {
+    authorize_view_expansion_with(
+        context,
+        sql_contract::is_sqlite_ad_hoc_function,
+        sql_contract::is_sqlite_ad_hoc_table_function,
+    )
+}
+
+/// Kernel SQL stages complete logical tables itself, unlike v1's observed-column
+/// staging. Its column-free admission must never enter the v1 authorizer.
+#[cfg(feature = "v2-kernel-probe")]
+fn authorize_kernel_v2_view_expansion(context: AuthContext<'_>) -> Authorization {
+    if matches!(context.action, AuthAction::Read { table_name, column_name }
+        if column_name.is_empty() && sql_contract::is_logical_relation(table_name))
+        && matches!(context.database_name, None | Some("main"))
+    {
+        return Authorization::Allow;
+    }
+    authorize_view_expansion_ad_hoc(context)
+}
+
+/// `table_function_allowed` names the table-valued functions (`json_each`,
+/// `json_tree`) whose eponymous virtual table may be read. SQLite reports
+/// that read against `main` with column names (`value`, `key`, ...) and no
+/// accessor when it comes from the caller's own statement; no governed
+/// schema holds a real table by that name, and every other table read keeps
+/// the logical-relation / controlled-accessor requirement.
+fn authorize_view_expansion_with(
+    context: AuthContext<'_>,
+    function_allowed: fn(&str) -> bool,
+    table_function_allowed: fn(&str) -> bool,
+) -> Authorization {
     match context.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
-        AuthAction::Read { table_name, .. } => {
+        AuthAction::Read { table_name, .. }
+            if context.database_name == Some("main") && table_function_allowed(table_name) =>
+        {
+            Authorization::Allow
+        }
+        AuthAction::Read {
+            table_name,
+            column_name,
+        } => {
+            // A reaction winner may acquire its public history UUID, never
+            // decode the source payload or read its type/actor after the fold.
+            if context.database_name == Some("main")
+                && table_name == "content_events"
+                && context.accessor == Some("message_reactions")
+                && !matches!(column_name, "id" | "seq")
+            {
+                return Authorization::Deny;
+            }
             let public_temp = context.database_name == Some("temp")
                 && sql_contract::is_logical_relation(table_name);
             let through_controlled = context
@@ -2420,10 +3169,7 @@ fn authorize_view_expansion(context: AuthContext<'_>) -> Authorization {
         {
             Authorization::Allow
         }
-        AuthAction::Function { function_name }
-            if sql_contract::is_portable_function(function_name)
-                || function_name.eq_ignore_ascii_case("like") =>
-        {
+        AuthAction::Function { function_name } if function_allowed(function_name) => {
             Authorization::Allow
         }
         AuthAction::Function { .. } => Authorization::Deny,
@@ -2449,23 +3195,52 @@ fn strict_lifecycle_source_read(context: &AuthContext<'_>, table_name: &str) -> 
         && context.accessor == Some("record_lifecycle_interpretations")
 }
 
+fn strict_reaction_source_read(context: &AuthContext<'_>, table_name: &str) -> bool {
+    context.database_name == Some("temp")
+        && table_name == "_query_sql_reaction_source"
+        && context.accessor == Some("message_reactions")
+}
+
 fn authorize_strict(context: AuthContext<'_>) -> Authorization {
+    authorize_strict_with(context, portable_function_allowed, no_table_functions)
+}
+
+/// Ad-hoc online sqlite-local SQL: the strict public-only schema with the
+/// ad-hoc function allowlist. See [`authorize_view_expansion_ad_hoc`].
+fn authorize_strict_ad_hoc(context: AuthContext<'_>) -> Authorization {
+    authorize_strict_with(
+        context,
+        sql_contract::is_sqlite_ad_hoc_function,
+        sql_contract::is_sqlite_ad_hoc_table_function,
+    )
+}
+
+fn authorize_strict_with(
+    context: AuthContext<'_>,
+    function_allowed: fn(&str) -> bool,
+    table_function_allowed: fn(&str) -> bool,
+) -> Authorization {
     match context.action {
         AuthAction::Select | AuthAction::Recursive => Authorization::Allow,
+        // The strict schema lives wholly in `temp`; `main` holds no table,
+        // so a `main` read of a table function is the eponymous virtual table.
+        AuthAction::Read { table_name, .. }
+            if context.database_name == Some("main") && table_function_allowed(table_name) =>
+        {
+            Authorization::Allow
+        }
         AuthAction::Read { table_name, .. }
             if context.database_name == Some("temp")
                 && (sql_contract::is_logical_relation(table_name)
                     || strict_task_source_read(&context, table_name)
                     || strict_heading_source_read(&context, table_name)
+                    || strict_reaction_source_read(&context, table_name)
                     || strict_lifecycle_source_read(&context, table_name)) =>
         {
             Authorization::Allow
         }
         AuthAction::Read { .. } if context.database_name.is_none() => Authorization::Allow,
-        AuthAction::Function { function_name }
-            if sql_contract::is_portable_function(function_name)
-                || function_name.eq_ignore_ascii_case("like") =>
-        {
+        AuthAction::Function { function_name } if function_allowed(function_name) => {
             Authorization::Allow
         }
         _ => Authorization::Deny,
@@ -2480,6 +3255,7 @@ fn authorize_strict_legacy_saved_sql(context: AuthContext<'_>) -> Authorization 
                 && (sql_contract::is_logical_relation(table_name)
                     || strict_task_source_read(&context, table_name)
                     || strict_heading_source_read(&context, table_name)
+                    || strict_reaction_source_read(&context, table_name)
                     || strict_lifecycle_source_read(&context, table_name)) =>
         {
             Authorization::Allow
@@ -2687,6 +3463,7 @@ fn build_frozen_validator() -> Result<rusqlite::Connection> {
         .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
     register_regexp_function(&conn)?;
     register_now_ms_stub(&conn)?;
+    register_current_principal_stub(&conn)?;
     register_utc_date_label_stub(&conn)?;
     FROZEN_VALIDATOR_BUILDS.with(|builds| builds.set(builds.get() + 1));
     Ok(conn)
@@ -2714,11 +3491,17 @@ fn build_strict_validator() -> Result<rusqlite::Connection> {
          CREATE TEMP VIEW record_lifecycle_interpretations AS
          SELECT record_id,status,raw,axis_key,axis_label,vocabulary_id,
                 vocabulary_name,value_id,canonical,terminality,reason
-         FROM _query_sql_lifecycle_source WHERE record_id IS NOT NULL",
+         FROM _query_sql_lifecycle_source WHERE record_id IS NOT NULL;
+         ALTER TABLE temp.message_reactions RENAME TO _query_sql_reaction_source;
+         CREATE TEMP VIEW message_reactions AS
+         SELECT reaction_id,message_id,emoji,actor_record_id,actor_name,
+                executor_kind,reacted_at,reacted_at_ms,viewer
+         FROM _query_sql_reaction_source WHERE reaction_id IS NOT NULL",
     )
     .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
     register_regexp_function(&conn)?;
     register_now_ms_stub(&conn)?;
+    register_current_principal_stub(&conn)?;
     register_utc_date_label_stub(&conn)?;
     STRICT_VALIDATOR_BUILDS.with(|builds| builds.set(builds.get() + 1));
     Ok(conn)
@@ -2792,6 +3575,36 @@ fn register_now_ms_stub(conn: &rusqlite::Connection) -> Result<()> {
     )
     .map_err(|e| contract_violation(format!("query_sql: now_ms setup failed: {e}")))?;
     Ok(())
+}
+
+/// `current_principal()` on the rusqlite validator connections, for the
+/// same reason as the `now_ms` stub: execution rewrites it to a hidden `?N`
+/// bound to the caller's principal, so this stub's NULL is never observed.
+fn register_current_principal_stub(conn: &rusqlite::Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "current_principal",
+        0,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |_ctx| Ok(None::<String>),
+    )
+    .map_err(|e| contract_violation(format!("query_sql: current_principal setup failed: {e}")))?;
+    Ok(())
+}
+
+/// The caller's principal as the hidden bind for `current_principal()`:
+/// the authenticated identity stamped as `content_events.actor`, pushed
+/// after the caller's parameters and any hidden clock.
+fn push_current_principal_bind(
+    parameters: &mut Vec<sql_contract::QuerySqlParameter>,
+    principal_uses: usize,
+    principal: &QueryPrincipal,
+) {
+    if principal_uses > 0 {
+        parameters.push(sql_contract::QuerySqlParameter::Text {
+            value: Some(principal.credential().to_string()),
+        });
+    }
 }
 
 /// Native e25665c: `utc_date_label(ms)` on the rusqlite validator
@@ -2880,6 +3693,48 @@ fn validate_strict_legacy_saved_sql(statement: &str) -> Result<()> {
     })
 }
 
+fn validate_view_expansion_ad_hoc(statement: &str) -> Result<()> {
+    with_frozen_validator(|conn| {
+        prepare_under_authorizer(conn, statement, authorize_view_expansion_ad_hoc)
+    })
+}
+
+fn validate_strict_ad_hoc(statement: &str) -> Result<()> {
+    with_strict_validator(|conn| prepare_under_authorizer(conn, statement, authorize_strict_ad_hoc))
+}
+
+/// Ad-hoc online sqlite-local `query_sql` only (Native 702de73): identical
+/// gates to [`validate`] with the ad-hoc function allowance in the shared
+/// classifier and in both engine authorizers. SQL being saved, stored SQL,
+/// member copies, Turso and Postgres never reach this.
+pub(crate) fn validate_ad_hoc(sql: &str) -> Result<()> {
+    let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
+    super::turso_ast_rules::check_statement(&statement)?;
+    validate_view_expansion_ad_hoc(&statement)?;
+    validate_strict_ad_hoc(&statement)
+}
+
+/// KernelV2-only validation. The strict pass still rejects caller-authored
+/// physical reads; v1 keeps its original population-read refusal.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn validate_kernel_v2_ad_hoc(sql: &str) -> Result<()> {
+    let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
+    super::turso_ast_rules::check_statement(&statement)?;
+    with_frozen_validator(|conn| {
+        prepare_under_authorizer(conn, &statement, authorize_kernel_v2_view_expansion)
+    })?;
+    validate_strict_ad_hoc(&statement)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn validated_kernel_v2_output_columns(sql: &str) -> Result<Vec<String>> {
+    let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
+    with_frozen_validator(|conn| {
+        prepare_under_authorizer(conn, &statement, authorize_kernel_v2_view_expansion)
+    })?;
+    describe_output_columns(&statement, authorize_strict_ad_hoc)
+}
+
 /// Validate caller SQL against both the real view expansion and a strict
 /// public-only schema. This is security enforcement, not linting.
 pub fn validate(sql: &str) -> Result<()> {
@@ -2914,9 +3769,23 @@ pub(crate) fn validated_output_columns(sql: &str) -> Result<Vec<String>> {
         sql,
     )?;
     validate_view_expansion(&statement)?;
+    describe_output_columns(&statement, authorize_strict)
+}
+
+/// Ad-hoc online sqlite-local form of [`validated_output_columns`].
+pub(crate) fn validated_output_columns_ad_hoc(sql: &str) -> Result<Vec<String>> {
+    let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
+    validate_view_expansion_ad_hoc(&statement)?;
+    describe_output_columns(&statement, authorize_strict_ad_hoc)
+}
+
+fn describe_output_columns(
+    statement: &str,
+    strict_authorizer: fn(AuthContext<'_>) -> Authorization,
+) -> Result<Vec<String>> {
     with_strict_validator(|conn| {
-        conn.authorizer(Some(authorize_strict));
-        let prepared = conn.prepare(&statement);
+        conn.authorizer(Some(strict_authorizer));
+        let prepared = conn.prepare(statement);
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         let prepared = prepared.map_err(|error| {
             sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, error.to_string())
@@ -2962,6 +3831,22 @@ pub(crate) fn validated_relation_dependencies(
         sql,
     )?;
     validate_view_expansion(&statement)?;
+    observe_relation_dependencies(&statement, authorize_strict)
+}
+
+/// Ad-hoc online sqlite-local form of [`validated_relation_dependencies`].
+pub(crate) fn validated_relation_dependencies_ad_hoc(
+    sql: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
+    validate_view_expansion_ad_hoc(&statement)?;
+    observe_relation_dependencies(&statement, authorize_strict_ad_hoc)
+}
+
+fn observe_relation_dependencies(
+    statement: &str,
+    strict_authorizer: fn(AuthContext<'_>) -> Authorization,
+) -> Result<std::collections::BTreeSet<String>> {
     let dependencies = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::<
         String,
     >::new()));
@@ -2979,6 +3864,11 @@ pub(crate) fn validated_relation_dependencies(
                         .lock()
                         .expect("dependency lock")
                         .insert("body_block_headings".to_owned());
+                } else if strict_reaction_source_read(&context, table_name) {
+                    observed
+                        .lock()
+                        .expect("dependency lock")
+                        .insert("message_reactions".to_owned());
                 } else if strict_lifecycle_source_read(&context, table_name) {
                     observed
                         .lock()
@@ -2993,9 +3883,9 @@ pub(crate) fn validated_relation_dependencies(
                         .insert(table_name.to_owned());
                 }
             }
-            authorize_strict(context)
+            strict_authorizer(context)
         }));
-        let prepared = conn.prepare(&statement);
+        let prepared = conn.prepare(statement);
         conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
         let prepared = prepared.map_err(|error| {
             sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, error.to_string())
@@ -3013,6 +3903,51 @@ pub(crate) fn validated_relation_dependencies(
         .expect("validator releases dependency observer")
         .into_inner()
         .expect("dependency lock"))
+}
+
+/// Prepare-time public reads for adapters with a narrower logical surface.
+/// SQLite observes aliases, CTEs, wildcard expansion and column-less counts.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn public_reads_ad_hoc(statement: &str) -> Result<BTreeSet<(String, String)>> {
+    let reads = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let observed = reads.clone();
+    with_strict_validator(|conn| {
+        conn.authorizer(Some(move |context: AuthContext<'_>| {
+            if let AuthAction::Read {
+                table_name,
+                column_name,
+            } = context.action
+            {
+                let relation = if strict_task_source_read(&context, table_name) {
+                    "body_task_items"
+                } else if strict_heading_source_read(&context, table_name) {
+                    "body_block_headings"
+                } else if strict_reaction_source_read(&context, table_name) {
+                    "message_reactions"
+                } else if strict_lifecycle_source_read(&context, table_name) {
+                    "record_lifecycle_interpretations"
+                } else {
+                    table_name
+                };
+                if sql_contract::is_logical_relation(relation) {
+                    observed
+                        .lock()
+                        .expect("reads lock")
+                        .insert((relation.to_owned(), column_name.to_owned()));
+                }
+            }
+            authorize_strict_ad_hoc(context)
+        }));
+        let result = conn.prepare(statement).map(|_| ()).map_err(|e| {
+            sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, e.to_string())
+        });
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        result
+    })?;
+    Ok(Arc::try_unwrap(reads)
+        .expect("observer released")
+        .into_inner()
+        .expect("reads lock"))
 }
 
 /// Check the app analyzer's read set against SQLite's prepare-time reads on
@@ -3052,6 +3987,10 @@ pub(crate) fn validate_app_sql_dependencies(
                     || (population_read && table_name == "_query_sql_lifecycle_source")
                 {
                     Some("record_lifecycle_interpretations")
+                } else if strict_reaction_source_read(&context, table_name)
+                    || (population_read && table_name == "_query_sql_reaction_source")
+                {
+                    Some("message_reactions")
                 } else {
                     None
                 };
@@ -3161,7 +4100,12 @@ pub(crate) fn validated_relation_dependencies_legacy_saved_sql(
     with_strict_validator(|conn| {
         conn.authorizer(Some(move |context: AuthContext<'_>| {
             if let AuthAction::Read { table_name, .. } = context.action {
-                if strict_lifecycle_source_read(&context, table_name) {
+                if strict_reaction_source_read(&context, table_name) {
+                    observed
+                        .lock()
+                        .expect("dependency lock")
+                        .insert("message_reactions".to_owned());
+                } else if strict_lifecycle_source_read(&context, table_name) {
                     observed
                         .lock()
                         .expect("dependency lock")
@@ -3276,7 +4220,13 @@ fn observe_rule_reads(statement: &str) -> Result<(BTreeMap<String, BTreeSet<Stri
                 column_name,
             } = context.action
             {
-                if context.database_name.is_none()
+                if strict_reaction_source_read(&context, table_name) {
+                    seen.lock()
+                        .expect("dependency lock")
+                        .entry("message_reactions".to_owned())
+                        .or_default()
+                        .insert(String::new());
+                } else if context.database_name.is_none()
                     && column_name.is_empty()
                     && table_name == "_query_sql_heading_source"
                 {
@@ -3372,6 +4322,14 @@ pub(crate) fn extract_rule_input_dependencies(
             "rule inputs reject hidden now_ms(): bind time explicitly with ?N and declare the now_ms parameter source",
         ));
     }
+    // A rule authorises a write at commit; a viewer-relative input would
+    // make its verdict depend on who happened to evaluate it.
+    if sql_contract::statement_uses_current_principal(profile, &statement)? {
+        return Err(sql_contract::categorized_error(
+            QuerySqlErrorCategory::UnsafeStatement,
+            "rule inputs reject current_principal(): a rule's inputs must not depend on who evaluates it",
+        ));
+    }
     // Authoritative slots cross-checked against the prepared statement's own
     // parameter count: both derive 1..=N, so any divergence fails closed.
     let parameter_slots = sql_contract::placeholder_slots(profile, &statement)?;
@@ -3421,7 +4379,7 @@ pub(super) fn validate_input(sql: &str) -> Result<()> {
     Ok(())
 }
 
-fn json_cell(row: &SqliteRow, index: usize) -> Result<Value> {
+pub(crate) fn json_cell(row: &SqliteRow, index: usize) -> Result<Value> {
     let raw = row.try_get_raw(index)?;
     if raw.is_null() {
         return Ok(Value::Null);
@@ -3573,7 +4531,7 @@ fn governed_sql_timeout() -> crate::error::Error {
     )
 }
 
-fn map_stream_error(error: sqlx::Error) -> crate::error::Error {
+pub(crate) fn map_stream_error(error: sqlx::Error) -> crate::error::Error {
     if error
         .to_string()
         .to_ascii_lowercase()
@@ -3599,8 +4557,26 @@ fn map_stream_error(error: sqlx::Error) -> crate::error::Error {
 /// (the save gate and the `LegacySavedSql` entries do not call it); nested
 /// unordered LIMITs keep their refusal in `validate()`, which callers run on
 /// the rewritten text.
-fn apply_ad_hoc_default_order(
+pub(crate) fn apply_ad_hoc_default_order(
     statement: &str,
+    allowance: sql_contract::FunctionAllowance,
+) -> Result<(String, Option<sql_contract::AssumedOrder>)> {
+    apply_ad_hoc_default_order_with(statement, |statement| match allowance {
+        sql_contract::FunctionAllowance::SqliteAdHoc => validated_output_columns_ad_hoc(statement),
+        _ => validated_output_columns(statement),
+    })
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn apply_kernel_v2_default_order(
+    statement: &str,
+) -> Result<(String, Option<sql_contract::AssumedOrder>)> {
+    apply_ad_hoc_default_order_with(statement, validated_kernel_v2_output_columns)
+}
+
+fn apply_ad_hoc_default_order_with(
+    statement: &str,
+    describe: impl FnOnce(&str) -> Result<Vec<String>>,
 ) -> Result<(String, Option<sql_contract::AssumedOrder>)> {
     if !super::turso_ast_rules::top_level_unordered_limit(statement) {
         return Ok((statement.to_owned(), None));
@@ -3609,7 +4585,8 @@ fn apply_ad_hoc_default_order(
     // column, denied relation, duplicate labels) must not invent a new
     // error: fall through so the original validator below surfaces the
     // categorised error exactly as before the default.
-    let labels = match validated_output_columns(statement) {
+    let described = describe(statement);
+    let labels = match described {
         Ok(labels) => labels,
         Err(_) => return Ok((statement.to_owned(), None)),
     };
@@ -3648,7 +4625,7 @@ pub(crate) fn default_order_repair(sql: &str) -> Option<String> {
     ))
 }
 
-fn cap_statement(statement: &str, row_limit: i64) -> String {
+pub(crate) fn cap_statement(statement: &str, row_limit: i64) -> String {
     if statement.starts_with("EXPLAIN QUERY PLAN ") {
         statement.to_owned()
     } else {
@@ -3674,6 +4651,28 @@ pub(crate) async fn query_sql_request_owned(
     query_sql_request_owned_with_vm_work(db, principal, request, None, true).await
 }
 
+/// The ad-hoc `query_sql` MCP tool's entry (Native 702de73): identical to
+/// [`query_sql_request_owned`] except that online sqlite-local execution
+/// runs under [`sql_contract::FunctionAllowance::SqliteAdHoc`]. Member
+/// copies keep the portable set on this entry as well. Library, test and
+/// internal callers of `query_sql_request_owned` stay portable.
+pub(crate) async fn query_sql_request_ad_hoc(
+    db: Db,
+    principal: QueryPrincipal,
+    request: QuerySqlRequest,
+) -> Result<SqlResult> {
+    query_sql_request_owned_observed(
+        db,
+        principal,
+        request,
+        None,
+        None,
+        true,
+        sql_contract::FunctionAllowance::SqliteAdHoc,
+    )
+    .await
+}
+
 /// Same governed execution and result as `query_sql_request_owned`, with an
 /// internal-only, coarse SQLite VM progress-callback counter. No count is
 /// included in `SqlResult` or exposed to the tool caller.
@@ -3691,6 +4690,7 @@ pub(crate) async fn query_sql_request_owned_with_vm_work(
         vm_callbacks,
         None,
         apply_default_order,
+        sql_contract::FunctionAllowance::Portable,
     )
     .await
 }
@@ -3705,8 +4705,16 @@ pub(crate) async fn query_sql_request_owned_replay(
     request: QuerySqlRequest,
     now_ms_override: i64,
 ) -> Result<SqlResult> {
-    query_sql_request_owned_observed(db, principal, request, None, Some(now_ms_override), false)
-        .await
+    query_sql_request_owned_observed(
+        db,
+        principal,
+        request,
+        None,
+        Some(now_ms_override),
+        false,
+        sql_contract::FunctionAllowance::Portable,
+    )
+    .await
 }
 
 /// Member-slice execution (contract c323277 rev 8 §2.3 `query_sql`).
@@ -3726,16 +4734,14 @@ async fn query_sql_member_slice(
     assumed_order: Option<sql_contract::AssumedOrder>,
     time_dependent: bool,
     now_ms_uses: usize,
+    principal_uses: usize,
 ) -> Result<SqlResult> {
     let _ = now_ms_uses;
     let pool = db.governed_pool().clone();
     let mut connection = pool.acquire().await?;
-    let contract = temp_contract();
-    for temp_statement in contract.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Err(error) = sqlx::query(temp_statement).execute(&mut *connection).await {
-            connection.close_on_drop();
-            return Err(error.into());
-        }
+    if let Err(error) = install_temp_contract(&mut connection).await {
+        connection.close_on_drop();
+        return Err(error.into());
     }
     // Member profile drops the physical currency columns (`is_current`,
     // `successor_count`), so the shared view would fail with `no such
@@ -3824,6 +4830,7 @@ async fn query_sql_member_slice(
             value: Some(now_ms.to_string()),
         });
     }
+    push_current_principal_bind(&mut effective_parameters, principal_uses, &principal);
     sql_contract::check_positional_arguments(
         sql_contract::QuerySqlProfile::SqliteLocal,
         &statement,
@@ -3926,20 +4933,35 @@ async fn query_sql_request_owned_observed(
     vm_callbacks: Option<Arc<AtomicU64>>,
     now_ms_override: Option<i64>,
     apply_default_order: bool,
+    allowance: sql_contract::FunctionAllowance,
 ) -> Result<SqlResult> {
+    use sql_contract::FunctionAllowance;
     sql_contract::require_available(sql_contract::QuerySqlProfile::SqliteLocal)?;
     request.validate()?;
-    let statement = sql_contract::classify_single_read_statement(
-        sql_contract::QuerySqlProfile::SqliteLocal,
-        &request.sql,
-    )?;
+    let member_mode = db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly;
+    // Native 702de73: the ad-hoc dialect is online-only. A member copy's
+    // preflight, `schema_config` gate and slice execution all run on the
+    // portable set, so member ad-hoc SQL stays portable.
+    let allowance = match allowance {
+        FunctionAllowance::SqliteAdHoc if member_mode => FunctionAllowance::Portable,
+        other => other,
+    };
+    let ad_hoc = allowance == FunctionAllowance::SqliteAdHoc;
+    let statement = if ad_hoc {
+        sql_contract::classify_sqlite_ad_hoc_statement(&request.sql)?
+    } else {
+        sql_contract::classify_single_read_statement(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            &request.sql,
+        )?
+    };
     // E2 ad-hoc default ORDER BY: enabled only when the caller passes
     // `apply_default_order` (the ad-hoc `query_sql` entry does; every other
     // caller leaves it off). Splice before validation so `validate()` below
     // runs once, on the final portable text; nested unordered LIMITs keep
     // their refusal there.
     let (statement, assumed_order) = if apply_default_order {
-        apply_ad_hoc_default_order(&statement)?
+        apply_ad_hoc_default_order(&statement, allowance)?
     } else {
         (statement, None)
     };
@@ -3951,7 +4973,6 @@ async fn query_sql_request_owned_observed(
     // stay exactly as the existing two-phase validator accepts them; online
     // behavior is unchanged because this branch only runs on member copies.
     // Never fabricates empty TEMP relations.
-    let member_mode = db.open_mode() == crate::db::DatabaseOpenMode::MemberReadOnly;
     if member_mode {
         if let Some(denied) = member_denied_requirement(&statement)? {
             return Err(crate::error::Error::unavailable_offline(
@@ -3960,7 +4981,11 @@ async fn query_sql_request_owned_observed(
             ));
         }
     }
-    validate(&statement)?;
+    if ad_hoc {
+        validate_ad_hoc(&statement)?;
+    } else {
+        validate(&statement)?;
+    }
     // I1 review: `?2` with one parameter must fail, not bind a silent
     // NULL. The `?N` set has to be exactly `1..=parameters.len()`.
     sql_contract::check_positional_arguments(
@@ -3976,6 +5001,15 @@ async fn query_sql_request_owned_observed(
         &statement,
         &request.parameters,
     )?;
+    // Native 702de73: the ad-hoc dialect's clock refusal also covers text
+    // bound as `now` / `localtime` / `utc` into a date/time function.
+    if ad_hoc {
+        sql_contract::validate_ad_hoc_clock_bound_args(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            &statement,
+            &request.parameters,
+        )?;
+    }
     // Native e25665c: bound `?N` label arguments meet the integer contract
     // (a `Text`-typed bound value is rejected with the type repair instead
     // of forking per engine at runtime).
@@ -3996,11 +5030,22 @@ async fn query_sql_request_owned_observed(
         &format!("?{hidden_index}"),
     )?;
     let time_dependent = now_ms_uses > 0;
+    // `current_principal()` takes the next hidden slot after the clock.
+    let principal_index = hidden_index + usize::from(time_dependent);
+    let (statement, principal_uses) = sql_contract::rewrite_current_principal_calls(
+        sql_contract::QuerySqlProfile::SqliteLocal,
+        &statement,
+        &format!("?{principal_index}"),
+    )?;
     // Relation dependencies resolve on the portable text: the
     // `utc_date_label` lowering below introduces `strftime`, which the
     // portable classifier refuses by design. The lowering embeds only the
     // caller's own argument, so it adds no relation.
-    let relation_dependencies = validated_relation_dependencies(&statement)?;
+    let relation_dependencies = if ad_hoc {
+        validated_relation_dependencies_ad_hoc(&statement)?
+    } else {
+        validated_relation_dependencies(&statement)?
+    };
     // Native e25665c: lower `utc_date_label(ms)` to the SQLite `strftime`
     // expression after validation (the validator saw the portable name via
     // the stub above). The lowering introduces no placeholder, so the
@@ -4011,6 +5056,13 @@ async fn query_sql_request_owned_observed(
         sql_contract::UtcDateLabelEngine::Sqlite,
     )?;
 
+    // `catalog_operations` resolves only with the executor's trusted
+    // snapshot (attached on the ad-hoc online dispatch). The member probe
+    // above already denied member copies with their own typed refusal, so
+    // this gate keeps its member-first order: it runs only for online
+    // executions.
+    let catalog_operations_snapshot =
+        resolve_catalog_operations_snapshot(&relation_dependencies, &principal)?;
     // Member slice execution (denial already returned above): never opens
     // excluded policy/history/Unit tables. Forbidden statements never reach
     // here.
@@ -4026,10 +5078,12 @@ async fn query_sql_request_owned_observed(
             assumed_order,
             time_dependent,
             now_ms_uses,
+            principal_uses,
         )
         .await;
     }
 
+    let needs_reactions = relation_dependencies.contains("message_reactions");
     let needs_awaiting_reply = relation_dependencies.contains("messages_awaiting_reply");
     let needs_lifecycle = relation_dependencies.contains("record_lifecycle_interpretations");
     let activity_dependent = relation_dependencies
@@ -4041,12 +5095,9 @@ async fn query_sql_request_owned_observed(
     let needs_disclosure = relation_dependencies.contains("content_events") || needs_actor_persons;
     let pool = db.governed_pool().clone();
     let mut connection = pool.acquire().await?;
-    let contract = temp_contract();
-    for temp_statement in contract.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Err(error) = sqlx::query(temp_statement).execute(&mut *connection).await {
-            connection.close_on_drop();
-            return Err(error.into());
-        }
+    if let Err(error) = install_temp_contract(&mut connection).await {
+        connection.close_on_drop();
+        return Err(error.into());
     }
     // This clear is deliberately outside the transaction: rolling it back
     // would restore a stale principal. Uncertain physical state is discarded.
@@ -4100,6 +5151,13 @@ async fn query_sql_request_owned_observed(
         return Err(error.into());
     }
     if let Err(error) = sqlx::query("DELETE FROM temp._query_sql_visible_ids")
+        .execute(&mut *connection)
+        .await
+    {
+        connection.close_on_drop();
+        return Err(error.into());
+    }
+    if let Err(error) = sqlx::query("DELETE FROM temp._query_sql_reaction_winners")
         .execute(&mut *connection)
         .await
     {
@@ -4162,6 +5220,13 @@ async fn query_sql_request_owned_observed(
             return Err(error);
         }
     }
+    if let Some(snapshot) = catalog_operations_snapshot.as_ref() {
+        if let Err(error) = populate_catalog_operations(&mut transaction, snapshot).await {
+            drop(transaction);
+            connection.close_on_drop();
+            return Err(error);
+        }
+    }
     if activity_dependent {
         prepare_activity_observations(&mut transaction).await?;
     }
@@ -4191,6 +5256,10 @@ async fn query_sql_request_owned_observed(
         // charging that queue/scheduler delay made bounded queries fail with
         // SQLITE_INTERRUPT despite doing no work during the elapsed time.
         let mut query_started = None;
+        #[cfg(test)]
+        let reaction_clock = needs_reactions
+            .then(|| REACTION_TEST_CLOCK.try_with(Arc::clone).ok())
+            .flatten();
         let vm_callbacks = vm_callbacks.clone();
         let vm_work_active = vm_work_active.clone();
         handle.set_progress_handler(PROGRESS_OPS, move || {
@@ -4198,6 +5267,10 @@ async fn query_sql_request_owned_observed(
                 if active.load(Ordering::Acquire) {
                     callbacks.fetch_add(1, Ordering::Relaxed);
                 }
+            }
+            #[cfg(test)]
+            if let Some(clock) = &reaction_clock {
+                return reaction_test_budget_alive(clock, &mut query_started);
             }
             query_started.get_or_insert_with(Instant::now).elapsed() < QUERY_DEADLINE
         });
@@ -4212,6 +5285,10 @@ async fn query_sql_request_owned_observed(
     #[cfg(test)]
     let caller_cpu_before = slice1_phase_cpu_before();
     let query_result: Result<(Vec<String>, Vec<Value>, bool)> = async {
+        if needs_reactions {
+            let _vm_work_phase = QueryVmWorkPhase::start(vm_work_active.clone());
+            populate_reaction_winners(&mut transaction).await?;
+        }
         if needs_awaiting_reply {
             populate_messages_awaiting_reply(&mut transaction, &principal).await?;
         }
@@ -4224,6 +5301,7 @@ async fn query_sql_request_owned_observed(
                 value: Some(now_ms.to_string()),
             });
         }
+        push_current_principal_bind(&mut effective_parameters, principal_uses, &principal);
         sql_contract::check_positional_arguments(
             sql_contract::QuerySqlProfile::SqliteLocal,
             &statement,
@@ -4406,8 +5484,9 @@ pub(crate) async fn query_sql_request_in_with_row_limit(
 /// Server-only observed form of the caller-transaction executor. `replay_clock`
 /// replaces only the statement-fixed `now_ms()` bind when the statement
 /// genuinely uses it; clock-free statements ignore it. `vm_callbacks` records
-/// only caller-authored VM work via the progress handler's active phase;
-/// preparation, metadata, diagnostic probes and cleanup stay uncounted. No
+/// caller-authored VM work plus reaction-dependent bounded freshness and
+/// reaction staging via the progress handler's active phase. Other preparation,
+/// metadata, diagnostic probes and cleanup stay uncounted. No
 /// caller-supplied clock or public MCP option flows here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn query_sql_request_in_with_row_limit_observed(
@@ -4430,6 +5509,7 @@ pub(crate) async fn query_sql_request_in_with_row_limit_observed(
         vm_callbacks,
         apply_default_order,
         &[],
+        ContractMode::PerCall,
     )
     .await
 }
@@ -4454,6 +5534,7 @@ pub(crate) async fn query_app_sql_request_in_with_row_limit(
         None,
         false,
         scopes,
+        ContractMode::PerCall,
     )
     .await
 }
@@ -4469,6 +5550,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
     vm_callbacks: Option<Arc<AtomicU64>>,
     apply_default_order: bool,
     record_scopes: &[crate::mcp::tools::alpha_tabs::ReadScope],
+    contract: ContractMode<'_>,
 ) -> Result<(SqlResult, GovernedSqlObservation)> {
     use sql_contract::FunctionAllowance;
     sql_contract::require_available(sql_contract::QuerySqlProfile::SqliteLocal)?;
@@ -4482,6 +5564,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
             sql_contract::QuerySqlProfile::SqliteLocal,
             &request.sql,
         )?,
+        FunctionAllowance::SqliteAdHoc => {
+            sql_contract::classify_sqlite_ad_hoc_statement(&request.sql)?
+        }
     };
     // E2 ad-hoc default ORDER BY: enabled only when the caller passes
     // `apply_default_order`. Never keyed on the allowance: `sql_write`
@@ -4490,13 +5575,21 @@ async fn query_sql_request_in_with_row_limit_scoped(
     // is always stated by the author. Splice before validation so the
     // allowance validators below run once, on the final text.
     let (statement, assumed_order) = if apply_default_order {
-        apply_ad_hoc_default_order(&statement)?
+        apply_ad_hoc_default_order(&statement, allowance)?
     } else {
         (statement, None)
     };
     match allowance {
         FunctionAllowance::Portable => validate(&statement)?,
         FunctionAllowance::LegacySavedSql => validate_legacy_saved_sql(&statement)?,
+        FunctionAllowance::SqliteAdHoc => {
+            validate_ad_hoc(&statement)?;
+            sql_contract::validate_ad_hoc_clock_bound_args(
+                sql_contract::QuerySqlProfile::SqliteLocal,
+                &statement,
+                &request.parameters,
+            )?;
+        }
     }
     // I1 review: `?2` with one parameter must fail, not bind a silent
     // NULL. The `?N` set has to be exactly `1..=parameters.len()`.
@@ -4534,6 +5627,13 @@ async fn query_sql_request_in_with_row_limit_scoped(
         &format!("?{hidden_index}"),
     )?;
     let time_dependent = now_ms_uses > 0;
+    // `current_principal()` takes the next hidden slot after the clock.
+    let principal_index = hidden_index + usize::from(time_dependent);
+    let (statement, principal_uses) = sql_contract::rewrite_current_principal_calls(
+        sql_contract::QuerySqlProfile::SqliteLocal,
+        &statement,
+        &format!("?{principal_index}"),
+    )?;
     // Dependencies resolve on the portable text (see the ad-hoc path):
     // the lowering below introduces `strftime`, which the portable
     // classifier refuses by design. Stored definitions keep their text
@@ -4543,7 +5643,14 @@ async fn query_sql_request_in_with_row_limit_scoped(
         FunctionAllowance::LegacySavedSql => {
             validated_relation_dependencies_legacy_saved_sql(&statement)?
         }
+        FunctionAllowance::SqliteAdHoc => validated_relation_dependencies_ad_hoc(&statement)?,
     };
+    // Saved SQL, alpha-tab needs and every other in-transaction execution
+    // carry no serving snapshot, so a real reference refuses here instead
+    // of reading an empty table. The ad-hoc owned path above populates;
+    // this shared path only ever resolves `None` today.
+    let catalog_operations_snapshot =
+        resolve_catalog_operations_snapshot(&relation_dependencies, &principal)?;
     // Native e25665c: lower `utc_date_label(ms)` to the SQLite `strftime`
     // expression after the dependency resolution above.
     let (statement, _) = sql_contract::rewrite_utc_date_label_calls(
@@ -4552,6 +5659,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
         sql_contract::UtcDateLabelEngine::Sqlite,
     )?;
 
+    let needs_reactions = relation_dependencies.contains("message_reactions");
     let needs_awaiting_reply = relation_dependencies.contains("messages_awaiting_reply");
     let needs_lifecycle = relation_dependencies.contains("record_lifecycle_interpretations");
     let activity_dependent = relation_dependencies
@@ -4563,15 +5671,21 @@ async fn query_sql_request_in_with_row_limit_scoped(
     let needs_disclosure = relation_dependencies.contains("content_events") || needs_actor_persons;
     let presence_only =
         relation_dependencies.len() == 1 && relation_dependencies.contains("agent_activity");
-    for temp_statement in temp_contract()
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-    {
-        sqlx::query(temp_statement)
-            .execute(&mut **transaction)
-            .await?;
+    match contract {
+        ContractMode::PerCall => install_temp_contract(transaction).await?,
+        // Installed once for the session. Its per-execution state is
+        // cleared here in full, so nothing an earlier execution staged
+        // (principal, visible ids, activity or claim rows) reaches this one.
+        ContractMode::Session(_) => {
+            sqlx::query(SESSION_EXECUTION_RESET)
+                .persistent(false)
+                .execute(&mut **transaction)
+                .await?;
+        }
     }
+    sqlx::query("DELETE FROM temp._query_sql_reaction_winners")
+        .execute(&mut **transaction)
+        .await?;
     guard_run_intents_source(transaction, &request.sql).await?;
     sqlx::query("DELETE FROM temp._query_sql_principal")
         .execute(&mut **transaction)
@@ -4606,10 +5720,14 @@ async fn query_sql_request_in_with_row_limit_scoped(
         .await?;
     // Freshness stamp (E1 M1 slice A): same-snapshot workspace head as the
     // owned path above. Unfiltered on purpose; hidden writes advance it.
-    let as_of_seq: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM main.content_events")
-            .fetch_one(&mut **transaction)
-            .await?;
+    let envelope_sql = if needs_reactions {
+        REACTION_BORROWED_ENVELOPE_SQL
+    } else {
+        "SELECT COALESCE(MAX(seq), 0) FROM main.content_events"
+    };
+    let as_of_seq: i64 = sqlx::query_scalar(envelope_sql)
+        .fetch_one(&mut **transaction)
+        .await?;
     // E1 M3: statement-fixed clock, captured once per statement beside the
     // freshness stamp. Stored definitions share this path with ad-hoc.
     // Server replay overrides only this bind when `now_ms()` is used.
@@ -4637,7 +5755,16 @@ async fn query_sql_request_in_with_row_limit_scoped(
     // snapshot, same principal row — and the unconditional
     // `visible_content_event_seq` probe below then reads the staged table
     // through `temp.content_events`, exactly one walk either way.
-    populate_visible_ids_live(transaction).await?;
+    match contract {
+        ContractMode::PerCall => populate_visible_ids_live(transaction).await?,
+        // A session carries its database, so the set comes through the
+        // shared per-database cache under its exact principal and fence
+        // key, sampled in this transaction's snapshot, as the owned
+        // `query_sql` path stages it.
+        ContractMode::Session(db) => {
+            populate_visible_ids_owned(db, transaction, &principal).await?
+        }
+    }
     if !record_scopes.is_empty() {
         // Scope entries are a union. No kind means every kind (including
         // NULL) of that exact type. This only removes viewer-visible IDs;
@@ -4665,7 +5792,17 @@ async fn query_sql_request_in_with_row_limit_scoped(
     }
     if needs_lifecycle {
         if let Err(error) = populate_lifecycle_interpretations(transaction).await {
-            cleanup_query_sql_temp_contract(transaction).await?;
+            if let ContractMode::PerCall = contract {
+                cleanup_query_sql_temp_contract(transaction).await?;
+            }
+            return Err(error);
+        }
+    }
+    if let Some(snapshot) = catalog_operations_snapshot.as_ref() {
+        if let Err(error) = populate_catalog_operations(transaction, snapshot).await {
+            if let ContractMode::PerCall = contract {
+                cleanup_query_sql_temp_contract(transaction).await?;
+            }
             return Err(error);
         }
     }
@@ -4680,10 +5817,17 @@ async fn query_sql_request_in_with_row_limit_scoped(
     if needs_disclosure {
         prepare_disclosable_actors(transaction, needs_actor_persons).await?;
     }
-    let visible_content_event_seq: i64 =
-        sqlx::query_scalar("SELECT coalesce(max(local_seq),0) FROM temp.content_events")
-            .fetch_one(&mut **transaction)
-            .await?;
+    let visible_content_event_seq: Option<i64> = if needs_reactions {
+        // Resolve only inside the existing deadline scope below. Other
+        // observations retain their existing head query and semantics.
+        None
+    } else {
+        Some(
+            sqlx::query_scalar("SELECT coalesce(max(local_seq),0) FROM temp.content_events")
+                .fetch_one(&mut **transaction)
+                .await?,
+        )
+    };
     let (activity_content_event_seq, control_event_seq): (i64, i64) = if activity_dependent {
         sqlx::query_as(
             "SELECT coalesce((SELECT max(event.seq)
@@ -4716,9 +5860,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
     let content_event_seq = if presence_only {
         Some(activity_content_event_seq)
     } else if activity_dependent {
-        Some(visible_content_event_seq.max(activity_content_event_seq))
+        visible_content_event_seq.map(|head| head.max(activity_content_event_seq))
     } else {
-        Some(visible_content_event_seq)
+        visible_content_event_seq
     };
     let authorization_boundary = if presence_only {
         // Presence authorization is independent of record policy state. Hash
@@ -4738,6 +5882,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
             "native.authorization-snapshot.v1.{:x}",
             Sha256::digest(source)
         )
+    } else if needs_reactions {
+        // Filled only after bounded admission inside the deadline scope.
+        String::new()
     } else {
         // Hash the effective caller-visible authorization set rather than the
         // database-global policy epoch. Hidden, unrelated policy mutations
@@ -4759,7 +5906,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
         }
         format!("native.authorization-snapshot.v1.{:x}", digest.finalize())
     };
-    let observation = GovernedSqlObservation {
+    let mut observation = GovernedSqlObservation {
         observed_at,
         content_event_seq,
         lifecycle_event_seq: activity_dependent.then_some(control_event_seq),
@@ -4770,6 +5917,11 @@ async fn query_sql_request_in_with_row_limit_scoped(
     let vm_work_active = vm_callbacks
         .as_ref()
         .map(|_| Arc::new(AtomicBool::new(false)));
+    // A single absolute deadline covers head seeks, staging and output.
+    // Explicit checks between small seeks complement the VM callback: each
+    // indexed LIMIT 1 can perform fewer than PROGRESS_OPS instructions.
+    let reaction_started = needs_reactions.then(Instant::now);
+    let reaction_deadline = reaction_started.map(ReactionDeadline::new);
     let previous_value_limit = {
         let mut handle = transaction.lock_handle().await?;
         // SAFETY: lock_handle gives exclusive access to this sqlite handle.
@@ -4781,6 +5933,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
             )
         };
         let mut query_started = None;
+        let handler_reaction_deadline = reaction_deadline.clone();
         let vm_callbacks = vm_callbacks.clone();
         let vm_work_active = vm_work_active.clone();
         handle.set_progress_handler(PROGRESS_OPS, move || {
@@ -4789,14 +5942,42 @@ async fn query_sql_request_in_with_row_limit_scoped(
                     callbacks.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            query_started.get_or_insert_with(Instant::now).elapsed() < QUERY_DEADLINE
+            if let Some(deadline) = &handler_reaction_deadline {
+                !deadline.expired()
+            } else {
+                query_started.get_or_insert_with(Instant::now).elapsed() < QUERY_DEADLINE
+            }
         });
         previous
     };
     let capped = cap_statement(&statement, row_limit);
     let query_result: Result<(Vec<String>, Vec<Value>, bool)> = async {
+        if needs_reactions {
+            let _vm_work_phase = QueryVmWorkPhase::start(vm_work_active.clone());
+            let visible_head = bounded_reaction_visible_head(
+                transaction,
+                reaction_deadline.as_ref().expect("reaction deadline"),
+            )
+            .await?;
+            observation.content_event_seq = Some(if activity_dependent {
+                visible_head.max(activity_content_event_seq)
+            } else {
+                visible_head
+            });
+            observation.authorization_boundary = reaction_visible_authorization_boundary(
+                transaction,
+                &principal,
+                &relation_dependencies,
+                reaction_deadline.as_ref().expect("reaction deadline"),
+            )
+            .await?;
+            populate_reaction_winners(transaction).await?;
+        }
         if needs_awaiting_reply {
             populate_messages_awaiting_reply(transaction, &principal).await?;
+        }
+        if let Some(deadline) = &reaction_deadline {
+            ensure_reaction_deadline(deadline)?;
         }
         // E1 M3: caller parameters plus the hidden statement-fixed clock,
         // with the same defensive exact-set check as the owned path.
@@ -4806,6 +5987,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
                 value: Some(now_ms.to_string()),
             });
         }
+        push_current_principal_bind(&mut effective_parameters, principal_uses, &principal);
         sql_contract::check_positional_arguments(
             sql_contract::QuerySqlProfile::SqliteLocal,
             &statement,
@@ -4819,6 +6001,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
         let mut encoded_bytes = 2_usize;
         let mut truncated = false;
         while let Some(row) = stream.try_next().await.map_err(map_stream_error)? {
+            if let Some(deadline) = &reaction_deadline {
+                ensure_reaction_deadline(deadline)?;
+            }
             if output.len() as i64 == row_limit {
                 truncated = true;
                 break;
@@ -4863,6 +6048,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
             }
             output.push(value);
         }
+        if let Some(deadline) = &reaction_deadline {
+            ensure_reaction_deadline(deadline)?;
+        }
         Ok((columns, output, truncated))
     }
     .await;
@@ -4892,7 +6080,11 @@ async fn query_sql_request_in_with_row_limit_scoped(
     // Artifact resolution continues in this same transaction to hydrate the
     // selected record IDs, so remove the governed projection before invoking
     // ordinary domain reads. The already-materialized result remains valid.
-    let cleanup_result = cleanup_query_sql_temp_contract(transaction).await;
+    let cleanup_result = match contract {
+        ContractMode::PerCall => cleanup_query_sql_temp_contract(transaction).await,
+        // The session drops the contract once, in `finish`.
+        ContractMode::Session(_) => Ok(()),
+    };
     let (columns, rows, truncated) = query_result?;
     cleanup_result?;
     Ok((
@@ -5292,6 +6484,7 @@ fn toobig_stable_key(relation: &str) -> &'static str {
         "agent_activity" => "activity_id",
         "agent_activity_claims" => "claim_id",
         "messages_awaiting_reply" => "message_id",
+        "message_reactions" => "reaction_id",
         _ => "id",
     }
 }
@@ -5429,7 +6622,7 @@ fn format_sqlite_toobig_detail(
     message
 }
 
-fn bind_parameters<'q>(
+pub(crate) fn bind_parameters<'q>(
     mut query: Query<'q, Sqlite, SqliteArguments<'q>>,
     parameters: &[QuerySqlParameter],
 ) -> Result<Query<'q, Sqlite, SqliteArguments<'q>>> {
@@ -5470,6 +6663,61 @@ fn bind_parameters<'q>(
         };
     }
     Ok(query)
+}
+
+/// Resolve the `catalog_operations` serving snapshot for a statement that
+/// really references the relation. Dependencies come from prepare-time
+/// authorizer observation, so same-named CTE aliases, comments and string
+/// literals never resolve here. `Some` carries the executor's trusted
+/// snapshot for population; `None` (no reference) skips it. A real
+/// reference without a snapshot refuses instead of serving an empty table:
+/// only the ad-hoc online executor dispatch attaches one, so member/offline,
+/// saved SQL, alpha-tab and direct API executions all land here.
+fn resolve_catalog_operations_snapshot(
+    relation_dependencies: &std::collections::BTreeSet<String>,
+    principal: &QueryPrincipal,
+) -> Result<Option<super::principal::CatalogOperationsSnapshot>> {
+    if !relation_dependencies.contains("catalog_operations") {
+        return Ok(None);
+    }
+    match principal.catalog_operations() {
+        Some(snapshot) => Ok(Some(snapshot.clone())),
+        None => Err(sql_contract::categorized_error(
+            QuerySqlErrorCategory::UnauthorizedRelation,
+            "query_sql relation 'catalog_operations' needs this server's serving executor catalogue, which this entry point does not carry: it resolves only in online executor ad-hoc query_sql (serving standby included - use describe_operation for contracts elsewhere; member/offline copies, saved SQL and alpha-tab executions refuse it)",
+        )),
+    }
+}
+
+/// Stage one execution's serving catalogue rows. Clears first so a pooled
+/// connection can never retain a prior request's rows; a second execution
+/// with another snapshot (or none, which refuses above) starts empty. One
+/// `json_each` statement keeps staging near free however many operations
+/// the serving catalogue holds.
+async fn populate_catalog_operations(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    snapshot: &super::principal::CatalogOperationsSnapshot,
+) -> Result<()> {
+    sqlx::query("DELETE FROM temp.catalog_operations")
+        .execute(&mut **transaction)
+        .await?;
+    if snapshot.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::to_string(snapshot.as_slice())?;
+    sqlx::query(
+        "INSERT INTO temp.catalog_operations(executor, operation, surface, access, plan_required, direct_execution_enabled, contract_version, contract_digest, source_tool, selector_field, selector_value, advertised_directly)
+         SELECT value ->> 'executor', value ->> 'operation', value ->> 'surface', value ->> 'access',
+                json_extract(value, '$.plan_required'), json_extract(value, '$.direct_execution_enabled'),
+                value ->> 'contract_version', value ->> 'contract_digest', value ->> 'source_tool',
+                value ->> 'selector_field', value ->> 'selector_value',
+                json_extract(value, '$.advertised_directly')
+         FROM json_each(?)",
+    )
+    .bind(payload)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 /// Backwards-compatible owned entrypoint retained for internal callers.
@@ -5735,7 +6983,7 @@ mod frozen_schema_cache_tests {
         // the tables before installing the generated views.
         conn.execute_batch("DROP TABLE catalog_relations; DROP TABLE catalog_columns;")
             .unwrap();
-        for statement in sql_contract::catalog_view_statements(true) {
+        for statement in sql_contract::catalog_view_statements(true, false) {
             conn.execute_batch(&statement).unwrap();
         }
         assert_eq!(columns_of(&conn, "catalog_relations"), strict_relations);
@@ -6001,6 +7249,20 @@ mod rule_input_extraction_tests {
     use super::*;
 
     #[test]
+    fn extractor_refuses_current_principal() {
+        let error = extract_rule_input_dependencies(
+            "SELECT id FROM records WHERE id = current_principal()",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("rule inputs reject current_principal()"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn extractor_pins_columns_params_and_population() {
         let readset = extract_rule_input_dependencies("SELECT id, name FROM records WHERE id = ?1")
             .expect("admitted");
@@ -6255,10 +7517,90 @@ mod logical_catalog_contract_tests {
         }
     }
 
+    /// Every `(type, name)` the contract creates, read from its text.
+    fn temp_contract_objects() -> std::collections::BTreeSet<(String, String)> {
+        let contract = temp_contract();
+        let mut objects = std::collections::BTreeSet::new();
+        for (at, _) in contract.match_indices("CREATE TEMP ") {
+            let rest = &contract[at + "CREATE TEMP ".len()..];
+            let (kind, rest) = if let Some(rest) = rest.strip_prefix("TABLE ") {
+                ("table", rest)
+            } else if let Some(rest) = rest.strip_prefix("VIEW ") {
+                ("view", rest)
+            } else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("IF NOT EXISTS ").unwrap_or(rest);
+            let rest = rest.strip_prefix("temp.").unwrap_or(rest);
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            objects.insert((kind.to_string(), name));
+        }
+        objects
+    }
+
+    /// The one-script install runs every statement: each object the contract
+    /// text creates is present afterwards, and cleanup removes them all.
+    #[tokio::test]
+    async fn install_creates_every_contract_object_and_cleanup_drops_them() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut tx = db.governed_pool().begin().await.unwrap();
+        install_temp_contract(&mut tx).await.unwrap();
+        let created: std::collections::BTreeSet<(String, String)> = sqlx::query_as(
+            "SELECT type, name FROM sqlite_temp_master WHERE type IN ('table', 'view')",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+        let expected = temp_contract_objects();
+        assert!(expected.len() > 40, "{expected:?}");
+        assert_eq!(created, expected);
+        cleanup_query_sql_temp_contract(&mut tx).await.unwrap();
+        let left: Vec<String> = sqlx::query_scalar("SELECT name FROM sqlite_temp_master")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
+    /// The release hook's object list (its sentinel and its drops) is
+    /// exactly the contract's views followed by its tables.
+    #[test]
+    fn release_hook_object_list_matches_the_contract() {
+        use crate::db::{QUERY_SQL_TEMP_CONTRACT_OBJECTS, QUERY_SQL_TEMP_VIEW_COUNT};
+        let names = |kind: &str| -> std::collections::BTreeSet<String> {
+            temp_contract_objects()
+                .into_iter()
+                .filter(|(object_kind, _)| object_kind == kind)
+                .map(|(_, name)| name)
+                .collect()
+        };
+        let listed = |slice: &[&str]| -> std::collections::BTreeSet<String> {
+            slice.iter().map(|name| name.to_string()).collect()
+        };
+        let (views, tables) = QUERY_SQL_TEMP_CONTRACT_OBJECTS.split_at(QUERY_SQL_TEMP_VIEW_COUNT);
+        assert_eq!(listed(views), names("view"));
+        assert_eq!(listed(tables), names("table"));
+        assert_eq!(
+            listed(QUERY_SQL_TEMP_CONTRACT_OBJECTS).len(),
+            QUERY_SQL_TEMP_CONTRACT_OBJECTS.len(),
+            "duplicate entries"
+        );
+    }
+
     #[test]
     fn temp_contract_comments_survive_naive_semicolon_splitting() {
-        // Installers run `temp_contract().split(';')`, which is not
-        // comment-aware, unlike `execute_batch`. Any semicolon that is not
+        // The full contract installs as one script, which SQLite parses
+        // comment-aware. The subset installer (`install_visible_records_in`)
+        // and some test helpers still run `temp_contract().split(';')`,
+        // which is not comment-aware. Any semicolon that is not
         // the last non-whitespace character of its comment line leaves a
         // following fragment starting with bare prose, which fails every
         // query_sql call with a syntax error. A trailing semicolon is
@@ -6299,6 +7641,269 @@ mod logical_catalog_contract_tests {
             .find(|relation| relation.name == "actors")
             .expect("additive actors relation is registered");
         assert_eq!(actors.semantic_version, 1);
+    }
+}
+
+#[cfg(test)]
+mod catalog_operations_tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+    use crate::query::principal::{CatalogOperationRow, CatalogOperationsSnapshot};
+
+    fn fixture_snapshot() -> CatalogOperationsSnapshot {
+        std::sync::Arc::new(vec![
+            CatalogOperationRow {
+                executor: "b_read".to_string(),
+                operation: "get".to_string(),
+                surface: "ordinary".to_string(),
+                access: "read".to_string(),
+                plan_required: false,
+                direct_execution_enabled: true,
+                contract_version: "native.operation-contract.v1".to_string(),
+                contract_digest: "d1".to_string(),
+                source_tool: "get_record".to_string(),
+                selector_field: None,
+                selector_value: None,
+                advertised_directly: true,
+            },
+            CatalogOperationRow {
+                executor: "a_write".to_string(),
+                operation: "put".to_string(),
+                surface: "ordinary".to_string(),
+                access: "mutation".to_string(),
+                plan_required: true,
+                direct_execution_enabled: false,
+                contract_version: "native.operation-contract.v1".to_string(),
+                contract_digest: "d2".to_string(),
+                source_tool: "save_record".to_string(),
+                selector_field: Some("kind".to_string()),
+                selector_value: Some("task".to_string()),
+                advertised_directly: false,
+            },
+        ])
+    }
+
+    fn principal_with_snapshot() -> QueryPrincipal {
+        QueryPrincipal::authenticated("alice", true)
+            .with_catalog_operations_snapshot(fixture_snapshot())
+    }
+
+    const COLUMNS: [&str; 11] = [
+        "executor",
+        "operation",
+        "surface",
+        "access",
+        "plan_required",
+        "direct_execution_enabled",
+        "contract_version",
+        "contract_digest",
+        "source_tool",
+        "selector_field",
+        "selector_value",
+    ];
+
+    #[tokio::test]
+    async fn serves_snapshot_rows_sorted_with_scalar_projection() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let result = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor, operation, surface, access, plan_required, direct_execution_enabled, contract_version, contract_digest, source_tool, selector_field, selector_value FROM catalog_operations ORDER BY executor, operation",
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.columns, COLUMNS);
+        assert_eq!(
+            result.rows,
+            vec![
+                json!({"executor": "a_write", "operation": "put", "surface": "ordinary", "access": "mutation", "plan_required": 1, "direct_execution_enabled": 0, "contract_version": "native.operation-contract.v1", "contract_digest": "d2", "source_tool": "save_record", "selector_field": "kind", "selector_value": "task"}),
+                json!({"executor": "b_read", "operation": "get", "surface": "ordinary", "access": "read", "plan_required": 0, "direct_execution_enabled": 1, "contract_version": "native.operation-contract.v1", "contract_digest": "d1", "source_tool": "get_record", "selector_field": Value::Null, "selector_value": Value::Null}),
+            ]
+        );
+        assert!(!result.truncated);
+        db.close().await;
+    }
+
+    /// The lean surface marks call_executor-only operations; the column is
+    /// an INTEGER 0/1 like the other catalogue booleans.
+    #[tokio::test]
+    async fn projects_advertised_directly_as_an_integer_marker() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let result = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor, operation, advertised_directly FROM catalog_operations ORDER BY executor, operation",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.rows,
+            vec![
+                json!({"executor": "a_write", "operation": "put", "advertised_directly": 0}),
+                json!({"executor": "b_read", "operation": "get", "advertised_directly": 1}),
+            ]
+        );
+        let hidden = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor, operation FROM catalog_operations WHERE advertised_directly = 0 ORDER BY executor, operation",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hidden.rows,
+            vec![json!({"executor": "a_write", "operation": "put"})]
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn refuses_without_snapshot_but_ignores_aliases_and_literals() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let bare = QueryPrincipal::authenticated("alice", true);
+        let error = query_sql(&db, bare.clone(), "SELECT executor FROM catalog_operations")
+            .await
+            .expect_err("no snapshot must refuse, not serve empty rows");
+        let message = error.to_string();
+        assert!(message.contains("catalog_operations"), "{message}");
+        assert!(message.contains("ad-hoc"), "{message}");
+        // A same-named CTE is not a relation read: no refusal.
+        let aliased = query_sql(
+            &db,
+            bare.clone(),
+            "WITH catalog_operations(executor) AS (SELECT 'x' AS executor) SELECT executor FROM catalog_operations",
+        )
+        .await
+        .unwrap();
+        assert_eq!(aliased.rows, vec![json!({"executor": "x"})]);
+        // A string literal naming it is not a read either.
+        let literal = query_sql(&db, bare, "SELECT 'catalog_operations' AS name")
+            .await
+            .unwrap();
+        assert_eq!(literal.rows, vec![json!({"name": "catalog_operations"})]);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn isolates_contexts_and_retains_nothing_readable() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let first = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT executor FROM catalog_operations ORDER BY executor",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            first.rows,
+            vec![
+                json!({"executor": "a_write"}),
+                json!({"executor": "b_read"})
+            ]
+        );
+        // A second context replaces the first entirely on the same handle.
+        let other = std::sync::Arc::new(vec![fixture_snapshot()[0].clone()]);
+        let second = query_sql(
+            &db,
+            QueryPrincipal::authenticated("alice", true).with_catalog_operations_snapshot(other),
+            "SELECT executor FROM catalog_operations ORDER BY executor",
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.rows, vec![json!({"executor": "b_read"})]);
+        // Without a snapshot the pooled connection's leftovers stay
+        // unreadable: refusal, never prior rows and never empty success.
+        let refused = query_sql(
+            &db,
+            QueryPrincipal::authenticated("alice", true),
+            "SELECT executor FROM catalog_operations",
+        )
+        .await
+        .expect_err("stale rows must not leak across requests");
+        assert!(refused.to_string().contains("catalog_operations"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn aggregates_over_named_columns_work_but_column_less_refuses() {
+        // The snapshot stages in a table (like the lifecycle staging
+        // tables), so a column-less `count(*)` reports no database to the
+        // validator authorizer and meets the staged-table refusal — while a
+        // named-column aggregate observes, populates and serves. Verified
+        // against SQLite authorizer callbacks: column-less reads carry no
+        // database name, named reads carry `temp`.
+        let db = crate::create_database(":memory:").await.unwrap();
+        let named = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT count(executor) AS n FROM catalog_operations",
+        )
+        .await
+        .unwrap();
+        assert_eq!(named.rows, vec![json!({"n": 2})]);
+        let refused = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT count(*) AS n FROM catalog_operations",
+        )
+        .await
+        .expect_err("column-less aggregates refuse over staged tables");
+        assert!(
+            refused.to_string().contains("unauthorized_relation"),
+            "{refused}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn columns_match_the_declared_contract() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let listed = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT column_name FROM catalog_columns WHERE relation_name = 'catalog_operations' ORDER BY column_position",
+        )
+        .await
+        .unwrap();
+        let names: Vec<String> = listed
+            .rows
+            .iter()
+            .map(|row| row["column_name"].as_str().unwrap().to_string())
+            .collect();
+        // The declared relation appends the lean direct-advertisement marker
+        // after the original columns, so their positions are unchanged.
+        assert_eq!(
+            names,
+            [COLUMNS.as_slice(), &["advertised_directly"]].concat()
+        );
+        let relation = query_sql(
+            &db,
+            principal_with_snapshot(),
+            "SELECT identity, caller_relative, completeness, profiles FROM catalog_relations WHERE relation_name = 'catalog_operations'",
+        )
+        .await
+        .unwrap();
+        assert_eq!(relation.rows.len(), 1);
+        assert_eq!(
+            relation.rows[0]["identity"],
+            json!("native.query-sql.catalog-operations")
+        );
+        assert_eq!(relation.rows[0]["profiles"], json!("sqlite-local"));
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn member_probe_denies_real_reads_only() {
+        let denied = member_denied_requirement("SELECT executor FROM catalog_operations")
+            .unwrap()
+            .expect("member copies refuse the serving relation");
+        assert_eq!(denied, "catalog_operations");
+        assert!(member_denied_requirement(
+            "WITH catalog_operations(executor) AS (SELECT 'x' AS executor) SELECT executor FROM catalog_operations"
+        )
+        .unwrap()
+        .is_none());
     }
 }
 
@@ -6980,6 +8585,247 @@ mod production_acl_tests {
     /// the governed pool, so pinning write slots would no longer force any
     /// governed reuse. Sized from the configured pool size so the pinning
     /// stays exact under `NATIVE_CE_GOVERNED_SQL_POOL_SIZE` overrides.
+    fn session_request(sql: &str) -> QuerySqlRequest {
+        QuerySqlRequest {
+            sql: sql.to_string(),
+            parameters: Vec::new(),
+        }
+    }
+
+    async fn per_call_execution(db: &Db, principal: &QueryPrincipal, sql: &str) -> SqlResult {
+        let mut tx = db.governed_pool().begin().await.unwrap();
+        let (result, _) = query_sql_request_in_with_row_limit_observed(
+            &mut tx,
+            principal.clone(),
+            session_request(sql),
+            MAX_ROWS,
+            sql_contract::FunctionAllowance::Portable,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        tx.rollback().await.unwrap();
+        result
+    }
+
+    async fn run_in_session(
+        session: &mut GovernedSqlSession<'_, '_>,
+        principal: QueryPrincipal,
+        sql: &str,
+    ) -> SqlResult {
+        session
+            .execute(
+                principal,
+                session_request(sql),
+                MAX_ROWS,
+                sql_contract::FunctionAllowance::Portable,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// Executions sharing one session, for two viewers in turn, answer
+    /// exactly as per-call executions do: each starts from cleared contract
+    /// state, so no principal, visible set or helper rows carry over.
+    #[tokio::test]
+    async fn session_executions_match_per_call_executions() {
+        let (db, alice, bea) = protected_fixture().await;
+        // Activity and claims rows for an activity reader, so the activity,
+        // claims and disclosure tables are populated by some executions and
+        // must be empty again for the next.
+        for (account, person) in [("alice", ALICE_PRIVATE_ID), ("bea", BEA_PRIVATE_ID)] {
+            sqlx::query(
+                "INSERT INTO member_contexts(account_id,person_record_id,root_record_id,created_at)
+                 VALUES(?,?,?,'2026-08-31T00:00:00.000Z')",
+            )
+            .bind(account)
+            .bind(person)
+            .bind(person)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        let run = "scout-chair-c748b2";
+        crate::control::ensure_agent_run(
+            &db,
+            run,
+            "alice",
+            crate::control::ReportedRunIdentity::default(),
+        )
+        .await
+        .unwrap();
+        replace_explicit_policy(
+            &db,
+            "test:session-claim",
+            ALICE_PRIVATE_ID,
+            vec![AllowEntry::account("alice", Capability::Edit)],
+        )
+        .await
+        .unwrap();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::authenticated("alice"),
+                "start_work",
+                json!({"record_id": ALICE_PRIVATE_ID, "action": "claim", "run_key": run}),
+            )
+            .await
+            .unwrap();
+        // SAFETY: models the hosted ingress after it admitted this member
+        // context; no SQL argument controls it.
+        let activity_reader = unsafe {
+            QueryPrincipal::activity_reader_unchecked(
+                "alice",
+                vec![
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "alice",
+                        "native:workspace-member:alice",
+                    ),
+                    crate::query::principal::ActivityRosterMember::verified_unchecked(
+                        "bea",
+                        "native:workspace-member:bea",
+                    ),
+                ],
+                true,
+            )
+        };
+        let activity_sql = "SELECT activity_id, run_key FROM agent_activity ORDER BY activity_id";
+        let claims_sql = "SELECT claim_id, record_id FROM agent_activity_claims ORDER BY claim_id";
+        let statements = [
+            format!("SELECT id FROM records WHERE id LIKE '%{PRIVATE_ID_SUFFIX}' ORDER BY id"),
+            "SELECT count(*) AS n FROM records".to_string(),
+            "SELECT id, name FROM records ORDER BY id LIMIT 10".to_string(),
+            "SELECT count(*) AS n FROM content_events".to_string(),
+            activity_sql.to_string(),
+            claims_sql.to_string(),
+            "SELECT record_id, status FROM record_lifecycle_interpretations ORDER BY record_id, axis_key"
+                .to_string(),
+        ];
+        let tx = db.governed_pool().begin().await.unwrap();
+        let mut session = GovernedSqlSession::begin(&db, tx).await.unwrap();
+        for principal in [&alice, &activity_reader, &alice, &bea, &activity_reader] {
+            for sql in &statements {
+                let in_session = run_in_session(&mut session, principal.clone(), sql).await;
+                let alone = per_call_execution(&db, principal, sql).await;
+                assert_eq!(in_session.columns, alone.columns, "{sql}");
+                assert_eq!(in_session.rows, alone.rows, "{sql}");
+            }
+        }
+        // Straight after the activity reader's rows, plain Alice sees none.
+        for sql in [activity_sql, claims_sql] {
+            let reader = run_in_session(&mut session, activity_reader.clone(), sql).await;
+            assert!(reader.row_count > 0, "{sql}");
+            let plain = run_in_session(&mut session, alice.clone(), sql).await;
+            assert_eq!(plain.row_count, 0, "{sql}");
+        }
+        let alice_private = run_in_session(&mut session, alice.clone(), &statements[0]).await;
+        assert_eq!(first_strings(&alice_private), [ALICE_PRIVATE_ID]);
+        session.finish().await.unwrap().rollback().await.unwrap();
+        db.close().await;
+    }
+
+    /// While the contract is installed, an unqualified `records` read sees
+    /// the viewer-filtered contract view, not the table. That is the hazard
+    /// a session keeps domain reads away from by owning the transaction;
+    /// `finish` must hand it back with every name resolving to `main` again.
+    #[tokio::test]
+    async fn session_shadows_domain_names_until_finish() {
+        let (db, alice, _) = protected_fixture().await;
+        let tx = db.governed_pool().begin().await.unwrap();
+        let mut session = GovernedSqlSession::begin(&db, tx).await.unwrap();
+        session
+            .execute(
+                alice,
+                session_request("SELECT count(*) AS n FROM records"),
+                MAX_ROWS,
+                sql_contract::FunctionAllowance::Portable,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let main_count: i64 = sqlx::query_scalar("SELECT count(*) FROM main.records")
+            .fetch_one(&mut **session.transaction_for_test())
+            .await
+            .unwrap();
+        let shadowed: i64 = sqlx::query_scalar("SELECT count(*) FROM records")
+            .fetch_one(&mut **session.transaction_for_test())
+            .await
+            .unwrap();
+        assert!(shadowed < main_count, "{shadowed} of {main_count}");
+        let mut tx = session.finish().await.unwrap();
+        let unqualified: i64 = sqlx::query_scalar("SELECT count(*) FROM records")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(unqualified, main_count);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
+    /// A session that ends without `finish` (abandoned after a failed
+    /// execution, or dropped by an error or a cancelled future) returns its
+    /// pooled connection with no contract left on it.
+    #[tokio::test]
+    async fn abandoned_session_leaves_the_pooled_connection_clean() {
+        let (db, alice, _) = protected_fixture().await;
+        let held = hold_all_but_one_governed_slot(&db).await;
+        for abandon in [true, false] {
+            let tx = db.governed_pool().begin().await.unwrap();
+            let mut session = GovernedSqlSession::begin(&db, tx).await.unwrap();
+            session
+                .execute(
+                    alice.clone(),
+                    session_request("SELECT count(*) AS n FROM records"),
+                    MAX_ROWS,
+                    sql_contract::FunctionAllowance::Portable,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            if abandon {
+                session.abandon().await;
+            } else {
+                drop(session);
+            }
+            // The one free slot is the connection the session used.
+            let mut connection = db.governed_pool().acquire().await.unwrap();
+            let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(left, 0, "abandon: {abandon}");
+            let unqualified: i64 = sqlx::query_scalar("SELECT count(*) FROM records")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            let main_count: i64 = sqlx::query_scalar("SELECT count(*) FROM main.records")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(unqualified, main_count, "abandon: {abandon}");
+        }
+        drop(held);
+        db.close().await;
+    }
+
     async fn hold_all_but_one_governed_slot(
         db: &Db,
     ) -> Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>> {
@@ -10031,7 +11877,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caller_tx_governed_warm_reuse_and_cancel_sanitizes() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, bea) = protected_fixture().await;
         // Warm the governed pool through the ordinary owned path first.
@@ -10146,7 +11992,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn governed_same_connection_gate_after_sql_sees_no_temp_shadows() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, _) = protected_fixture().await;
         // Baseline from the write pool: the unqualified gate-style read
@@ -13155,6 +15001,413 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         );
     }
 
+    const MESSAGES_PAGE_SQL: &str = r#"WITH w AS (SELECT r.id, r.type, r.home_id, r.created_at_ms, r.name, r.body, (SELECT l.target_id FROM links l WHERE l.source_id = r.id AND l.relationship = 'part_of' ORDER BY l.target_id LIMIT 1) AS bearer_id FROM records r WHERE r.type IN ('Message', 'Annotation') AND r.kind IN ('text', 'comment') AND r.deleted_at IS NULL AND (r.created_at_ms < ?1 OR (r.created_at_ms = ?1 AND r.id < ?2)) ORDER BY r.created_at_ms DESC, r.id DESC LIMIT 200) SELECT s.stage AS private_stage, s.archived AS private_archived, s.unread AS private_unread, s.is_own AS private_own, s.mentioned AS private_mentioned, EXISTS(SELECT 1 FROM my_mentions mm WHERE mm.source_id=w.id) AS private_reference, w.id, origin.id AS origin_id, origin.name AS origin_name, a.person_id AS actor_person_id, a.display_name AS actor_name, CASE w.type WHEN 'Message' THEN 'message' ELSE 'comment' END AS kind, w.created_at_ms, w.name AS title, substr(w.body, 1, 1200) AS body, length(w.body) AS body_len, (SELECT e.actor FROM content_events e WHERE e.record_id = w.id AND e.type = 'record.created' ORDER BY e.local_seq LIMIT 1) AS actor, (SELECT e.run_key FROM content_events e WHERE e.record_id = w.id AND e.type = 'record.created' ORDER BY e.local_seq LIMIT 1) AS run_key, (SELECT l.target_id FROM links l WHERE l.source_id = w.id AND l.relationship = 'addressed_to' ORDER BY l.target_id LIMIT 1) AS to_id, (SELECT p.name FROM links l JOIN records p ON p.id = l.target_id WHERE l.source_id = w.id AND l.relationship = 'addressed_to' ORDER BY l.target_id LIMIT 1) AS to_name, (SELECT l.target_id FROM links l WHERE l.source_id = w.id AND l.relationship = 'reply_to' ORDER BY l.target_id LIMIT 1) AS reply_to, w.bearer_id, (SELECT b.type FROM records b WHERE b.id = w.bearer_id) AS bearer_type, (SELECT b.name FROM records b WHERE b.id = w.bearer_id) AS bearer_name, (SELECT v.value FROM facet_values v WHERE v.record_id = w.id AND v.key = 'expectation') AS expectation, (SELECT sum(CASE e.type WHEN 'message.reaction.added.v1' THEN 1 ELSE -1 END) FROM content_events e WHERE e.record_id = w.id AND e.type IN ('message.reaction.added.v1', 'message.reaction.removed.v1')) AS reactions FROM w LEFT JOIN my_message_state s ON s.message_id=w.id LEFT JOIN records origin ON origin.id = w.home_id LEFT JOIN actors a ON a.actor = (SELECT e.actor FROM content_events e WHERE e.record_id = w.id AND e.type = 'record.created' ORDER BY e.local_seq LIMIT 1) ORDER BY w.created_at_ms DESC, w.id DESC LIMIT 200"#;
+
+    /// The Messages v2 PAGE_SQL bounded consumer, including its nested
+    /// content/actor reads and private relation joins (b2583dc).
+    #[tokio::test]
+    async fn messages_bounded_page_private_read_wake_changes_only_own_rows() {
+        use crate::awareness::PreferenceAction;
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        sqlx::query("UPDATE records SET kind='text' WHERE type='Message'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE records SET type='Annotation',kind='comment' WHERE id=?")
+            .bind(D6_D_REF)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO links(id,source_id,target_id,relationship) VALUES('page-comment-bearer',?,?,'part_of')")
+            .bind(D6_D_REF).bind(D6_M_TEAM).execute(db.write_pool()).await.unwrap();
+        let [alice, bea, ..] = d6_viewers();
+        // Kept literal so SQL admission is tested on the shipped page shape.
+        let request = || QuerySqlRequest {
+            sql: MESSAGES_PAGE_SQL.into(),
+            parameters: vec![
+                QuerySqlParameter::Integer {
+                    value: Some(i64::MAX.to_string()),
+                },
+                QuerySqlParameter::Text {
+                    value: Some("".into()),
+                },
+            ],
+        };
+        let before = query_sql_request_owned(db.clone(), alice.clone(), request())
+            .await
+            .unwrap();
+        let other = query_sql_request_owned(db.clone(), bea.clone(), request())
+            .await
+            .unwrap();
+        assert_eq!(
+            before.rows.iter().find(|r| r["id"] == D6_M_TEAM).unwrap()["private_unread"],
+            1
+        );
+        assert!(before.rows.iter().any(|r| r["kind"] == "comment"
+            && r["private_unread"].is_null()
+            && r["private_reference"] == 1));
+        let head: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        d6_prefer(&db, "alice", D6_M_TEAM, PreferenceAction::MarkRead, None).await;
+        let after = query_sql_request_owned(db.clone(), alice, request())
+            .await
+            .unwrap();
+        assert_ne!(before.rows, after.rows);
+        assert_eq!(
+            after.rows.iter().find(|r| r["id"] == D6_M_TEAM).unwrap()["private_unread"],
+            0
+        );
+        assert_eq!(
+            query_sql_request_owned(db.clone(), bea, request())
+                .await
+                .unwrap()
+                .rows,
+            other.rows
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            head
+        );
+    }
+
+    /// Reuse D6's policy anchors and Message templates at the retained 5,000
+    /// Message scale. Execute the exact page under production admission and
+    /// byte/deadline budgets, and measure VM work independently of wall time.
+    #[tokio::test]
+    async fn messages_bounded_page_private_read_at_5000_messages() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        sqlx::query("UPDATE records SET kind='text',created_at='2026-10-01T00:00:00.000Z' WHERE type='Message'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 4997)
+            INSERT INTO records(id,type,kind,name,body,home_id,owner_id,policy_anchor_id,created_at)
+            SELECT printf('scale-message-%05d',n.i),template.type,template.kind,template.name,template.body,
+                   template.home_id,template.owner_id,template.policy_anchor_id,'2026-10-06T00:00:00.000Z'
+              FROM n JOIN records template ON template.id=CASE n.i%2 WHEN 0 THEN ? ELSE ? END")
+            .bind(D6_M_BEA_ONLY).bind(D6_M_TEAM).execute(db.write_pool()).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM records WHERE type='Message'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            5000
+        );
+        let plan = governed_plan(
+            &db,
+            "bea",
+            true,
+            &MESSAGES_PAGE_SQL
+                .replace("?1", "9223372036854775807")
+                .replace("?2", "''"),
+        )
+        .await;
+        assert!(
+            !plan.iter().any(|line| line == "SCAN visible_message"
+                || line == "MATERIALIZE _query_sql_mention_visible"),
+            "{plan:#?}"
+        );
+        let [alice, bea, ..] = d6_viewers();
+        let execute = |principal: QueryPrincipal| {
+            let db = db.clone();
+            async move {
+                let work = Arc::new(AtomicU64::new(0));
+                let result = query_sql_request_owned_with_vm_work(
+                    db,
+                    principal,
+                    QuerySqlRequest {
+                        sql: MESSAGES_PAGE_SQL.into(),
+                        parameters: vec![
+                            QuerySqlParameter::Integer {
+                                value: Some(i64::MAX.to_string()),
+                            },
+                            QuerySqlParameter::Text {
+                                value: Some("".into()),
+                            },
+                        ],
+                    },
+                    Some(work.clone()),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.rows.len(), 200);
+                assert!(serde_json::to_vec(&result.rows).unwrap().len() < MAX_RESULT_ENCODED_BYTES);
+                let callbacks = work.load(Ordering::Relaxed);
+                // Bound the 5,000-Message page at 2.5 million caller VM
+                // operations, independently of the production deadline and
+                // result caps, which remain enabled. No host-speed assertion.
+                assert!(
+                    callbacks > 0 && callbacks <= 2_500,
+                    "page used {callbacks} progress intervals"
+                );
+                eprintln!("PAGE_SQL 5000: {callbacks} progress intervals");
+                (result.rows, callbacks)
+            }
+        };
+        let (before, work_before) = execute(alice.clone()).await;
+        let (other, _) = execute(bea.clone()).await;
+        // Alice cannot see Bea-only templates; Bea sees both policy cohorts.
+        assert!(before.iter().all(|row| row["id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("scale-message-")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            % 2
+            == 1));
+        assert!(other.iter().any(|row| row["id"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("scale-message-")
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
+            % 2
+            == 0));
+        assert!(before.iter().all(|row| row["private_unread"] == 1));
+        assert!(other.iter().all(|row| row["private_unread"] == 0));
+        let selected = before[0]["id"].as_str().unwrap();
+        let head: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        d6_prefer(
+            &db,
+            "alice",
+            selected,
+            crate::awareness::PreferenceAction::MarkRead,
+            None,
+        )
+        .await;
+        let (after, work_after) = execute(alice).await;
+        assert_eq!(after[0]["private_unread"], 0);
+        assert_eq!(&after[1..], &before[1..]);
+        assert_eq!(execute(bea).await.0, other);
+        assert!(
+            work_after <= work_before + 2,
+            "preference changed page work from {work_before} to {work_after}"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            head
+        );
+    }
+
+    #[tokio::test]
+    async fn private_read_preferences_match_tools_and_preserve_human_history() {
+        use crate::awareness::{HumanStage, PreferenceAction};
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let [alice, bea, ..] = d6_viewers();
+        let mut registry = crate::mcp::ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::register_surface_tools(&mut registry).unwrap();
+        let bea_before = d6_rows(
+            &db,
+            &bea,
+            "SELECT * FROM my_message_state ORDER BY message_id",
+        )
+        .await;
+        d6_advance(&db, "alice", D6_M_TEAM, HumanStage::Opened).await;
+        d6_advance(&db, "alice", D6_M_TEAM, HumanStage::Acknowledged).await;
+        let human_before: (String, i64, i64, String, String) = sqlx::query_as(
+            "SELECT stage,version,last_event_seq,opened_at,acknowledged_at FROM human_message_awareness WHERE subject_account_id='alice' AND message_id=?",
+        ).bind(D6_M_TEAM).fetch_one(db.pool()).await.unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        crate::awareness::set_routing(
+            &mut tx,
+            &crate::awareness::MutationContext {
+                subject_account_id: "alice",
+                authenticated_actor: "alice",
+                executor_kind: "system",
+                executor_ref: None,
+                delegation_ref: None,
+                reason_code: "open obligation fixture",
+            },
+            D6_M_TEAM,
+            "open",
+            "agent",
+            Some("fixture-policy-v1"),
+            0,
+            "routing-fixture",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let routing_before:(String,String,i64,i64) = sqlx::query_as("SELECT obligation_state,executor_route,version,last_event_seq FROM message_inbox_routing WHERE subject_account_id='alice' AND message_id=?").bind(D6_M_TEAM).fetch_one(db.pool()).await.unwrap();
+        let content_before: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (version, preference, expected) in [
+            (0, "mark_unread", true),
+            (1, "mark_read", false),
+            (2, "mark_unread", true),
+        ] {
+            let receipt = registry.call(db.clone(), crate::mcp::Caller::authenticated("alice"), "manage_messages", json!({
+                "action":"set_preference","message_id":D6_M_TEAM,"preference":preference,
+                "expected_version":version,"idempotency_key":format!("read-{version}"),"reason":"explicit read preference",
+            })).await.unwrap();
+            assert_eq!(receipt["version"], version + 1);
+            assert_eq!(receipt["unread_override"], expected);
+            let tool = registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::authenticated("alice"),
+                    "manage_messages",
+                    json!({"action":"list_message_state","message_ids":[D6_M_TEAM]}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(tool["messages"][0]["human"]["stage"], "acknowledged");
+            assert_eq!(tool["messages"][0]["human"]["version"], human_before.1);
+            assert_eq!(tool["messages"][0]["mention"]["principal"], true);
+            assert_eq!(tool["messages"][0]["attention"]["unread"], expected);
+            assert_eq!(tool["messages"][0]["attention"]["version"], version + 1);
+            let rows = d6_rows(&db,&alice,"SELECT unread,stage FROM my_message_state WHERE message_id='0e550000-0000-4000-8000-00000000000b'").await;
+            assert_eq!(rows[0]["unread"], i64::from(expected));
+            assert_eq!(rows[0]["stage"], "acknowledged");
+        }
+        // Retrying the original mark-read after mark-unread returns its own
+        // receipt before checking the stale CAS, without reverting current state.
+        let retry = registry.call(db.clone(), crate::mcp::Caller::authenticated("alice"), "manage_messages", json!({
+            "action":"set_preference","message_id":D6_M_TEAM,"preference":"mark_read",
+            "expected_version":1,"idempotency_key":"read-1","reason":"explicit read preference",
+        })).await.unwrap();
+        assert_eq!(retry["version"], 2);
+        assert_eq!(retry["unread_override"], false);
+        assert_eq!(retry["idempotent"], true);
+        d6_prefer(&db, "alice", D6_M_TEAM, PreferenceAction::Mute, None).await;
+        assert_eq!(
+            d6_rows(
+                &db,
+                &alice,
+                "SELECT unread FROM my_message_state WHERE is_own=0"
+            )
+            .await[0]["unread"],
+            1
+        );
+        d6_prefer(&db, "alice", D6_M_OPEN, PreferenceAction::MarkUnread, None).await;
+        assert_eq!(
+            d6_rows(
+                &db,
+                &alice,
+                "SELECT unread FROM my_message_state WHERE is_own=1"
+            )
+            .await[0]["unread"],
+            0
+        );
+        d6_prefer(&db, "alice", D6_M_TEAM, PreferenceAction::Archive, None).await;
+        assert_eq!(
+            d6_rows(
+                &db,
+                &alice,
+                "SELECT unread FROM my_message_state WHERE is_own=0"
+            )
+            .await[0]["unread"],
+            0
+        );
+        d6_prefer(&db, "alice", D6_M_TEAM, PreferenceAction::Restore, None).await;
+        assert_eq!(
+            d6_rows(
+                &db,
+                &alice,
+                "SELECT unread FROM my_message_state WHERE is_own=0"
+            )
+            .await[0]["unread"],
+            1
+        );
+        assert_eq!(
+            d6_rows(
+                &db,
+                &bea,
+                "SELECT * FROM my_message_state ORDER BY message_id"
+            )
+            .await,
+            bea_before
+        );
+        let human_after: (String,i64,i64,String,String) = sqlx::query_as("SELECT stage,version,last_event_seq,opened_at,acknowledged_at FROM human_message_awareness WHERE subject_account_id='alice' AND message_id=?").bind(D6_M_TEAM).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(human_after, human_before);
+        assert_eq!(sqlx::query_as::<_,(String,String,i64,i64)>("SELECT obligation_state,executor_route,version,last_event_seq FROM message_inbox_routing WHERE subject_account_id='alice' AND message_id=?").bind(D6_M_TEAM).fetch_one(db.pool()).await.unwrap(),routing_before);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(seq) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            content_before
+        );
+        crate::awareness::rebuild_projections(&db).await.unwrap();
+        assert_eq!(
+            d6_rows(
+                &db,
+                &alice,
+                "SELECT unread,stage FROM my_message_state WHERE is_own=0"
+            )
+            .await,
+            [json!({"unread":1,"stage":"acknowledged"})]
+        );
+        // A caller may neither mutate nor read a hidden viewer's Message.
+        assert!(registry.call(db.clone(),crate::mcp::Caller::authenticated("alice"),"manage_messages",json!({"action":"set_preference","message_id":D6_M_BEA_ONLY,"preference":"mark_read","expected_version":0,"idempotency_key":"hidden","reason":"test"})).await.is_err());
+        replace_explicit_policy(
+            &db,
+            "test:d6",
+            D6_M_TEAM,
+            vec![AllowEntry::account("bea", Capability::View)],
+        )
+        .await
+        .unwrap();
+        let revoked = registry.call(db.clone(),crate::mcp::Caller::authenticated("alice"),"manage_messages",json!({"action":"set_preference","message_id":D6_M_TEAM,"preference":"mark_read","expected_version":1,"idempotency_key":"read-1","reason":"explicit read preference"})).await.unwrap_err();
+        assert!(revoked.to_string().contains("does not exist"), "{revoked}");
+        assert!(registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::authenticated("alice"),
+                "manage_messages",
+                json!({"action":"list_message_state","message_ids":[D6_M_TEAM]})
+            )
+            .await
+            .is_err());
+        assert!(d6_rows(
+            &db,
+            &alice,
+            "SELECT unread FROM my_message_state WHERE is_own=0"
+        )
+        .await
+        .is_empty());
+        // The own-human rule resolves the same active person in SQL and tools.
+        sqlx::query("UPDATE records SET deleted_at='2026-10-06T00:00:00.000Z' WHERE id=?")
+            .bind(D6_P_ALICE)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let own_tool = registry
+            .call(
+                db.clone(),
+                crate::mcp::Caller::authenticated("alice"),
+                "manage_messages",
+                json!({"action":"list_message_state","message_ids":[D6_M_OPEN]}),
+            )
+            .await
+            .unwrap();
+        let own_sql = d6_rows(&db, &alice, "SELECT unread FROM my_message_state").await;
+        assert_eq!(own_tool["messages"][0]["attention"]["unread"], true);
+        assert_eq!(own_sql, [json!({"unread":1})]);
+    }
+
     /// D6 5.1 and 5.4: no other viewer's awareness write, in any lane, moves
     /// Alice's serialized result for any statement shape over the two
     /// relations, column-less counts, aggregates, self-joins and CTE cross
@@ -14687,6 +16940,282 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         db.close().await;
     }
 
+    async fn ad_hoc_rows(
+        db: &Db,
+        principal: &QueryPrincipal,
+        sql: &str,
+        parameters: Vec<sql_contract::QuerySqlParameter>,
+    ) -> Result<SqlResult> {
+        query_sql_request_ad_hoc(
+            db.clone(),
+            principal.clone(),
+            QuerySqlRequest {
+                sql: sql.to_owned(),
+                parameters,
+            },
+        )
+        .await
+    }
+
+    async fn set_json_facet(db: &Db, record_id: &str, value: &str) {
+        set_facet(
+            db,
+            record_id,
+            FacetSetPayload {
+                key: "jsondata".into(),
+                value: Some(value.into()),
+                vocab_ref: None,
+                as_of: None,
+                observation_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Native 702de73: ad-hoc online sqlite-local SQL is SQLite's read-only
+    /// dialect. The portable entry still refuses the same statements.
+    #[tokio::test]
+    async fn ad_hoc_sqlite_accepts_json_and_date_functions_the_portable_entry_refuses() {
+        let (db, alice, _) = protected_fixture().await;
+        set_json_facet(&db, ALICE_PRIVATE_ID, r#"{"tags":["x","y"],"n":3}"#).await;
+        let sql = "SELECT json_extract(value, '$.n') AS n, value ->> '$.tags[1]' AS tag, \
+                   json_array_length(value, '$.tags') AS len, json_type(value) AS kind, \
+                   json_valid(value) AS ok, json_object('k', 1) AS obj, \
+                   instr(value, 'tags') AS pos, typeof(value) AS ty, \
+                   upper(hex(char(65))) AS hx, printf('%03d', 7) AS pf, \
+                   datetime(86400, 'unixepoch') AS dt, strftime('%Y', 0, 'unixepoch') AS yr \
+                   FROM facet_values WHERE key = 'jsondata' ORDER BY id";
+        let result = ad_hoc_rows(&db, &alice, sql, Vec::new()).await.unwrap();
+        let row = result.rows[0].as_object().unwrap();
+        assert_eq!(row["n"], json!(3));
+        assert_eq!(row["tag"], json!("y"));
+        assert_eq!(row["len"], json!(2));
+        assert_eq!(row["kind"], json!("object"));
+        assert_eq!(row["ok"], json!(1));
+        assert_eq!(row["obj"], json!(r#"{"k":1}"#));
+        assert_eq!(row["ty"], json!("text"));
+        assert_eq!(row["hx"], json!("41"));
+        assert_eq!(row["pf"], json!("007"));
+        assert_eq!(row["dt"], json!("1970-01-02 00:00:00"));
+        assert_eq!(row["yr"], json!("1970"));
+        // `now_ms()` is the supported clock and composes with the date set.
+        let clock = ad_hoc_rows(
+            &db,
+            &alice,
+            "SELECT datetime(now_ms() / 1000, 'unixepoch') AS now_text",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(clock.time_dependent);
+        // The default ORDER BY still applies to an ad-hoc LIMIT with JSON.
+        let limited = ad_hoc_rows(
+            &db,
+            &alice,
+            "SELECT json_extract(value, '$.n') AS n FROM facet_values WHERE key = 'jsondata' LIMIT 5",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(limited.assumed_order.is_some());
+        // The portable entry (library callers, saved-SQL gate) still refuses.
+        let portable = query_sql_request_owned(
+            db.clone(),
+            alice.clone(),
+            QuerySqlRequest {
+                sql: sql.to_owned(),
+                parameters: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(portable.contains("is unavailable"), "{portable}");
+        assert!(validate(sql).is_err());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn ad_hoc_sqlite_json_each_reads_only_caller_visible_rows() {
+        let (db, alice, bea) = protected_fixture().await;
+        set_json_facet(&db, ALICE_PRIVATE_ID, r#"["alice-1","alice-2"]"#).await;
+        set_json_facet(&db, BEA_PRIVATE_ID, r#"["bea-1"]"#).await;
+        const ELEMENTS: &str = "SELECT j.value AS element \
+            FROM facet_values AS f JOIN records AS r ON r.id = f.record_id, \
+                 json_each(f.value) AS j \
+            WHERE f.key = 'jsondata' ORDER BY j.value";
+        let strings = |result: &SqlResult| -> Vec<String> {
+            result
+                .rows
+                .iter()
+                .map(|row| row["element"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let alice_rows = ad_hoc_rows(&db, &alice, ELEMENTS, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(strings(&alice_rows), ["alice-1", "alice-2"]);
+        let bea_rows = ad_hoc_rows(&db, &bea, ELEMENTS, Vec::new()).await.unwrap();
+        assert_eq!(strings(&bea_rows), ["bea-1"]);
+        let stranger = QueryPrincipal::authenticated("nobody", false);
+        let none = ad_hoc_rows(&db, &stranger, ELEMENTS, Vec::new())
+            .await
+            .unwrap();
+        assert!(none.rows.is_empty());
+        // json_tree walks the same visible column.
+        let tree = ad_hoc_rows(
+            &db,
+            &bea,
+            "SELECT t.value AS element FROM facet_values AS f, json_tree(f.value) AS t \
+             WHERE f.key = 'jsondata' AND t.type = 'text' ORDER BY t.value",
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(strings(&tree), ["bea-1"]);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn ad_hoc_sqlite_hidden_record_json_is_unreachable() {
+        let (db, _, bea) = protected_fixture().await;
+        set_json_facet(&db, ALICE_PRIVATE_ID, r#"["alice-secret"]"#).await;
+        // Addressing the hidden record by id yields no JSON to expand.
+        let by_id = ad_hoc_rows(
+            &db,
+            &bea,
+            &format!(
+                "SELECT j.value AS element FROM json_each(\
+                   (SELECT value FROM facet_values WHERE record_id = '{ALICE_PRIVATE_ID}' \
+                    AND key = 'jsondata')) AS j ORDER BY j.value"
+            ),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert!(by_id.rows.is_empty(), "{:?}", by_id.rows);
+        // The raw table behind the view is not a relation json_each can
+        // reach: the authorizer still denies the physical read.
+        for sql in [
+            "SELECT j.value FROM json_each((SELECT value FROM main.facet_values LIMIT 1)) AS j ORDER BY 1",
+            "SELECT j.value FROM json_each((SELECT sql FROM sqlite_master LIMIT 1)) AS j ORDER BY 1",
+            "SELECT j.value FROM main.records AS r, json_each(r.body) AS j ORDER BY 1",
+        ] {
+            let error = ad_hoc_rows(&db, &bea, sql, Vec::new())
+                .await
+                .expect_err(sql)
+                .to_string();
+            assert!(!error.contains("alice-secret"), "{sql}: {error}");
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn ad_hoc_sqlite_refuses_clock_reads_and_excluded_functions() {
+        let (db, alice, _) = protected_fixture().await;
+        for sql in [
+            "SELECT date() AS d",
+            "SELECT datetime('now') AS d",
+            "SELECT date('2026-01-01', 'localtime') AS d",
+            "SELECT strftime('%s') AS d",
+        ] {
+            let error = ad_hoc_rows(&db, &alice, sql, Vec::new())
+                .await
+                .expect_err(sql)
+                .to_string();
+            assert!(error.contains("now_ms()"), "{sql}: {error}");
+        }
+        let text = |value: &str| sql_contract::QuerySqlParameter::Text {
+            value: Some(value.to_owned()),
+        };
+        for clock in ["now", "localtime", "UTC"] {
+            let error = ad_hoc_rows(&db, &alice, "SELECT date(?1) AS d", vec![text(clock)])
+                .await
+                .expect_err(clock)
+                .to_string();
+            assert!(error.contains("now_ms()"), "{clock}: {error}");
+        }
+        let ok = ad_hoc_rows(
+            &db,
+            &alice,
+            "SELECT date(?1) AS d",
+            vec![text("2026-01-02")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.rows[0]["d"], json!("2026-01-02"));
+        for sql in [
+            "SELECT random() AS x",
+            "SELECT hex(randomblob(4)) AS x",
+            "SELECT load_extension('x') AS x",
+            "SELECT sqlite_version() AS x",
+            "SELECT changes() AS x",
+            "SELECT total_changes() AS x",
+            "SELECT last_insert_rowid() AS x",
+            "SELECT length(zeroblob(4)) AS x",
+        ] {
+            let error = ad_hoc_rows(&db, &alice, sql, Vec::new())
+                .await
+                .expect_err(sql)
+                .to_string();
+            assert!(error.contains("is unavailable"), "{sql}: {error}");
+        }
+        db.close().await;
+    }
+
+    /// The authorizer enforces the same list without the classifier in front:
+    /// names outside it are denied by default, whatever the shared scanner
+    /// would have said.
+    #[test]
+    fn ad_hoc_authorizers_deny_functions_outside_the_shared_allowlist() {
+        let denied = |sql: &str| {
+            validate_view_expansion_ad_hoc(sql).is_err() && validate_strict_ad_hoc(sql).is_err()
+        };
+        for sql in [
+            "SELECT random() FROM records",
+            "SELECT randomblob(4) FROM records",
+            "SELECT zeroblob(4) FROM records",
+            "SELECT sqlite_version() FROM records",
+            "SELECT soundex(name) FROM records",
+            "SELECT unlikely(id) FROM records",
+            // Only json_each / json_tree are table functions; any other
+            // eponymous virtual table stays a prohibited read.
+            "SELECT * FROM pragma_table_info('records')",
+            "SELECT * FROM main.records",
+        ] {
+            assert!(denied(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT json_extract(name, '$.a') FROM records",
+            "SELECT name ->> '$.a' FROM records",
+            "SELECT j.value FROM records AS r, json_each(r.name) AS j",
+            "SELECT datetime(0, 'unixepoch') FROM records",
+        ] {
+            validate_view_expansion_ad_hoc(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+            validate_strict_ad_hoc(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        // The portable authorizers are untouched.
+        assert!(validate_view_expansion("SELECT json_extract(name, '$.a') FROM records").is_err());
+        assert!(validate_strict("SELECT json_extract(name, '$.a') FROM records").is_err());
+    }
+
+    /// The allowlist excludes `floor`/`ceil`/`ceiling` only because
+    /// the pinned SQLite build omits its math functions. If the build gains
+    /// them this fails, naming what to add to `SQLITE_AD_HOC_FUNCTIONS`.
+    #[test]
+    fn ad_hoc_allowlist_tracks_the_pinned_sqlite_math_functions() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for name in ["floor", "ceil", "ceiling", "sign"] {
+            let in_build = conn.prepare(&format!("SELECT {name}(1.5)")).is_ok();
+            assert_eq!(
+                in_build,
+                sql_contract::is_sqlite_ad_hoc_extra_function(name),
+                "{name}: pinned build has it = {in_build}; keep SQLITE_AD_HOC_FUNCTIONS in step"
+            );
+        }
+    }
+
     /// Slice 1 (task 77bd40a) opt-in measurement gate, in the style of
     /// `tests/tools/batch_semantic_measurement.rs`: page statement p50 CPU
     /// <= 100 ms and count statement p50 CPU <= 30 ms at 20,000 tasks,
@@ -14893,7 +17422,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         )
         .await
         .unwrap();
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -14926,7 +17455,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             sql: "SELECT now_ms() AS a, now_ms() AS b".to_string(),
             parameters: Vec::new(),
         };
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut first_rows = Vec::new();
         let mut first_columns = Vec::new();
@@ -14990,6 +17519,118 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     }
 
     #[tokio::test]
+    async fn current_principal_binds_each_caller_on_every_sqlite_path() {
+        let (db, alice, bea) = protected_fixture().await;
+        let sql =
+            "SELECT ?1 AS x, now_ms() AS t, current_principal() AS p, CURRENT_PRINCIPAL() AS q";
+        let request = || QuerySqlRequest {
+            sql: sql.to_string(),
+            parameters: vec![sql_contract::QuerySqlParameter::Text {
+                value: Some("x".into()),
+            }],
+        };
+        for (principal, expected) in [(alice.clone(), "alice"), (bea.clone(), "bea")] {
+            // Ad-hoc `query_sql`.
+            let owned = query_sql_request_owned(db.clone(), principal.clone(), request())
+                .await
+                .unwrap();
+            assert_eq!(owned.rows[0]["p"], expected);
+            assert_eq!(owned.rows[0]["q"], expected);
+            assert_eq!(owned.rows[0]["x"], "x");
+            assert!(owned.time_dependent);
+            // The caller-transaction path behind saved queries, alpha-tab
+            // needs and artifact relation ports, under both allowances.
+            for allowance in [
+                sql_contract::FunctionAllowance::Portable,
+                sql_contract::FunctionAllowance::LegacySavedSql,
+            ] {
+                let mut connection = db.write_pool().acquire().await.unwrap();
+                let mut tx = connection.begin().await.unwrap();
+                let (scoped, _) = query_sql_request_in_with_row_limit_observed(
+                    &mut tx,
+                    principal.clone(),
+                    request(),
+                    200,
+                    allowance,
+                    Some(1_234_567),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+                assert_eq!(scoped.rows[0]["p"], expected, "{allowance:?}");
+                assert_eq!(scoped.rows[0]["t"], serde_json::json!(1_234_567));
+                assert_eq!(
+                    scoped.rows,
+                    owned
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            let mut row = row.clone();
+                            row["t"] = serde_json::json!(1_234_567);
+                            row
+                        })
+                        .collect::<Vec<_>>()
+                );
+                tx.rollback().await.unwrap();
+            }
+        }
+        // Without a clock the principal takes the first hidden slot.
+        let plain = query_sql_request_owned(
+            db.clone(),
+            alice.clone(),
+            QuerySqlRequest {
+                sql: "SELECT current_principal() AS p".into(),
+                parameters: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(plain.rows[0]["p"], "alice");
+        assert!(!plain.time_dependent);
+        // A caller cannot name the hidden slot to substitute another value.
+        let spoof = query_sql_request_owned(
+            db.clone(),
+            alice.clone(),
+            QuerySqlRequest {
+                sql: "SELECT current_principal() AS p, ?2 AS q".into(),
+                parameters: vec![sql_contract::QuerySqlParameter::Text {
+                    value: Some("bea".into()),
+                }],
+            },
+        )
+        .await;
+        assert!(spoof.is_err(), "{spoof:?}");
+        // Nor on the stored-query path, under either allowance.
+        for allowance in [
+            sql_contract::FunctionAllowance::Portable,
+            sql_contract::FunctionAllowance::LegacySavedSql,
+        ] {
+            let mut connection = db.write_pool().acquire().await.unwrap();
+            let mut tx = connection.begin().await.unwrap();
+            let spoof = query_sql_request_in_with_row_limit_observed(
+                &mut tx,
+                alice.clone(),
+                QuerySqlRequest {
+                    sql: "SELECT current_principal() AS p, ?2 AS q".into(),
+                    parameters: vec![sql_contract::QuerySqlParameter::Text {
+                        value: Some("bea".into()),
+                    }],
+                },
+                200,
+                allowance,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert!(spoof.is_err(), "{allowance:?}: {spoof:?}");
+            tx.rollback().await.unwrap();
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn caller_tx_observed_vm_counter_measures_authored_work_identically() {
         let (db, alice, _) = protected_fixture().await;
         let request = QuerySqlRequest {
@@ -15012,7 +17653,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         .await
         .unwrap();
         assert!(callbacks.load(Ordering::Relaxed) > 0);
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -15044,7 +17685,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn caller_tx_portable_row_limit200_first_delivered_membership_cap_cleanup() {
         let (db, alice, _) = protected_fixture().await;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut connection = db.write_pool().acquire().await.unwrap();
         let mut tx = connection.begin().await.unwrap();
@@ -15510,6 +18151,106 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         assert!(!error.contains("Offending:"), "{error}");
     }
 
+    /// `comment_anchors` applies the comments' own visibility: a row needs both
+    /// the comment (visible through its bearer) and the anchored record visible.
+    /// Citations, deleted comments and blob anchors never appear.
+    #[tokio::test]
+    async fn comment_anchors_need_both_the_comment_and_its_record_visible() {
+        let (db, alice, bea) = protected_fixture().await;
+        const C_COMMON: &str = "9e795000-0000-4000-8000-00000c000001";
+        const C_ALICE: &str = "9e795000-0000-4000-8000-00000c000002";
+        const C_BEA: &str = "9e795000-0000-4000-8000-00000c000003";
+        const C_CROSS: &str = "9e795000-0000-4000-8000-00000c000004";
+        const C_CITATION: &str = "9e795000-0000-4000-8000-00000c000005";
+        const C_DELETED: &str = "9e795000-0000-4000-8000-00000c000006";
+        // (annotation, kind, part_of bearer, anchored record)
+        for (id, kind, bearer, anchored) in [
+            (C_COMMON, "comment", COMMON_ID, COMMON_ID),
+            (C_ALICE, "comment", ALICE_PRIVATE_ID, ALICE_PRIVATE_ID),
+            (C_BEA, "comment", BEA_PRIVATE_ID, BEA_PRIVATE_ID),
+            // A comment Alice can see whose anchor names a record she cannot.
+            (C_CROSS, "comment", COMMON_ID, BEA_PRIVATE_ID),
+            (C_CITATION, "citation", COMMON_ID, COMMON_ID),
+            (C_DELETED, "comment", COMMON_ID, COMMON_ID),
+        ] {
+            create_record(
+                &db,
+                json!({ "id": id, "type": "Annotation", "kind": kind, "name": "Comment",
+                "body": "note", "home_id": crate::schema::ROOT_RECORD_ID }),
+            )
+            .await
+            .unwrap();
+            add_link(
+                &db,
+                LinkAddedPayload {
+                    id: Some(format!("{id}-part")),
+                    source_id: id.into(),
+                    target_id: bearer.into(),
+                    relationship: "part_of".into(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO annotation_targets (annotation_id, target_record_id, source_slot, source_event_seq,
+                   source_sha256, selectors, purpose, created_at, updated_at)
+                 VALUES (?, ?, 'body', 1, ?, ?, 'comment_context', 't', 't')")
+                .bind(id).bind(anchored).bind("a".repeat(64))
+                .bind(r#"[{"type":"text_quote","exact":"sharedterm"}]"#)
+                .execute(db.write_pool()).await.unwrap();
+        }
+        delete_record(&db, C_DELETED).await.unwrap();
+        let ids = |rows: Vec<Value>| {
+            rows.iter()
+                .map(|row| row["annotation_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let sql = "SELECT annotation_id, target_record_id, purpose, selectors, source_event_seq, source_sha256 FROM comment_anchors ORDER BY annotation_id";
+        let alice_rows = query_sql(&db, &alice, sql).await.unwrap().rows;
+        assert_eq!(ids(alice_rows.clone()), vec![C_COMMON, C_ALICE]);
+        assert_eq!(
+            alice_rows[0]["selectors"],
+            r#"[{"type":"text_quote","exact":"sharedterm"}]"#
+        );
+        assert_eq!(alice_rows[0]["source_event_seq"], 1);
+        assert_eq!(alice_rows[0]["source_sha256"], "a".repeat(64));
+        assert_eq!(
+            ids(query_sql(&db, &bea, sql).await.unwrap().rows),
+            vec![C_COMMON, C_BEA, C_CROSS]
+        );
+        // Aggregates see no more than rows do.
+        let count = query_sql(&db, &alice, "SELECT count(*) AS n FROM comment_anchors")
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(count[0]["n"], 2);
+        // The physical table stays unreachable.
+        assert!(query_sql(
+            &db,
+            &alice,
+            "SELECT annotation_id FROM main.annotation_targets ORDER BY 1"
+        )
+        .await
+        .is_err());
+        // An archived bearer stays visible, as records do; a deleted bearer
+        // takes its comments' anchors with it.
+        sqlx::query("UPDATE records SET archived = 1 WHERE id = ?")
+            .bind(COMMON_ID)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            ids(query_sql(&db, &alice, sql).await.unwrap().rows),
+            vec![C_COMMON, C_ALICE]
+        );
+        delete_record(&db, ALICE_PRIVATE_ID).await.unwrap();
+        assert_eq!(
+            ids(query_sql(&db, &alice, sql).await.unwrap().rows),
+            vec![C_COMMON]
+        );
+    }
+
     #[tokio::test]
     async fn sqlite_toobig_links_require_both_endpoints_visible() {
         let (db, alice, _) = protected_fixture().await;
@@ -15728,6 +18469,2185 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             !error.contains(TOOBIG_EXTERNAL_BLOB_ID),
             "named an external blob by size_bytes: {error}"
         );
+    }
+    async fn exact_reaction_event(
+        db: &Db,
+        id: &str,
+        message: &str,
+        actor: &str,
+        emoji: &str,
+        added: bool,
+        payload_shape: (bool, bool),
+    ) {
+        let (sequence, oversized) = payload_shape;
+        let reason = if oversized {
+            "x".repeat(1024 * 1024)
+        } else {
+            "reaction fixture".into()
+        };
+        let key = if oversized {
+            "k".repeat(1024 * 1024)
+        } else {
+            id.into()
+        };
+        let command = if added {
+            "add_reaction"
+        } else {
+            "remove_reaction"
+        };
+        let payload = if sequence {
+            json!([
+                "native.message-reaction.v1",
+                emoji,
+                key,
+                command,
+                true,
+                actor,
+                "authenticated_principal",
+                null,
+                reason
+            ])
+        } else {
+            json!({"format":"native.message-reaction.v1", "emoji":emoji,
+                "idempotency_key":key, "command":command, "changed":true,
+                "actor_account_id":actor, "executor_kind":"authenticated_principal",
+                "executor_ref":null, "reason":reason})
+        };
+        serde_json::from_value::<crate::events::MessageReactionPayload>(payload.clone())
+            .unwrap()
+            .validate(Some(actor))
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+                     VALUES(?,?,?,?,?,'2026-10-01T12:00:00.000Z',1,'legacy_unknown')",
+        )
+        .bind(id)
+        .bind(message)
+        .bind(if added {
+            "message.reaction.added.v1"
+        } else {
+            "message.reaction.removed.v1"
+        })
+        .bind(payload.to_string())
+        .bind(actor)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_install_keeps_catalog_and_retention_contract() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut connection = db.governed_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        // Exercise main's frozen batch installer, also used by app-v2 sessions.
+        install_temp_contract(&mut tx).await.unwrap();
+        let relations = sqlx::query("SELECT relation_name,comment FROM temp.catalog_relations")
+            .fetch_all(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(relations.len(), sql_contract::LOGICAL_RELATIONS.len());
+        for (name, _, _, _, _, _, comment) in sql_contract::catalog_relation_rows() {
+            let row = relations
+                .iter()
+                .find(|row| row.get::<String, _>("relation_name") == name)
+                .unwrap();
+            assert_eq!(row.get::<String, _>("comment"), comment);
+        }
+        let columns: i64 = sqlx::query_scalar("SELECT count(*) FROM temp.catalog_columns")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(columns as usize, sql_contract::catalog_column_rows().len());
+
+        // This independently pins the stored-column assumptions behind the
+        // view's non-filtering retention predicates; do not replace them with
+        // nullable test tables or an authorizer population-read exception.
+        for (pragma, column) in [
+            ("PRAGMA main.table_info(content_events)", "id"),
+            ("PRAGMA temp.table_info(_query_sql_principal)", "account_id"),
+        ] {
+            let schema = sqlx::query(pragma).fetch_all(&mut *tx).await.unwrap();
+            let field = schema
+                .iter()
+                .find(|row| row.get::<String, _>("name") == column)
+                .unwrap();
+            assert_eq!(field.get::<String, _>("type"), "TEXT");
+            assert_eq!(field.get::<i64, _>("notnull"), 1);
+        }
+        for value in ["", "plain", "世界🙂", "\0embedded"] {
+            let retained: i64 = sqlx::query_scalar("SELECT length(?) >= 0")
+                .bind(value)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(retained, 1);
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_preserve_legacy_partitions_privacy_and_oversized_payloads() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_event(
+            &db,
+            "object-old",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (false, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "object-remove",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            false,
+            (false, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "object-undo",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (false, true),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "array-old",
+            D6_M_OPEN,
+            "alice",
+            "😂",
+            true,
+            (true, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "array-winning",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (true, true),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "hidden-actor",
+            D6_M_OPEN,
+            "harriet",
+            "🎉",
+            true,
+            (false, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "unbound-actor",
+            D6_M_OPEN,
+            "orphan",
+            "❤️",
+            true,
+            (false, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "hidden-message",
+            D6_M_BEA_ONLY,
+            "bea",
+            "👀",
+            true,
+            (false, true),
+        )
+        .await;
+        let sql = "SELECT * FROM message_reactions ORDER BY reaction_id";
+        let alice = QueryPrincipal::authenticated("alice", true);
+        let bea = QueryPrincipal::authenticated("bea", true);
+        let rows = d6_rows(&db, &alice, sql).await;
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows.iter().filter(|r| r["emoji"] == "👍").count(),
+            2,
+            "object and NULL legacy partition winners must both survive"
+        );
+        let old = crate::mcp::tools::messaging::reaction_groups_for_projection_test(
+            &db, "alice", D6_M_OPEN,
+        )
+        .await
+        .unwrap();
+        for group in old {
+            assert_eq!(
+                rows.iter().filter(|r| r["emoji"] == group["emoji"]).count(),
+                group["count"].as_u64().unwrap() as usize
+            );
+        }
+        for r in rows.iter().filter(|r| r["viewer"] == 1) {
+            assert_eq!(r["actor_record_id"], D6_P_ALICE);
+            assert_eq!(r["executor_kind"], "authenticated_principal");
+        }
+        let bea_rows = d6_rows(&db, &bea, sql).await;
+        assert_eq!(bea_rows.len(), 5);
+        let hidden = bea_rows
+            .iter()
+            .find(|r| r["reaction_id"] == "hidden-actor")
+            .unwrap();
+        for key in ["actor_record_id", "actor_name", "executor_kind"] {
+            assert!(hidden[key].is_null(), "{hidden}");
+        }
+        let unbound = bea_rows
+            .iter()
+            .find(|r| r["reaction_id"] == "unbound-actor")
+            .unwrap();
+        assert!(unbound["executor_kind"].is_null());
+        // This test deliberately exercises the existing trusted-local gate.
+        let local = unsafe { QueryPrincipal::trusted_local_unchecked("local") };
+        let trusted = d6_rows(&db, &local, sql).await;
+        let unbound = trusted
+            .iter()
+            .find(|r| r["reaction_id"] == "unbound-actor")
+            .unwrap();
+        assert!(unbound["actor_record_id"].is_null());
+        assert_eq!(unbound["executor_kind"], "authenticated_principal");
+        // Visible binding and name mutations change attribution without a
+        // new reaction. Hidden rows remain present and UUIDs remain stable.
+        sqlx::query("UPDATE records SET name='Renamed Alice' WHERE id=?")
+            .bind(D6_P_ALICE)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let renamed = d6_rows(&db, &alice, sql).await;
+        assert_eq!(
+            renamed
+                .iter()
+                .map(|r| &r["reaction_id"])
+                .collect::<Vec<_>>(),
+            rows.iter().map(|r| &r["reaction_id"]).collect::<Vec<_>>()
+        );
+        assert!(renamed
+            .iter()
+            .filter(|r| r["viewer"] == 1)
+            .all(|r| r["actor_name"] == "Renamed Alice"));
+        for r in renamed {
+            for key in r.as_object().unwrap().keys() {
+                assert!(
+                    !key.contains("seq") && !key.contains("account") && !key.contains("payload"),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_count_selfjoin_cte_and_app_grants_share_full_population() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        for id in ["a", "b"] {
+            exact_reaction_event(&db, id, D6_M_OPEN, id, "👍", true, (false, false)).await;
+        }
+        let principal = QueryPrincipal::authenticated("alice", true);
+        let cases = [
+            ("SELECT count(*) AS n FROM message_reactions", 2),
+            ("SELECT count(*) AS n FROM message_reactions a CROSS JOIN message_reactions b", 4),
+            ("SELECT count(*) AS n FROM message_reactions a INNER JOIN message_reactions b ON 1=1", 4),
+            ("WITH r AS (SELECT reaction_id FROM message_reactions) SELECT count(*) AS n FROM r", 2),
+            // x.n is the non-null sequence 1,2, so count(x.n) counts all four
+            // cross-product rows without a column-less read of the CTE.
+            // Plain reaction COUNT(*) remains covered above.
+            ("WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<2) SELECT count(x.n) AS n FROM x CROSS JOIN message_reactions", 4),
+        ];
+        let declared = crate::mcp::tools::alpha_tabs::parse_reads_declaration(
+            &json!({"relations":{"message_reactions":["reaction_id"]}}),
+        )
+        .unwrap();
+        for (sql, n) in cases {
+            assert!(validated_relation_dependencies(sql)
+                .unwrap()
+                .contains("message_reactions"));
+            assert_eq!(d6_rows(&db, &principal, sql).await[0]["n"], n);
+            let result = app_query(&db, &declared, principal.clone(), sql).await;
+            // The existing apps analyzer admits INNER/LEFT joins with ON,
+            // while CTEs and CROSS joins remain outside reads.v1's shape.
+            // Direct query_sql retains every corresponding data assertion.
+            if sql.starts_with("WITH") || sql.contains("CROSS JOIN") {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("app_sql [unsupported_sql]"), "{error}");
+            } else {
+                assert_eq!(result.unwrap().rows[0]["n"], n);
+            }
+        }
+        for sql in [
+            "SELECT reaction_id FROM message_reactions WHERE 0",
+            "SELECT reaction_id FROM message_reactions ORDER BY reaction_id LIMIT 0",
+        ] {
+            assert!(validated_relation_dependencies(sql)
+                .unwrap()
+                .contains("message_reactions"));
+            assert!(app_query(&db, &declared, principal.clone(), sql)
+                .await
+                .unwrap()
+                .rows
+                .is_empty());
+        }
+        assert!(app_query(
+            &db,
+            &app_declared_records(),
+            principal.clone(),
+            "SELECT count(*) AS n FROM message_reactions"
+        )
+        .await
+        .is_err());
+        assert!(app_query(
+            &db,
+            &declared,
+            principal.clone(),
+            "SELECT actor_name FROM message_reactions"
+        )
+        .await
+        .is_err());
+        let scoped = crate::mcp::tools::alpha_tabs::parse_reads_declaration(
+            &json!({"relations":{"message_reactions":["reaction_id"]},"scope":[{"type":"Message"}]})).unwrap();
+        assert!(app_query(
+            &db,
+            &scoped,
+            principal.clone(),
+            "SELECT reaction_id FROM message_reactions"
+        )
+        .await
+        .is_err());
+        let shadow = "WITH message_reactions AS (SELECT id FROM records) SELECT count(*) AS n FROM message_reactions";
+        assert!(!validated_relation_dependencies(shadow)
+            .unwrap()
+            .contains("message_reactions"));
+        for sql in [
+            "SELECT event_seq FROM _query_sql_reaction_winners",
+            "SELECT reaction_id FROM _query_sql_reaction_source",
+            "SELECT event_seq FROM content_event_reaction_meta",
+            "SELECT seq FROM message_reactions",
+            "SELECT payload FROM message_reactions",
+        ] {
+            assert!(query_sql(&db, &principal, sql).await.is_err(), "{sql}");
+        }
+        // Successful borrowed app calls tear down the relation and its stage.
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name IN ('message_reactions','_query_sql_reaction_winners')")
+            .fetch_one(&mut *connection).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn exact_reaction_fold_is_source_free_and_public_identity_reads_only_id_seq() {
+        let conn = build_frozen_validator().unwrap();
+        conn.execute_batch(
+            "INSERT INTO temp._query_sql_visible_ids(id) SELECT id FROM main.records;",
+        )
+        .unwrap();
+        conn.authorizer(Some(|c: AuthContext<'_>| {
+            if let AuthAction::Read {
+                table_name: "content_events",
+                ..
+            } = c.action
+            {
+                Authorization::Deny
+            } else {
+                Authorization::Allow
+            }
+        }));
+        conn.execute(REACTION_WINNER_SQL, [MAX_REACTION_WINNERS + 1])
+            .unwrap();
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        let seen = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let reads = seen.clone();
+        conn.authorizer(Some(move |c: AuthContext<'_>| {
+            if let AuthAction::Read {
+                table_name: "content_events",
+                column_name,
+            } = c.action
+            {
+                reads.lock().unwrap().insert(column_name.to_owned());
+                if !matches!(column_name, "id" | "seq") {
+                    return Authorization::Deny;
+                }
+            }
+            authorize_view_expansion(c)
+        }));
+        conn.prepare("SELECT * FROM message_reactions ORDER BY reaction_id")
+            .unwrap();
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            BTreeSet::from(["id".into(), "seq".into()])
+        );
+        // Injecting an accidental payload read into the controlled view must
+        // fail the production expansion authorizer, not only a test callback.
+        conn.execute_batch("DROP VIEW temp.message_reactions;
+             CREATE TEMP VIEW message_reactions AS SELECT e.payload AS reaction_id FROM main.content_events e;").unwrap();
+        assert!(prepare_under_authorizer(
+            &conn,
+            "SELECT reaction_id FROM message_reactions",
+            authorize_view_expansion
+        )
+        .is_err());
+        for column in ["type", "actor"] {
+            conn.execute_batch(&format!("DROP VIEW temp.message_reactions; CREATE TEMP VIEW message_reactions AS SELECT e.{column} AS reaction_id FROM main.content_events e;")).unwrap();
+            assert!(prepare_under_authorizer(
+                &conn,
+                "SELECT reaction_id FROM message_reactions",
+                authorize_view_expansion
+            )
+            .is_err());
+        }
+    }
+    async fn exact_reaction_bulk(db: &Db, message: &str, prefix: &str, amount: i64) {
+        let payload = json!({"format":"native.message-reaction.v1","emoji":"👍",
+            "idempotency_key":"bulk","command":"add_reaction","changed":true,
+            "actor_account_id":"bulk","executor_kind":"authenticated_principal",
+            "executor_ref":null,"reason":"bounded history qualification"})
+        .to_string();
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+            INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+            SELECT ?||x,?,'message.reaction.added.v1',?,'bulk','2026-10-01T12:00:00.000Z',1,'legacy_unknown' FROM n",
+        )
+        .bind(amount)
+        .bind(prefix)
+        .bind(message)
+        .bind(payload)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_session_reuse_clears_previous_viewers_winners() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_event(
+            &db,
+            "shared",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (false, false),
+        )
+        .await;
+        exact_reaction_event(
+            &db,
+            "private",
+            D6_M_BEA_ONLY,
+            "bea",
+            "👀",
+            true,
+            (false, false),
+        )
+        .await;
+        let tx = db.governed_pool().begin().await.unwrap();
+        let mut session = GovernedSqlSession::begin(&db, tx).await.unwrap();
+        for (viewer, count) in [("bea", 2), ("alice", 1), ("bea", 2), ("alice", 1)] {
+            let (rows, _) = session
+                .execute(
+                    QueryPrincipal::authenticated(viewer, true),
+                    QuerySqlRequest {
+                        sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                        parameters: vec![],
+                    },
+                    MAX_ROWS,
+                    sql_contract::FunctionAllowance::Portable,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.rows[0]["n"], count, "{viewer}");
+            // An unrelated next statement must clear the internal stage too.
+            session
+                .execute(
+                    QueryPrincipal::authenticated(viewer, true),
+                    QuerySqlRequest {
+                        sql: "SELECT count(*) AS n FROM records".into(),
+                        parameters: vec![],
+                    },
+                    MAX_ROWS,
+                    sql_contract::FunctionAllowance::Portable,
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let staged: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM temp._query_sql_reaction_winners")
+                    .fetch_one(&mut **session.transaction_for_test())
+                    .await
+                    .unwrap();
+            assert_eq!(staged, 0);
+        }
+        let mut tx = session.finish().await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name IN ('message_reactions','_query_sql_reaction_winners')")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        tx.rollback().await.unwrap();
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_vm_work_bounds_the_visible_history_window() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let principal = QueryPrincipal::authenticated("alice", true);
+        exact_reaction_bulk(&db, D6_M_OPEN, "visible-small-", 500).await;
+        let measured = |sql: &str| QuerySqlRequest {
+            sql: sql.into(),
+            parameters: vec![],
+        };
+        let run = |request| {
+            query_sql_request_owned_with_vm_work(
+                db.clone(),
+                principal.clone(),
+                request,
+                Some(Arc::new(AtomicU64::new(0))),
+                true,
+            )
+        };
+        let before = Arc::new(AtomicU64::new(0));
+        let sql = "SELECT count(*) AS n FROM message_reactions";
+        assert_eq!(
+            query_sql_request_owned_with_vm_work(
+                db.clone(),
+                principal.clone(),
+                measured(sql),
+                Some(before.clone()),
+                true
+            )
+            .await
+            .unwrap()
+            .rows[0]["n"],
+            1
+        );
+        exact_reaction_bulk(&db, D6_M_BEA_ONLY, "hidden-", 10_000).await;
+        let hidden = Arc::new(AtomicU64::new(0));
+        query_sql_request_owned_with_vm_work(
+            db.clone(),
+            principal.clone(),
+            measured(sql),
+            Some(hidden.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            hidden.load(Ordering::Relaxed) <= before.load(Ordering::Relaxed) + 3,
+            "private reaction work grew with hidden history"
+        );
+        exact_reaction_bulk(&db, D6_M_OPEN, "visible-large-", 4_000).await;
+        let large = Arc::new(AtomicU64::new(0));
+        query_sql_request_owned_with_vm_work(
+            db.clone(),
+            principal.clone(),
+            measured(sql),
+            Some(large.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            large.load(Ordering::Relaxed) > before.load(Ordering::Relaxed) * 3,
+            "measurement must include full window work despite the single winning row"
+        );
+        let capped = Arc::new(AtomicU64::new(0));
+        query_sql_request_owned_with_vm_work(
+            db.clone(),
+            principal.clone(),
+            measured("SELECT reaction_id FROM message_reactions ORDER BY reaction_id LIMIT 1"),
+            Some(capped.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(
+            capped.load(Ordering::Relaxed) + 3 >= large.load(Ordering::Relaxed),
+            "output LIMIT must not bypass the history window"
+        );
+        run(measured(
+            "SELECT reaction_id FROM message_reactions WHERE 0",
+        ))
+        .await
+        .unwrap();
+        let conn = build_frozen_validator().unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {REACTION_WINNER_SQL}"))
+            .unwrap()
+            .query_map([MAX_REACTION_WINNERS + 1], |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|p| p
+                .contains("SEARCH meta USING INDEX idx_content_event_reaction_meta_record")
+                && p.contains("record_id=?")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|p| p.contains("SCAN meta")), "{plan:?}");
+        let public_plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT * FROM message_reactions")
+            .unwrap()
+            .query_map([], |r| r.get(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            public_plan
+                .iter()
+                .any(|p| p.contains("SEARCH identity USING INTEGER PRIMARY KEY")),
+            "{public_plan:?}"
+        );
+        assert!(
+            !public_plan.iter().any(|p| p.contains("SCAN actor_binding")),
+            "{public_plan:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_history_cap_is_visible_complete_or_error_before_fold() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let seed_types: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT type,count(*) FROM main.content_events WHERE record_id=? GROUP BY type ORDER BY type",
+        )
+        .bind(D6_M_BEA_ONLY)
+        .fetch_all(db.write_pool())
+        .await
+        .unwrap();
+        assert_eq!(seed_types, [("record.created".to_owned(), 1)]);
+        let source_counts_sql = "SELECT
+            (SELECT count(*) FROM main.content_events WHERE record_id=?),
+            (SELECT count(*) FROM main.content_events WHERE record_id=?
+                AND type IN ('message.reaction.added.v1','message.reaction.removed.v1')),
+            (SELECT count(*) FROM main.content_events)";
+        let baseline: (i64, i64, i64) = sqlx::query_as(source_counts_sql)
+            .bind(D6_M_BEA_ONLY)
+            .bind(D6_M_BEA_ONLY)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!((baseline.0, baseline.1), (1, 0));
+        let guard_count_sql = "SELECT count(*) FROM main.sqlite_master WHERE type='trigger'
+            AND tbl_name='content_events' AND name IN ('content_events_no_update','content_events_no_delete')";
+        let guards: i64 = sqlx::query_scalar(guard_count_sql)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(guards, 2);
+        exact_reaction_bulk(
+            &db,
+            D6_M_BEA_ONLY,
+            "hidden-bound-",
+            MAX_REACTION_SOURCE_EVENTS + 1,
+        )
+        .await;
+        let pre_error: (i64, i64, i64) = sqlx::query_as(source_counts_sql)
+            .bind(D6_M_BEA_ONLY)
+            .bind(D6_M_BEA_ONLY)
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            pre_error,
+            (
+                baseline.0 + MAX_REACTION_SOURCE_EVENTS + 1,
+                MAX_REACTION_SOURCE_EVENTS + 1,
+                baseline.2 + MAX_REACTION_SOURCE_EVENTS + 1
+            )
+        );
+        let alice = QueryPrincipal::authenticated("alice", true);
+        assert_eq!(
+            d6_rows(&db, &alice, "SELECT count(*) AS n FROM message_reactions").await[0]["n"],
+            0
+        );
+        let bea = QueryPrincipal::authenticated("bea", true);
+        for sql in [
+            "SELECT count(*) AS n FROM message_reactions",
+            "SELECT reaction_id FROM message_reactions ORDER BY reaction_id LIMIT 1",
+            "SELECT reaction_id FROM message_reactions WHERE 0",
+            "WITH r AS (SELECT reaction_id FROM message_reactions) SELECT count(*) AS n FROM r",
+        ] {
+            let error = query_sql(&db, &bea, sql).await.unwrap_err().to_string();
+            assert!(
+                error.contains("visible reaction history bound exceeded"),
+                "{error}"
+            );
+            assert!(
+                !error.contains(D6_M_BEA_ONLY) && !error.contains("bulk"),
+                "{error}"
+            );
+        }
+        // A CTE shadow never creates a reaction dependency or incurs the cap.
+        let shadow = "WITH message_reactions(reaction_id) AS (VALUES(1))
+            SELECT count(reaction_id) AS n FROM message_reactions";
+        assert!(validated_relation_dependencies(shadow).unwrap().is_empty());
+        assert_eq!(d6_rows(&db, &bea, shadow).await, [json!({"n": 1})]);
+        // A borrowed transaction also refuses before output, then removes all
+        // TEMP state while preserving the ordinary domain transaction.
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let error = query_sql_request_in(
+            &mut tx,
+            bea,
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible reaction history bound exceeded"),
+            "{error}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        // Keep the seed and all unrelated/root source rows in the proof.
+        // With both append-only guards still installed, unchanged physical
+        // counts prove the refused read inserted no partial source history.
+        let after_error: (i64, i64, i64) = sqlx::query_as(source_counts_sql)
+            .bind(D6_M_BEA_ONLY)
+            .bind(D6_M_BEA_ONLY)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(after_error, pre_error);
+        let guards: i64 = sqlx::query_scalar(guard_count_sql)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(guards, 2);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_deadline_cancel_and_pool_reuse_clear_winners() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_event(
+            &db,
+            "deadline-reaction",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (false, true),
+        )
+        .await;
+        let held = hold_all_but_one_governed_slot(&db).await;
+        let alice = QueryPrincipal::authenticated("alice", true);
+        let busy = "WITH RECURSIVE x(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM x WHERE n<100000000) SELECT sum(x.n) AS n FROM x CROSS JOIN message_reactions";
+        let error = query_sql(&db, &alice, busy).await.unwrap_err().to_string();
+        assert!(
+            error.contains("timeout") || error.contains("deadline"),
+            "{error}"
+        );
+        assert_eq!(
+            d6_rows(&db, &alice, "SELECT count(*) AS n FROM message_reactions").await[0]["n"],
+            1
+        );
+        let work = Arc::new(AtomicU64::new(0));
+        let future = query_sql_request_owned_with_vm_work(
+            db.clone(),
+            alice.clone(),
+            QuerySqlRequest {
+                sql: busy.into(),
+                parameters: vec![],
+            },
+            Some(work.clone()),
+            true,
+        );
+        let task = tokio::spawn(future);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while work.load(Ordering::Relaxed) == 0 {
+                if task.is_finished() {
+                    panic!("query finished before cancellation probe");
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let bea = QueryPrincipal::authenticated("bea", true);
+        assert_eq!(
+            d6_rows(&db, &bea, "SELECT viewer FROM message_reactions").await[0]["viewer"],
+            0
+        );
+        let mut connection = db.governed_pool().acquire().await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name IN ('message_reactions','_query_sql_reaction_winners')")
+            .fetch_one(&mut *connection).await.unwrap();
+        assert_eq!(left, 0);
+        drop(connection);
+        drop(held);
+        // Successful caller-owned execution cleans before rollback/reuse.
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        query_sql_request_in(
+            &mut tx,
+            alice,
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name IN ('message_reactions','_query_sql_reaction_winners')")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        tx.rollback().await.unwrap();
+    }
+    async fn exact_reaction_head_fixture_events(
+        db: &Db,
+        record: &str,
+        prefix: &str,
+        amount: i64,
+        event_type: &str,
+    ) {
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+            INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+            SELECT ?||x,?,?,'{}','alice','2026-10-01T12:00:00.000Z',1,'legacy_unknown' FROM n")
+            .bind(amount).bind(prefix).bind(record).bind(event_type)
+            .execute(db.write_pool()).await.unwrap();
+    }
+
+    async fn exact_reaction_borrowed_observation(
+        db: &Db,
+        work: Arc<AtomicU64>,
+    ) -> GovernedSqlObservation {
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let (_, observation) = query_sql_request_in_with_row_limit_observed(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                parameters: vec![],
+            },
+            200,
+            sql_contract::FunctionAllowance::Portable,
+            None,
+            Some(work),
+            false,
+        )
+        .await
+        .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        tx.rollback().await.unwrap();
+        observation
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_head_matches_history_and_ignores_hidden_churn() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        for (i, event_type) in [
+            "record.updated",
+            "occurrence.bound.v1",
+            "reconciliation.recorded.v1",
+            "unit.superseded.v1",
+            "receipt.dependency_audited.v1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // Non-Message history contributes, including occurrence.bound.
+            exact_reaction_head_fixture_events(
+                &db,
+                D6_D_REF,
+                &format!("head-type-{i}-"),
+                1,
+                event_type,
+            )
+            .await;
+        }
+        let expected: i64 =
+            sqlx::query_scalar("SELECT seq FROM content_events WHERE id='head-type-1-1'")
+                .fetch_one(db.write_pool())
+                .await
+                .unwrap();
+        let before = Arc::new(AtomicU64::new(0));
+        let old_head = d6_rows(
+            &db,
+            &QueryPrincipal::authenticated("alice", true),
+            "SELECT coalesce(max(local_seq),0) AS head FROM content_events",
+        )
+        .await[0]["head"]
+            .as_i64()
+            .unwrap();
+        assert_eq!(old_head, expected);
+        let first = exact_reaction_borrowed_observation(&db, before.clone()).await;
+        assert_eq!(first.content_event_seq, Some(old_head));
+        exact_reaction_head_fixture_events(
+            &db,
+            D6_M_BEA_ONLY,
+            "head-hidden-",
+            10_000,
+            "record.updated",
+        )
+        .await;
+        let after = Arc::new(AtomicU64::new(0));
+        let second = exact_reaction_borrowed_observation(&db, after.clone()).await;
+        assert_eq!(second.content_event_seq, first.content_event_seq);
+        assert_eq!(second.authorization_boundary, first.authorization_boundary);
+        assert!(
+            after.load(Ordering::Relaxed) <= before.load(Ordering::Relaxed) + 2,
+            "hidden history grew bounded-stage VM work: before={} after={}",
+            before.load(Ordering::Relaxed),
+            after.load(Ordering::Relaxed)
+        );
+        // Owned envelope deliberately retains its existing global head.
+        let owned = query_sql(
+            &db,
+            &QueryPrincipal::authenticated("alice", true),
+            "SELECT count(*) AS n FROM message_reactions",
+        )
+        .await
+        .unwrap();
+        let global: i64 = sqlx::query_scalar("SELECT max(seq) FROM content_events")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(owned.as_of_seq, global);
+        assert!(global > expected);
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_head_preserves_negative_empty_and_minimum_sequences() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE _query_sql_visible_ids(id TEXT PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded_reaction_visible_head(
+                &mut tx,
+                &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE)
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        // Isolate a new real record with no positive fixture history.
+        // Other records are deliberately absent from this private test stage.
+        sqlx::query("INSERT INTO records(id,type,name,policy_anchor_id) VALUES('negative-head-record','Document','Negative',?)")
+            .bind(D6_D_REF).execute(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO _query_sql_visible_ids VALUES('negative-head-record')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded_reaction_visible_head(
+                &mut tx,
+                &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE)
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let expired = bounded_reaction_visible_head(&mut tx, &ReactionDeadline::at(Instant::now()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(expired.contains("shared deadline exceeded"), "{expired}");
+        for (seq, event_type) in [
+            (i64::MIN, "record.updated"),
+            (-2, "occurrence.bound.v1"),
+            (-1, "unit.superseded.v1"),
+        ] {
+            sqlx::query("INSERT INTO content_events(seq,id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+                VALUES(?,?,'negative-head-record',?,'{}','alice','2026-10-01T12:00:00.000Z',1,'legacy_unknown')")
+                .bind(seq).bind(format!("negative-{seq}")).bind(event_type).execute(&mut *tx).await.unwrap();
+            let expected: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events WHERE record_id='negative-head-record'
+                AND type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')")
+                .fetch_one(&mut *tx).await.unwrap();
+            assert_eq!(
+                bounded_reaction_visible_head(
+                    &mut tx,
+                    &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE)
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_envelope_preserves_global_range_and_constant_vm() {
+        use sqlx::Connection as _;
+        // The actual sqlx SQLite backend and current production schema, with
+        // no bootstrap events masking empty/all-negative envelope cases.
+        let mut connection = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        for statement in DDL_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        let schema = sqlx::query("PRAGMA main.table_info(content_events)")
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+        let record_id = schema
+            .iter()
+            .find(|row| row.get::<String, _>("name") == "record_id")
+            .unwrap();
+        assert_eq!(record_id.get::<String, _>("type"), "TEXT");
+        assert_eq!(record_id.get::<i64, _>("notnull"), 1);
+        for value in ["", "世界🙂", "\0embedded"] {
+            let true_for_value: i64 = sqlx::query_scalar("SELECT length(?)>=0")
+                .bind(value)
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(true_for_value, 1);
+        }
+        async fn observed(connection: &mut sqlx::SqliteConnection) -> (i64, u64) {
+            let steps = Arc::new(AtomicU64::new(0));
+            {
+                let mut handle = connection.lock_handle().await.unwrap();
+                let counter = steps.clone();
+                handle.set_progress_handler(1, move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    true
+                });
+            }
+            let head: i64 = sqlx::query_scalar(REACTION_BORROWED_ENVELOPE_SQL)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            connection
+                .lock_handle()
+                .await
+                .unwrap()
+                .remove_progress_handler();
+            let expected: i64 =
+                sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM main.content_events")
+                    .fetch_one(connection)
+                    .await
+                    .unwrap();
+            assert_eq!(head, expected);
+            (head, steps.load(Ordering::Relaxed))
+        }
+        assert_eq!(observed(&mut connection).await.0, 0);
+        for (seq, record, expected) in [(i64::MIN, "", i64::MIN), (-5, "世界🙂", -5)] {
+            sqlx::query("INSERT INTO content_events(seq,id,record_id,type,payload,causal_envelope_version,causal_status)
+                VALUES(?,?,?,'probe.envelope','{}',1,'legacy_unknown')")
+                .bind(seq).bind(format!("envelope-{seq}")).bind(record)
+                .execute(&mut connection).await.unwrap();
+            assert_eq!(observed(&mut connection).await.0, expected);
+        }
+        let before = observed(&mut connection).await.1;
+        // Other records' history must advance the actual global envelope,
+        // while its rightmost lookup stays constant work before the handler.
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+            INSERT INTO content_events(seq,id,record_id,type,payload,causal_envelope_version,causal_status)
+            SELECT x,'envelope-hidden-'||x,'other-hidden-record','probe.envelope','{}',1,'legacy_unknown' FROM n")
+            .execute(&mut connection).await.unwrap();
+        let (head, after) = observed(&mut connection).await;
+        assert_eq!(head, 10000);
+        assert!(
+            before > 0 && after <= before + 2 && after < 100,
+            "envelope VM: {before} -> {after}"
+        );
+        sqlx::query("INSERT INTO content_events(seq,id,record_id,type,payload,causal_envelope_version,causal_status)
+            VALUES(?,'envelope-max',?,'probe.envelope','{}',1,'legacy_unknown')")
+            .bind(i64::MAX).bind("\0embedded").execute(&mut connection).await.unwrap();
+        assert_eq!(observed(&mut connection).await.0, i64::MAX);
+        let plan = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {REACTION_BORROWED_ENVELOPE_SQL}"
+        ))
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        let details: Vec<String> = plan.iter().map(|row| row.get(3)).collect();
+        assert!(
+            details
+                .iter()
+                .any(|line| line.contains("SEARCH main.content_events")),
+            "{details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|line| line.contains("SCAN") || line.contains("TEMP B-TREE")),
+            "{details:?}"
+        );
+        let bytecode = sqlx::query(&format!("EXPLAIN {REACTION_BORROWED_ENVELOPE_SQL}"))
+            .fetch_all(&mut connection)
+            .await
+            .unwrap();
+        assert!(bytecode.iter().any(|row| row.get::<String, _>(1) == "Last"));
+        assert!(!bytecode.iter().any(|row| matches!(
+            row.get::<String, _>(1).as_str(),
+            "Rewind" | "Next" | "SorterOpen" | "Sort"
+        )));
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_path_source_authorizer_is_payload_free() {
+        use std::ffi::{c_char, c_int, c_void, CStr};
+        struct Trace(std::sync::Mutex<Vec<(String, String, String)>>);
+        unsafe extern "C" fn authorize(
+            data: *mut c_void,
+            action: c_int,
+            table: *const c_char,
+            column: *const c_char,
+            database: *const c_char,
+            accessor: *const c_char,
+        ) -> c_int {
+            if action != libsqlite3_sys::SQLITE_READ || table.is_null() || column.is_null() {
+                return libsqlite3_sys::SQLITE_OK;
+            }
+            // SAFETY: SQLite supplies live NUL-terminated callback strings;
+            // the test retains Trace until the callback is removed below.
+            let table = unsafe { CStr::from_ptr(table) }.to_string_lossy();
+            if table != "content_events" {
+                return libsqlite3_sys::SQLITE_OK;
+            }
+            let column = unsafe { CStr::from_ptr(column) }
+                .to_string_lossy()
+                .into_owned();
+            let accessor = if accessor.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(accessor) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let database = if database.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(database) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            unsafe { &*(data as *const Trace) }.0.lock().unwrap().push((
+                column.clone(),
+                accessor.clone(),
+                database,
+            ));
+            let permitted = if accessor == "message_reactions" {
+                matches!(column.as_str(), "id" | "seq")
+            } else {
+                matches!(column.as_str(), "seq" | "record_id" | "type")
+            };
+            if permitted {
+                libsqlite3_sys::SQLITE_OK
+            } else {
+                libsqlite3_sys::SQLITE_DENY
+            }
+        }
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_event(
+            &db,
+            "borrowed-authorized-winner",
+            D6_M_OPEN,
+            "alice",
+            "👍",
+            true,
+            (false, true),
+        )
+        .await;
+        // The envelope must retain a later hidden source event, even though
+        // the public winning row and visible freshness head exclude it.
+        exact_reaction_event(
+            &db,
+            "borrowed-hidden-envelope",
+            D6_M_BEA_ONLY,
+            "bea",
+            "👍",
+            true,
+            (false, false),
+        )
+        .await;
+        let trace = Box::new(Trace(std::sync::Mutex::new(vec![])));
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let global_envelope: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM main.content_events")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        {
+            let mut handle = tx.lock_handle().await.unwrap();
+            // SAFETY: exclusive handle, boxed trace remains live across await.
+            assert_eq!(
+                unsafe {
+                    libsqlite3_sys::sqlite3_set_authorizer(
+                        handle.as_raw_handle().as_ptr(),
+                        Some(authorize),
+                        (&*trace as *const Trace).cast_mut().cast(),
+                    )
+                },
+                libsqlite3_sys::SQLITE_OK
+            );
+        }
+        let result = query_sql_request_in(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT reaction_id,viewer FROM message_reactions".into(),
+                parameters: vec![],
+            },
+        )
+        .await;
+        {
+            let mut handle = tx.lock_handle().await.unwrap();
+            // SAFETY: remove callback before dropping its boxed state.
+            assert_eq!(
+                unsafe {
+                    libsqlite3_sys::sqlite3_set_authorizer(
+                        handle.as_raw_handle().as_ptr(),
+                        None,
+                        std::ptr::null_mut(),
+                    )
+                },
+                libsqlite3_sys::SQLITE_OK
+            );
+        }
+        let result = result.unwrap_or_else(|error| {
+            panic!(
+                "borrowed source-authorizer result: {error}; actual SQLite READ trace: {:?}",
+                trace.0.lock().unwrap()
+            )
+        });
+        assert_eq!(result.as_of_seq, global_envelope);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0]["reaction_id"], "borrowed-authorized-winner");
+        {
+            let reads = trace.0.lock().unwrap();
+            assert!(
+                reads
+                    .iter()
+                    .any(|(column, accessor, _)| column == "type" && accessor.is_empty()),
+                "{reads:?}"
+            );
+            assert!(
+                reads
+                    .iter()
+                    .any(|(column, accessor, _)| column == "id" && accessor == "message_reactions"),
+                "{reads:?}"
+            );
+            assert!(
+                !reads.iter().any(|(column, _, _)| matches!(
+                    column.as_str(),
+                    "payload" | "actor" | "run_key"
+                )),
+                "{reads:?}"
+            );
+            assert!(
+                reads.iter().all(|(_, _, database)| database == "main"),
+                "{reads:?}"
+            );
+        }
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_excluded_tail_fails_closed_and_reuses_transaction() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_head_fixture_events(
+            &db,
+            D6_D_REF,
+            "head-excluded-",
+            MAX_REACTION_HEAD_EVENTS + 1,
+            "unit.superseded.v1",
+        )
+        .await;
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let error = query_sql_request_in(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions WHERE 0".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        // A cold/slow machine can reach the SAME absolute deadline before the
+        // aggregate cap. Neither path may return a partial head or receipt.
+        assert!(
+            error.contains("visible freshness history bound exceeded")
+                || error.contains("deadline")
+                || error.contains("timeout"),
+            "{error}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        let result = query_sql_request_in(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT 42 AS n".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows[0]["n"], 42);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_head_budget_is_aggregate_across_all_visible_records() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        for (prefix, record) in [
+            ("aggregate-note-", D6_D_REF),
+            ("aggregate-message-", D6_M_OPEN),
+        ] {
+            exact_reaction_head_fixture_events(&db, record, prefix, 2, "unit.superseded.v1").await;
+        }
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE _query_sql_visible_ids(id TEXT PRIMARY KEY)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO _query_sql_visible_ids VALUES(?),(?)")
+            .bind(D6_D_REF)
+            .bind(D6_M_OPEN)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // Each record needs three inspected rows (two excluded + winner).
+        // Five total is insufficient although each record individually fits.
+        let error = bounded_reaction_visible_head_with_bounds(
+            &mut tx,
+            2,
+            5,
+            &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible freshness history bound exceeded"),
+            "{error}"
+        );
+        let expected: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events WHERE record_id IN (?,?)
+            AND type NOT IN ('reconciliation.recorded.v1','unit.superseded.v1','receipt.dependency_audited.v1')")
+            .bind(D6_D_REF).bind(D6_M_OPEN).fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(
+            bounded_reaction_visible_head_with_bounds(
+                &mut tx,
+                2,
+                6,
+                &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE)
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        let error = bounded_reaction_visible_head_with_bounds(
+            &mut tx,
+            1,
+            6,
+            &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible freshness record bound exceeded"),
+            "{error}"
+        );
+        for statement in [REACTION_HEAD_EVENTS_SQL, REACTION_HEAD_PREVIOUS_EVENT_SQL] {
+            // The initial lookup has one bind, the keyset step has two.
+            let rows = if statement == REACTION_HEAD_EVENTS_SQL {
+                sqlx::query(&format!("EXPLAIN QUERY PLAN {statement}"))
+                    .bind(D6_D_REF)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap()
+            } else {
+                sqlx::query(&format!("EXPLAIN QUERY PLAN {statement}"))
+                    .bind(D6_D_REF)
+                    .bind(i64::MAX)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .unwrap()
+            };
+            let plan: Vec<String> = rows.iter().map(|r| r.get(3)).collect();
+            assert!(
+                plan.iter()
+                    .any(|p| p.contains("SEARCH event USING INDEX idx_content_events_record")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|p| p.contains("SCAN event") || p.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+        let steps = Arc::new(AtomicU64::new(0));
+        {
+            let mut handle = tx.lock_handle().await.unwrap();
+            let counter = steps.clone();
+            handle.set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        }
+        bounded_reaction_visible_head(
+            &mut tx,
+            &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE),
+        )
+        .await
+        .unwrap();
+        let before = steps.swap(0, Ordering::Relaxed);
+        // Hidden history is not in the staged record set. It cannot cause
+        // work proportional to its size, even though global seq advances.
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+            INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+            SELECT 'head-vm-hidden-'||x,?,'record.updated','{}','bea','2026-10-01T12:00:00.000Z',1,'legacy_unknown' FROM n")
+            .bind(D6_M_BEA_ONLY).execute(&mut *tx).await.unwrap();
+        steps.store(0, Ordering::Relaxed);
+        bounded_reaction_visible_head(
+            &mut tx,
+            &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE),
+        )
+        .await
+        .unwrap();
+        let hidden = steps.swap(0, Ordering::Relaxed);
+        assert!(
+            before > 0 && hidden <= before + 50,
+            "head VM grew with hidden history: {before} -> {hidden}"
+        );
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10)
+            INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+            SELECT 'head-vm-visible-'||x,?,'unit.superseded.v1','{}','alice','2026-10-01T12:00:00.000Z',1,'legacy_unknown' FROM n")
+            .bind(D6_D_REF).execute(&mut *tx).await.unwrap();
+        steps.store(0, Ordering::Relaxed);
+        bounded_reaction_visible_head(
+            &mut tx,
+            &ReactionDeadline::at(Instant::now() + QUERY_DEADLINE),
+        )
+        .await
+        .unwrap();
+        let visible = steps.load(Ordering::Relaxed);
+        assert!(
+            visible > hidden && visible <= hidden + 1000,
+            "indexed excluded-tail head VM should grow linearly: {hidden} -> {visible}"
+        );
+        tx.lock_handle().await.unwrap().remove_progress_handler();
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_record_cap_counts_nonmessages_and_cleans_up() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+            INSERT INTO records(id,type,name,policy_anchor_id)
+            SELECT 'head-record-cap-'||x,'Document','Head candidate',policy_anchor_id FROM n CROSS JOIN records WHERE records.id=?")
+            .bind((MAX_REACTION_HEAD_RECORDS + 1) as i64).bind(D6_D_REF).execute(db.write_pool()).await.unwrap();
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let error = query_sql_request_in(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions WHERE 0".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible freshness record bound exceeded")
+                || error.contains("timeout")
+                || error.contains("deadline"),
+            "{error}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        let result = query_sql_request_in(
+            &mut tx,
+            QueryPrincipal::authenticated("alice", true),
+            QuerySqlRequest {
+                sql: "SELECT 42 AS n".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows[0]["n"], 42);
+        tx.rollback().await.unwrap();
+    }
+    // Request-scoped test probe: authorizer notifications observe preparation
+    // only, admit every read, and never issue SQL or inspect source values.
+    struct ReactionPhaseProbe {
+        claimed: AtomicU64,
+        seen: AtomicU64,
+        notify: tokio::sync::Notify,
+        cancel_phase: u64,
+        gate: (std::sync::Mutex<bool>, std::sync::Condvar),
+        clock: Option<Arc<ReactionTestClock>>,
+        handle: AtomicU64,
+        lowered_limit: AtomicU64,
+    }
+
+    impl ReactionPhaseProbe {
+        fn new(cancel_phase: u64, clock: Option<Arc<ReactionTestClock>>) -> Self {
+            Self {
+                claimed: AtomicU64::new(0),
+                seen: AtomicU64::new(0),
+                notify: tokio::sync::Notify::new(),
+                cancel_phase,
+                gate: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+                clock,
+                handle: AtomicU64::new(0),
+                lowered_limit: AtomicU64::new(0),
+            }
+        }
+        fn release(&self) {
+            *self.gate.0.lock().unwrap() = true;
+            self.gate.1.notify_all();
+        }
+    }
+
+    unsafe extern "C" fn reaction_phase_authorizer(
+        data: *mut std::ffi::c_void,
+        action: std::ffi::c_int,
+        table: *const std::ffi::c_char,
+        column: *const std::ffi::c_char,
+        _database: *const std::ffi::c_char,
+        accessor: *const std::ffi::c_char,
+    ) -> std::ffi::c_int {
+        use std::ffi::CStr;
+        if action != libsqlite3_sys::SQLITE_READ
+            || table.is_null()
+            || column.is_null()
+            || (!accessor.is_null() && !unsafe { CStr::from_ptr(accessor) }.to_bytes().is_empty())
+        {
+            return libsqlite3_sys::SQLITE_OK;
+        }
+        // SAFETY: callback strings are live; a retained Arc owns the probe
+        // until authorizer removal after the worker/release hook has finished.
+        let table = unsafe { CStr::from_ptr(table) }.to_bytes();
+        let column = unsafe { CStr::from_ptr(column) }.to_bytes();
+        let phase = if table == b"content_events" && column == b"type" {
+            1
+        } else if table == b"content_event_reaction_meta" && column == b"record_id" {
+            2
+        } else {
+            return libsqlite3_sys::SQLITE_OK;
+        };
+        let probe = unsafe { &*(data as *const ReactionPhaseProbe) };
+        if probe.claimed.fetch_or(phase, Ordering::AcqRel) & phase == 0 {
+            let handle =
+                probe.handle.load(Ordering::Acquire) as usize as *mut libsqlite3_sys::sqlite3;
+            // SAFETY: this is a read of the limit on the same live SQLite
+            // worker handle invoking the callback, with no SQL re-entry.
+            let limit = unsafe {
+                libsqlite3_sys::sqlite3_limit(handle, libsqlite3_sys::SQLITE_LIMIT_LENGTH, -1)
+            };
+            probe.lowered_limit.store(limit as u64, Ordering::Release);
+            if let Some(clock) = &probe.clock {
+                // Each phase consumes <2s; together they exceed the SAME
+                // request deadline. This is virtual time, never a sleep.
+                clock.advance(QUERY_DEADLINE / 5 * 3);
+            }
+            probe.seen.fetch_or(phase, Ordering::Release);
+            probe.notify.notify_one();
+            if probe.cancel_phase == phase {
+                let mut released = probe.gate.0.lock().unwrap();
+                while !*released {
+                    released = probe.gate.1.wait(released).unwrap();
+                }
+            }
+        }
+        libsqlite3_sys::SQLITE_OK
+    }
+
+    async fn install_reaction_phase_probe(
+        connection: &mut sqlx::SqliteConnection,
+        probe: &Arc<ReactionPhaseProbe>,
+    ) -> (usize, i32, usize) {
+        let mut handle = connection.lock_handle().await.unwrap();
+        let raw = handle.as_raw_handle().as_ptr();
+        probe.handle.store(raw as usize as u64, Ordering::Release);
+        // Retained raw Arc survives cancellation, including failure paths.
+        // A failing test may leak this small probe, never a dangling callback.
+        let retained = Arc::into_raw(probe.clone()) as usize;
+        // SAFETY: exclusive handle; raw Arc lives until explicit removal.
+        let original =
+            unsafe { libsqlite3_sys::sqlite3_limit(raw, libsqlite3_sys::SQLITE_LIMIT_LENGTH, -1) };
+        assert_eq!(
+            unsafe {
+                libsqlite3_sys::sqlite3_set_authorizer(
+                    raw,
+                    Some(reaction_phase_authorizer),
+                    retained as *mut std::ffi::c_void,
+                )
+            },
+            libsqlite3_sys::SQLITE_OK
+        );
+        (raw as usize, original, retained)
+    }
+
+    async fn remove_reaction_phase_probe(connection: &mut sqlx::SqliteConnection, retained: usize) {
+        let mut handle = connection.lock_handle().await.unwrap();
+        // SAFETY: remove callback before releasing the Arc it may reference.
+        assert_eq!(
+            unsafe {
+                libsqlite3_sys::sqlite3_set_authorizer(
+                    handle.as_raw_handle().as_ptr(),
+                    None,
+                    std::ptr::null_mut(),
+                )
+            },
+            libsqlite3_sys::SQLITE_OK
+        );
+        unsafe { drop(Arc::from_raw(retained as *const ReactionPhaseProbe)) };
+    }
+
+    async fn assert_reaction_borrowed_scope_restored(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        original: i32,
+    ) {
+        let actual = {
+            let mut handle = tx.lock_handle().await.unwrap();
+            // SAFETY: exclusive live handle, limit read only.
+            unsafe {
+                libsqlite3_sys::sqlite3_limit(
+                    handle.as_raw_handle().as_ptr(),
+                    libsqlite3_sys::SQLITE_LIMIT_LENGTH,
+                    -1,
+                )
+            }
+        };
+        assert_eq!(actual, original);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut **tx).await.unwrap();
+        assert_eq!(left, 0);
+        // >PROGRESS_OPS instructions: an expired retained handler would
+        // interrupt ordinary domain work instead of letting it complete.
+        let sum: i64 = sqlx::query_scalar("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000) SELECT sum(x) FROM n")
+            .fetch_one(&mut **tx).await.unwrap();
+        assert_eq!(sum, 500500);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_reaction_reads_borrowed_cancel_in_head_and_staging_restores_pinned_slot() {
+        for phase in [1, 2] {
+            let db = crate::create_database(":memory:").await.unwrap();
+            d6_fixture(&db).await;
+            exact_reaction_event(
+                &db,
+                "cancel-borrowed-winner",
+                D6_M_OPEN,
+                "alice",
+                "👍",
+                true,
+                (false, true),
+            )
+            .await;
+            let held = hold_all_but_one_governed_slot(&db).await;
+            let clock = Arc::new(ReactionTestClock::new());
+            let probe = Arc::new(ReactionPhaseProbe::new(phase, Some(clock.clone())));
+            let worker_clock = clock.clone();
+            let worker_probe = probe.clone();
+            let worker_db = db.clone();
+            let (installed_tx, installed_rx) = tokio::sync::oneshot::channel();
+            let mut worker = tokio::spawn(async move {
+                let mut connection = worker_db.governed_pool().acquire().await.unwrap();
+                let installed = install_reaction_phase_probe(&mut connection, &worker_probe).await;
+                installed_tx.send(installed).unwrap();
+                let mut tx = connection.begin().await.unwrap();
+                REACTION_TEST_CLOCK
+                    .scope(
+                        worker_clock,
+                        query_sql_request_in(
+                            &mut tx,
+                            QueryPrincipal::authenticated("alice", true),
+                            QuerySqlRequest {
+                                sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                                parameters: vec![],
+                            },
+                        ),
+                    )
+                    .await
+            });
+            let (identity, original, retained) = installed_rx.await.unwrap();
+            let reached = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let notified = probe.notify.notified();
+                    if probe.seen.load(Ordering::Acquire) & phase != 0 {
+                        break;
+                    }
+                    tokio::select! {
+                        outcome = &mut worker => {
+                            probe.release();
+                            panic!("borrowed executor completed before target phase: {outcome:?}");
+                        }
+                        _ = notified => {}
+                    }
+                }
+            })
+            .await;
+            if reached.is_err() {
+                worker.abort();
+                probe.release();
+                let _ = worker.await;
+                panic!("borrowed executor never prepared the target phase");
+            }
+            // The SQLite preparation gate prevents reaching output before
+            // abort. Release only after cancellation has dropped the future.
+            worker.abort();
+            let cancelled = worker.await;
+            clock.advance(QUERY_DEADLINE);
+            probe.release();
+            assert!(cancelled.unwrap_err().is_cancelled());
+            assert_eq!(
+                probe.lowered_limit.load(Ordering::Acquire),
+                MAX_SQLITE_VALUE_BYTES as u64
+            );
+            let mut connection =
+                tokio::time::timeout(Duration::from_secs(30), db.governed_pool().acquire())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let reused = {
+                let mut handle = connection.lock_handle().await.unwrap();
+                handle.as_raw_handle().as_ptr() as usize
+            };
+            assert_eq!(
+                reused, identity,
+                "cleanup must reuse the pinned physical slot"
+            );
+            remove_reaction_phase_probe(&mut connection, retained).await;
+            // The cancelled handler's private clock is now expired. Ordinary
+            // VM work can complete only if release actually removed it.
+            let mut tx = connection.begin().await.unwrap();
+            assert_reaction_borrowed_scope_restored(&mut tx, original).await;
+            let result = query_sql_request_in(
+                &mut tx,
+                QueryPrincipal::authenticated("bea", true),
+                QuerySqlRequest {
+                    sql: "SELECT viewer FROM message_reactions".into(),
+                    parameters: vec![],
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.rows[0]["viewer"], 0);
+            tx.rollback().await.unwrap();
+            drop(connection);
+            drop(held);
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_borrowed_tiny_seek_deadline_carries_into_staging_and_callback() {
+        for history in [1, 500] {
+            let db = crate::create_database(":memory:").await.unwrap();
+            d6_fixture(&db).await;
+            exact_reaction_bulk(&db, D6_M_OPEN, "clock-history-", history).await;
+            let held = hold_all_but_one_governed_slot(&db).await;
+            let mut connection = db.governed_pool().acquire().await.unwrap();
+            let clock = Arc::new(ReactionTestClock::new());
+            let probe = Arc::new(ReactionPhaseProbe::new(0, Some(clock.clone())));
+            let (identity, original, retained) =
+                install_reaction_phase_probe(&mut connection, &probe).await;
+            let callbacks = Arc::new(AtomicU64::new(0));
+            let mut tx = connection.begin().await.unwrap();
+            let result = REACTION_TEST_CLOCK
+                .scope(
+                    clock.clone(),
+                    query_sql_request_in_with_row_limit_observed(
+                        &mut tx,
+                        QueryPrincipal::authenticated("alice", true),
+                        QuerySqlRequest {
+                            sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                            parameters: vec![],
+                        },
+                        MAX_ROWS,
+                        sql_contract::FunctionAllowance::Portable,
+                        None,
+                        Some(callbacks.clone()),
+                        false,
+                    ),
+                )
+                .await;
+            let error = result.unwrap_err().to_string();
+            assert!(
+                error.contains("timeout") || error.contains("deadline"),
+                "{error}"
+            );
+            assert_eq!(
+                probe.seen.load(Ordering::Acquire),
+                3,
+                "both individually sub-budget phases must run"
+            );
+            assert_eq!(
+                clock.nanos.load(Ordering::Acquire),
+                (QUERY_DEADLINE / 5 * 6).as_nanos() as u64
+            );
+            assert_eq!(
+                probe.lowered_limit.load(Ordering::Acquire),
+                MAX_SQLITE_VALUE_BYTES as u64
+            );
+            if history == 500 {
+                assert!(
+                    callbacks.load(Ordering::Acquire) > 0,
+                    "shared clock must expire the actual SQLite callback too"
+                );
+            }
+            assert!(
+                REACTION_TEST_CLOCK.try_with(|_| ()).is_err(),
+                "test clock leaked outside request scope"
+            );
+            assert_reaction_borrowed_scope_restored(&mut tx, original).await;
+            // The old callback's clock remains expired. A subsequent actual
+            // borrowed request must have a fresh deadline and principal.
+            let (_, observation) = query_sql_request_in_with_row_limit_observed(
+                &mut tx,
+                QueryPrincipal::authenticated("bea", true),
+                QuerySqlRequest {
+                    sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                    parameters: vec![],
+                },
+                MAX_ROWS,
+                sql_contract::FunctionAllowance::Portable,
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(observation.content_event_seq.is_some());
+            tx.rollback().await.unwrap();
+            remove_reaction_phase_probe(&mut connection, retained).await;
+            drop(connection);
+            let mut connection = db.governed_pool().acquire().await.unwrap();
+            let reused = {
+                let mut handle = connection.lock_handle().await.unwrap();
+                handle.as_raw_handle().as_ptr() as usize
+            };
+            assert_eq!(identity, reused);
+            let mut tx = connection.begin().await.unwrap();
+            assert_reaction_borrowed_scope_restored(&mut tx, original).await;
+            tx.rollback().await.unwrap();
+            drop(connection);
+            drop(held);
+            db.close().await;
+        }
+    }
+
+    async fn exact_reaction_cap_bulk(
+        db: &Db,
+        prefix: &str,
+        amount: i64,
+        actor: &str,
+        unique: bool,
+    ) {
+        let payload = json!({"format":"native.message-reaction.v1","emoji":"👍",
+            "idempotency_key":"boundary","command":"add_reaction","changed":true,
+            "actor_account_id":actor,"executor_kind":"authenticated_principal",
+            "executor_ref":null,"reason":"full-window boundary"})
+        .to_string();
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+            INSERT INTO content_events(id,record_id,type,payload,actor,created_at,causal_envelope_version,causal_status)
+            SELECT ?||x,?,'message.reaction.added.v1',
+                json_set(?,'$.actor_account_id',CASE WHEN ? THEN ?||x ELSE ? END),
+                CASE WHEN ? THEN ?||x ELSE ? END,'2026-10-01T12:00:00.000Z',1,'legacy_unknown' FROM n")
+            .bind(amount).bind(prefix).bind(D6_M_OPEN).bind(payload)
+            .bind(unique).bind(actor).bind(actor).bind(unique).bind(actor).bind(actor)
+            .execute(db.write_pool()).await.unwrap();
+    }
+
+    async fn exact_reaction_cap_refuses_and_restores(db: &Db, diagnostic: &str) {
+        let sql = "SELECT count(*) AS n FROM message_reactions WHERE 0";
+        // Admission bounds, rather than wall-clock scheduling, are the subject
+        // of these boundary fixtures. Deadline expiry has phase-clock coverage.
+        let error = REACTION_TEST_CLOCK
+            .scope(Arc::new(ReactionTestClock::new()), async {
+                query_sql(db, &QueryPrincipal::authenticated("alice", true), sql).await
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(diagnostic), "{error}");
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let original = {
+            let mut handle = connection.lock_handle().await.unwrap();
+            // SAFETY: exclusive live handle, read only.
+            unsafe {
+                libsqlite3_sys::sqlite3_limit(
+                    handle.as_raw_handle().as_ptr(),
+                    libsqlite3_sys::SQLITE_LIMIT_LENGTH,
+                    -1,
+                )
+            }
+        };
+        let mut tx = connection.begin().await.unwrap();
+        let clock = Arc::new(ReactionTestClock::new());
+        let error = REACTION_TEST_CLOCK
+            .scope(
+                clock.clone(),
+                query_sql_request_in(
+                    &mut tx,
+                    QueryPrincipal::authenticated("alice", true),
+                    QuerySqlRequest {
+                        sql: sql.into(),
+                        parameters: vec![],
+                    },
+                ),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(diagnostic), "{error}");
+        // Expire the exact handle a stale progress callback would retain.
+        clock.advance(QUERY_DEADLINE);
+        assert_reaction_borrowed_scope_restored(&mut tx, original).await;
+        let (main, ordinary): (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM main.content_events),(SELECT count(*) FROM content_events)")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(
+            main, ordinary,
+            "domain history must not remain shadowed after failure"
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_visible_message_candidate_boundary_is_complete_or_error() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let alice = QueryPrincipal::authenticated("alice", true);
+        let base = d6_rows(
+            &db,
+            &alice,
+            "SELECT count(*) AS n FROM records WHERE type='Message'",
+        )
+        .await[0]["n"]
+            .as_i64()
+            .unwrap();
+        assert!(base > 0 && base < MAX_REACTION_MESSAGES);
+        sqlx::query(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<?)
+            INSERT INTO records(id,type,kind,name,policy_anchor_id)
+            SELECT 'message-cap-'||x,'Message','message','Boundary Message',policy_anchor_id
+              FROM n CROSS JOIN records WHERE records.id=?",
+        )
+        .bind(MAX_REACTION_MESSAGES - base)
+        .bind(D6_M_OPEN)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+        // Raw fixtures still advance the real source head, invalidating the
+        // ordinary visibility cache exactly as an admitted source write does.
+        exact_reaction_head_fixture_events(
+            &db,
+            D6_M_OPEN,
+            "message-cap-version-",
+            1,
+            "record.updated",
+        )
+        .await;
+        let admitted = d6_rows(
+            &db,
+            &alice,
+            "SELECT count(*) AS n FROM records WHERE type='Message'",
+        )
+        .await;
+        assert_eq!(admitted[0]["n"], MAX_REACTION_MESSAGES);
+        assert_eq!(
+            d6_rows(&db, &alice, "SELECT count(*) AS n FROM message_reactions").await[0]["n"],
+            0
+        );
+        sqlx::query("INSERT INTO records(id,type,kind,name,policy_anchor_id)
+            SELECT 'message-cap-plus-one','Message','message','Overflow',policy_anchor_id FROM records WHERE id=?")
+            .bind(D6_M_OPEN).execute(db.write_pool()).await.unwrap();
+        exact_reaction_head_fixture_events(
+            &db,
+            D6_M_OPEN,
+            "message-cap-overflow-version-",
+            1,
+            "record.updated",
+        )
+        .await;
+        let error = query_sql(
+            &db,
+            &alice,
+            "SELECT count(*) AS n FROM message_reactions WHERE 0",
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible Message candidate bound exceeded"),
+            "{error}"
+        );
+        // The borrowed all-visible-record head cap precedes this separate
+        // Message-only cap. It truthfully fails its stricter admission first.
+        let mut connection = db.write_pool().acquire().await.unwrap();
+        let mut tx = connection.begin().await.unwrap();
+        let error = query_sql_request_in(
+            &mut tx,
+            alice,
+            QuerySqlRequest {
+                sql: "SELECT count(*) AS n FROM message_reactions".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("visible freshness record bound exceeded"),
+            "{error}"
+        );
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name='message_reactions'")
+            .fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(left, 0);
+        tx.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn owned_reaction_test_budget_starts_on_first_vm_and_expires_at_deadline() {
+        let clock = ReactionTestClock::new();
+        let mut started = None;
+        // Scheduling before the first callback consumes no VM budget.
+        clock.advance(QUERY_DEADLINE);
+        assert!(reaction_test_budget_alive(&clock, &mut started));
+        clock.advance(QUERY_DEADLINE - Duration::from_nanos(1));
+        assert!(reaction_test_budget_alive(&clock, &mut started));
+        clock.advance(Duration::from_nanos(1));
+        assert!(!reaction_test_budget_alive(&clock, &mut started));
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_metadata_byte_boundary_counts_superseded_source_rows() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        let actor = "a".repeat(1000);
+        exact_reaction_cap_bulk(&db, "metadata-byte-first-", 1, &actor, false).await;
+        // Measure UTF-8 fields in the stored projection independently of SQL
+        // SUM admission. The 128-byte overhead is the engineering contract.
+        let fields: (String, String, Option<String>, String, String, String) = sqlx::query_as(
+            "SELECT record_id,actor,legacy_emoji,emoji,executor_kind,created_at FROM content_event_reaction_meta")
+            .fetch_one(db.write_pool()).await.unwrap();
+        let row_bytes = 128
+            + fields.0.len()
+            + fields.1.len()
+            + fields.2.unwrap().len()
+            + fields.3.len()
+            + fields.4.len()
+            + fields.5.len();
+        let fixed = row_bytes - actor.len();
+        let regular = (MAX_REACTION_METADATA_BYTES as usize - fixed - 1) / row_bytes;
+        assert!(regular > 1 && regular < MAX_REACTION_SOURCE_EVENTS as usize);
+        exact_reaction_cap_bulk(
+            &db,
+            "metadata-byte-regular-",
+            (regular - 1) as i64,
+            &actor,
+            false,
+        )
+        .await;
+        let last_actor =
+            "b".repeat(MAX_REACTION_METADATA_BYTES as usize - regular * row_bytes - fixed);
+        assert!(!last_actor.is_empty() && last_actor.len() < MAX_SQLITE_VALUE_BYTES as usize);
+        exact_reaction_cap_bulk(&db, "metadata-byte-exact-", 1, &last_actor, false).await;
+        assert_eq!(
+            regular * row_bytes + fixed + last_actor.len(),
+            MAX_REACTION_METADATA_BYTES as usize
+        );
+        // Thousands of superseded additions contribute bytes although only
+        // two rows win. At the exact byte boundary both winners survive.
+        // This fixture measures byte admission. The phase-clock tests above
+        // independently verify deadline expiry and cleanup.
+        let clock = Arc::new(ReactionTestClock::new());
+        let rows = REACTION_TEST_CLOCK
+            .scope(clock.clone(), async {
+                d6_rows(
+                    &db,
+                    &QueryPrincipal::authenticated("alice", true),
+                    "SELECT count(*) AS n FROM message_reactions",
+                )
+                .await
+            })
+            .await;
+        assert_eq!(rows[0]["n"], 2);
+        assert!(
+            clock.reads.load(Ordering::Relaxed) > 0,
+            "owned reaction VM handler must consult the scoped test clock"
+        );
+        exact_reaction_cap_bulk(&db, "metadata-byte-overflow-", 1, &actor, false).await;
+        // Winner cardinality is unchanged; full history must still refuse.
+        exact_reaction_cap_refuses_and_restores(&db, "visible metadata byte bound exceeded").await;
+    }
+
+    #[tokio::test]
+    async fn exact_reaction_reads_winner_boundary_keeps_all_hidden_actor_duplicates_then_refuses() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        d6_fixture(&db).await;
+        exact_reaction_cap_bulk(
+            &db,
+            "winner-bound-",
+            MAX_REACTION_WINNERS,
+            "unmapped-actor-",
+            true,
+        )
+        .await;
+        let alice = QueryPrincipal::authenticated("alice", true);
+        REACTION_TEST_CLOCK.scope(Arc::new(ReactionTestClock::new()), async {
+            let rows = d6_rows(&db, &alice, "SELECT count(*) AS n, count(actor_record_id) AS disclosed, count(executor_kind) AS executors FROM message_reactions").await;
+            assert_eq!(rows[0]["n"], MAX_REACTION_WINNERS);
+            assert_eq!(rows[0]["disclosed"], 0);
+            assert_eq!(rows[0]["executors"], 0);
+            // All emitted (message,emoji,NULL actor) tuples are identical; exact
+            // winning-event identity must keep every row before admission caps.
+            let identities = d6_rows(
+                &db,
+                &alice,
+                "SELECT count(DISTINCT reaction_id) AS n FROM message_reactions",
+            )
+            .await;
+            assert_eq!(identities[0]["n"], MAX_REACTION_WINNERS);
+        }).await;
+        exact_reaction_cap_bulk(&db, "winner-overflow-", 1, "another-unmapped-actor", false).await;
+        exact_reaction_cap_refuses_and_restores(&db, "winning row bound exceeded").await;
     }
 }
 
@@ -16031,3 +20951,147 @@ mod vocabulary_json_node_tests {
 #[cfg(test)]
 #[path = "schema_config_json_node_tests.rs"]
 mod schema_config_json_node_tests;
+
+#[cfg(test)]
+#[path = "facet_value_json_node_tests.rs"]
+mod facet_value_json_node_tests;
+
+#[cfg(test)]
+#[path = "facet_observation_json_node_tests.rs"]
+mod facet_observation_json_node_tests;
+
+#[cfg(test)]
+#[path = "record_body_json_node_tests.rs"]
+mod record_body_json_node_tests;
+
+/// Internal projection source. Uses the exact production governed views, but
+/// does not serialize through the public SQL cell/result/row limits. Every
+/// body and facet is returned whole; the caller releases this transaction
+/// before rendering. No renderer receives a database handle.
+#[cfg(unix)]
+pub(crate) async fn projection_snapshot(
+    db: &Db,
+    principal: QueryPrincipal,
+) -> Result<crate::markdown_vault::SourceSnapshot> {
+    use crate::markdown_vault::{SourceLink, SourceRecord, SourceSnapshot};
+    // The node's accepted-generation owner chooses/opens the engine. Keep
+    // this collector independently engine-aware: never run v1 views over NKV2.
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(db.pool())
+        .await?;
+    if marker == crate::db::V2_APPLICATION_ID {
+        #[cfg(feature = "v2-kernel-probe")]
+        return crate::markdown_vault::kernel_v2::snapshot(db, principal.credential()).await;
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        return Err(crate::Error::engine(
+            "v2 Markdown vault requires v2-kernel-probe",
+        ));
+    }
+    let mut connection = db.governed_pool().acquire().await?;
+    install_temp_contract(&mut connection).await?;
+    // Never restore a previous principal when rolling back a pooled session.
+    sqlx::query("DELETE FROM temp._query_sql_principal")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("DELETE FROM temp._query_sql_visible_ids")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("DELETE FROM temp._query_sql_disclosable_actors")
+        .execute(&mut *connection)
+        .await?;
+    let mut tx = connection.begin().await?;
+    let result: Result<SourceSnapshot> = async {
+        install_visible_records_in(&mut tx, principal.clone()).await?;
+        populate_visible_ids_live(&mut tx).await?;
+        let act = crate::act::current_act(&mut tx).await?;
+        prepare_disclosable_actors(&mut tx,true).await?;
+        let origin = sqlx::query_scalar("SELECT origin_db_id FROM main.database_identity WHERE singleton=1").fetch_one(&mut *tx).await?;
+        let mut snapshot = SourceSnapshot { origin, act, account: principal.credential().to_owned(), ..Default::default() };
+        let rows = sqlx::query("SELECT * FROM temp.records ORDER BY created_at, id").fetch_all(&mut *tx).await?;
+        for row in rows {
+            let mut metadata = BTreeMap::new();
+            for key in ["summary", "lifecycle", "maturity", "created_at", "updated_at", "last_activity_at"] {
+                let value: Option<String> = row.try_get(key)?;
+                if let Some(value) = value { metadata.insert(key.to_owned(), Value::String(value)); }
+            }
+            if row.try_get::<Option<i64>, _>("is_current")? == Some(0) || row.try_get::<i64,_>("successor_count")? > 0 {
+                metadata.insert("superseded".into(), Value::Bool(true));
+            }
+            let record = SourceRecord {
+                id: row.try_get("id")?, record_type: row.try_get("type")?, kind: row.try_get("kind")?,
+                name: row.try_get("name")?, body: row.try_get("body")?, home_id: row.try_get("home_id")?,
+                archived: row.try_get::<i64,_>("archived")? != 0, metadata, ..Default::default()
+            };
+            snapshot.records.insert(record.id.clone(), record);
+        }
+        for row in sqlx::query("SELECT record_id, key, value FROM temp.facet_values ORDER BY record_id, key, id").fetch_all(&mut *tx).await? {
+            if let Some(record) = snapshot.records.get_mut(&row.try_get::<String,_>("record_id")?) {
+                record.facets.insert(row.try_get("key")?, row.try_get::<Option<String>,_>("value")?.map(Value::String).unwrap_or(Value::Null));
+            }
+        }
+        // Related identities are disclosed only through the same visible set.
+        for row in sqlx::query("SELECT r.id, p.id AS owner FROM main.records r JOIN temp.records p ON p.id=r.owner_id JOIN temp.records visible ON visible.id=r.id ORDER BY r.id").fetch_all(&mut *tx).await? {
+            if let Some(record) = snapshot.records.get_mut(&row.try_get::<String,_>("id")?) {
+                record.metadata.insert("owner".into(), Value::String(row.try_get("owner")?));
+            }
+        }
+        for row in sqlx::query("SELECT annotation_id, selectors FROM temp.comment_anchors ORDER BY annotation_id, target_record_id").fetch_all(&mut *tx).await? {
+            if let Some(record) = snapshot.records.get_mut(&row.try_get::<String,_>("annotation_id")?) {
+                record.anchors.push(serde_json::from_str(&row.try_get::<String,_>("selectors")?)?);
+            }
+        }
+        for row in sqlx::query("SELECT e.record_id, a.person_id FROM temp.content_events e JOIN temp.actors a ON a.actor=e.actor WHERE e.type='record.created' AND e.local_seq=(SELECT MIN(first.local_seq) FROM temp.content_events first WHERE first.record_id=e.record_id AND first.type='record.created') ORDER BY e.record_id").fetch_all(&mut *tx).await? {
+            if let (Some(record),Some(author)) = (snapshot.records.get_mut(&row.try_get::<String,_>("record_id")?),row.try_get::<Option<String>,_>("person_id")?) {record.metadata.insert("author".into(),Value::String(author));}
+        }
+        // Production logical relation. 8134d50 owns standby materialization
+        // repair; never union raw relationship/replica tables in a renderer.
+        for row in sqlx::query("SELECT source_id, target_id, relationship, note FROM temp.links ORDER BY source_id, relationship, target_id, id").fetch_all(&mut *tx).await? {
+            snapshot.links.push(SourceLink { source_id:row.try_get("source_id")?, target_id:row.try_get("target_id")?, relationship:row.try_get("relationship")?, note:row.try_get("note")? });
+        }
+        Ok(snapshot)
+    }.await;
+    let rollback = tx.rollback().await;
+    if result.is_err() || rollback.is_err() {
+        connection.close_on_drop();
+    }
+    rollback?;
+    result
+}
+
+#[cfg(test)]
+mod imported_catalogue_population_tests {
+    use super::*;
+
+    #[test]
+    fn column_free_catalogue_reads_are_public_without_admitting_physical_tables() {
+        assert!(validate_ad_hoc("SELECT count(*) FROM catalog_operations").is_err());
+        validate_ad_hoc("SELECT id FROM vocabularies").unwrap();
+        #[cfg(feature = "v2-kernel-probe")]
+        for relation in [
+            "vocabularies",
+            "vocabulary_values",
+            "record_lifecycle_interpretations",
+            "agent_activity_claims",
+        ] {
+            let sql = format!("SELECT count(*) AS n FROM {relation}");
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                validate_kernel_v2_ad_hoc(&sql).unwrap();
+                validated_kernel_v2_output_columns(&sql).unwrap();
+                let reads = public_reads_ad_hoc(&sql).unwrap();
+                assert!(
+                    reads.iter().any(|(r, _)| r == relation),
+                    "{relation}: {reads:?}"
+                );
+            }
+        }
+        for sql in [
+            "SELECT count(*) FROM kernel_v1_state",
+            "SELECT count(*) FROM main.vocabulary_values",
+        ] {
+            assert!(validate_ad_hoc(sql).is_err(), "{sql}");
+            #[cfg(feature = "v2-kernel-probe")]
+            assert!(validate_kernel_v2_ad_hoc(sql).is_err(), "{sql}");
+        }
+    }
+}

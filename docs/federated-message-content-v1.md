@@ -9,7 +9,13 @@ decrypted semantic-content contract consumed by the sealed ingest seam in
 Authenticated v1 and v2 ingress require a closed-vocabulary expectation.
 Omission or null is rejected during preflight, before any batch mutation. This
 requirement does not backfill historical stored Messages or silently rewrite
-preserved export content.
+preserved export content. Both versions also require every `source_event.id` to
+be a canonical lowercase, hyphenated RFC 4122 UUIDv4. A canonical ID with the
+wrong version or variant is refused with `invalid_source_event_id`; malformed
+or non-canonical UUID text is refused with `invalid_uuid`. Refusal happens
+before any batch mutation. Peer event IDs are preserved verbatim; record and
+participant ID validation, replay, idempotency, causal parents and source
+fingerprints are unchanged. UUIDv4 shape alone does not prove peer entropy.
 
 ## MessageUnitV1 expectation field
 

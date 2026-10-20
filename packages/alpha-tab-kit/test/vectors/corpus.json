@@ -66,6 +66,11 @@
       "admitted": true
     },
     {
+      "name": "current_principal()",
+      "sql": "SELECT record_id FROM content_events WHERE actor = current_principal() ORDER BY record_id LIMIT 5",
+      "admitted": true
+    },
+    {
       "name": "compound with trailing order",
       "sql": "SELECT id FROM records WHERE kind = 'task' UNION SELECT id FROM records WHERE kind = 'epic' ORDER BY 1 LIMIT 10",
       "admitted": true
@@ -75,6 +80,12 @@
       "sql": "SELECT id FROM records LIMIT 5",
       "admitted": false,
       "rule": "sql.limit-order"
+    },
+    {
+      "name": "serving catalogue rejected for alpha needs",
+      "sql": "SELECT executor, operation FROM catalog_operations ORDER BY executor, operation",
+      "admitted": false,
+      "rule": "sql.catalog-operations"
     },
     {
       "name": "nested limit without order",
@@ -216,6 +227,104 @@
     }
   ],
   "declaration": [
+    {
+      "name": "app v2 marker, nothing declared",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [],
+        "effects": []
+      },
+      "admitted": true
+    },
+    {
+      "name": "unknown contract value",
+      "declaration": {
+        "contract": "native.app.v3",
+        "needs": [],
+        "effects": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "contract value in the wrong case",
+      "declaration": {
+        "contract": "NATIVE.APP.V2",
+        "needs": [],
+        "effects": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "contract not a string",
+      "declaration": {
+        "contract": 2,
+        "needs": [],
+        "effects": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "contract null",
+      "declaration": {
+        "contract": null,
+        "needs": [],
+        "effects": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "app v2 marker with a need",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [
+          "attention.query.v1"
+        ],
+        "effects": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "app v2 marker with an effect",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [],
+        "effects": [
+          "task.triage-set.v1"
+        ]
+      },
+      "admitted": false
+    },
+    {
+      "name": "app v2 marker with an empty sessions array",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [],
+        "effects": [],
+        "sessions": []
+      },
+      "admitted": false
+    },
+    {
+      "name": "app v2 marker with sessions",
+      "declaration": {
+        "contract": "native.app.v2",
+        "needs": [],
+        "effects": [],
+        "sessions": [
+          {
+            "session": "session.body.v1",
+            "key": "k",
+            "scope": {
+              "type": "A",
+              "kind": "note"
+            },
+            "mode": "edit",
+            "presence": true
+          }
+        ]
+      },
+      "admitted": false
+    },
     {
       "name": "minimal",
       "declaration": {

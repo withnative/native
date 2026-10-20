@@ -407,7 +407,7 @@ pub async fn check_derivation_request_shape(db: &Db) -> Result<CheckResult> {
 /// CLOSED TYPES — the load-bearing rule. A new top-level type must be
 /// unrepresentable, and so must a NULL (untyped) record — a SQLite CHECK passes
 /// NULL, so the closed set needs NOT NULL asserted separately; every one of the
-/// 10 spine types must be representable; and no existing row may violate (the
+/// spine types must be representable; and no existing row may violate (the
 /// scan must name NULL explicitly, because `NOT IN` never matches NULL rows).
 pub async fn check_closed_types(db: &Db) -> Result<CheckResult> {
     let mut violations: Vec<String> = Vec::new();
@@ -429,7 +429,7 @@ pub async fn check_closed_types(db: &Db) -> Result<CheckResult> {
     .await?;
     if rogue.is_none() {
         violations.push(
-            "a non-spine top-level type was accepted (records.type CHECK missing or widened) — the type tier must be CLOSED at the 10 spine types"
+            "a non-spine top-level type was accepted (records.type CHECK missing or widened) — the type tier must be CLOSED at the spine types"
                 .into(),
         );
     }
@@ -440,7 +440,7 @@ pub async fn check_closed_types(db: &Db) -> Result<CheckResult> {
     .await?;
     if null_type.is_none() {
         violations.push(
-            "a NULL type was accepted — every record must carry one of the 10 spine types".into(),
+            "a NULL type was accepted — every record must carry one of the spine types".into(),
         );
     }
 

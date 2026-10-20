@@ -262,10 +262,11 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
             })
             .collect::<Result<Vec<_>>>()?
             .join(" | ");
-        let carries_base_object = exclusive_names.is_some()
-            && (object.contains_key("properties")
-                || object.contains_key("required")
-                || object.contains_key("additionalProperties"));
+        // Sibling constraints apply alongside every oneOf branch, not only
+        // the singleton-required spelling of mutually exclusive properties.
+        let carries_base_object = object.contains_key("properties")
+            || object.contains_key("required")
+            || object.contains_key("additionalProperties");
         if carries_base_object {
             let mut base = object.clone();
             base.remove("oneOf");
@@ -327,7 +328,9 @@ fn schema_to_ts(schema: &Value, context: &str) -> Result<String> {
             )
         }) =>
         {
-            Ok("Record<string, unknown>".to_string())
+            // Annotations do not require an object. This also preserves
+            // narrower sibling/branch constraints when intersecting schemas.
+            Ok("unknown".to_string())
         }
         None if object.is_empty() => Ok("unknown".to_string()),
         None => Err(Error::engine(format!(
@@ -454,30 +457,47 @@ fn object_type(schema: &serde_json::Map<String, Value>, context: &str) -> Result
     let Some(not) = schema.get("not") else {
         return Ok(base);
     };
-    let forbidden = not
-        .as_object()
-        .and_then(|value| value.get("required"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Error::engine(format!(
-                "only `not: {{ required: [...] }}` is supported at {context}"
-            ))
-        })?;
-    if forbidden.is_empty() {
-        return Err(Error::engine(format!(
-            "empty forbidden required set at {context}"
-        )));
+    // Conjunction of forbidden field sets: not(anyOf(required(...), ...)).
+    // This preserves conditional exclusions such as record_id with body/home_id.
+    let sets = match not.get("anyOf") {
+        Some(Value::Array(branches)) if !branches.is_empty() => branches.iter().collect::<Vec<_>>(),
+        Some(_) => {
+            return Err(Error::engine(format!(
+                "invalid forbidden anyOf at {context}"
+            )))
+        }
+        None => vec![not],
+    };
+    let mut constraints = Vec::with_capacity(sets.len());
+    for set in sets {
+        let forbidden = set
+            .as_object()
+            .and_then(|value| value.get("required"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                Error::engine(format!(
+                    "only forbidden required sets are supported at {context}"
+                ))
+            })?;
+        if forbidden.is_empty() {
+            return Err(Error::engine(format!(
+                "empty forbidden required set at {context}"
+            )));
+        }
+        let alternatives = forbidden
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .map(|name| format!("{{ {}?: never }}", quoted(name)))
+                    .ok_or_else(|| {
+                        Error::engine(format!("non-string forbidden property at {context}"))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(" | ");
+        constraints.push(format!("({alternatives})"));
     }
-    let alternatives = forbidden
-        .iter()
-        .map(|name| {
-            name.as_str()
-                .map(|name| format!("{{ {}?: never }}", quoted(name)))
-                .ok_or_else(|| Error::engine(format!("non-string forbidden property at {context}")))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .join(" | ");
-    Ok(format!("{base} & ({alternatives})"))
+    Ok(format!("{base} & {}", constraints.join(" & ")))
 }
 
 fn literal(value: &Value, context: &str) -> Result<String> {
@@ -497,6 +517,13 @@ fn quoted(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forbidden_field_pairs_preserve_each_exclusion() {
+        let schema = serde_json::json!({"type":"object","properties":{"record_id":{"type":"string"},"body":{"type":"string"},"home_id":{"type":"string"}},"not":{"anyOf":[{"required":["record_id","body"]},{"required":["record_id","home_id"]}]}});
+        let ts = schema_to_ts(&schema, "register").unwrap();
+        assert!(ts.contains("({ \"record_id\"?: never } | { \"body\"?: never }) & ({ \"record_id\"?: never } | { \"home_id\"?: never })"),"{ts}");
+    }
 
     #[test]
     fn parses_write_and_check_modes_and_rejects_unknown_arguments() {
@@ -576,6 +603,67 @@ mod tests {
             .unwrap(),
             "{  } & ({ \"record_id\"?: never })"
         );
+    }
+
+    #[test]
+    fn description_only_base_property_does_not_narrow_typed_branches() {
+        let rendered = schema_to_ts(
+            &serde_json::json!({
+                "properties":{"reason":{"description":"Why this change?"}},
+                "required":["reason"],
+                "oneOf":[
+                    {"properties":{"reason":{"type":"string"}},"required":["reason"]},
+                    {"properties":{"reason":{"type":"number"}},"required":["reason"]}
+                ]
+            }),
+            "annotation alongside typed branches",
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "({ \"reason\": unknown }) & (({ \"reason\": string }) | ({ \"reason\": number }))"
+        );
+        assert_eq!(
+            schema_to_ts(
+                &serde_json::json!({"description":"Any JSON value"}),
+                "value"
+            )
+            .unwrap(),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn discriminated_one_of_keeps_shared_required_properties() {
+        let rendered = schema_to_ts(
+            &serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "action":{"enum":["inspect","ensure"]},
+                    "kind":{"const":"focus_preferences"},
+                    "reason":{"type":"string"}
+                },
+                "required":["action","kind"],
+                "oneOf":[
+                    {"properties":{"action":{"const":"inspect"}},"not":{"required":["reason"]}},
+                    {"properties":{"action":{"const":"ensure"}},"required":["reason"]}
+                ]
+            }),
+            "account configuration",
+        )
+        .unwrap();
+
+        assert!(
+            rendered.contains("\"action\": \"inspect\" | \"ensure\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"kind\": \"focus_preferences\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"reason\"?: string"), "{rendered}");
+        assert!(rendered.contains("\"reason\"?: never"), "{rendered}");
+        assert!(rendered.contains("\"reason\": unknown"), "{rendered}");
     }
 
     #[test]

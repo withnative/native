@@ -31,16 +31,16 @@
 //! interval may appear. An empty interval (`F1 == F2`) is valid and yields
 //! thirteen empty sections. A gapped interval — an act in range with no row
 //! anywhere — is refused, as is any tampered section (out-of-range or NULL
-//! act, wrong inventory/order, broken primary-key order, non-revision-5
+//! act, wrong inventory/order, broken primary-key order, non-revision-8
 //! shape).
 //!
 //! Bounds are validated against the authority act head observed in the *same*
 //! consistent read transaction via the accepted Slice 2a probe
 //! ([`super::authority_probe::read_authority_act_head_on`]): negative bounds,
 //! reversed ranges, and `to` beyond that observed head are refused. The probe
-//! also keeps the live-authority guards (native revision 5, governed binding
+//! also keeps the live-authority guards (native revision 8, governed binding
 //! seeds, empty webhooks) on the delta path; this slice adds no pins beyond
-//! relying on that accepted head. Only live-authority revision-5 rows are
+//! relying on that accepted head. Only live-authority revision-8 rows are
 //! cut — legacy grouping-unknown `NULL`-act rows never match the range
 //! predicate and any `NULL` act in the emitted sections fails validation.
 
@@ -158,7 +158,7 @@ impl AuthorityActCut {
 
     /// Fail-closed structural validation of an authority-produced cut: bounds, exact 13-table
     /// inventory/order tied to [`crate::act::ACT_STAMPED_TABLES`] and the
-    /// standby classification, revision-5 section shape with strictly
+    /// standby classification, revision-8 section shape with strictly
     /// increasing primary-key order, exact in-range non-NULL acts on every
     /// row, and the whole-act coverage proof.
     ///
@@ -222,7 +222,7 @@ impl AuthorityActCut {
             )?;
             require(
                 section.revision == crate::interchange::REVISION,
-                "authority act cut requires native canonical-interchange revision 5",
+                "authority act cut requires native canonical-interchange revision 8",
             )?;
             require(
                 crate::interchange::SECTION_NAMES.contains(&section.name.as_str()),
@@ -325,8 +325,9 @@ impl AuthorityActCut {
     /// Fail-closed structural validation of the companion closure: exact
     /// inventory and order tied to
     /// [`super::companion_closure::COMPANION_TABLES`], each section classified
-    /// exactly `ImmutableCanonicalCompanion`, never act-stamped, present in the
-    /// canonical interchange, revision-5 shaped with strictly increasing
+    /// exactly `ImmutableCanonicalCompanion`, never act-stamped, portable except
+    /// for the explicitly retained authority-local issuance anchors, and
+    /// revision-8 shaped with strictly increasing
     /// primary keys (which is also duplicate-free), and — for `blobs` — every
     /// row portable.
     ///
@@ -355,10 +356,13 @@ impl AuthorityActCut {
             )?;
             require(
                 section.revision == crate::interchange::REVISION,
-                "authority act cut companion requires native canonical-interchange revision 5",
+                "authority act cut companion requires native canonical-interchange revision 8",
             )?;
+            // The exact inventory above admits one authority-local companion
+            // retained by same-database snapshots/deltas, never portable import.
             require(
-                crate::interchange::SECTION_NAMES.contains(&section.name.as_str()),
+                section.name == "provenance_local_attestation_authority"
+                    || crate::interchange::SECTION_NAMES.contains(&section.name.as_str()),
                 "authority act cut companion is missing from canonical interchange",
             )?;
             let kind = crate::schema::standby_classification::TABLE_CLASSIFICATIONS
@@ -1488,10 +1492,10 @@ mod tests {
             .len()
     }
 
-    /// An empty interval still carries all thirteen companion sections, each
+    /// An empty interval still carries all fourteen companion sections, each
     /// with the live schema's exact columns and primary key and no rows.
     #[tokio::test]
-    async fn empty_range_carries_thirteen_empty_companion_sections() {
+    async fn empty_range_carries_every_empty_companion_section() {
         let db = fresh_authority().await;
         let head = live_head_act(&db).await;
         let cut = read_authority_act_cut(&db, head, head).await.unwrap();

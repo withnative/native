@@ -1,0 +1,331 @@
+{
+  "description": "Frozen Docs/Spaces SQL request templates for HQ W7 compatibility; source files are repository app definitions, never HQ data.",
+  "sources": {
+    "docs": {
+      "path": "web/apps/src/apps/docs/declaration.json",
+      "sha256": "472a6f8bda774293b4bff9fe13f1c92924eefa503a5abbb6524439733b8c78bc",
+      "needs": [
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.pulse",
+          "label": "The newest change number in your workspace (a signal that something moved; no content)",
+          "sql": "SELECT local_seq FROM content_events ORDER BY local_seq DESC LIMIT 1"
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.recent",
+          "label": "Your 200 most recently changed documents: title, kind, folder and time (no bodies)",
+          "sql": "SELECT id, kind, substr(name, 1, 160) AS name, home_id, updated_at_ms FROM records WHERE type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') <> 'attachment' AND (COALESCE(kind, '') <> 'artifact' OR EXISTS (SELECT 1 FROM facet_values m WHERE m.record_id = records.id AND m.key = 'runtime' AND m.value IN ('native.mdx.v1', 'native.mdx.v2'))) AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY updated_at_ms DESC, id ASC LIMIT 200"
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.edit_target",
+          "label": "The requested document id, if it is an editable Document; private Body Save target check",
+          "sql": "SELECT id FROM records WHERE id = ?1 AND type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') NOT IN ('attachment', 'artifact') AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "required": true,
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "folders.children",
+          "label": "One folder's pages and sub-folders, by name, 200 at a time (no bodies)",
+          "sql": "SELECT id, type, kind, name, updated_at_ms FROM records WHERE home_id = ?1 AND deleted_at IS NULL AND type IN ('Collection', 'Document') AND COALESCE(kind, '') NOT IN ('attachment', 'query', 'selection') AND (COALESCE(kind, '') <> 'artifact' OR EXISTS (SELECT 1 FROM facet_values m WHERE m.record_id = records.id AND m.key = 'runtime' AND m.value IN ('native.mdx.v1', 'native.mdx.v2'))) AND (name COLLATE NOCASE > ?2 OR (name COLLATE NOCASE = ?2 AND id > ?3)) AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY name COLLATE NOCASE ASC, id ASC LIMIT 200",
+          "params": [
+            {
+              "name": "folder",
+              "type": "text",
+              "max_len": 128
+            },
+            {
+              "name": "after_name",
+              "type": "text",
+              "max_len": 512
+            },
+            {
+              "name": "after_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.stamp",
+          "label": "One page's change stamp: last change number, link, reply and resolved-comment counts (no content)",
+          "sql": "SELECT r.updated_at_ms, r.deleted_at_ms, (SELECT max(local_seq) FROM content_events WHERE record_id = ?1) AS seq, (SELECT count(*) FROM links WHERE target_id = ?1) AS n_in, (SELECT max(created_at_ms) FROM links WHERE target_id = ?1) AS in_at, (SELECT count(*) FROM links WHERE source_id = ?1) AS n_out, (SELECT max(created_at_ms) FROM links WHERE source_id = ?1) AS out_at, (SELECT count(*) FROM facet_values WHERE record_id = ?1) AS n_facets, (SELECT count(*) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS n_replies, (SELECT max(lp.created_at_ms) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS replies_at, (SELECT count(*) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL AND rt.lifecycle = 'resolved' WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS n_resolved FROM records r WHERE r.id = ?1 ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.page",
+          "label": "One page: title, kind, status, summary, times and up to five folders above it (no body)",
+          "sql": "SELECT r.id, r.type, r.kind, r.name, r.lifecycle, r.summary, r.created_at, r.updated_at, r.updated_at_ms, r.home_id, EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = r.id AND a.key = 'archived') AS archived, (SELECT m.value FROM facet_values m WHERE m.record_id = r.id AND m.key = 'runtime') AS runtime, h1.name AS h1n, h1.home_id AS h1h, h2.id AS h2, h2.name AS h2n, h2.home_id AS h2h, h3.id AS h3, h3.name AS h3n, h3.home_id AS h3h, h4.id AS h4, h4.name AS h4n, h4.home_id AS h4h, h5.id AS h5, h5.name AS h5n, h5.home_id AS h5h FROM records r LEFT JOIN records h1 ON h1.id = r.home_id LEFT JOIN records h2 ON h2.id = h1.home_id LEFT JOIN records h3 ON h3.id = h2.home_id LEFT JOIN records h4 ON h4.id = h3.home_id LEFT JOIN records h5 ON h5.id = h4.home_id WHERE r.id = ?1 AND r.deleted_at IS NULL ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.links",
+          "label": "One page's links/comments with passage quotes and properties (100 each), recent history (12), or replies and authors",
+          "sql": "SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, NULL AS event_id, NULL AS record_id, NULL AS channel_kind, NULL AS actor_name, NULL AS root_id, NULL AS run_key, NULL AS client, NULL AS model, anchor, anchor_seq, anchor_sha, NULL AS lifecycle FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, NULL AS prop_key, NULL AS prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT 'in' AS dir, l.relationship AS rel, s.id, substr(s.name, 1, 160) AS name, s.type, s.kind, l.created_at_ms AS linked_at, CASE WHEN s.kind = 'comment' THEN substr(s.body, 1, 4000) END AS excerpt, c.selectors AS anchor, c.source_event_seq AS anchor_seq, c.source_sha256 AS anchor_sha FROM links l JOIN records s ON s.id = l.source_id LEFT JOIN comment_anchors c ON s.kind = 'comment' AND c.annotation_id = s.id AND c.target_record_id = ?1 AND length(c.selectors) <= 2560 WHERE l.target_id = ?1 AND s.deleted_at IS NULL UNION ALL SELECT 'out', l.relationship, t.id, substr(t.name, 1, 160), t.type, t.kind, l.created_at_ms, NULL, NULL, NULL, NULL FROM links l JOIN records t ON t.id = l.target_id WHERE l.source_id = ?1 AND t.deleted_at IS NULL ORDER BY 1 DESC, 7 DESC, 3 ASC LIMIT 100) AS link_rows UNION ALL SELECT 'prop', NULL, NULL, NULL, NULL, NULL, NULL, NULL, key, value, NULL, NULL, NULL FROM (SELECT key, substr(value, 1, 300) AS value FROM facet_values WHERE record_id = ?1 ORDER BY key ASC LIMIT 100) AS prop_rows) ORDER BY CASE WHEN dir = 'prop' THEN 1 ELSE 0 END ASC, dir DESC, linked_at DESC, id ASC, prop_key ASC LIMIT 200) AS detail_rows WHERE ?2 = 'details' UNION ALL SELECT 'history', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, event_id, record_id, channel_kind, actor_name, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM (SELECT e.id AS event_id, e.record_id, e.channel_kind, a.display_name AS actor_name FROM content_events e LEFT JOIN actors a ON a.actor = e.actor WHERE e.record_id = ?1 ORDER BY e.local_seq DESC LIMIT 12) AS history_rows WHERE ?2 = 'history' UNION ALL SELECT 'thread', NULL, id, NULL, NULL, NULL, linked_at, excerpt, NULL, NULL, event_id, NULL, channel_kind, actor_name, root_id, run_key, client, model, NULL, NULL, NULL, lifecycle FROM (SELECT c.id, c.root_id, c.linked_at, c.excerpt, c.lifecycle, ev.id AS event_id, ev.channel_kind, a.display_name AS actor_name, ev.run_key, ru.reported_client AS client, ru.reported_model AS model FROM (SELECT * FROM (SELECT s.id, NULL AS root_id, l.created_at_ms AS linked_at, NULL AS excerpt, s.lifecycle AS lifecycle FROM links l JOIN records s ON s.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100) UNION ALL SELECT * FROM (SELECT s.id, l.target_id AS root_id, l.created_at_ms AS linked_at, substr(s.body, 1, 4000) AS excerpt, NULL AS lifecycle FROM links l JOIN links p ON p.source_id = l.target_id AND p.target_id = ?1 AND p.relationship = 'part_of' JOIN records root ON root.id = l.target_id AND root.type = 'Annotation' AND root.kind = 'comment' AND root.deleted_at IS NULL JOIN records s ON s.id = l.source_id WHERE l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100)) AS c LEFT JOIN content_events ev ON ev.record_id = c.id AND ev.type = 'record.created' AND ev.local_seq = (SELECT min(e2.local_seq) FROM content_events e2 WHERE e2.record_id = c.id AND e2.type = 'record.created') LEFT JOIN actors a ON a.actor = ev.actor LEFT JOIN runs ru ON ru.run_key = ev.run_key) AS thread_rows WHERE ?2 = 'threads' ORDER BY dir DESC, linked_at DESC, id ASC, prop_key ASC, event_id ASC LIMIT 200",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            },
+            {
+              "name": "section",
+              "type": "text",
+              "required": true,
+              "max_len": 7
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.body",
+          "label": "One page body: full at up to 262,142 characters, otherwise the first 120,000 characters",
+          "sql": "SELECT r.id, CASE WHEN length(r.body)<=262142 THEN r.body ELSE substr(r.body,1,120000) END AS body, length(r.body) AS body_length, CASE WHEN length(r.body)<=262142 THEN 'full' ELSE 'prefix' END AS body_source FROM records r WHERE r.id = ?1 AND r.deleted_at IS NULL ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        }
+      ]
+    },
+    "spaces": {
+      "path": "web/apps/src/apps/spaces/reads.json",
+      "sha256": "d81de1ba1818be5907f37268a93fb8072c7eddae5d88219956874e050604ec93",
+      "needs": [
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.edit_target",
+          "label": "The requested document id, if it is an editable Document; private Body Save target check",
+          "sql": "SELECT id FROM records WHERE id = ?1 AND type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') NOT IN ('attachment', 'artifact') AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "required": true,
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.stamp",
+          "label": "One page's change stamp: last change number and link counts (no content)",
+          "sql": "SELECT r.updated_at_ms, r.deleted_at_ms, (SELECT max(local_seq) FROM content_events WHERE record_id = ?1) AS seq, (SELECT count(*) FROM links WHERE target_id = ?1) AS n_in, (SELECT max(created_at_ms) FROM links WHERE target_id = ?1) AS in_at, (SELECT count(*) FROM links WHERE source_id = ?1) AS n_out, (SELECT max(created_at_ms) FROM links WHERE source_id = ?1) AS out_at, (SELECT count(*) FROM facet_values WHERE record_id = ?1) AS n_facets, (SELECT count(*) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS n_replies, (SELECT max(lp.created_at_ms) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS replies_at FROM records r WHERE r.id = ?1 ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.links",
+          "label": "Page links/properties or comment authors and flat replies (100 roots, 100 replies; bodies \u22644,000 chars)",
+          "sql": "SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, NULL AS event_id, NULL AS record_id, NULL AS channel_kind, NULL AS actor_name, NULL AS root_id, NULL AS run_key, NULL AS client, NULL AS model, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, NULL AS prop_key, NULL AS prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT 'in' AS dir, l.relationship AS rel, s.id, substr(s.name, 1, 160) AS name, s.type, s.kind, l.created_at_ms AS linked_at, CASE WHEN s.kind = 'comment' THEN substr(s.body, 1, 4000) END AS excerpt, c.selectors AS anchor, c.source_event_seq AS anchor_seq, c.source_sha256 AS anchor_sha FROM links l JOIN records s ON s.id = l.source_id LEFT JOIN comment_anchors c ON s.kind = 'comment' AND c.annotation_id = s.id AND c.target_record_id = ?1 AND length(c.selectors) <= 2560 WHERE l.target_id = ?1 AND s.deleted_at IS NULL UNION ALL SELECT 'out', l.relationship, t.id, substr(t.name, 1, 160), t.type, t.kind, l.created_at_ms, NULL, NULL, NULL, NULL FROM links l JOIN records t ON t.id = l.target_id WHERE l.source_id = ?1 AND t.deleted_at IS NULL ORDER BY 1 DESC, 7 DESC, 3 ASC LIMIT 100) AS link_rows UNION ALL SELECT 'prop', NULL, NULL, NULL, NULL, NULL, NULL, NULL, key, value, NULL, NULL, NULL FROM (SELECT key, substr(value, 1, 300) AS value FROM facet_values WHERE record_id = ?1 ORDER BY key ASC LIMIT 100) AS prop_rows) ORDER BY CASE WHEN dir = 'prop' THEN 1 ELSE 0 END ASC, dir DESC, linked_at DESC, id ASC, prop_key ASC LIMIT 200) AS detail_rows WHERE ?2 = 'details' UNION ALL SELECT 'thread', NULL, id, NULL, NULL, NULL, linked_at, excerpt, NULL, NULL, event_id, NULL, channel_kind, actor_name, root_id, run_key, client, model, NULL, NULL, NULL FROM (SELECT c.id, c.root_id, c.linked_at, c.excerpt, ev.id AS event_id, ev.channel_kind, a.display_name AS actor_name, ev.run_key, ru.reported_client AS client, ru.reported_model AS model FROM (SELECT * FROM (SELECT s.id, NULL AS root_id, l.created_at_ms AS linked_at, NULL AS excerpt FROM links l JOIN records s ON s.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100) UNION ALL SELECT * FROM (SELECT s.id, l.target_id AS root_id, l.created_at_ms AS linked_at, substr(s.body, 1, 4000) AS excerpt FROM links l JOIN links p ON p.source_id = l.target_id AND p.target_id = ?1 AND p.relationship = 'part_of' JOIN records root ON root.id = l.target_id AND root.type = 'Annotation' AND root.kind = 'comment' AND root.deleted_at IS NULL JOIN records s ON s.id = l.source_id WHERE l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100)) AS c LEFT JOIN content_events ev ON ev.record_id = c.id AND ev.type = 'record.created' AND ev.local_seq = (SELECT min(e2.local_seq) FROM content_events e2 WHERE e2.record_id = c.id AND e2.type = 'record.created') LEFT JOIN actors a ON a.actor = ev.actor LEFT JOIN runs ru ON ru.run_key = ev.run_key) AS thread_rows WHERE ?2 = 'threads' ORDER BY dir DESC, linked_at DESC, id ASC, prop_key ASC, event_id ASC LIMIT 200",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            },
+            {
+              "name": "section",
+              "type": "text",
+              "required": true,
+              "max_len": 7
+            }
+          ]
+        }
+      ]
+    },
+    "docs_0_8_2": {
+      "path": "web/apps/src/apps/docs/declaration.json",
+      "revision": "19c133cba1e172edbbabeb6abfcf90e09f62ed7a",
+      "sha256": "3f63a61e5861425143ecaf9b860adfd50b715105388cebca41bbdd0027fe553d",
+      "needs": [
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.pulse",
+          "label": "The newest change number in your workspace (a signal that something moved; no content)",
+          "sql": "SELECT local_seq FROM content_events ORDER BY local_seq DESC LIMIT 1"
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.recent",
+          "label": "Your 200 most recently changed documents: title, kind, folder and time (no bodies)",
+          "sql": "SELECT id, kind, substr(name, 1, 160) AS name, home_id, updated_at_ms FROM records WHERE type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') <> 'attachment' AND (COALESCE(kind, '') <> 'artifact' OR EXISTS (SELECT 1 FROM facet_values m WHERE m.record_id = records.id AND m.key = 'runtime' AND m.value IN ('native.mdx.v1', 'native.mdx.v2'))) AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY updated_at_ms DESC, id ASC LIMIT 200"
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.edit_target",
+          "label": "The requested document id, if it is an editable Document; private Body Save target check",
+          "sql": "SELECT id FROM records WHERE id = ?1 AND type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') NOT IN ('attachment', 'artifact') AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "required": true,
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "folders.children",
+          "label": "One folder's pages and sub-folders, by name, 200 at a time (no bodies)",
+          "sql": "SELECT id, type, kind, name, updated_at_ms FROM records WHERE home_id = ?1 AND deleted_at IS NULL AND type IN ('Collection', 'Document') AND COALESCE(kind, '') NOT IN ('attachment', 'query', 'selection') AND (COALESCE(kind, '') <> 'artifact' OR EXISTS (SELECT 1 FROM facet_values m WHERE m.record_id = records.id AND m.key = 'runtime' AND m.value IN ('native.mdx.v1', 'native.mdx.v2'))) AND (name COLLATE NOCASE > ?2 OR (name COLLATE NOCASE = ?2 AND id > ?3)) AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY name COLLATE NOCASE ASC, id ASC LIMIT 200",
+          "params": [
+            {
+              "name": "folder",
+              "type": "text",
+              "max_len": 128
+            },
+            {
+              "name": "after_name",
+              "type": "text",
+              "max_len": 512
+            },
+            {
+              "name": "after_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.stamp",
+          "label": "One page's change stamp: last change number, link and reply counts (no content)",
+          "sql": "SELECT r.updated_at_ms, r.deleted_at_ms, (SELECT max(local_seq) FROM content_events WHERE record_id = ?1) AS seq, (SELECT count(*) FROM links WHERE target_id = ?1) AS n_in, (SELECT max(created_at_ms) FROM links WHERE target_id = ?1) AS in_at, (SELECT count(*) FROM links WHERE source_id = ?1) AS n_out, (SELECT max(created_at_ms) FROM links WHERE source_id = ?1) AS out_at, (SELECT count(*) FROM facet_values WHERE record_id = ?1) AS n_facets, (SELECT count(*) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS n_replies, (SELECT max(lp.created_at_ms) FROM links lr JOIN records rt ON rt.id = lr.source_id AND rt.type = 'Annotation' AND rt.kind = 'comment' AND rt.deleted_at IS NULL JOIN links lp ON lp.target_id = lr.source_id AND lp.relationship = 'part_of' JOIN records rp ON rp.id = lp.source_id AND rp.type = 'Annotation' AND rp.kind = 'comment' AND rp.deleted_at IS NULL WHERE lr.target_id = ?1 AND lr.relationship = 'part_of') AS replies_at FROM records r WHERE r.id = ?1 ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.page",
+          "label": "One page: title, kind, status, summary, times and up to five folders above it (no body)",
+          "sql": "SELECT r.id, r.type, r.kind, r.name, r.lifecycle, r.summary, r.created_at, r.updated_at, r.updated_at_ms, r.home_id, EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = r.id AND a.key = 'archived') AS archived, (SELECT m.value FROM facet_values m WHERE m.record_id = r.id AND m.key = 'runtime') AS runtime, h1.name AS h1n, h1.home_id AS h1h, h2.id AS h2, h2.name AS h2n, h2.home_id AS h2h, h3.id AS h3, h3.name AS h3n, h3.home_id AS h3h, h4.id AS h4, h4.name AS h4n, h4.home_id AS h4h, h5.id AS h5, h5.name AS h5n, h5.home_id AS h5h FROM records r LEFT JOIN records h1 ON h1.id = r.home_id LEFT JOIN records h2 ON h2.id = h1.home_id LEFT JOIN records h3 ON h3.id = h2.home_id LEFT JOIN records h4 ON h4.id = h3.home_id LEFT JOIN records h5 ON h5.id = h4.home_id WHERE r.id = ?1 AND r.deleted_at IS NULL ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.links",
+          "label": "One page's links/comments with passage quotes and properties (100 each), recent history (12), or replies and authors",
+          "sql": "SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, NULL AS event_id, NULL AS record_id, NULL AS channel_kind, NULL AS actor_name, NULL AS root_id, NULL AS run_key, NULL AS client, NULL AS model, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, NULL AS prop_key, NULL AS prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT 'in' AS dir, l.relationship AS rel, s.id, substr(s.name, 1, 160) AS name, s.type, s.kind, l.created_at_ms AS linked_at, CASE WHEN s.kind = 'comment' THEN substr(s.body, 1, 4000) END AS excerpt, c.selectors AS anchor, c.source_event_seq AS anchor_seq, c.source_sha256 AS anchor_sha FROM links l JOIN records s ON s.id = l.source_id LEFT JOIN comment_anchors c ON s.kind = 'comment' AND c.annotation_id = s.id AND c.target_record_id = ?1 AND length(c.selectors) <= 2560 WHERE l.target_id = ?1 AND s.deleted_at IS NULL UNION ALL SELECT 'out', l.relationship, t.id, substr(t.name, 1, 160), t.type, t.kind, l.created_at_ms, NULL, NULL, NULL, NULL FROM links l JOIN records t ON t.id = l.target_id WHERE l.source_id = ?1 AND t.deleted_at IS NULL ORDER BY 1 DESC, 7 DESC, 3 ASC LIMIT 100) AS link_rows UNION ALL SELECT 'prop', NULL, NULL, NULL, NULL, NULL, NULL, NULL, key, value, NULL, NULL, NULL FROM (SELECT key, substr(value, 1, 300) AS value FROM facet_values WHERE record_id = ?1 ORDER BY key ASC LIMIT 100) AS prop_rows) ORDER BY CASE WHEN dir = 'prop' THEN 1 ELSE 0 END ASC, dir DESC, linked_at DESC, id ASC, prop_key ASC LIMIT 200) AS detail_rows WHERE ?2 = 'details' UNION ALL SELECT 'history', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, event_id, record_id, channel_kind, actor_name, NULL, NULL, NULL, NULL, NULL, NULL, NULL FROM (SELECT e.id AS event_id, e.record_id, e.channel_kind, a.display_name AS actor_name FROM content_events e LEFT JOIN actors a ON a.actor = e.actor WHERE e.record_id = ?1 ORDER BY e.local_seq DESC LIMIT 12) AS history_rows WHERE ?2 = 'history' UNION ALL SELECT 'thread', NULL, id, NULL, NULL, NULL, linked_at, excerpt, NULL, NULL, event_id, NULL, channel_kind, actor_name, root_id, run_key, client, model, NULL, NULL, NULL FROM (SELECT c.id, c.root_id, c.linked_at, c.excerpt, ev.id AS event_id, ev.channel_kind, a.display_name AS actor_name, ev.run_key, ru.reported_client AS client, ru.reported_model AS model FROM (SELECT * FROM (SELECT s.id, NULL AS root_id, l.created_at_ms AS linked_at, NULL AS excerpt FROM links l JOIN records s ON s.id = l.source_id WHERE l.target_id = ?1 AND l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100) UNION ALL SELECT * FROM (SELECT s.id, l.target_id AS root_id, l.created_at_ms AS linked_at, substr(s.body, 1, 4000) AS excerpt FROM links l JOIN links p ON p.source_id = l.target_id AND p.target_id = ?1 AND p.relationship = 'part_of' JOIN records root ON root.id = l.target_id AND root.type = 'Annotation' AND root.kind = 'comment' AND root.deleted_at IS NULL JOIN records s ON s.id = l.source_id WHERE l.relationship = 'part_of' AND s.type = 'Annotation' AND s.kind = 'comment' AND s.deleted_at IS NULL ORDER BY l.created_at_ms DESC, s.id ASC LIMIT 100)) AS c LEFT JOIN content_events ev ON ev.record_id = c.id AND ev.type = 'record.created' AND ev.local_seq = (SELECT min(e2.local_seq) FROM content_events e2 WHERE e2.record_id = c.id AND e2.type = 'record.created') LEFT JOIN actors a ON a.actor = ev.actor LEFT JOIN runs ru ON ru.run_key = ev.run_key) AS thread_rows WHERE ?2 = 'threads' ORDER BY dir DESC, linked_at DESC, id ASC, prop_key ASC, event_id ASC LIMIT 200",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            },
+            {
+              "name": "section",
+              "type": "text",
+              "required": true,
+              "max_len": 7
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "docs.body",
+          "label": "One page body: full at up to 262,142 characters, otherwise the first 120,000 characters",
+          "sql": "SELECT r.id, CASE WHEN length(r.body)<=262142 THEN r.body ELSE substr(r.body,1,120000) END AS body, length(r.body) AS body_length, CASE WHEN length(r.body)<=262142 THEN 'full' ELSE 'prefix' END AS body_source FROM records r WHERE r.id = ?1 AND r.deleted_at IS NULL ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        }
+      ]
+    },
+    "spaces_frozen_0_7_0": {
+      "path": "web/apps/src/apps/spaces/reads.json",
+      "revision": "14469a590c6593686018b8900f1108bab8b5ccb3",
+      "sha256": "c849499496c5ded46aed20d4eeeb00b20b6eae70e7fb0e50e69d1992e2715e7a",
+      "needs": [
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.edit_target",
+          "label": "The requested document id, if it is an editable Document; private Body Save target check",
+          "sql": "SELECT id FROM records WHERE id = ?1 AND type = 'Document' AND deleted_at IS NULL AND COALESCE(kind, '') NOT IN ('attachment', 'artifact') AND NOT EXISTS (SELECT 1 FROM facet_values a WHERE a.record_id = records.id AND a.key = 'archived') ORDER BY id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "required": true,
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.stamp",
+          "label": "One page's change stamp: last change number and link counts (no content)",
+          "sql": "SELECT r.updated_at_ms, r.deleted_at_ms, (SELECT max(local_seq) FROM content_events WHERE record_id = ?1) AS seq, (SELECT count(*) FROM links WHERE target_id = ?1) AS n_in, (SELECT max(created_at_ms) FROM links WHERE target_id = ?1) AS in_at, (SELECT count(*) FROM links WHERE source_id = ?1) AS n_out, (SELECT max(created_at_ms) FROM links WHERE source_id = ?1) AS out_at, (SELECT count(*) FROM facet_values WHERE record_id = ?1) AS n_facets FROM records r WHERE r.id = ?1 ORDER BY r.id LIMIT 1",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        },
+        {
+          "need": "sql.snapshot.v1",
+          "key": "spaces.links",
+          "label": "One page's links/comments (100, bodies \u22644,000 chars, passage quotes) and properties (100, values \u2264300 chars)",
+          "sql": "SELECT dir, rel, id, name, type, kind, linked_at, excerpt, prop_key, prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT dir, rel, id, name, type, kind, linked_at, excerpt, NULL AS prop_key, NULL AS prop_value, anchor, anchor_seq, anchor_sha FROM (SELECT 'in' AS dir, l.relationship AS rel, s.id, substr(s.name, 1, 160) AS name, s.type, s.kind, l.created_at_ms AS linked_at, CASE WHEN s.kind = 'comment' THEN substr(s.body, 1, 4000) END AS excerpt, c.selectors AS anchor, c.source_event_seq AS anchor_seq, c.source_sha256 AS anchor_sha FROM links l JOIN records s ON s.id = l.source_id LEFT JOIN comment_anchors c ON s.kind = 'comment' AND c.annotation_id = s.id AND c.target_record_id = ?1 AND length(c.selectors) <= 2560 WHERE l.target_id = ?1 AND s.deleted_at IS NULL UNION ALL SELECT 'out', l.relationship, t.id, substr(t.name, 1, 160), t.type, t.kind, l.created_at_ms, NULL, NULL, NULL, NULL FROM links l JOIN records t ON t.id = l.target_id WHERE l.source_id = ?1 AND t.deleted_at IS NULL ORDER BY 1 DESC, 7 DESC, 3 ASC LIMIT 100) AS link_rows UNION ALL SELECT 'prop', NULL, NULL, NULL, NULL, NULL, NULL, NULL, key, value, NULL, NULL, NULL FROM (SELECT key, substr(value, 1, 300) AS value FROM facet_values WHERE record_id = ?1 ORDER BY key ASC LIMIT 100) AS prop_rows) ORDER BY CASE WHEN dir = 'prop' THEN 1 ELSE 0 END ASC, dir DESC, linked_at DESC, id ASC, prop_key ASC LIMIT 200",
+          "params": [
+            {
+              "name": "record_id",
+              "type": "text",
+              "max_len": 128
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

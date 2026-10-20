@@ -43,7 +43,7 @@ async fn unknown_body_drop_never_decrements_or_becomes_driver_ack() {
 }
 
 #[tokio::test]
-async fn body_options_preserve_actual_readonly_and_immutable_filename() {
+async fn body_options_preserve_actual_readonly_and_mutable_filename() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("body-options.db");
     let source = create_database(path.to_str().unwrap()).await.unwrap();
@@ -58,8 +58,11 @@ async fn body_options_preserve_actual_readonly_and_immutable_filename() {
         options.get_filename(),
         db.governed_pool.connect_options().get_filename()
     );
+    // Standby serving connections are read-only but deliberately not
+    // `immutable`: the refresh controller applies deltas to this file in
+    // place, so readers must see SQLite's normal locking and change detection.
     let url = options.to_url_lossy();
-    assert!(url
+    assert!(!url
         .query_pairs()
         .any(|(k, v)| k == "immutable" && v == "true"));
     let mut raw = options.connect().await.unwrap();

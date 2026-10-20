@@ -9,5 +9,6 @@
 
 pub mod artifact_intents;
 pub mod css;
+pub mod deployment_keyring;
 pub mod mdx;
 pub mod mdx_v2;

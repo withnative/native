@@ -464,7 +464,7 @@ pub async fn seed_vocabularies(db: &Db) -> Result<()> {
         tx.commit().await?;
     }
     // Core kind identities are one manifest installation, so preflight all
-    // ten vocabularies and every shipped value before appending any of them.
+    // spine-type kind vocabularies and every shipped value before appending any of them.
     // The single transaction also makes a late uniqueness conflict roll the
     // whole installation back.
     let manifest = core_kind_manifest()?;

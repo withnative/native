@@ -2,11 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { LIMITS } from "../src/limits.mjs";
-import { completenessAnalysis, completenessFindings, inlineScripts, LINT_BUDGET, readsField, tokenize } from "../src/completeness-lint.mjs";
+import { completenessAnalysis, completenessFindings, inlineScripts, LINT_BUDGET, PACKAGE_LINT_BUDGET, readsField, tokenize } from "../src/completeness-lint.mjs";
+import { validateHtml } from "../src/html.mjs";
 import { validatePackage } from "../src/validate.mjs";
 import { planInstall } from "../src/install.mjs";
 import { computeDigests } from "../src/digest.mjs";
 import { shapeSqlResult } from "../src/fake-host/rules.mjs";
+import { runNode } from "./helpers/run-node.mjs";
 
 const doc = (script) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>T</title></head><body><main><h1>T</h1><ul id="list"></ul></main><script>${script}</script></body></html>`;
 const SQL_NEED = { need: "sql.snapshot.v1", key: "lane.all", label: "All", sql: "SELECT id, name FROM records ORDER BY id LIMIT 200" };
@@ -236,4 +238,86 @@ test("inline scripts: linear over unclosed tags, closed as a browser closes them
     ["a.rows", "x</scripts>"]);
   assert.deepEqual(inlineScripts("<script>".repeat(60_000)), []);
   assert.deepEqual(inlineScripts("<script".repeat(60_000)), []);
+});
+
+// Package bundle limit: native Docs with live editing is 651,823 bytes, over
+// the 512 KiB ordinary limit and inside the 1 MiB package limit.
+const bigDoc = (bytes) => {
+  const shell = doc("");
+  // Densest valid tokens (one per byte) plus a read, padded to `bytes` exactly.
+  const head = "var s = input.sql['lane.all']; note(s.rows, s.truncated); var z = [";
+  const tail = "];";
+  const filler = bytes - Buffer.byteLength(shell) - head.length - tail.length;
+  return doc(`${head}${"[],".repeat(Math.floor(filler / 3))}${"".padEnd(filler % 3, " ")}${tail}`);
+};
+
+test("package: a ~650 KB package bundle passes the lint and validates; ordinary 600 KB HTML still fails", () => {
+  const package650 = bigDoc(650_000);
+  assert.equal(Buffer.byteLength(package650), 650_000);
+  assert.ok(Buffer.byteLength(package650) > LIMITS.html.body_max_bytes);
+  assert.ok(Buffer.byteLength(package650) < LIMITS.html.package_body_max_bytes);
+  // The lint runs to an answer under the package budget...
+  const asPackage = completenessAnalysis(package650, [SQL_NEED], undefined, { package: true });
+  assert.equal(asPackage.exhausted, null);
+  assert.deepEqual(asPackage.findings, []);
+  assert.deepEqual(completenessFindings(package650, [SQL_NEED], { package: true }), []);
+  // ...and stops at its script-size bound for an ordinary document.
+  const ordinary = completenessAnalysis(package650, [SQL_NEED]);
+  assert.equal(ordinary.exhausted, "script size");
+  // validatePackage treats the bundle as a package by default: no body-size error.
+  const result = validatePackage({ descriptor: descriptorFor(package650), html: package650 });
+  assert.deepEqual(result.findings.filter((item) => item.severity === "error"), []);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.findings.filter((item) => item.rule.startsWith("reads.")), []);
+  // An ordinary 600 KB body is still refused (validateHtml default, and package: false).
+  const ordinary600 = bigDoc(600_000);
+  for (const found of [
+    validateHtml(ordinary600),
+    validatePackage({ descriptor: descriptorFor(ordinary600), html: ordinary600, package: false }).findings,
+  ]) {
+    assert.deepEqual(found.filter((item) => item.severity === "error").map((item) => item.rule), ["body-size"]);
+  }
+  assert.deepEqual(validateHtml(ordinary600, { package: true }).filter((item) => item.severity === "error"), []);
+});
+
+test("package: the limit is exact, 1 MiB, and one byte over is refused even as a package", () => {
+  const at = bigDoc(LIMITS.html.package_body_max_bytes);
+  assert.deepEqual(validateHtml(at, { package: true }).filter((item) => item.severity === "error"), []);
+  const over = bigDoc(LIMITS.html.package_body_max_bytes + 1);
+  assert.deepEqual(validateHtml(over, { package: true }).map((item) => item.rule), ["body-size"]);
+  assert.equal(PACKAGE_LINT_BUDGET.scriptBytes, LIMITS.html.package_body_max_bytes);
+  assert.equal(LINT_BUDGET.scriptBytes, LIMITS.html.body_max_bytes);
+});
+
+test("package: planInstall marks a bundle over the ordinary limit with the package facet on both routes, and only then", () => {
+  const html = bigDoc(600_000);
+  const common = { descriptor: descriptorFor(html), html, homeId: "c59dffa3-a401-431a-a44b-c79cae9b8346", reason: "Install a package" };
+  const whole = planInstall(common);
+  assert.equal(LIMITS.install.package_facet_key, "app_package");
+  assert.deepEqual(whole.steps.find((step) => step.step === "create-artifact").arguments.facets, { runtime: "native.html.v1", app_package: "true" });
+  const chunked = planInstall({ ...common, chunked: true });
+  assert.deepEqual(chunked.steps.find((step) => step.step === "rekind-artifact").arguments.facets, { runtime: "native.html.v1", app_package: "true" });
+  // A bundle within the ordinary limit keeps its plan unchanged: no marker.
+  const small = doc("");
+  const plain = planInstall({ ...common, descriptor: descriptorFor(small), html: small });
+  assert.deepEqual(plain.steps.find((step) => step.step === "create-artifact").arguments.facets, { runtime: "native.html.v1" });
+});
+
+test("package: the validate CLI defaults to package validation; --no-package holds a bundle to 512 KiB", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const cli = fileURLToPath(new URL("../bin/alpha-tab-kit.mjs", import.meta.url));
+  const dir = mkdtempSync(join(tmpdir(), "kit-package-"));
+  const html = bigDoc(600_000);
+  writeFileSync(join(dir, "bundle.html"), html);
+  writeFileSync(join(dir, "descriptor.json"), JSON.stringify(descriptorFor(html)));
+  const run = (...extra) => runNode([cli, "validate", join(dir, "descriptor.json"), "--html", join(dir, "bundle.html"), ...extra]);
+  assert.equal(run().status, 0);
+  assert.equal(run("--package").status, 0);
+  const ordinary = run("--no-package");
+  assert.equal(ordinary.status, 1);
+  assert.match(ordinary.stdout, /body-size|UTF-8 body limit is 524288/);
+  assert.equal(run("--package", "--no-package").status, 2);
 });

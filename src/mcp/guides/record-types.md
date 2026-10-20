@@ -14,6 +14,7 @@ The closed spine-type vocabulary is generated from the engine contract:
 - `Conversation`
 - `Message`
 - `Annotation`
+- `Configuration`
 
 `type` chooses a stable storage and interoperability category. `kind` is the required open-additive extension point: use the governed kind registry when one applies, or an honest novel non-empty token when it does not. Do not invent a new top-level type for a subtype.
 
@@ -58,3 +59,13 @@ One communication event within a conversation, with an explicit audience and exp
 ### `Annotation`
 
 Commentary or a proposed change attached to another record. Kinds distinguish comments, suggestions, and other annotation forms without widening the spine.
+
+### `Configuration`
+
+A named, authored definition that tells an app or the host how to behave or where to open, such as a saved view, a preference, or an app setting. Unlike a Document, its value is not what it says but what it configures. Kinds distinguish the forms of definition without widening the spine.
+
+`Entity/persona` is an owner-private participant profile. Register it with
+`manage_participants.register_persona`; existing profiles must already be
+owner-only. Registration locks owner, type, placement and policy, and prevents
+deletion; retire it to preserve history. Name, body and open facets remain
+editable. The messaging guide describes speaker facts and assurance.

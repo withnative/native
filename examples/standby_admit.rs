@@ -4,6 +4,11 @@
 //! Usage: standby_admit <runtime.json> <consumer-executable> <snapshot.db> <manifest.json>
 //! Acquisition: standby_admit --acquire-only <runtime.json> <consumer-executable> <refresh.json>
 //! Acquisition does not admit or publish a generation. Run the default mode separately.
+//! Delta: standby_admit --delta <runtime.json> <consumer-executable> <refresh.json>
+//! applies at most one authenticated whole-act delta in place to the current
+//! generation, or reports that a whole snapshot is required. It never downloads one.
+//! Audit: standby_admit --audit <runtime.json> <consumer-executable> runs the full
+//! verifier over the current copy; a failure makes the next refresh take a whole snapshot.
 //! TMPDIR may point to private disposable memory-backed storage for replay scratch.
 
 use std::path::Path;
@@ -106,6 +111,55 @@ async fn acquire(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+async fn delta(args: &[String]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(
+            "usage: standby_admit --delta <runtime.json> <consumer-executable> <refresh.json>"
+                .into(),
+        );
+    }
+    let runtime = StandbyRuntimeConfig::from_json(&std::fs::read(&args[0])?)?;
+    let observed = observe_consumer(Path::new(&args[1])).await?;
+    // Consumers built before in-place deltas open generations `immutable`
+    // and must never serve a copy that a delta advances.
+    if observed.source_sha != native_ce::FULL_GIT_SHA {
+        return Err("delta requires the consumer built from this helper's source".into());
+    }
+    let config = StandbyRefreshConfig::from_json(&std::fs::read(&args[2])?)?;
+    let store = GenerationStore::open(
+        &runtime.replica_root,
+        &runtime.hosted_route_database_id,
+        Some(runtime.origin_database_id.clone()),
+    )?;
+    let controller = StandbyRefreshController::new(runtime, config, store, observed)?;
+    let started = std::time::Instant::now();
+    let outcome = controller.refresh_delta_only().await?;
+    let mut receipt = serde_json::to_value(&outcome)?;
+    receipt["delta_elapsed_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
+    println!("{receipt}");
+    Ok(())
+}
+
+async fn audit(args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        return Err("usage: standby_admit --audit <runtime.json> <consumer-executable>".into());
+    }
+    let runtime = StandbyRuntimeConfig::from_json(&std::fs::read(&args[0])?)?;
+    let observed = observe_consumer(Path::new(&args[1])).await?;
+    let store = GenerationStore::open(
+        runtime.replica_root,
+        runtime.hosted_route_database_id,
+        Some(runtime.origin_database_id),
+    )?;
+    let started = std::time::Instant::now();
+    eprintln!("standby_admit: auditing the current copy with the full verifier");
+    let outcome = store.audit_current(&observed).await?;
+    let mut receipt = serde_json::to_value(&outcome)?;
+    receipt["audit_elapsed_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
+    println!("{receipt}");
+    Ok(())
+}
+
 async fn admit(args: &[String]) -> Result<()> {
     if args.len() != 4 {
         return Err("usage: standby_admit <runtime.json> <consumer-executable> <snapshot.db> <manifest.json>".into());
@@ -159,10 +213,11 @@ async fn main() -> std::process::ExitCode {
         )
         .init();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    let result = if args.first().is_some_and(|arg| arg == "--acquire-only") {
-        acquire(&args[1..]).await
-    } else {
-        admit(&args).await
+    let result = match args.first().map(String::as_str) {
+        Some("--acquire-only") => acquire(&args[1..]).await,
+        Some("--delta") => delta(&args[1..]).await,
+        Some("--audit") => audit(&args[1..]).await,
+        _ => admit(&args).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

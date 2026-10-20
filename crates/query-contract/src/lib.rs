@@ -14,5 +14,6 @@ pub mod sql_contract;
 pub use error::QueryError;
 pub use events::ContentInvalidation;
 pub use principal::QueryPrincipal;
+pub use principal::{CatalogOperationRow, CatalogOperationsSnapshot};
 
 pub type Result<T> = std::result::Result<T, QueryError>;

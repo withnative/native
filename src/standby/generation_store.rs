@@ -7,11 +7,29 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row};
 
-use crate::error::{Error, Result};
-use crate::standby_snapshot::{ObservedInstalledConsumerIdentity, StandbySnapshotManifest};
+use crate::error::{Error, Result, StandbyAdmissionCheck};
+use crate::standby_snapshot::{
+    ObservedInstalledConsumerIdentity, StandbyGenerationMaterialization, StandbySnapshotManifest,
+};
+
+mod consumer_rebind;
+mod maintenance;
+mod verification_status;
+pub use consumer_rebind::ConsumerRebind;
 
 const POINTER_CONTRACT: &str = "native.standby-current-pointer.v1";
 const STARTUP_STATE_CONTRACT: &str = "native.standby-startup-state.v1";
+const GENERATION_HEAD_CONTRACT: &str = "native.standby-generation-head.v1";
+const SERVING_READER_CONTRACT: &str = "native.standby-serving-reader.v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServingReader {
+    contract: String,
+    version: u32,
+    generation_id: String,
+    source_sha: String,
+}
 
 pub(crate) const SEQUENCED_LOGS: &[&str] = &[
     "content_events",
@@ -39,6 +57,7 @@ pub(crate) const UNSEQUENCED_APPEND_ONLY: &[&str] = &[
     "provenance_action_events",
     "provenance_attestation_validity_events",
     "provenance_action_outputs",
+    "provenance_action_app_attributions",
     "relationship_foreign_action_attestations",
     "relationship_foreign_action_outputs",
     "relationship_federation_events",
@@ -61,7 +80,89 @@ pub struct InstalledGeneration {
     pub manifest: StandbySnapshotManifest,
 }
 
-/// A fully revalidated generation selected for serving at process startup.
+/// The mutable serving state of one generation, kept beside its immutable
+/// manifest in `accepted/heads/<generation id>.json`.
+///
+/// A generation's manifest describes the whole snapshot it was installed from:
+/// that snapshot is the checkpoint. The refresh controller then advances the
+/// current generation's database in place with authenticated whole-act deltas,
+/// so after the first delta its bytes no longer match the manifest digest. This
+/// record says so (`materialization: delta`), carries the act the copy was last
+/// known to hold, and carries the conservative time the copy was last found
+/// current against hosted Native.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationHead {
+    pub contract: String,
+    /// v2 certifies that every in-place delta used the authority-complete
+    /// companion inventory. v1 remains readable for conservative FULL recovery.
+    pub version: u32,
+    pub generation_id: String,
+    pub head_act: i64,
+    pub materialization: StandbyGenerationMaterialization,
+    /// Sampled before the hosted head probe that found this copy current, or
+    /// before the probe that led to the delta which made it so.
+    pub synced_at: String,
+    /// Set when an explicit audit of this copy failed. The next refresh then
+    /// replaces it with a whole snapshot instead of applying deltas.
+    pub full_refresh_required: bool,
+}
+
+/// What blocked a delta that was otherwise ready to apply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DeltaDeferral {
+    /// The serving reader is not a live process of the controller's build.
+    ReaderNotUpgraded,
+    /// A serving read held the copy past the writer's wait.
+    DatabaseBusy,
+}
+
+/// Consecutive deferred delta ticks per cause, kept beside the head record in
+/// `heads/<id>.deferrals`. This is deliberately not part of the head record:
+/// the count is non-zero exactly while an older build may be serving, and
+/// older builds refuse a head record with fields they do not know.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferralCounts {
+    #[serde(default)]
+    pub reader_not_upgraded: u32,
+    #[serde(default)]
+    pub database_busy: u32,
+}
+
+impl GenerationHead {
+    fn checkpoint(generation: &InstalledGeneration) -> Self {
+        Self {
+            contract: GENERATION_HEAD_CONTRACT.into(),
+            version: 2,
+            generation_id: generation.id.clone(),
+            head_act: generation.manifest.head_act.unwrap_or_default(),
+            materialization: StandbyGenerationMaterialization::Snapshot,
+            synced_at: generation.manifest.captured_at.clone(),
+            full_refresh_required: false,
+        }
+    }
+
+    pub fn advanced_in_place(&self) -> bool {
+        self.materialization == StandbyGenerationMaterialization::Delta
+    }
+
+    /// v1 delta writers omitted local attestation authority, so their copies
+    /// can be internally consistent yet miss compatibility links. A binary
+    /// rebind or an unrelated v2 delta cannot establish historical completeness.
+    pub(super) fn needs_projection_recovery(&self) -> bool {
+        self.advanced_in_place() && self.version < 2
+    }
+}
+
+/// The result of [`GenerationStore::audit_current`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct StandbyAuditOutcome {
+    pub generation_id: String,
+    pub passed: bool,
+}
+
+/// A generation selected for serving at process startup.
 ///
 /// The private shared lease must live for as long as the runtime may open new
 /// SQLite connections by pathname. Retention takes the corresponding
@@ -73,38 +174,6 @@ pub struct ActivatedGeneration {
     pub retained_generation_ids: Vec<String>,
     pub retention_warnings: Vec<String>,
     _lease: File,
-    // Process memory only: no importer, serializer, or pointer can supply this.
-    // The serving bundle retains it and the lease through physical pool drain.
-    full_proof: Option<FullVerificationProof>,
-}
-
-/// Issued only at the end of the complete snapshot verifier. The measured
-/// executable binds all compiled checks and awareness semantics; FULL includes
-/// the entire standby observational suite and external awareness reconstruction.
-/// This is not a successor-pair proof and is never written to disk.
-/// The audited replay/state paths derive validity from snapshot data and compiled
-/// constants (see the maintainer guide's call-chain audit). Evaluation-time
-/// validity inputs added later must run on every reuse or prevent issuance;
-/// binary identity alone cannot bind them. Cancellation is always checked anew.
-#[derive(Debug)]
-struct FullVerificationProof {
-    generation_id: String,
-    canonical_manifest: Vec<u8>,
-    consumer: ObservedInstalledConsumerIdentity,
-    profile: crate::conformance::ConformanceProfile,
-}
-
-impl FullVerificationProof {
-    fn matches(
-        &self,
-        generation: &InstalledGeneration,
-        observed: &ObservedInstalledConsumerIdentity,
-    ) -> Result<bool> {
-        Ok(self.profile == crate::conformance::ConformanceProfile::Full
-            && self.consumer == *observed
-            && self.generation_id == generation.id
-            && self.canonical_manifest == generation.manifest.canonical_json()?)
-    }
 }
 
 /// A cheap observation of the accepted descriptor, never a validation receipt.
@@ -165,6 +234,10 @@ pub struct GenerationStore {
     root: PathBuf,
     expected_route_id: String,
     expected_origin_id: Option<String>,
+    verification_status: verification_status::VerificationStatusCache,
+    maintenance: std::sync::Arc<maintenance::MaintenanceControl>,
+    #[cfg(test)]
+    verification_pause: std::sync::Arc<std::sync::Mutex<Option<VerificationPause>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +246,7 @@ pub(super) enum GenerationProvenanceStatus {
     Missing,
     Invalid,
     Unavailable,
+    Unverified,
 }
 
 #[derive(Clone, Debug)]
@@ -182,9 +256,16 @@ pub(super) struct GenerationStoreStatus {
     pub retained_generation_ids: Vec<String>,
     pub candidate_count: usize,
     pub unusable_candidate_count: usize,
+    pub unverified_candidate_count: usize,
     pub startup_reason: Option<StandbyStartupReason>,
     pub startup_reason_available: bool,
 }
+
+#[cfg(test)]
+type VerificationPause = (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
 
 impl GenerationStore {
     /// Observe only the small current descriptor. No historical proof is
@@ -239,7 +320,7 @@ impl GenerationStore {
     }
 
     /// Pin a published candidate and the accepted predecessor under the
-    /// promotion lock, then run genuine full verification outside that lock.
+    /// promotion lock, then run device verification outside that lock.
     /// Unlike startup, a hot successor is always fenced by the actual serving
     /// generation; recovery never authorises a hot downgrade.
     pub async fn activate_accepted(
@@ -266,9 +347,13 @@ impl GenerationStore {
                 accepted_lease,
             )
         };
-        // Every new candidate always takes the complete verifier.
-        let (generation, full_proof) = self
-            .verify_generation_with_full_proof(&hint.generation_id, observed)
+        // Every new candidate takes the device verifier: authenticity,
+        // binding, compatibility, SQLite health and read-only safety. Full
+        // conformance (rebuild-and-diff, relationship history, awareness
+        // rebuild) is not a device gate per ratified decision e15d82a; it
+        // lives on the hosted side and in CI.
+        let generation = self
+            .verify_generation_for_startup(&hint.generation_id, observed)
             .await?;
         if generation.manifest.snapshot.sha256 != hint.snapshot_sha256 {
             return Err(Error::engine("standby accepted snapshot identity changed"));
@@ -362,6 +447,7 @@ impl GenerationStore {
                 })?;
             }
         }
+        self.refresh_cached_pointer(&generation.id, observed);
         drop(accepted_lease);
         Ok(ActivatedGeneration {
             generation,
@@ -369,12 +455,11 @@ impl GenerationStore {
             retained_generation_ids: Vec::new(),
             retention_warnings: Vec::new(),
             _lease: lease,
-            full_proof: Some(full_proof),
         })
     }
 
     /// Recheck the moving desired state after readiness. The candidate remains
-    /// full-verified and pinned; a valid newer hint need not starve its handoff.
+    /// device-verified and pinned; a valid newer hint need not starve its handoff.
     /// Malformed, missing, mismatched or backward descriptors refuse publication.
     pub fn confirm_handoff(&self, active: &ActivatedGeneration) -> Result<()> {
         let current = self
@@ -406,6 +491,7 @@ impl GenerationStore {
         create_private_directory(&root.join("staging"))?;
         create_private_directory(&root.join("generations"))?;
         create_private_directory(&root.join("leases"))?;
+        create_private_directory(&root.join("heads"))?;
         let expected_route_id = expected_route_id.into();
         if expected_route_id.trim().is_empty() {
             return Err(Error::engine("standby expected route id is empty"));
@@ -414,6 +500,10 @@ impl GenerationStore {
             root,
             expected_route_id,
             expected_origin_id,
+            verification_status: Default::default(),
+            maintenance: Default::default(),
+            #[cfg(test)]
+            verification_pause: Default::default(),
         })
     }
 
@@ -442,37 +532,45 @@ impl GenerationStore {
         Ok(Some(generation))
     }
 
-    /// Resolve and fully verify the generation named by the durable pointer
-    /// immediately before a delta refresh clones it. A missing pointer is the ordinary
-    /// first-install case; malformed or unusable pointed state remains an
-    /// error so the controller can take the independently verified snapshot
-    /// path without treating untrusted bytes as a delta base.
-    pub(super) async fn current_for_refresh(
+    /// Deliberate off-path deep audit: run the full verifier (integrity,
+    /// observational conformance including rebuild-and-diff, awareness
+    /// reconstruction) over the current copy, including one that deltas have
+    /// advanced in place. It never runs on the refresh, startup, status or
+    /// serving paths, and it never gates serving: a failure leaves the copy
+    /// serving but makes the next refresh replace it with a whole snapshot.
+    /// This preserves the pre-e15d82a deep audit as an opt-in early warning,
+    /// not a device gate.
+    pub async fn audit_current(
         &self,
         observed: &ObservedInstalledConsumerIdentity,
-    ) -> Result<Option<InstalledGeneration>> {
-        let pointer = match self.read_pointer() {
-            Ok(pointer) => pointer,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None)
-            }
-            Err(error) => return Err(error),
+    ) -> Result<StandbyAuditOutcome> {
+        let pointer = self.read_pointer()?;
+        let generation = self.verify_generation_identity(&pointer.generation_id)?;
+        let before = self.status_stamp(&pointer.generation_id, observed).ok();
+        let passed = match verify_generation_for_audit(self, &pointer.generation_id, observed).await
+        {
+            Ok(verified) => verified.manifest.snapshot.sha256 == pointer.snapshot_sha256,
+            // Running out of scratch space, a busy lock or cancellation says
+            // nothing about the copy: report it without forcing a full copy.
+            Err(error) if audit_infrastructure_error(&error) => return Err(error),
+            Err(_) => false,
         };
-        let generation = self
-            .verify_generation_for_startup(&pointer.generation_id, observed)
-            .await?;
-        if generation.manifest.snapshot.sha256 != pointer.snapshot_sha256 {
-            return Err(Error::engine(
-                "standby current pointer digest does not match its generation",
-            ));
+        if !passed {
+            self.require_full_refresh(&generation)?;
+            self.cache_completed_verification(&generation.id, observed, false);
+        } else {
+            self.remember_verification(&generation.id, observed, before, true);
         }
-        Ok(Some(generation))
+        Ok(StandbyAuditOutcome {
+            generation_id: generation.id,
+            passed,
+        })
     }
 
     /// Inspect accepted generations for status disclosure without changing the
-    /// pointer, retention, or any immutable generation. Every generation named
-    /// as retained or current has passed the same full verification used at
-    /// activation time.
+    /// pointer, retention, or any immutable generation. Results are cached
+    /// observations from completed device checks, invalidated by input changes;
+    /// inspection never copies or verifies a database.
     pub(super) async fn inspect_status(
         &self,
         observed: &ObservedInstalledConsumerIdentity,
@@ -486,6 +584,7 @@ impl GenerationStore {
                     retained_generation_ids: Vec::new(),
                     candidate_count: 0,
                     unusable_candidate_count: 0,
+                    unverified_candidate_count: 0,
                     startup_reason: None,
                     startup_reason_available: false,
                 }
@@ -493,9 +592,15 @@ impl GenerationStore {
         };
         let mut usable = Vec::new();
         let mut unusable_candidate_count = 0;
+        let mut unverified_candidate_count = 0;
         for id in &candidate_ids {
-            match self.verify_generation_for_startup(id, observed).await {
-                Ok(generation) => usable.push(generation),
+            match self.verify_generation_identity(id) {
+                Ok(generation) => match self.cached_verification(id, observed) {
+                    Some(true) => usable.push(generation),
+                    Some(false) => unusable_candidate_count += 1,
+                    None => unverified_candidate_count += 1,
+                },
+                Err(error) if audit_infrastructure_error(&error) => unverified_candidate_count += 1,
                 Err(_) => unusable_candidate_count += 1,
             }
         }
@@ -514,7 +619,21 @@ impl GenerationStore {
                     Some(generation.clone()),
                     GenerationProvenanceStatus::Available,
                 ),
-                None => (None, GenerationProvenanceStatus::Invalid),
+                None => match self.verify_generation_identity(&pointer.generation_id) {
+                    Ok(generation)
+                        if generation.manifest.snapshot.sha256 == pointer.snapshot_sha256 =>
+                    {
+                        (
+                            None,
+                            if self.cached_verification(&generation.id, observed) == Some(false) {
+                                GenerationProvenanceStatus::Invalid
+                            } else {
+                                GenerationProvenanceStatus::Unverified
+                            },
+                        )
+                    }
+                    _ => (None, GenerationProvenanceStatus::Invalid),
+                },
             },
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 (None, GenerationProvenanceStatus::Missing)
@@ -534,6 +653,7 @@ impl GenerationStore {
             retained_generation_ids,
             candidate_count: candidate_ids.len(),
             unusable_candidate_count,
+            unverified_candidate_count,
             startup_reason,
             startup_reason_available,
         }
@@ -545,8 +665,29 @@ impl GenerationStore {
         manifest_path: &Path,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Result<InstalledGeneration> {
-        self.install_staged_with_hook(snapshot, manifest_path, observed, |_| Ok(()))
+        self.install_staged_observing_publication(snapshot, manifest_path, observed, || Ok(()))
             .await
+    }
+
+    /// Observe publication only after the unchanged admission checks succeed.
+    /// The observer receives no candidate bytes or paths and cannot bypass a check.
+    pub(super) async fn install_staged_observing_publication(
+        &self,
+        snapshot: &Path,
+        manifest_path: &Path,
+        observed: &ObservedInstalledConsumerIdentity,
+        mut publication: impl FnMut() -> Result<()>,
+    ) -> Result<InstalledGeneration> {
+        let generation = self
+            .install_staged_with_hook(snapshot, manifest_path, observed, |transition| {
+                if transition == PublishTransition::GenerationDurable {
+                    publication()?;
+                }
+                Ok(())
+            })
+            .await?;
+        self.cache_completed_verification(&generation.id, observed, true);
+        Ok(generation)
     }
 
     /// Recover and select the immutable generation this process may serve.
@@ -554,7 +695,7 @@ impl GenerationStore {
     /// "Newest" is authority capture order: parsed `captured_at`, then
     /// `snapshot_completed_at`, then generation id. Filesystem iteration order
     /// and mtimes are deliberately irrelevant. Invalid generations are left in
-    /// place for bounded diagnosis; retention removes only fully revalidated,
+    /// place for bounded diagnosis; retention removes only device-verified,
     /// unleased known-good generations.
     pub async fn activate_for_startup(
         &self,
@@ -579,8 +720,18 @@ impl GenerationStore {
                 "standby startup requires a configured origin database id",
             ));
         }
-        let _promotion_lock = acquire_promotion_lock(self.root.join("promotion.lock")).await?;
-        let mut retention_warnings = self.cleanup_pruning_workspaces();
+        let _promotion_lock = verification_phase(
+            "startup-lock",
+            acquire_promotion_lock(self.root.join("promotion.lock")),
+        )
+        .await?;
+        let retention_warnings = verification_phase("startup-cleanup", async {
+            let mut warnings = self.cleanup_pruning_workspaces();
+            warnings.extend(self.cleanup_rebind_temps());
+            Ok(warnings)
+        })
+        .await?;
+        let selection_started = std::time::Instant::now();
         let pointer = self.read_pointer();
         let pointer_generation = pointer
             .as_ref()
@@ -592,28 +743,45 @@ impl GenerationStore {
         );
 
         let candidate_ids = self.generation_ids()?;
-        let mut usable = Vec::new();
-        let mut full_proofs = std::collections::HashMap::new();
+        // Manifest identity is a scheduling hint, not a device-verification
+        // receipt. It lets us order candidates without copying their databases.
+        let mut candidates = Vec::new();
         let mut unusable_candidate_count = 0;
         for id in &candidate_ids {
-            // Cold startup has no reuse input, including retained generations.
-            match self.verify_generation_with_full_proof(id, observed).await {
-                Ok((generation, proof)) => {
-                    full_proofs.insert(generation.id.clone(), proof);
-                    usable.push(generation);
-                }
+            match self.verify_generation_identity(id) {
+                Ok(generation) => candidates.push(generation),
                 Err(_) => unusable_candidate_count += 1,
             }
         }
-        usable.sort_by(compare_generation_newest_first);
-
-        let current = pointer.as_ref().ok().and_then(|pointer| {
-            usable.iter().find(|generation| {
-                generation.id == pointer.generation_id
-                    && generation.manifest.snapshot.sha256 == pointer.snapshot_sha256
+        candidates.sort_by(compare_generation_newest_first);
+        let pointer_verified = if let Ok(pointer) = &pointer {
+            match self
+                .verify_generation_for_startup(&pointer.generation_id, observed)
+                .await
+            {
+                Ok(generation) => Some(generation),
+                Err(_) => {
+                    if candidates
+                        .iter()
+                        .any(|candidate| candidate.id == pointer.generation_id)
+                    {
+                        unusable_candidate_count += 1;
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let current = pointer_verified
+            .as_ref()
+            .filter(|generation| {
+                pointer.as_ref().is_ok_and(|pointer| {
+                    generation.manifest.snapshot.sha256 == pointer.snapshot_sha256
+                })
             })
-        });
-        let mut selected = current.cloned();
+            .cloned();
+        let mut selected = current.clone();
         let mut startup_reason = if pointer_missing {
             Some(StandbyStartupReason::CurrentMissing)
         } else if current.is_none() {
@@ -622,35 +790,55 @@ impl GenerationStore {
             None
         };
 
-        // A crash after generation durability but before pointer durability
-        // leaves a complete published successor. Finish that transition only
-        // after proving the orphan is a non-regressing deep successor.
-        if let Some(current) = current {
-            for candidate in &usable {
-                if candidate.id == current.id
-                    || compare_generation_newest_first(candidate, current)
-                        != std::cmp::Ordering::Less
-                {
-                    continue;
+        // Preserve durable-successor recovery, but never verify an older prior
+        // merely to serve a healthy current. If current failed, stop at the
+        // first usable fallback in authority-capture order.
+        for candidate in &candidates {
+            if pointer_generation.as_deref() == Some(&candidate.id) {
+                if current.is_none() {
+                    if let Some(generation) = &pointer_verified {
+                        selected = Some(generation.clone());
+                        break;
+                    }
                 }
-                if candidate
-                    .manifest
-                    .frontier
-                    .is_componentwise_non_regressing_from(&current.manifest.frontier)?
-                    && verify_database_successor(&current.snapshot_path, &candidate.snapshot_path)
-                        .await
-                        .is_ok()
-                {
-                    selected = Some(candidate.clone());
-                    startup_reason = Some(StandbyStartupReason::DurableGenerationRecovered);
+                continue;
+            }
+            if let Some(current) = &current {
+                if compare_generation_newest_first(candidate, current) != std::cmp::Ordering::Less {
                     break;
                 }
             }
-        } else if let Some(candidate) = usable.first() {
-            selected = Some(candidate.clone());
+            let candidate = match self
+                .verify_generation_for_startup(&candidate.id, observed)
+                .await
+            {
+                Ok(candidate) => candidate,
+                Err(_) => {
+                    unusable_candidate_count += 1;
+                    continue;
+                }
+            };
+            if let Some(current) = &current {
+                if !candidate
+                    .manifest
+                    .frontier
+                    .is_componentwise_non_regressing_from(&current.manifest.frontier)?
+                    || verify_database_successor(&current.snapshot_path, &candidate.snapshot_path)
+                        .await
+                        .is_err()
+                {
+                    continue;
+                }
+                startup_reason = Some(StandbyStartupReason::DurableGenerationRecovered);
+            }
+            selected = Some(candidate);
+            break;
         }
 
         let Some(selected) = selected else {
+            tracing::info!(target: "native_ce::standby::verification", phase = "startup-selection",
+                elapsed_ms = selection_started.elapsed().as_millis(), serving = false,
+                "standby startup phase finished");
             return Ok(StandbyStartupOutcome::StatusOnly(StatusOnlyStartup {
                 reason: "no_usable_generation",
                 candidate_count: candidate_ids.len(),
@@ -680,13 +868,16 @@ impl GenerationStore {
             })?;
         }
 
+        self.refresh_cached_pointer(&selected.id, observed);
         let lease = self.acquire_serving_lease(&selected.id)?;
-        retention_warnings.extend(self.prune_known_good(&selected.id, &usable));
+        tracing::info!(target: "native_ce::standby::verification", phase = "startup-selection",
+            elapsed_ms = selection_started.elapsed().as_millis(), "standby startup phase finished");
+        tracing::info!(target: "native_ce::standby::verification", phase = "startup-prune",
+            elapsed_ms = 0_u64, deferred = true, "standby startup phase finished");
         let mut retained_generation_ids = self.generation_ids()?;
         retained_generation_ids.sort();
         Ok(StandbyStartupOutcome::Serving(Box::new(
             ActivatedGeneration {
-                full_proof: full_proofs.remove(&selected.id),
                 generation: selected,
                 startup_reason,
                 retained_generation_ids,
@@ -699,33 +890,14 @@ impl GenerationStore {
     /// Converge retention after a refresh without requiring an MCP restart.
     ///
     /// Selection remains pointer-authoritative and every deletion candidate is
-    /// fully revalidated against the installed consumer. Per-generation
+    /// device-verified against the installed consumer. Per-generation
     /// failures are returned as bounded warnings so cleanup cannot make a
     /// verified current generation unavailable.
     pub async fn prune_retention(
         &self,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Result<Vec<String>> {
-        let _promotion_lock = acquire_promotion_lock(self.root.join("promotion.lock")).await?;
-        let mut warnings = self.cleanup_pruning_workspaces();
-        let pointer = self.read_pointer()?;
-        let mut usable = Vec::new();
-        for id in self.generation_ids()? {
-            if let Ok(generation) = self.verify_generation_for_startup(&id, observed).await {
-                usable.push(generation);
-            }
-        }
-        let current = usable
-            .iter()
-            .find(|generation| {
-                generation.id == pointer.generation_id
-                    && generation.manifest.snapshot.sha256 == pointer.snapshot_sha256
-            })
-            .ok_or_else(|| {
-                Error::engine("standby current generation is not usable for retention")
-            })?;
-        warnings.extend(self.prune_known_good(&current.id, &usable));
-        Ok(warnings)
+        self.maintain_generations(observed, false).await
     }
 
     /// Return the durable fallback/recovery reason that still applies to the
@@ -783,9 +955,10 @@ impl GenerationStore {
                 .as_ref()
                 .is_some_and(|id| id != &manifest.origin_database_id)
         {
-            return Err(Error::engine(
-                "standby candidate does not match configured route/origin",
-            ));
+            return Err(
+                Error::engine("standby candidate does not match configured route/origin")
+                    .at_standby_check(StandbyAdmissionCheck::RouteOrigin),
+            );
         }
         verify_snapshot(
             "candidate",
@@ -798,25 +971,63 @@ impl GenerationStore {
 
         let current = self.read_current_manifest()?;
         if let Some((current_path, current_manifest)) = &current {
-            verify_snapshot(
-                "predecessor",
-                current_path,
-                current_manifest,
-                None,
-                &self.staging_dir(),
-            )
-            .await?;
-            if manifest.hosted_route_database_id != current_manifest.hosted_route_database_id
-                || manifest.origin_database_id != current_manifest.origin_database_id
-                || !manifest
-                    .frontier
-                    .is_componentwise_non_regressing_from(&current_manifest.frontier)?
-            {
-                return Err(Error::engine(
-                    "standby candidate fails scalar rollback/continuity fence",
-                ));
+            let current_id = hex::encode(Sha256::digest(serde_jcs::to_vec(current_manifest)?));
+            let head = self.generation_head(&current_id)?;
+            // The act the current copy is known to hold: its head when it has
+            // one, else (an earlier-revision checkpoint) its manifest's.
+            let held_act = head
+                .as_ref()
+                .map(|head| head.head_act)
+                .or(current_manifest.head_act);
+            let replaceable = head
+                .as_ref()
+                .is_some_and(|head| head.advanced_in_place() || head.full_refresh_required)
+                || current_manifest.is_other_engine_revision();
+            if replaceable {
+                // Without a known act there is no floor to hold the candidate
+                // to, so refuse rather than treat the copy as holding none.
+                let held_act = held_act.ok_or_else(|| {
+                    Error::engine("standby current generation holds no act frontier")
+                        .at_standby_check(StandbyAdmissionCheck::CurrentGeneration)
+                })?;
+                // Trusted deltas advanced the current copy, an audit found it
+                // bad, or an earlier engine revision wrote it. A whole
+                // snapshot is how that copy is repaired, so its own rows do
+                // not fence the candidate: only identity and act order do.
+                // An earlier revision's rows cannot be compared with this
+                // build's candidate at all; the candidate has just passed
+                // this build's full verification.
+                if manifest.hosted_route_database_id != current_manifest.hosted_route_database_id
+                    || manifest.origin_database_id != current_manifest.origin_database_id
+                    || manifest.head_act.unwrap_or_default() < held_act
+                {
+                    return Err(Error::engine(
+                        "standby candidate fails act-order/continuity fence",
+                    )
+                    .at_standby_check(StandbyAdmissionCheck::ActOrderContinuity));
+                }
+            } else {
+                verify_snapshot(
+                    "predecessor",
+                    current_path,
+                    current_manifest,
+                    None,
+                    &self.staging_dir(),
+                )
+                .await?;
+                if manifest.hosted_route_database_id != current_manifest.hosted_route_database_id
+                    || manifest.origin_database_id != current_manifest.origin_database_id
+                    || !manifest
+                        .frontier
+                        .is_componentwise_non_regressing_from(&current_manifest.frontier)?
+                {
+                    return Err(Error::engine(
+                        "standby candidate fails scalar rollback/continuity fence",
+                    )
+                    .at_standby_check(StandbyAdmissionCheck::ScalarRollbackContinuity));
+                }
+                verify_database_successor(current_path, &owned_snapshot).await?;
             }
-            verify_database_successor(current_path, &owned_snapshot).await?;
         }
 
         let id = hex::encode(Sha256::digest(manifest.canonical_json()?));
@@ -862,6 +1073,7 @@ impl GenerationStore {
             // before an idempotent retry can publish its pointer.
             File::open(&destination)?.sync_all()?;
             File::open(&generations)?.sync_all()?;
+            transition(PublishTransition::GenerationDurable)?;
             if self
                 .read_pointer()
                 .ok()
@@ -932,42 +1144,90 @@ impl GenerationStore {
         Ok(ids)
     }
 
+    /// Device verification for admission and startup per ratified decision
+    /// e15d82a: authenticity (manifest size/SHA-256), binding (route, origin,
+    /// account, consumer), compatibility (supported schema), SQLite health
+    /// (`quick_check`, foreign keys) and read-only safety. Rebuild-and-diff,
+    /// exhaustive relationship history and awareness reconstruction are not
+    /// device gates; they live on the hosted side and in CI.
     async fn verify_generation_for_startup(
         &self,
         id: &str,
         observed: &ObservedInstalledConsumerIdentity,
     ) -> Result<InstalledGeneration> {
-        self.verify_generation_with_full_proof(id, observed)
-            .await
-            .map(|(generation, _)| generation)
+        let started = std::time::Instant::now();
+        let before = self.status_stamp(id, observed).ok();
+        #[cfg(test)]
+        {
+            let pause = self.verification_pause.lock().unwrap().take();
+            if let Some((entered, resume)) = pause {
+                entered.notify_one();
+                resume.notified().await;
+            }
+        }
+        let result = self.verify_generation_for_use(id, observed, true).await;
+        match &result {
+            Err(error) if audit_infrastructure_error(error) => {
+                self.invalidate_verification(id, observed)
+            }
+            _ => self.remember_verification(id, observed, before, result.is_ok()),
+        }
+        tracing::info!(target: "native_ce::standby::verification", phase = "startup-generation-verify",
+            generation_id = id, elapsed_ms = started.elapsed().as_millis(), ok = result.is_ok(),
+            "standby startup phase finished");
+        result
     }
 
-    async fn verify_generation_with_full_proof(
+    async fn verify_generation_for_use(
         &self,
         id: &str,
         observed: &ObservedInstalledConsumerIdentity,
-    ) -> Result<(InstalledGeneration, FullVerificationProof)> {
+        allow_rebind: bool,
+    ) -> Result<InstalledGeneration> {
         verification_phase("startup-generation", async {
             let generation = self.verify_generation_identity(id)?;
-            let proof = verification_phase(
+            if allow_rebind {
+                if verification_phase("startup-rebind", self.ensure_consumer_binding(id, observed))
+                    .await?
+                {
+                    return Ok(generation);
+                }
+            } else {
+                self.consumer_rebind(id, observed)?;
+            }
+            // Hold the checkpoint shared while its bytes may be hashed, so the
+            // first in-place delta cannot change them mid-check. Re-read the
+            // head under the lock: that delta may have just marked it.
+            let checkpoint = open_generation_lock(&self.root.join("leases"), id, "checkpoint")?;
+            fs2::FileExt::lock_shared(&checkpoint)?;
+            let advanced = self.advanced_in_place(id)?;
+            if advanced {
+                drop(checkpoint);
+            }
+            verification_phase(
                 "startup-snapshot",
                 verify_snapshot_contents(
                     &generation.snapshot_path,
                     &generation.manifest,
-                    Some(observed),
+                    None,
                     &self.staging_dir(),
+                    advanced,
                 ),
             )
-            .await?
-            .ok_or_else(|| Error::engine("standby full verification lacks consumer binding"))?;
-            Ok((generation, proof))
+            .await?;
+            Ok(generation)
         })
         .await
     }
 
-    /// Only the long-lived reader's still-leased predecessor can supply a
-    /// witness. A lease prevents pruning, not mutation of bytes. Trusted unique
-    /// read-only publication remains the existing hash-to-SQLite-use premise.
+    /// Re-check a still-served predecessor against the active serving bundle.
+    /// The matching path re-checks manifest identity, route/origin binding
+    /// and byte hash/sidecars (skipped only for copies advanced in place by
+    /// trusted deltas, where the checkpoint digest no longer applies). It
+    /// does NOT re-run SQLite health or engine-shape checks: those were
+    /// established at admission/activation and the hash pins the bytes.
+    /// There is no reusable cross-process proof. A lease prevents pruning,
+    /// not mutation of bytes.
     async fn verify_reader_predecessor(
         &self,
         id: &str,
@@ -975,29 +1235,42 @@ impl GenerationStore {
         predecessor: Option<&ActivatedGeneration>,
     ) -> Result<InstalledGeneration> {
         if let Some(active) = predecessor.filter(|active| active.generation.id == id) {
-            if let Some(proof) = &active.full_proof {
-                // Canonical identity includes manifest/generation and checks
-                // the configured route/origin and published file shape anew.
-                let generation = self.verify_generation_identity(id)?;
+            // Canonical identity includes manifest/generation and checks
+            // the configured route/origin and published file shape anew.
+            let generation = self.verify_generation_identity(id)?;
+            self.ensure_consumer_binding(id, observed).await?;
+            // A copy advanced in place by trusted deltas no longer matches
+            // its checkpoint digest, so byte identity is checked against the
+            // checkpoint manifest only for unadvanced copies. Consumer binding
+            // is always re-validated: nothing about the advanced state waives
+            // the account/consumer check.
+            if self.advanced_in_place(id)? {
+                verification_phase("manifest-consumer-identity", async {
+                    require_regular_no_symlink(&generation.snapshot_path)?;
+                    generation.manifest.validate()?;
+                    self.consumer_rebind(id, observed)?;
+                    Ok(())
+                })
+                .await?;
+            } else {
                 verification_phase("byte-manifest-consumer-identity", async {
                     verify_snapshot_byte_identity(
                         &generation.snapshot_path,
                         &generation.manifest,
-                        Some(observed),
+                        None,
                     )
                 })
                 .await?;
-                if generation.snapshot_path == active.generation.snapshot_path
-                    && generation.manifest == active.generation.manifest
-                    && proof.matches(&generation, observed)?
-                {
-                    check_verification_cancellation()?;
-                    return Ok(generation);
-                }
+            }
+            if generation.snapshot_path == active.generation.snapshot_path
+                && generation.manifest == active.generation.manifest
+            {
+                check_verification_cancellation()?;
+                return Ok(generation);
             }
         }
-        // Absent or mismatched proof never creates a hit or a reduced profile.
-        // Hash/identity errors above honestly refuse rather than becoming hits.
+        // An absent or changed predecessor takes the device verifier; hash or
+        // identity errors honestly refuse rather than becoming hits.
         self.verify_generation_for_startup(id, observed).await
     }
 
@@ -1006,7 +1279,7 @@ impl GenerationStore {
             return Err(Error::engine("invalid standby generation id"));
         }
         let directory = self.root.join("generations").join(id);
-        require_published_generation(&directory)?;
+        self.require_generation_files(id, &directory)?;
         let manifest = read_canonical_manifest(&directory.join("manifest.json"))?;
         if hex::encode(Sha256::digest(manifest.canonical_json()?)) != id {
             return Err(Error::engine("standby generation manifest id mismatch"));
@@ -1035,6 +1308,7 @@ impl GenerationStore {
         Ok(lease)
     }
 
+    #[cfg(test)]
     fn prune_known_good(&self, selected_id: &str, usable: &[InstalledGeneration]) -> Vec<String> {
         let mut ordered = usable.to_vec();
         ordered.sort_by(compare_generation_newest_first);
@@ -1082,10 +1356,11 @@ impl GenerationStore {
         }
         let generations = self.root.join("generations");
         let source = generations.join(id);
-        require_published_generation(&source)?;
+        self.require_generation_files(id, &source)?;
         let mut children = fs::read_dir(&source)?
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<std::io::Result<Vec<_>>>()?;
+        children.retain(|name| name != "snapshot.db-journal");
         children.sort();
         if children != ["manifest.json", "snapshot.db"].map(std::ffi::OsString::from) {
             return Err(Error::engine(
@@ -1095,7 +1370,8 @@ impl GenerationStore {
         let pruning = generations.join(format!(".pruning-{}", uuid::Uuid::new_v4()));
         fs::rename(&source, &pruning)?;
         File::open(&generations)?.sync_all()?;
-        self.remove_pruning_workspace(&pruning)
+        self.remove_pruning_workspace(&pruning)?;
+        self.remove_generation_head(id)
     }
 
     fn cleanup_pruning_workspaces(&self) -> Vec<String> {
@@ -1136,10 +1412,9 @@ impl GenerationStore {
             .map(|entry| entry.map(|entry| entry.file_name()))
             .collect::<std::io::Result<Vec<_>>>()?;
         children.sort();
-        if children
-            .iter()
-            .any(|name| name != "manifest.json" && name != "snapshot.db")
-        {
+        if children.iter().any(|name| {
+            name != "manifest.json" && name != "snapshot.db" && name != "snapshot.db-journal"
+        }) {
             return Err(Error::engine(
                 "standby pruning workspace contains unexpected entries",
             ));
@@ -1156,17 +1431,43 @@ impl GenerationStore {
         Ok(())
     }
 
+    /// The generation `current.json` selects, for deciding whether a candidate
+    /// may replace it. A manifest written by an earlier engine revision is
+    /// returned too (see [`StandbySnapshotManifest::is_other_engine_revision`]):
+    /// it is bound to the pointer by its canonical digest like any other, but
+    /// this build's `validate` would refuse it, which must not stop the whole
+    /// snapshot that is the way to replace it. Refusals other than local I/O
+    /// carry [`StandbyAdmissionCheck::CurrentGeneration`].
     fn read_current_manifest(&self) -> Result<Option<(PathBuf, StandbySnapshotManifest)>> {
+        self.read_current_manifest_untagged()
+            .map_err(|error| match error {
+                Error::Io(_) => error,
+                other => other.at_standby_check(StandbyAdmissionCheck::CurrentGeneration),
+            })
+    }
+
+    fn read_current_manifest_untagged(&self) -> Result<Option<(PathBuf, StandbySnapshotManifest)>> {
         let pointer = match self.read_pointer() {
             Ok(value) => value,
             Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
         let dir = self.root.join("generations").join(&pointer.generation_id);
-        require_published_generation(&dir)?;
-        let manifest = read_canonical_manifest(&dir.join("manifest.json"))?;
+        self.require_generation_files(&pointer.generation_id, &dir)?;
+        let manifest_path = dir.join("manifest.json");
+        require_regular_no_symlink(&manifest_path)?;
+        let bytes = fs::read(&manifest_path)?;
+        let manifest: StandbySnapshotManifest = serde_json::from_slice(&bytes)?;
+        if serde_jcs::to_vec(&manifest)? != bytes {
+            return Err(Error::engine("standby manifest is not canonical JSON"));
+        }
+        if manifest.is_other_engine_revision() {
+            manifest.validate_other_revision_for_replacement()?;
+        } else {
+            manifest.validate()?;
+        }
         if manifest.snapshot.sha256 != pointer.snapshot_sha256
-            || hex::encode(Sha256::digest(manifest.canonical_json()?)) != pointer.generation_id
+            || hex::encode(Sha256::digest(&bytes)) != pointer.generation_id
         {
             return Err(Error::engine("standby current pointer digest mismatch"));
         }
@@ -1225,6 +1526,328 @@ impl GenerationStore {
     }
 }
 
+impl GenerationStore {
+    /// The generation's mutable head record, if one has been written. A
+    /// malformed record is an error, never "not advanced": treating unknown
+    /// bytes as an untouched checkpoint would misreport them.
+    pub fn generation_head(&self, id: &str) -> Result<Option<GenerationHead>> {
+        if !is_generation_id(id) {
+            return Err(Error::engine("invalid standby generation id"));
+        }
+        let path = self.root.join("heads").join(format!("{id}.json"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        require_regular_no_symlink(&path)?;
+        let head: GenerationHead = serde_json::from_slice(&bytes)?;
+        if head.contract != GENERATION_HEAD_CONTRACT
+            || !matches!(head.version, 1 | 2)
+            || head.generation_id != id
+            || head.head_act < 0
+            || chrono::DateTime::parse_from_rfc3339(&head.synced_at).is_err()
+        {
+            return Err(Error::engine("invalid standby generation head"));
+        }
+        Ok(Some(head))
+    }
+
+    fn advanced_in_place(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .generation_head(id)?
+            .is_some_and(|head| head.advanced_in_place()))
+    }
+
+    fn write_generation_head(&self, head: &GenerationHead) -> Result<()> {
+        let heads = self.root.join("heads");
+        let temp = heads.join(format!(".head-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        set_mode(&temp, 0o600)?;
+        file.write_all(&serde_jcs::to_vec(head)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, heads.join(format!("{}.json", head.generation_id)))?;
+        File::open(&heads)?.sync_all()?;
+        Ok(())
+    }
+
+    fn remove_generation_head(&self, id: &str) -> Result<()> {
+        let heads = self.root.join("heads");
+        let mut names = vec![
+            format!("{id}.json"),
+            format!("{id}.reader.json"),
+            format!("{id}.reader.lock"),
+            format!("{id}.deferrals"),
+            format!("{id}.consumer-rebind.json"),
+        ];
+        for entry in fs::read_dir(&heads)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Some(name) = name.to_str().filter(|name| {
+                name.starts_with(&format!("{id}.consumer-rebind-")) && name.ends_with(".json")
+            }) {
+                names.push(name.into());
+            }
+        }
+        for name in names {
+            match fs::remove_file(heads.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(heads)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Take a shared lock on `accepted/heads/<id>.reader.lock`. The caller
+    /// keeps the returned file for as long as it serves the generation; the
+    /// kernel drops the lock if the process dies, so a held lock is evidence
+    /// of a live reader that a stale marker alone cannot give.
+    pub fn hold_serving_reader(&self, id: &str) -> Result<File> {
+        let lock = open_generation_lock(&self.root.join("heads"), id, "reader.lock")?;
+        fs2::FileExt::lock_shared(&lock)?;
+        Ok(lock)
+    }
+
+    /// Whether some process currently holds the reader lock. The probe is a
+    /// non-blocking exclusive lock; if it succeeds nobody was holding, and it
+    /// is released at once.
+    fn serving_reader_alive(&self, id: &str) -> bool {
+        let path = self.root.join("heads").join(format!("{id}.reader.lock"));
+        if require_regular_no_symlink(&path).is_err() {
+            return false;
+        }
+        let Ok(lock) = File::open(&path) else {
+            return false;
+        };
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => {
+                let _ = fs2::FileExt::unlock(&lock);
+                false
+            }
+            Err(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+        }
+    }
+
+    /// Record that a serving process built from `observed.source_sha` is
+    /// serving this generation. Call it after the swap, while holding the
+    /// reader lock. Deltas rewrite the serving file in place, so they are
+    /// refused until the generation is served by the matching build: older
+    /// builds open generations `immutable` and would read pages that a delta
+    /// rewrites.
+    pub fn record_serving_reader(
+        &self,
+        id: &str,
+        observed: &ObservedInstalledConsumerIdentity,
+    ) -> Result<()> {
+        if !is_generation_id(id) {
+            return Err(Error::engine("invalid standby generation id"));
+        }
+        let heads = self.root.join("heads");
+        let temp = heads.join(format!(".reader-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        set_mode(&temp, 0o600)?;
+        file.write_all(&serde_jcs::to_vec(&ServingReader {
+            contract: SERVING_READER_CONTRACT.into(),
+            version: 1,
+            generation_id: id.into(),
+            source_sha: observed.source_sha.clone(),
+        })?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp, heads.join(format!("{id}.reader.json")))?;
+        File::open(&heads)?.sync_all()?;
+        Ok(())
+    }
+
+    /// Whether a live serving process built from `source_sha` is serving this
+    /// generation: the last marker names that build and the reader lock is
+    /// held now. Missing or malformed markers, or a lock nobody holds, answer
+    /// `false`.
+    pub(super) fn served_by_build(&self, id: &str, source_sha: &str) -> bool {
+        if !is_generation_id(id) || !self.serving_reader_alive(id) {
+            return false;
+        }
+        let path = self.root.join("heads").join(format!("{id}.reader.json"));
+        if require_regular_no_symlink(&path).is_err() {
+            return false;
+        }
+        fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ServingReader>(&bytes).ok())
+            .is_some_and(|reader| {
+                reader.contract == SERVING_READER_CONTRACT
+                    && reader.version == 1
+                    && reader.generation_id == id
+                    && reader.source_sha == source_sha
+            })
+    }
+
+    /// The consecutive deferred delta ticks recorded for this generation.
+    /// Missing or malformed counts read as zero.
+    pub fn deferral_counts(&self, id: &str) -> DeferralCounts {
+        if !is_generation_id(id) {
+            return DeferralCounts::default();
+        }
+        let path = self.root.join("heads").join(format!("{id}.deferrals"));
+        if require_regular_no_symlink(&path).is_err() {
+            return DeferralCounts::default();
+        }
+        fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Count one more consecutive tick on which `cause` blocked a delta, or
+    /// clear that cause's count. Advisory: it only feeds status, so failures
+    /// are ignored.
+    pub(super) fn note_deferral(&self, id: &str, cause: DeltaDeferral, deferred: bool) {
+        let mut counts = self.deferral_counts(id);
+        let count = match cause {
+            DeltaDeferral::ReaderNotUpgraded => &mut counts.reader_not_upgraded,
+            DeltaDeferral::DatabaseBusy => &mut counts.database_busy,
+        };
+        if !deferred && *count == 0 {
+            return;
+        }
+        *count = if deferred { count.saturating_add(1) } else { 0 };
+        let _ = self.write_deferral_counts(id, &counts);
+    }
+
+    fn write_deferral_counts(&self, id: &str, counts: &DeferralCounts) -> Result<()> {
+        let heads = self.root.join("heads");
+        let target = heads.join(format!("{id}.deferrals"));
+        if *counts == DeferralCounts::default() {
+            return match fs::remove_file(&target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.into()),
+            };
+        }
+        let temp = heads.join(format!(".deferrals-{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)?;
+        set_mode(&temp, 0o600)?;
+        file.write_all(&serde_jcs::to_vec(counts)?)?;
+        drop(file);
+        fs::rename(&temp, target)?;
+        Ok(())
+    }
+
+    /// Record that this copy holds `head_act` and that hosted Native was
+    /// observed at that act no earlier than `synced_at`.
+    pub(super) fn record_synced(
+        &self,
+        generation: &InstalledGeneration,
+        head_act: i64,
+        synced_at: &str,
+    ) -> Result<GenerationHead> {
+        let mut head = self
+            .generation_head(&generation.id)?
+            .unwrap_or_else(|| GenerationHead::checkpoint(generation));
+        head.head_act = head_act;
+        head.synced_at = synced_at.into();
+        self.write_generation_head(&head)?;
+        Ok(head)
+    }
+
+    /// Make the next refresh replace this generation with a whole snapshot.
+    pub fn require_full_refresh(&self, generation: &InstalledGeneration) -> Result<()> {
+        let mut head = self
+            .generation_head(&generation.id)?
+            .unwrap_or_else(|| GenerationHead::checkpoint(generation));
+        head.full_refresh_required = true;
+        self.write_generation_head(&head)
+    }
+
+    /// Open the current generation's database for one in-place delta.
+    ///
+    /// Before the first byte changes, the head record is marked `delta`, so no
+    /// later verification mistakes advanced bytes for a corrupted checkpoint.
+    /// That first transition waits for no one: if a verification is still
+    /// hashing the checkpoint, this returns `None` and the caller retries on a
+    /// later tick. Opening the writer also rolls back a journal left by an
+    /// interrupted earlier delta.
+    pub(super) async fn open_head_writer(
+        &self,
+        generation: &InstalledGeneration,
+    ) -> Result<Option<crate::Db>> {
+        let mut head = self
+            .generation_head(&generation.id)?
+            .unwrap_or_else(|| GenerationHead::checkpoint(generation));
+        if head.needs_projection_recovery() {
+            return Err(Error::engine(
+                "v1 delta generation requires a whole snapshot for authority/link recovery",
+            ));
+        }
+        if !head.advanced_in_place() {
+            let checkpoint =
+                open_generation_lock(&self.root.join("leases"), &generation.id, "checkpoint")?;
+            match checkpoint.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+            head.materialization = StandbyGenerationMaterialization::Delta;
+            // Mark before any database write, including interrupted applies.
+            head.version = 2;
+            self.write_generation_head(&head)?;
+        }
+        let directory = generation
+            .snapshot_path
+            .parent()
+            .ok_or_else(|| Error::engine("standby generation has no directory"))?;
+        set_mode(directory, 0o700)?;
+        set_mode(&generation.snapshot_path, 0o600)?;
+        crate::db::open_standby_head_writer(&generation.snapshot_path)
+            .await
+            .map(Some)
+    }
+
+    /// Check the generation directory's file shape and report whether its
+    /// database has been advanced in place. An advanced generation is owner
+    /// writable and may hold the rollback journal of an interrupted delta.
+    fn require_generation_files(&self, id: &str, directory: &Path) -> Result<bool> {
+        let advanced = self.advanced_in_place(id)?;
+        if advanced {
+            require_advanced_generation_shape(directory)?;
+        } else {
+            require_published_generation(directory)?;
+        }
+        Ok(advanced)
+    }
+}
+
+/// Failures of the machinery around an audit, not verdicts about the copy:
+/// local I/O (including a full scratch disk), SQLite busy/locked/full/I/O,
+/// pool exhaustion and cancellation.
+pub(super) fn audit_infrastructure_error(error: &Error) -> bool {
+    match error {
+        Error::StandbyAdmission { source, .. } => audit_infrastructure_error(source),
+        Error::Io(_) => true,
+        Error::Sqlx(sqlx::Error::Database(database)) => database
+            .code()
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6 | 10 | 13)),
+        Error::Sqlx(sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed) => {
+            true
+        }
+        Error::Engine(message) => message == "standby verification cancelled",
+        _ => false,
+    }
+}
+
 fn is_generation_id(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1252,10 +1875,17 @@ fn compare_generation_newest_first(
 }
 
 fn open_generation_lease(directory: &Path, id: &str) -> Result<File> {
+    open_generation_lock(directory, id, "lock")
+}
+
+/// `lock` is the serving lease; `checkpoint` is held shared while a
+/// checkpoint's bytes are verified against its digest and taken exclusively by
+/// the first in-place delta.
+fn open_generation_lock(directory: &Path, id: &str, kind: &str) -> Result<File> {
     if !is_generation_id(id) {
         return Err(Error::engine("invalid standby generation lease id"));
     }
-    let path = directory.join(format!("{id}.lock"));
+    let path = directory.join(format!("{id}.{kind}"));
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     #[cfg(target_os = "linux")]
@@ -1379,18 +2009,40 @@ pub(crate) fn check_verification_cancellation() -> Result<()> {
 // Aggregate-only events: never attach errors, rows, paths or provider bodies.
 // A finished phase is successful only when `ok` is true. Cancellation leaves
 // its start visible without inventing a completion receipt.
-async fn verification_phase<T>(
+fn verification_phase<T>(
     phase: &'static str,
     work: impl std::future::Future<Output = Result<T>>,
-) -> Result<T> {
-    check_verification_cancellation()?;
-    tracing::info!(target: "native_ce::standby::verification", phase, "standby phase started");
-    let started = std::time::Instant::now();
-    let result = work.await;
-    tracing::info!(target: "native_ce::standby::verification",
+) -> impl std::future::Future<Output = Result<T>> {
+    // Box before constructing the async state: verification futures must not
+    // propagate through install, activation and refresh callers by value.
+    let work = Box::pin(work);
+    async move {
+        check_verification_cancellation()?;
+        tracing::info!(target: "native_ce::standby::verification", phase, "standby phase started");
+        let started = std::time::Instant::now();
+        let result = work.await.map_err(|error| {
+            let check = match phase {
+                "engine-manifest-state" | "engine-advanced-state" => {
+                    Some(StandbyAdmissionCheck::EngineShape)
+                }
+                "sqlite-quick-check-foreign-keys" | "sqlite-integrity-foreign-keys" => {
+                    Some(StandbyAdmissionCheck::Integrity)
+                }
+                "observational-conformance" => Some(StandbyAdmissionCheck::Conformance),
+                "successor-fence" => Some(StandbyAdmissionCheck::SuccessorPreservation),
+                "awareness-projections" => Some(StandbyAdmissionCheck::Awareness),
+                _ => None,
+            };
+            match check {
+                Some(check) => error.at_standby_check(check),
+                None => error,
+            }
+        });
+        tracing::info!(target: "native_ce::standby::verification",
         phase, elapsed_ms = started.elapsed().as_millis(), ok = result.is_ok(),
         "standby phase finished");
-    result
+        result
+    }
 }
 
 async fn verify_snapshot(
@@ -1402,7 +2054,7 @@ async fn verify_snapshot(
 ) -> Result<()> {
     verification_phase(
         phase,
-        verify_snapshot_contents(path, manifest, observed, scratch_parent),
+        verify_snapshot_contents(path, manifest, observed, scratch_parent, false),
     )
     .await
     .map(|_| ())
@@ -1416,13 +2068,17 @@ fn verify_snapshot_byte_identity(
     require_regular_no_symlink(path)?;
     manifest.validate()?;
     if let Some(observed) = observed {
-        manifest.consumer.validate_observed_installed(observed)?;
+        manifest
+            .consumer
+            .validate_observed_installed(observed)
+            .map_err(|error| error.at_standby_check(StandbyAdmissionCheck::Consumer))?;
     }
     let metadata = fs::metadata(path)?;
     if metadata.len() != manifest.snapshot.size_bytes
         || sha256_file(path)? != manifest.snapshot.sha256
     {
-        return Err(Error::engine("standby snapshot byte identity mismatch"));
+        return Err(Error::engine("standby snapshot byte identity mismatch")
+            .at_standby_check(StandbyAdmissionCheck::ByteIdentity));
     }
     reject_sqlite_sidecars(path)?;
     Ok(())
@@ -1433,19 +2089,180 @@ async fn verify_snapshot_contents(
     manifest: &StandbySnapshotManifest,
     observed: Option<&ObservedInstalledConsumerIdentity>,
     scratch_parent: &Path,
-) -> Result<Option<FullVerificationProof>> {
-    verification_phase("byte-manifest-consumer-identity", async {
-        verify_snapshot_byte_identity(path, manifest, observed)
-    })
-    .await?;
+    advanced: bool,
+) -> Result<()> {
+    if advanced {
+        // Trusted deltas have moved these bytes past the checkpoint digest, and
+        // the refresh controller may advance them again during this check.
+        // Verify one consistent private copy against the checkpoint identity.
+        verification_phase("advanced-manifest-consumer-identity", async {
+            require_regular_no_symlink(path)?;
+            manifest.validate()?;
+            if let Some(observed) = observed {
+                manifest
+                    .consumer
+                    .validate_observed_installed(observed)
+                    .map_err(|error| error.at_standby_check(StandbyAdmissionCheck::Consumer))?;
+            }
+            Ok(())
+        })
+        .await?;
+        let scratch_dir = tempfile::Builder::new()
+            .prefix(".verify-head-")
+            .tempdir_in(scratch_parent)?;
+        let copy = scratch_dir.path().join("snapshot.db");
+        verification_phase("advanced-consistent-copy", consistent_copy(path, &copy)).await?;
+        verification_phase("engine-advanced-state", async {
+            crate::db::validate_current_engine_shape_immutable(&copy).await?;
+            validate_advanced_state(&copy, manifest).await
+        })
+        .await?;
+        verify_snapshot_database(&copy).await?;
+    } else {
+        verification_phase("byte-manifest-consumer-identity", async {
+            verify_snapshot_byte_identity(path, manifest, observed)
+        })
+        .await?;
+        verification_phase("engine-manifest-state", async {
+            crate::db::validate_current_engine_shape_immutable(path).await?;
+            crate::standby_snapshot::validate_completed_export_manifest(path, manifest).await?;
+            Ok(())
+        })
+        .await?;
+        verify_snapshot_database(path).await?;
+    }
+    check_verification_cancellation()?;
+    Ok(())
+}
 
-    verification_phase("engine-manifest-state", async {
-        crate::db::validate_current_engine_shape_immutable(path).await?;
-        crate::standby_snapshot::validate_completed_export_manifest(path, manifest).await?;
+/// The deep checks shared by checkpoints and advanced copies: SQLite health
+/// (`quick_check`, foreign keys, no unexpected embeddings) over a path that
+/// must not change while they run. Rebuild-and-diff, exhaustive relationship
+/// history and awareness reconstruction are not device gates per ratified
+/// decision e15d82a.
+async fn verify_snapshot_database(path: &Path) -> Result<()> {
+    verification_phase("sqlite-quick-check-foreign-keys", async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .immutable(true)
+            .create_if_missing(false);
+        let mut raw = sqlx::SqliteConnection::connect_with(&options).await?;
+        let integrity: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&mut raw)
+            .await?;
+        let foreign_key_violation: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
+                .fetch_one(&mut raw)
+                .await?;
+        let embeddings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+            .fetch_one(&mut raw)
+            .await?;
+        raw.close().await?;
+        if integrity != "ok" || foreign_key_violation != 0 || embeddings != 0 {
+            return Err(Error::engine(
+                "standby snapshot integrity or foreign-key validation failed",
+            )
+            .at_standby_check(StandbyAdmissionCheck::Integrity));
+        }
         Ok(())
     })
-    .await?;
+    .await
+}
 
+/// Deliberate deep audit helper: the full pre-e15d82a verifier over one
+/// generation — byte identity, engine shape, `integrity_check`, the
+/// observational conformance suite including rebuild-and-diff, and awareness
+/// reconstruction. Only [`GenerationStore::audit_current`] calls this; it is
+/// never a serving, startup, status or admission gate.
+async fn verify_generation_for_audit(
+    store: &GenerationStore,
+    id: &str,
+    observed: &ObservedInstalledConsumerIdentity,
+) -> Result<InstalledGeneration> {
+    verification_phase("audit-generation", async {
+        let generation = store.verify_generation_identity(id)?;
+        store.ensure_consumer_binding(id, observed).await?;
+        let checkpoint = open_generation_lock(&store.root.join("leases"), id, "checkpoint")?;
+        fs2::FileExt::lock_shared(&checkpoint)?;
+        let advanced = store.advanced_in_place(id)?;
+        if advanced {
+            drop(checkpoint);
+        }
+        verification_phase(
+            "audit-snapshot",
+            verify_snapshot_contents_deep(
+                &generation.snapshot_path,
+                &generation.manifest,
+                None,
+                &store.staging_dir(),
+                advanced,
+            ),
+        )
+        .await?;
+        Ok(generation)
+    })
+    .await
+}
+
+async fn verify_snapshot_contents_deep(
+    path: &Path,
+    manifest: &StandbySnapshotManifest,
+    observed: Option<&ObservedInstalledConsumerIdentity>,
+    scratch_parent: &Path,
+    advanced: bool,
+) -> Result<()> {
+    if advanced {
+        verification_phase("advanced-manifest-consumer-identity", async {
+            require_regular_no_symlink(path)?;
+            manifest.validate()?;
+            if let Some(observed) = observed {
+                manifest
+                    .consumer
+                    .validate_observed_installed(observed)
+                    .map_err(|error| error.at_standby_check(StandbyAdmissionCheck::Consumer))?;
+            }
+            Ok(())
+        })
+        .await?;
+        let scratch_dir = tempfile::Builder::new()
+            .prefix(".verify-head-")
+            .tempdir_in(scratch_parent)?;
+        let copy = scratch_dir.path().join("snapshot.db");
+        verification_phase("advanced-consistent-copy", consistent_copy(path, &copy)).await?;
+        verification_phase("engine-advanced-state", async {
+            crate::db::validate_current_engine_shape_immutable(&copy).await?;
+            validate_advanced_state(&copy, manifest).await
+        })
+        .await?;
+        verify_snapshot_database_deep(&copy, scratch_parent, true).await?;
+    } else {
+        verification_phase("byte-manifest-consumer-identity", async {
+            verify_snapshot_byte_identity(path, manifest, observed)
+        })
+        .await?;
+        verification_phase("engine-manifest-state", async {
+            crate::db::validate_current_engine_shape_immutable(path).await?;
+            crate::standby_snapshot::validate_completed_export_manifest(path, manifest).await?;
+            Ok(())
+        })
+        .await?;
+        verify_snapshot_database_deep(path, scratch_parent, false).await?;
+    }
+    check_verification_cancellation()?;
+    Ok(())
+}
+
+/// The pre-e15d82a deep checks, retained only for the deliberate off-path
+/// audit: full `integrity_check` and foreign keys, the observational
+/// conformance suite, and awareness projections. `path` must not change while
+/// they run; a `disposable` path is a private copy the awareness rebuild may
+/// write to directly.
+async fn verify_snapshot_database_deep(
+    path: &Path,
+    scratch_parent: &Path,
+    disposable: bool,
+) -> Result<()> {
     verification_phase("sqlite-integrity-foreign-keys", async {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(path)
@@ -1467,7 +2284,8 @@ async fn verify_snapshot_contents(
         if integrity != "ok" || foreign_key_violation != 0 || embeddings != 0 {
             return Err(Error::engine(
                 "standby snapshot integrity or foreign-key validation failed",
-            ));
+            )
+            .at_standby_check(StandbyAdmissionCheck::Integrity));
         }
         Ok(())
     })
@@ -1482,26 +2300,25 @@ async fn verify_snapshot_contents(
             return Err(Error::engine(format!(
                 "standby snapshot conformance failed: {}",
                 crate::conformance::format_report(&report)
-            )));
+            ))
+            .at_standby_check(StandbyAdmissionCheck::Conformance));
         }
         Ok(())
     })
     .await?;
-    verification_phase(
-        "awareness-projections",
-        verify_awareness_projections(path, scratch_parent),
-    )
-    .await?;
-    check_verification_cancellation()?;
-    // Sole issuer, after ALL observational checks and awareness have succeeded.
-    // No consumer evidence means no reusable proof, even after a full audit.
-    let canonical_manifest = manifest.canonical_json()?;
-    Ok(observed.map(|consumer| FullVerificationProof {
-        generation_id: hex::encode(Sha256::digest(&canonical_manifest)),
-        canonical_manifest,
-        consumer: consumer.clone(),
-        profile: crate::conformance::ConformanceProfile::Full,
-    }))
+    if disposable {
+        verification_phase(
+            "awareness-projections",
+            verify_awareness_projections_at(path),
+        )
+        .await
+    } else {
+        verification_phase(
+            "awareness-projections",
+            verify_awareness_projections(path, scratch_parent),
+        )
+        .await
+    }
 }
 
 async fn verify_awareness_projections(path: &Path, scratch_parent: &Path) -> Result<()> {
@@ -1511,7 +2328,15 @@ async fn verify_awareness_projections(path: &Path, scratch_parent: &Path) -> Res
     let scratch = scratch_dir.path().join("snapshot.db");
     fs::copy(path, &scratch)?;
     set_mode(&scratch, 0o600)?;
-    let db = crate::open_database_at(&scratch).await?;
+    verify_awareness_projections_at(&scratch).await?;
+    drop(scratch_dir);
+    Ok(())
+}
+
+/// Rebuild the awareness projections in a disposable database and require
+/// them to equal what it already holds.
+async fn verify_awareness_projections_at(scratch: &Path) -> Result<()> {
+    let db = crate::open_database_at(scratch).await?;
     for table in crate::awareness::REBUILD_PROJECTION_TABLES {
         sqlx::query(&format!(
             "CREATE TABLE _standby_expected_{table} AS SELECT * FROM {table}"
@@ -1539,7 +2364,54 @@ async fn verify_awareness_projections(path: &Path, scratch_parent: &Path) -> Res
         }
     }
     db.close().await;
-    drop(scratch_dir);
+    Ok(())
+}
+
+/// One transactionally consistent copy of a database that may be written
+/// concurrently. `VACUUM INTO` reads under a single shared lock.
+async fn consistent_copy(source: &Path, destination: &Path) -> Result<()> {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(source)
+        .read_only(true)
+        .create_if_missing(false)
+        .busy_timeout(std::time::Duration::from_secs(60));
+    let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(destination.to_string_lossy().as_ref())
+        .execute(&mut connection)
+        .await?;
+    connection.close().await?;
+    set_mode(destination, 0o600)
+}
+
+/// An advanced copy keeps its checkpoint's identity and schema and never
+/// falls behind the checkpoint's act.
+async fn validate_advanced_state(path: &Path, manifest: &StandbySnapshotManifest) -> Result<()> {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .immutable(true)
+        .create_if_missing(false);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    let row = sqlx::query(
+        "SELECT (SELECT origin_db_id FROM database_identity WHERE singleton=1) origin,
+                (SELECT user_version FROM pragma_user_version) schema_version,
+                (SELECT next_act FROM act_state WHERE singleton=1) head_act",
+    )
+    .fetch_one(&mut connection)
+    .await?;
+    let origin: Option<String> = row.try_get("origin")?;
+    let schema_version: i64 = row.try_get("schema_version")?;
+    let head_act: Option<i64> = row.try_get("head_act")?;
+    connection.close().await?;
+    if origin.as_deref() != Some(manifest.origin_database_id.as_str())
+        || schema_version != manifest.engine.schema_version
+        || head_act.unwrap_or_default() < manifest.head_act.unwrap_or_default()
+    {
+        return Err(Error::engine(
+            "standby advanced copy does not continue its checkpoint",
+        ));
+    }
     Ok(())
 }
 
@@ -1552,10 +2424,11 @@ async fn verify_database_successor(current: &Path, candidate: &Path) -> Result<(
 }
 
 async fn verify_database_successor_contents(current: &Path, candidate: &Path) -> Result<()> {
+    // Not immutable: the current generation may be advanced in place while
+    // this runs, and SQLite's shared lock keeps each comparison consistent.
     let options = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(current)
         .read_only(true)
-        .immutable(true)
         .create_if_missing(false);
     let mut conn = sqlx::SqliteConnection::connect_with(&options).await?;
     sqlx::query("ATTACH DATABASE ? AS candidate")
@@ -1572,9 +2445,10 @@ async fn verify_database_successor_contents(current: &Path, candidate: &Path) ->
             .get::<i64, _>(0)
             != 0
         {
-            return Err(Error::engine(format!(
-                "standby candidate does not preserve {table}"
-            )));
+            return Err(
+                Error::engine(format!("standby candidate does not preserve {table}"))
+                    .at_standby_check(StandbyAdmissionCheck::SuccessorPreservation),
+            );
         }
     }
     for table in UNFENCED_EXACT {
@@ -1588,9 +2462,10 @@ async fn verify_database_successor_contents(current: &Path, candidate: &Path) ->
                 .get::<i64, _>(0)
                 != 0
             {
-                return Err(Error::engine(format!(
-                    "standby candidate changes unfenced {table}"
-                )));
+                return Err(
+                    Error::engine(format!("standby candidate changes unfenced {table}"))
+                        .at_standby_check(StandbyAdmissionCheck::SuccessorPreservation),
+                );
             }
         }
     }
@@ -1747,6 +2622,47 @@ fn require_generation_shape(path: &Path, directory_mode: u32) -> Result<()> {
     let _ = directory_mode;
     Ok(())
 }
+/// A generation advanced in place keeps its read-only manifest, but its
+/// directory and database become owner-writable and an interrupted delta may
+/// leave SQLite's rollback journal beside the database.
+fn require_advanced_generation_shape(path: &Path) -> Result<()> {
+    require_directory_no_symlink(path)?;
+    let mut children = fs::read_dir(path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    children.retain(|name| name != "snapshot.db-journal");
+    children.sort();
+    if children != ["manifest.json", "snapshot.db"].map(std::ffi::OsString::from) {
+        return Err(Error::engine(
+            "standby advanced generation contains unexpected entries",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = fs::metadata(path)?.permissions().mode() & 0o777;
+        if directory != 0o500 && directory != 0o700 {
+            return Err(Error::engine(
+                "standby advanced generation directory mode is invalid",
+            ));
+        }
+        for (name, modes) in [
+            ("snapshot.db", [0o400, 0o600]),
+            ("manifest.json", [0o400, 0o400]),
+        ] {
+            let child = path.join(name);
+            require_regular_no_symlink(&child)?;
+            let metadata = fs::metadata(child)?;
+            if metadata.nlink() != 1 || !modes.contains(&(metadata.permissions().mode() & 0o777)) {
+                return Err(Error::engine(
+                    "standby advanced generation file ownership shape is invalid",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn create_private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         fs::create_dir(path)?;
@@ -1834,8 +2750,29 @@ fn rename_directory_no_replace(_: &Path, _: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod test_diagnostics {
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tracing_subscriber::prelude::*;
+
+    /// Capturing tests install a scoped dispatcher and rebuild tracing's
+    /// process-wide callsite interest cache. Two hazards follow:
+    ///
+    /// 1. Concurrent captures race that rebuild, so every log-capturing test
+    ///    holds this crate-wide lock for its whole capture. Async tests take it
+    ///    with `.lock().await`; synchronous tests would use `blocking_lock()`,
+    ///    never inside a runtime.
+    /// 2. While exactly one dispatcher is registered, tracing computes the
+    ///    interest of a callsite it has not seen before from the *current
+    ///    thread's* default. A non-capturing test thread that reaches a
+    ///    verification callsite first would cache it as `Interest::never`, and
+    ///    the capturing test would then silently drop that event.
+    ///    `keepalive()` keeps a second, no-op dispatcher registered so interest
+    ///    is always resolved against the whole registered set instead.
+    pub(crate) static LOG_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn keepalive() -> &'static tracing::Dispatch {
+        static KEEPALIVE: OnceLock<tracing::Dispatch> = OnceLock::new();
+        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()))
+    }
 
     #[derive(Clone, Default)]
     pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -1852,6 +2789,7 @@ pub(crate) mod test_diagnostics {
 
     impl Capture {
         pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            let _ = keepalive();
             let writer = self.clone();
             tracing_subscriber::registry().with(
                 tracing_subscriber::fmt::layer()
@@ -1956,6 +2894,357 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn install_refusals_carry_actual_act_and_scalar_fence_checks() {
+        for advanced in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = crate::create_database(":memory:").await.unwrap();
+            let origin = crate::identity::database_id(&db).await.unwrap();
+            let store =
+                GenerationStore::open(dir.path().join("replica"), "route-1", Some(origin)).unwrap();
+            let (older_snapshot, older_manifest) = stage(&store, &db, "older").await;
+            crate::store::create_record(
+                &db,
+                serde_json::json!({"type":"Document","kind":"note","name":"advance"}),
+            )
+            .await
+            .unwrap();
+            let (snapshot, manifest) = stage(&store, &db, "newer").await;
+            let installed = store
+                .install_staged(&snapshot, &manifest, &observed())
+                .await
+                .unwrap();
+            if advanced {
+                store
+                    .record_synced(
+                        &installed,
+                        installed.manifest.head_act.unwrap() + 1,
+                        "2026-10-13T00:00:00.000Z",
+                    )
+                    .unwrap();
+            }
+            if advanced {
+                store.require_full_refresh(&installed).unwrap();
+            }
+            let error = store
+                .install_staged(&older_snapshot, &older_manifest, &observed())
+                .await
+                .unwrap_err();
+            let expected = if advanced {
+                StandbyAdmissionCheck::ActOrderContinuity
+            } else {
+                StandbyAdmissionCheck::ScalarRollbackContinuity
+            };
+            assert!(
+                matches!(error, Error::StandbyAdmission { check, .. } if check == expected),
+                "{error}"
+            );
+            db.close().await;
+        }
+    }
+
+    /// How [`become_other_revision_current`] rewrites the current generation.
+    struct OtherRevision {
+        schema_version: i64,
+        route: Option<&'static str>,
+        origin: Option<String>,
+        /// The manifest's `head_act`; `None` omits it.
+        manifest_head_act: Option<i64>,
+        /// Delta head to write (`full_refresh_required`), or none at all.
+        head: Option<bool>,
+    }
+
+    impl OtherRevision {
+        /// One schema older, advanced in place by trusted deltas (or flagged
+        /// for a full refresh): the shape the rev7 replica had.
+        fn older_delta_advanced(
+            manifest_head_act: Option<i64>,
+            full_refresh_required: bool,
+        ) -> Self {
+            Self {
+                schema_version: crate::CURRENT_ENGINE_SCHEMA_VERSION - 1,
+                route: None,
+                origin: None,
+                manifest_head_act,
+                head: Some(full_refresh_required),
+            }
+        }
+
+        /// A plain checkpoint with no head file, as before any delta.
+        fn without_head(schema_version: i64, manifest_head_act: Option<i64>) -> Self {
+            Self {
+                schema_version,
+                route: None,
+                origin: None,
+                manifest_head_act,
+                head: None,
+            }
+        }
+    }
+
+    /// Rewrite the current generation as another engine revision wrote it: a
+    /// manifest this build's `validate` rejects (other schema, DDL and
+    /// consumer build). With a head it has the modes and delta head trusted
+    /// deltas leave; without one it stays a read-only checkpoint. Returns the
+    /// rewritten generation's id.
+    fn become_other_revision_current(
+        store: &GenerationStore,
+        installed: &InstalledGeneration,
+        spec: OtherRevision,
+    ) -> String {
+        let mut old = installed.manifest.clone();
+        let installed_act = old.head_act.unwrap();
+        old.engine.schema_version = spec.schema_version;
+        old.engine.ddl_sha256 = "d".repeat(64);
+        old.consumer.engine_schema_version = spec.schema_version;
+        old.consumer.ddl_sha256 = "d".repeat(64);
+        old.consumer.source_sha = "e".repeat(40);
+        old.head_act = spec.manifest_head_act;
+        if let Some(route) = spec.route {
+            old.hosted_route_database_id = route.into();
+        }
+        if let Some(origin) = spec.origin {
+            old.origin_database_id = origin;
+        }
+        assert!(
+            old.validate().is_err(),
+            "another revision must not validate"
+        );
+        let bytes = serde_jcs::to_vec(&old).unwrap();
+        let id = hex::encode(Sha256::digest(&bytes));
+
+        let generations = store.root.join("generations");
+        let from = generations.join(&installed.id);
+        let to = generations.join(&id);
+        set_mode(&from, 0o700).unwrap();
+        fs::rename(&from, &to).unwrap();
+        set_mode(&to.join("manifest.json"), 0o600).unwrap();
+        fs::write(to.join("manifest.json"), bytes).unwrap();
+        set_mode(&to.join("manifest.json"), 0o400).unwrap();
+        store.remove_generation_head(&installed.id).unwrap();
+        store
+            .write_pointer(&CurrentPointer {
+                contract: POINTER_CONTRACT.into(),
+                version: 1,
+                generation_id: id.clone(),
+                snapshot_sha256: old.snapshot.sha256.clone(),
+            })
+            .unwrap();
+        match spec.head {
+            Some(full_refresh_required) => {
+                set_mode(&to.join("snapshot.db"), 0o600).unwrap();
+                store
+                    .write_generation_head(&GenerationHead {
+                        contract: GENERATION_HEAD_CONTRACT.into(),
+                        version: 1,
+                        generation_id: id.clone(),
+                        head_act: installed_act + 1,
+                        materialization: StandbyGenerationMaterialization::Delta,
+                        synced_at: "2026-10-12T20:22:34.597Z".into(),
+                        full_refresh_required,
+                    })
+                    .unwrap();
+            }
+            None => set_mode(&to, 0o500).unwrap(),
+        }
+        id
+    }
+
+    async fn store_with_installed(dir: &Path) -> (crate::Db, GenerationStore, InstalledGeneration) {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let store = GenerationStore::open(dir.join("replica"), "route-1", Some(origin)).unwrap();
+        let (snapshot, manifest) = stage(&store, &db, "old").await;
+        let installed = store
+            .install_staged(&snapshot, &manifest, &observed())
+            .await
+            .unwrap();
+        (db, store, installed)
+    }
+
+    async fn advance_and_stage(
+        store: &GenerationStore,
+        db: &crate::Db,
+        stem: &str,
+        records: usize,
+    ) -> (PathBuf, PathBuf) {
+        for n in 0..records {
+            crate::store::create_record(
+                db,
+                serde_json::json!({"type":"Document","kind":"note","name":format!("{stem}-{n}")}),
+            )
+            .await
+            .unwrap();
+        }
+        stage(store, db, stem).await
+    }
+
+    #[tokio::test]
+    async fn full_snapshot_replaces_other_revision_current() {
+        let current = crate::CURRENT_ENGINE_SCHEMA_VERSION;
+        // Older and newer revisions, delta-advanced or flagged for a full
+        // refresh. The newer direction is allowed on purpose: this build
+        // cannot read that copy either, and a whole snapshot repairs it.
+        for (schema_version, full_refresh_required) in [
+            (current - 1, false),
+            (current - 1, true),
+            (current + 1, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, store, installed) = store_with_installed(dir.path()).await;
+            let mut spec = OtherRevision::older_delta_advanced(
+                installed.manifest.head_act,
+                full_refresh_required,
+            );
+            spec.schema_version = schema_version;
+            let old_id = become_other_revision_current(&store, &installed, spec);
+
+            // The candidate is ahead of the copy's deltas, so act order holds.
+            let (snapshot, manifest) = advance_and_stage(&store, &db, "new", 2).await;
+            let replaced = store
+                .install_staged(&snapshot, &manifest, &observed())
+                .await
+                .unwrap();
+            assert_ne!(replaced.id, old_id);
+            assert_eq!(store.read_pointer().unwrap().generation_id, replaced.id);
+            assert!(store
+                .generation_head(&replaced.id)
+                .unwrap()
+                .is_none_or(|head| !head.advanced_in_place()));
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn other_revision_current_still_fences_route_origin_and_act_order() {
+        let other_origin = format!("ndb_{}", "0".repeat(32));
+        for case in ["route", "origin", "act"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, store, installed) = store_with_installed(dir.path()).await;
+            let mut spec = OtherRevision::older_delta_advanced(installed.manifest.head_act, false);
+            match case {
+                "route" => spec.route = Some("route-0"),
+                "origin" => spec.origin = Some(other_origin.clone()),
+                _ => {}
+            }
+            let old_id = become_other_revision_current(&store, &installed, spec);
+            // Identity cases bring a candidate ahead in act order, so only the
+            // identity differs. The act case brings one the copy's deltas
+            // (head_act + 1) have already passed.
+            let records = if case == "act" { 0 } else { 2 };
+            let (snapshot, manifest) = advance_and_stage(&store, &db, "candidate", records).await;
+            let error = store
+                .install_staged(&snapshot, &manifest, &observed())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::StandbyAdmission { check, .. } if check == StandbyAdmissionCheck::ActOrderContinuity),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                store.read_pointer().unwrap().generation_id,
+                old_id,
+                "{case}"
+            );
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn other_revision_current_without_an_act_frontier_refuses_and_keeps_current() {
+        // (schema, expected refusal): an act-capable manifest must carry its
+        // act; a pre-act one is accepted as a copy but gives no floor.
+        for (schema_version, expected) in [
+            (
+                crate::CURRENT_ENGINE_SCHEMA_VERSION - 1,
+                "missing its act frontier",
+            ),
+            (58, "holds no act frontier"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, store, installed) = store_with_installed(dir.path()).await;
+            let old_id = become_other_revision_current(
+                &store,
+                &installed,
+                OtherRevision::without_head(schema_version, None),
+            );
+            let pointer_before = fs::read(store.root.join("current.json")).unwrap();
+            // A verified candidate that would be backwards if the copy held
+            // any act at all.
+            let (snapshot, manifest) = stage(&store, &db, "candidate").await;
+            let error = store
+                .install_staged(&snapshot, &manifest, &observed())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, Error::StandbyAdmission { check, .. } if check == StandbyAdmissionCheck::CurrentGeneration),
+                "{schema_version}: {error}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                fs::read(store.root.join("current.json")).unwrap(),
+                pointer_before
+            );
+            assert_eq!(store.read_pointer().unwrap().generation_id, old_id);
+            db.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_integrity_refusal_carries_integrity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let snapshot = exported_file(&db, dir.path(), "foreign-key.db").await;
+        let mut conn = open_raw(&snapshot).await;
+        sqlx::query("PRAGMA foreign_keys=OFF")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO links (id, source_id, target_id, relationship) VALUES ('bad-link', 'missing', 'missing', 'relates_to')")
+            .execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let error = verify_snapshot_database_deep(&snapshot, dir.path(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::StandbyAdmission {
+                    check: StandbyAdmissionCheck::Integrity,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn actual_conformance_refusal_keeps_its_stage_despite_body_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        crate::store::create_record(&db, serde_json::json!({"type":"Document","kind":"note","name":"sentinel","body":"original"})).await.unwrap();
+        let snapshot = exported_file(&db, dir.path(), "drift.db").await;
+        let mut conn = open_raw(&snapshot).await;
+        sqlx::query("UPDATE records SET body='route origin consumer credential-SENTINEL' WHERE name='sentinel'")
+            .execute(&mut conn).await.unwrap();
+        conn.close().await.unwrap();
+        let error = verify_snapshot_database_deep(&snapshot, dir.path(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                Error::StandbyAdmission {
+                    check: StandbyAdmissionCheck::Conformance,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        db.close().await;
+    }
+
+    #[tokio::test]
     async fn connected_activation_recovers_full_durable_orphan_without_hot_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::create_database(":memory:").await.unwrap();
@@ -2012,7 +3301,7 @@ pub(crate) mod tests {
             recovered.generation.id
         );
         // A newer external acceptance arriving before pinning cannot starve a
-        // valid intermediate successor. Its complete prefix proof permits
+        // valid intermediate successor. Its complete device verification permits
         // progress without ever replacing the newer accepted pointer.
         crate::store::create_record(
             &db,
@@ -2041,11 +3330,8 @@ pub(crate) mod tests {
         store.confirm_handoff(&progress).unwrap();
         // The active floor refuses both a valid older pointer and a malformed
         // descriptor. Startup recovery is deliberately a separate authority.
+        // The fence below, not any cached proof, refuses the regression.
         fs::write(store.root.join("current.json"), pointer).unwrap();
-        assert!(
-            recovered.full_proof.is_some(),
-            "valid old proof cannot permit regression"
-        );
         assert!(store
             .activate_accepted(&hints[0], &observed(), Some(&recovered))
             .await
@@ -2060,6 +3346,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn connected_floor_refuses_full_valid_divergence_even_with_equal_frontiers() {
+        let _capture_guard = test_diagnostics::LOG_CAPTURE_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let db = crate::create_database(":memory:").await.unwrap();
@@ -2103,7 +3390,7 @@ pub(crate) mod tests {
             divergent.manifest.frontier
         );
         // Model an external accepted descriptor containing individually valid
-        // bytes from the wrong branch. The real full verifier must succeed;
+        // bytes from the wrong branch. The device verifier must succeed;
         // the actual served predecessor/successor fence must still refuse.
         let destination = store.root.join("generations").join(&divergent.id);
         fs::create_dir(&destination).unwrap();
@@ -2129,7 +3416,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let hint = store.accepted_identity_hint().unwrap().unwrap();
-        assert!(active.full_proof.is_some());
         use tracing::instrument::WithSubscriber;
         let logs = test_diagnostics::Capture::default();
         let error = store
@@ -2138,13 +3424,20 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("does not preserve"));
+        assert!(matches!(
+            error,
+            Error::StandbyAdmission {
+                check: StandbyAdmissionCheck::SuccessorPreservation,
+                ..
+            }
+        ));
         assert_eq!(
             logs.output()
                 .lines()
                 .filter(|line| line.contains("standby suite started"))
                 .count(),
-            1,
-            "candidate FULL plus valid old proof must still refuse pair divergence"
+            0,
+            "device checks plus successor fence refuse pair divergence with no conformance suite"
         );
         assert!(active.generation.snapshot_path.is_file());
         fork.close().await;
@@ -2153,6 +3446,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn cancelled_verification_has_no_completion_receipt() {
+        let _capture_guard = test_diagnostics::LOG_CAPTURE_LOCK.lock().await;
         use tracing::instrument::WithSubscriber;
         let logs = test_diagnostics::Capture::default();
         let mut work = Box::pin(
@@ -2307,7 +3601,13 @@ pub(crate) mod tests {
         );
         let pointer_before_tamper = fs::read(store.root.join("current.json")).unwrap();
         set_mode(&recovered.snapshot_path, 0o600).unwrap();
-        assert!(store.read_current_manifest().is_err());
+        assert!(matches!(
+            store.read_current_manifest(),
+            Err(Error::StandbyAdmission {
+                check: StandbyAdmissionCheck::CurrentGeneration,
+                ..
+            })
+        ));
         assert_eq!(
             fs::read(store.root.join("current.json")).unwrap(),
             pointer_before_tamper
@@ -2363,6 +3663,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn startup_revalidates_current_and_falls_back_from_corruption() {
+        let _capture_guard = test_diagnostics::LOG_CAPTURE_LOCK.lock().await;
         use tracing::instrument::WithSubscriber;
         let logs = test_diagnostics::Capture::default();
         startup_corruption_fixture()
@@ -2383,9 +3684,9 @@ pub(crate) mod tests {
             "predecessor",
             "startup-generation",
             "startup-snapshot",
-            "observational-conformance",
-            "sqlite-integrity-foreign-keys",
-            "awareness-projections",
+            "byte-manifest-consumer-identity",
+            "engine-manifest-state",
+            "sqlite-quick-check-foreign-keys",
             "successor-fence",
         ] {
             assert!(
@@ -2427,6 +3728,14 @@ pub(crate) mod tests {
                 < output
                     .find("standby phase started phase=\"predecessor\"")
                     .unwrap()
+        );
+        assert!(
+            !output.contains("standby suite started"),
+            "admission and startup run no conformance suite"
+        );
+        assert!(
+            !output.contains("rebuild-and-diff"),
+            "admission and startup run no historical rebuild"
         );
     }
 
@@ -2510,6 +3819,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn startup_without_a_usable_generation_is_status_only() {
+        let _capture_guard = test_diagnostics::LOG_CAPTURE_LOCK.lock().await;
         let root = tempfile::tempdir().unwrap();
         let store = GenerationStore::open(
             root.path().join("standby"),
@@ -2760,5 +4070,5 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
-#[path = "generation_store/full_proof_tests.rs"]
-mod full_proof_tests;
+#[path = "generation_store/device_verification_tests.rs"]
+mod device_verification_tests;

@@ -529,7 +529,11 @@ pub fn validate_image(bytes: &[u8]) -> std::result::Result<&'static str, RecordI
     Ok(mime)
 }
 
-fn request_digest(metadata: &ImageInsertMetadata, body: &str, bytes: &[u8]) -> Result<String> {
+pub(crate) fn request_digest(
+    metadata: &ImageInsertMetadata,
+    body: &str,
+    bytes: &[u8],
+) -> Result<String> {
     let metadata_sha256 = sha256_hex(&serde_jcs::to_vec(metadata)?);
     let value = json!({
         "metadata_sha256": metadata_sha256,
@@ -539,7 +543,7 @@ fn request_digest(metadata: &ImageInsertMetadata, body: &str, bytes: &[u8]) -> R
     Ok(sha256_hex(&serde_jcs::to_vec(&value)?))
 }
 
-fn replay_from_receipt(receipt: &Value, expected: &str) -> Option<ImageInsertResult> {
+pub(crate) fn replay_from_receipt(receipt: &Value, expected: &str) -> Option<ImageInsertResult> {
     if receipt.get("version")?.as_str()? != INSERT_VERSION
         || receipt.get("request_digest")?.as_str()? != expected
     {
@@ -583,6 +587,10 @@ pub async fn insert_record_image(
         &body[metadata.splice.end..]
     );
     let committed_digest = sha256_hex(committed_body.as_bytes());
+    // Single-writer rule: holds the database's session open gate, and routes
+    // the body change into a live session on the bearer when one has peers.
+    let mut live_write = crate::coedit::live::begin_body_write(db, bearer_id, caller).await?;
+    let mut routed_event: Option<(String, i64)> = None;
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
     {
@@ -643,7 +651,15 @@ pub async fn insert_record_image(
             return Err(RecordImageError::NotFound);
         }
         let stored_body: Option<String> = row.try_get("body")?;
-        if sha256_hex(stored_body.as_deref().unwrap_or("").as_bytes()) != metadata.if_body_digest {
+        // During a live session the precondition is the LIVE text, and the
+        // splice must have been computed against exactly that text.
+        let base_body = match live_write.live_body() {
+            Some(live) => live.to_owned(),
+            None => stored_body.unwrap_or_default(),
+        };
+        if sha256_hex(base_body.as_bytes()) != metadata.if_body_digest
+            || (live_write.is_routed() && base_body != body)
+        {
             return Err(RecordImageError::Conflict);
         }
 
@@ -686,17 +702,30 @@ pub async fn insert_record_image(
                 RecordImageError::Internal(error)
             }
         })?;
+        let mut base = serde_json::Map::new();
+        if live_write.is_routed() {
+            base.insert("reason".into(), json!("image inserted"));
+        }
+        let payload = live_write
+            .body_payload(caller, &committed_body, "image inserted", base)
+            .await?;
         port.append_content(AppendSpec {
             record_id: bearer_id.to_owned(),
             event_type: "record.updated".into(),
-            payload: json!({"body": committed_body}),
+            payload: Value::Object(payload),
             actor: Some(caller.actor().into()),
         })
         .await?;
+        if live_write.is_routed() {
+            routed_event = Some(crate::coedit::live::latest_event_in(port.tx, bearer_id).await?);
+        }
     }
     db.commit_content_for_domain(tx)
         .await
         .map_err(|error| RecordImageError::Internal(Error::engine(error.to_string())))?;
+    if let Some((event_id, seq)) = routed_event {
+        live_write.finish(&event_id, seq).await;
+    }
     Ok(ImageInsertResult {
         version: RESULT_VERSION,
         attachment_id: metadata.idempotency_key,

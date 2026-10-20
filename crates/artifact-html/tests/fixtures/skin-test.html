@@ -1,0 +1,16 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Skin fixture</title>
+<style>:root{--app-bg:#ffffff;--app-text:#111111;--app-gap:8px;--app-font:system-ui}body{background:var(--app-bg);color:var(--app-text);font-family:var(--app-font)}h1{padding:var(--app-gap)}</style>
+<script type="application/json" id="native-skin-labels">{"heading":"Built-in heading","draft":"Write a draft"}</script>
+</head><body><h1>Built-in heading</h1><textarea aria-label="Draft" placeholder="Write a draft"></textarea>
+<script>
+window.fixtureRuntime=crypto.randomUUID();
+const defaults=JSON.parse(document.getElementById('native-skin-labels').textContent);
+window.nativeArtifact.ready.then(()=>{
+  if(!window.native?.skin)return;
+  window.stopFixtureSkin=window.native.skin.subscribe(snapshot=>{
+    window.fixtureSkinSnapshot=snapshot;
+    document.querySelector('h1').textContent=Object.hasOwn(snapshot.labels,'heading')?snapshot.labels.heading:defaults.heading;
+    document.querySelector('textarea').placeholder=Object.hasOwn(snapshot.labels,'draft')?snapshot.labels.draft:defaults.draft;
+  });
+});
+</script></body></html>

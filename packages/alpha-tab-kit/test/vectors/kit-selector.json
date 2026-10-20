@@ -1,0 +1,114 @@
+[
+  {
+    "name": "default",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "1.1.0"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "rollback",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "1.0.0"
+        }
+      ]
+    },
+    "valid": true
+  },
+  {
+    "name": "disabled",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": []
+    },
+    "valid": true
+  },
+  {
+    "name": "unknown-field",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [],
+      "extra": true
+    },
+    "valid": false
+  },
+  {
+    "name": "unknown-version",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "1.0.1"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "wrong-major",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 2,
+          "version": "1.0.0"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "duplicate-major",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "1.0.0"
+        },
+        {
+          "major": 1,
+          "version": "1.0.0"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "path-version",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 1,
+          "version": "../1.0.0"
+        }
+      ]
+    },
+    "valid": false
+  },
+  {
+    "name": "out-of-range",
+    "selector": {
+      "schema": "native.app-kit.selector.v1",
+      "selections": [
+        {
+          "major": 65536,
+          "version": "65536.0.0"
+        }
+      ]
+    },
+    "valid": false
+  }
+]

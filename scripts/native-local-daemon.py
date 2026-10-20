@@ -53,7 +53,8 @@ def refresh_metadata(path):
         keys = ("state", "cadence_seconds", "last_attempt_at", "last_failed_attempt_at",
                 "last_successful_attempt_at", "last_failure_phase", "last_error_code",
                 "last_failure_error_code", "phase", "completed_phase", "finished_at",
-                "durations_seconds", "download_bytes", "generation_id", "next_due_at")
+                "durations_seconds", "download_bytes", "generation_id", "next_due_at",
+                "deferred_reason", "full_refresh_reason", "next_full_due_at")
         return dict({"configured": True, "status_available": True},
                     **{key: value[key] for key in keys if key in value})
     except (OSError, ValueError):
@@ -534,13 +535,22 @@ async def serve(args):
                 writer.close()
                 await writer.wait_closed()
 
-        server = await asyncio.start_unix_server(
-            client, path=str(endpoint), limit=MAX_LINE)
+        # Bind under a 0177 umask so the socket is never visible with a wider mode, even briefly.
+        previous_umask = os.umask(0o177)
+        try:
+            server = await asyncio.start_unix_server(
+                client, path=str(endpoint), limit=MAX_LINE)
+        finally:
+            os.umask(previous_umask)
         endpoint.chmod(0o600)
         if control_endpoint is not None:
             remove_owner_socket(control_endpoint)
-            control = await asyncio.start_unix_server(
-                activate_client, path=str(control_endpoint), limit=4096)
+            previous_umask = os.umask(0o177)
+            try:
+                control = await asyncio.start_unix_server(
+                    activate_client, path=str(control_endpoint), limit=4096)
+            finally:
+                os.umask(previous_umask)
             control_endpoint.chmod(0o600)
         print(f"native-local-daemon: kernel connected mode={mode}", file=sys.stderr, flush=True)
         process_exit = asyncio.create_task(pool.wait_exit())

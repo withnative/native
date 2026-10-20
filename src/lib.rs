@@ -73,6 +73,9 @@ pub mod backup;
 pub mod blob;
 pub mod body_blocks;
 pub(crate) mod body_blocks_projection;
+#[cfg(unix)]
+pub mod node;
+pub(crate) mod persona;
 // Request-bound PRIMARY SQLite service; body authority requires a genuine adopted source.
 #[doc(hidden)]
 pub mod body_read;
@@ -126,6 +129,8 @@ pub mod interchange;
 pub mod interpretation;
 pub mod interventions;
 pub mod keyed_freshness;
+#[cfg(unix)]
+pub(crate) mod markdown_vault;
 pub mod mcp;
 pub mod member_copy_admission;
 pub mod member_copy_client;
@@ -152,6 +157,8 @@ pub mod need_subscriptions;
 mod package_adopt_tests;
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub mod package_manifest;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod package_operations;
 pub mod plugins;
 pub mod policy;
 /// Bounded SQL portability for Native-owned relational statements.
@@ -159,6 +166,7 @@ pub mod policy;
 /// Physical schema, concurrency, search, raw SQL, backup, and topology remain
 /// backend-owned; this module is deliberately not a storage/CRUD abstraction.
 pub mod portable_sql;
+pub(crate) mod position;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod projector;
@@ -197,6 +205,8 @@ pub mod standby_snapshot;
 pub mod storage_migration;
 pub mod storage_profile;
 pub mod store;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod structured_values;
 pub(crate) mod suggestion_lifecycle;
 /// The general K3 surface-binding resolver (design `6e2acbd` §3).
 pub mod surface_binding;
@@ -208,6 +218,11 @@ mod surface_view_tests;
 pub mod turso_local;
 /// Typed `date`, `instant` and `zoned` time values (task fef3469, D2 slice T1).
 pub mod typed_time;
+/// Gated v2 budget application proof: a pure, host-owned spreadsheet
+/// arithmetic provider with a closed formula grammar and hard admission caps.
+/// Proof slice 1; no storage, SQL, migration, or default-build effect.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod v2_budget;
 #[cfg(test)]
 mod v2_slice1_probe;
 #[cfg(test)]
@@ -222,14 +237,29 @@ pub mod wordlist;
 pub mod workspace_index;
 pub mod workspace_snapshot;
 
+// Exceptional root fixtures own process-global configuration or tracing state.
+// Their ordinary libtest identities remain in the complete unfiltered suite.
+#[cfg(test)]
+pub(crate) mod test_process;
+
 pub use db::{
     apply_schema, create_database, create_database_named, open_database, open_database_at,
     open_existing_database, open_existing_database_at, probe_database, seed_content_tier,
     seed_content_tier_named, DatabaseVersionState, Db, CURRENT_ENGINE_SCHEMA_VERSION,
     SUPPORTED_ENGINE_SCHEMA_BASELINE,
 };
-pub use error::{DeploymentReadOnlyOperation, Error, Result};
+pub use error::{
+    DeploymentReadOnlyOperation, Error, ReplayApplied, ReplayBound, Result,
+    REPLAY_BOUND_EXCEEDED_CODE, REPLAY_BOUND_EXCEEDED_PARTIAL_RECOVERY,
+    REPLAY_BOUND_EXCEEDED_RECOVERY,
+};
 pub use instructions::{
     MAX_BOOTSTRAP_CONTEXT_METADATA_BYTES, MAX_BOOTSTRAP_INSTRUCTION_ENTRIES,
     MAX_BOOTSTRAP_PENDING_OBLIGATIONS, MAX_RESOLVED_INSTRUCTION_BYTES,
 };
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod v1_import;
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod definition_shape;

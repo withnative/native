@@ -168,7 +168,7 @@ pub(crate) trait RequestLifecyclePort: Sync {
 
     fn mint_run_key<'a>(&'a self, agent_key: Option<&'a str>) -> BoxFuture<'a, Result<String>>;
 
-    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Option<String>>;
+    fn intent_at<'a>(&'a self, run_key: Option<&'a str>) -> BoxFuture<'a, Result<Option<String>>>;
 
     /// Persist a successful intent declaration for one already-validated full
     /// run key. This is separate from the optional interaction tap: adapters
@@ -184,6 +184,39 @@ pub(crate) trait RequestLifecyclePort: Sync {
         reported: crate::control::ReportedRunIdentity,
         channel: crate::provenance::Channel,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Read-pool binding for one full run key, if the backend holds an
+    /// `agent_runs` projection. Default is no binding (suppressed backends
+    /// never admit). SQLite overrides with a read-pool lookup; the write path
+    /// rechecks transactionally.
+    fn read_run_binding<'a>(
+        &'a self,
+        _run_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::control::RunBinding>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Read-pool stored identity for one admitted run. Default is absence.
+    fn read_stored_identity<'a>(
+        &'a self,
+        _run_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::control::ReportedRunIdentity>>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Admit a missing run or enrich missing->present identity fields,
+    /// transactionally. Returns `Ok(None)` when this backend holds no
+    /// `agent_runs` projection (suppressed paths never reach here because the
+    /// wrapper gates on `RunContext` capability first).
+    fn admit_or_enrich_run<'a>(
+        &'a self,
+        _run_key: &'a str,
+        _authenticated_account: &'a str,
+        _reported: crate::control::ReportedRunIdentity,
+        _channel: crate::provenance::Channel,
+    ) -> BoxFuture<'a, Result<Option<crate::control::FirstCallOutcome>>> {
+        Box::pin(async { Ok(None) })
+    }
 
     fn displaced_key_note<'a>(&'a self, caller: &'a Caller) -> BoxFuture<'a, Option<String>>;
 
@@ -309,7 +342,7 @@ fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, d
     let run_key_schema = if describe {
         serde_json::json!({
             "type": "string",
-            "description": "Run correlation handle from bootstrap. Reuse the same key on every call, reads included. Mint with \"new\" or \"new:<agent_key>\". See coordination guide."
+            "description": "Bootstrap run correlation handle; same key every call, reads included. Mint \"new\" or \"new:<agent_key>\"; coordination guide."
         })
     } else {
         serde_json::json!({"type": "string"})
@@ -317,7 +350,7 @@ fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, d
     let parent_key_schema = if describe {
         serde_json::json!({
             "type": "string",
-            "description": "Optional spawning run_key; an unverified lineage hint. Minting sentinels are invalid. See coordination guide."
+            "description": "Optional spawning run_key; unverified lineage hint. Minting sentinels invalid; coordination guide."
         })
     } else {
         serde_json::json!({"type": "string"})
@@ -361,8 +394,13 @@ pub(crate) async fn resolve_run_context<P: RequestLifecyclePort + ?Sized>(
     caller: Caller,
     arguments: &Value,
     public_origin: Option<&str>,
-) -> ResolvedRunContext {
-    let (raw_run_key, raw_parent_key) = run_context_values(arguments);
+) -> Result<ResolvedRunContext> {
+    let pinned = caller.deferred_run_context().cloned();
+    let pinned_arguments = pinned
+        .as_ref()
+        .map(|(run, parent, _)| serde_json::json!({"run_key":run,"parent_key":parent}));
+    let (raw_run_key, raw_parent_key) =
+        run_context_values(pinned_arguments.as_ref().unwrap_or(arguments));
     let capability = port.capability(GovernedRequestOperation::RunContext);
     let mut run_key = crate::runkey::validate_run_key_value(raw_run_key);
     if let crate::runkey::KeyOutcome::Requested { agent_key } = &run_key {
@@ -382,9 +420,13 @@ pub(crate) async fn resolve_run_context<P: RequestLifecyclePort + ?Sized>(
         run_key.stored().map(String::from),
         parent_key.stored().map(String::from),
     );
-    let intent = match capability {
-        RequestStageCapability::Applied => port.intent_at(caller.run_key()).await,
-        RequestStageCapability::Suppressed | RequestStageCapability::Unsupported => None,
+    let intent = if let Some((_, _, intent)) = pinned {
+        intent
+    } else {
+        match capability {
+            RequestStageCapability::Applied => port.intent_at(caller.run_key()).await?,
+            RequestStageCapability::Suppressed | RequestStageCapability::Unsupported => None,
+        }
     };
     let caller = caller.with_intent(intent.clone());
     let displaced_note = if raw_run_key.and_then(Value::as_str).is_some_and(|raw| {
@@ -405,11 +447,11 @@ pub(crate) async fn resolve_run_context<P: RequestLifecyclePort + ?Sized>(
         displaced_note,
         public_origin,
     );
-    ResolvedRunContext {
+    Ok(ResolvedRunContext {
         caller,
         echo,
         intent,
-    }
+    })
 }
 
 pub(crate) async fn run_context_for<P: RequestLifecyclePort + ?Sized>(
@@ -418,9 +460,12 @@ pub(crate) async fn run_context_for<P: RequestLifecyclePort + ?Sized>(
     arguments: &Value,
     public_origin: Option<&str>,
 ) -> Value {
-    resolve_run_context(port, caller, arguments, public_origin)
-        .await
-        .echo
+    // This metadata-only helper returns a JSON echo even when transport
+    // validation already failed. Disclose lookup failures in that echo.
+    match resolve_run_context(port, caller, arguments, public_origin).await {
+        Ok(resolved) => resolved.echo,
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    }
 }
 
 fn run_context_echo(
@@ -465,13 +510,26 @@ fn run_context_echo(
         if public_origin.is_none() {
             notes.push(RELATIVE_FOLLOW_LINK_NOTE.into());
         }
+        if caller.is_outage_bootstrap() {
+            notes.push(
+                "Local run and intent history is unavailable (not empty) while hosted Native is unreachable."
+                    .into(),
+            );
+        }
     }
     if caller.run_key().is_none() {
-        notes.push(
-            "This call is not attached to a run. Pass run_key on every call to correlate \
-             them — use the required key issued by bootstrap."
-                .into(),
-        );
+        if caller.is_outage_bootstrap() {
+            notes.push(
+                "This call is not attached to a run. Hosted Native is unreachable; run keys, intents and declarations wait until hosted is reachable — bootstrap against hosted then."
+                    .into(),
+            );
+        } else {
+            notes.push(
+                "This call is not attached to a run. Pass run_key on every call to correlate \
+                 them — use the required key issued by bootstrap."
+                    .into(),
+            );
+        }
     }
     notes.extend(run_key.note());
     notes.extend(parent_key.parent_note());
@@ -531,6 +589,102 @@ fn admitted_stage<P: RequestLifecyclePort + ?Sized>(
     }
 }
 
+/// Whether a first-call capture would fill anything, mirroring the canonical
+/// reducer's name/version coupling so the read-pool fast path skips the write
+/// pool when nothing would change.
+fn capture_fills(
+    stored: &crate::control::ReportedRunIdentity,
+    incoming: &crate::control::ReportedRunIdentity,
+) -> (bool, bool, bool) {
+    let name_conflicts = matches!(
+        (&stored.client_name, &incoming.client_name),
+        (Some(stored), Some(incoming)) if stored != incoming
+    );
+    let fill_name = stored.client_name.is_none() && incoming.client_name.is_some();
+    let fill_version = stored.client_version.is_none()
+        && incoming.client_version.is_some()
+        && !name_conflicts
+        && (stored.client_name.is_none()
+            || incoming.client_name.as_deref() == stored.client_name.as_deref());
+    let fill_model = stored.model.is_none() && incoming.model.is_some();
+    (fill_name, fill_version, fill_model)
+}
+
+/// Correct the handler's optimistic `declared_model` block from the committed
+/// stored model. A missing->present fill keeps the optimistic accept; a lost
+/// concurrent race becomes an honest refusal naming the winner.
+fn patch_declared_model_from_commit(
+    structured: &mut Value,
+    declared: Option<&str>,
+    recorded: Option<&str>,
+) {
+    let Some(block) = structured
+        .get_mut("declared_model")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let refused = match (declared, recorded) {
+        (Some(declared), Some(recorded)) => declared != recorded,
+        (Some(_), None) => false,
+        (None, _) => false,
+    };
+    block.insert(
+        "recorded".into(),
+        recorded.map_or(Value::Null, |value| Value::String(value.into())),
+    );
+    block.insert("refused".into(), Value::Bool(refused));
+    if refused {
+        block.insert(
+            "note".into(),
+            Value::String(format!(
+                "This run already records declared model '{}'. The declaration of '{}' is refused and the recorded model is unchanged. This call's intent is still recorded and its briefing still returned. A self-declared model is the model's own unverified claim, grants nothing, and never decides access or routing.",
+                recorded.unwrap_or_default(),
+                declared.unwrap_or_default()
+            )),
+        );
+    }
+}
+
+/// Read-only honesty outcome: no admission, no enrichment, no canonical
+/// write — just the stored identity plus what this call's report refused.
+fn read_only_outcome(
+    binding: crate::control::RunBinding,
+    stored: crate::control::ReportedRunIdentity,
+    incoming: &crate::control::ReportedRunIdentity,
+) -> crate::control::FirstCallOutcome {
+    crate::control::FirstCallOutcome {
+        lifecycle: crate::control::AgentRunLifecycle {
+            activity_id: binding.activity_id,
+            started_at: binding.started_at,
+            ended_at: binding.ended_at,
+            changed: false,
+        },
+        stored: stored.clone(),
+        admitted: false,
+        enriched: false,
+        refused_name: incoming.client_name.is_some() && stored.client_name != incoming.client_name,
+        refused_version: incoming.client_version.is_some()
+            && stored.client_version != incoming.client_version,
+        refused_model: incoming.model.is_some() && stored.model != incoming.model,
+    }
+}
+
+fn capture_refused_notes(outcome: &crate::control::FirstCallOutcome) -> Vec<String> {
+    let mut notes = Vec::new();
+    if outcome.refused_name || outcome.refused_version {
+        notes.push(
+            "This call's clientInfo differs from the run's recorded harness; the recorded values are unchanged. Client-asserted harness never decides access or routing.".into(),
+        );
+    }
+    if outcome.refused_model {
+        notes.push(
+            "This call's declared model differs from the run's recorded model; the recorded value is unchanged. A self-declared model never decides access or routing.".into(),
+        );
+    }
+    notes
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_request<P, F, Fut>(
     port: &P,
@@ -585,11 +739,163 @@ where
             intent: None,
         }
     } else {
-        resolve_run_context(port, caller, &original_arguments, public_origin).await
+        resolve_run_context(port, caller, &original_arguments, public_origin).await?
     };
     trace.record(GovernedRequestOperation::RunContext, run_context_stage);
     let capture_caller = resolved.caller.clone();
     let declaration_run_key = resolved.caller.run_key().map(String::from);
+    // Synchronous first-call harness bind BEFORE handler mutation (c2e2b7d):
+    // a supplied full-key run is admitted or harness-enriched transactionally
+    // here, so cross-account refusal lands before any direct mutation and two
+    // accounts cannot both mutate under one missing key. ONLY the transport
+    // harness rides pre-handler: the optional `model` is validated by the
+    // `set_intent` handler and enriches post-success below. Bootstrap issues
+    // its key in the handler and admits post-success. Gating: `RunContext`
+    // capability Applied (excludes standby, member-copy, frozen reads, caller
+    // suppression), `capture` true (excludes uncaptured federation source
+    // reads, which stay observational despite Applied RunContext), and actual
+    // MCP channel (clientInfo alone is not proof; web/local callers sharing
+    // this seam never gain canonical rows from it). Enrolled storage returns
+    // no binding from the port and skips silently.
+    let mut pre_capture: Option<crate::control::FirstCallOutcome> = None;
+    if run_context_stage == GovernedRequestStageDisposition::Applied
+        && capture
+        && capture_caller.channel() == crate::provenance::Channel::Mcp
+        && kind.is_some()
+        && !kind.is_some_and(ToolKind::ignores_run_context_arguments)
+        && !kind.is_some_and(ToolKind::issues_run_key)
+    {
+        if let Some(run_key) = declaration_run_key.as_deref() {
+            if matches!(
+                crate::runkey::validate_full(Some(run_key)),
+                crate::runkey::KeyOutcome::Valid(_)
+            ) {
+                let incoming = capture_caller.reported_run_identity().clamped();
+                let binding = port.read_run_binding(run_key).await?;
+                match binding {
+                    None => {
+                        pre_capture = port
+                            .admit_or_enrich_run(
+                                run_key,
+                                capture_caller.credential(),
+                                incoming,
+                                capture_caller.channel(),
+                            )
+                            .await?;
+                    }
+                    Some(binding) => {
+                        if binding.account_id != capture_caller.credential() {
+                            return Err(Error::engine(
+                                "run key is already bound to another authenticated account",
+                            ));
+                        }
+                        let stored = port.read_stored_identity(run_key).await?;
+                        // Closed runs keep existing behavior: repeated close
+                        // and unchanged reads proceed to the handler untouched
+                        // (close stays idempotent). Only enrichment of closed
+                        // identity is refused — closed identity is final.
+                        if binding.ended_at.is_some() {
+                            let stored_for_check = stored.clone().unwrap_or_default();
+                            let (fill_name, fill_version, fill_model) =
+                                capture_fills(&stored_for_check, &incoming);
+                            // Closed identity is final: only missing->present
+                            // fills are refused here. Present->different
+                            // conflicts enrich nothing, so inspection and
+                            // idempotent close proceed with honest refused
+                            // notes on the read-only outcome instead.
+                            if fill_name || fill_version || fill_model {
+                                return Err(Error::engine(
+                                    "cannot enrich the identity of a closed durable activity",
+                                ));
+                            }
+                            // No-fill on a closed run still reports a divergent
+                            // harness honestly (read-only: no canonical
+                            // write), while inspection and idempotent close
+                            // proceed to the handler unchanged.
+                            let lifecycle = crate::control::AgentRunLifecycle {
+                                activity_id: binding.activity_id,
+                                started_at: binding.started_at,
+                                ended_at: binding.ended_at,
+                                changed: false,
+                            };
+                            pre_capture = Some(crate::control::FirstCallOutcome {
+                                lifecycle,
+                                stored: stored_for_check.clone(),
+                                admitted: false,
+                                enriched: false,
+                                refused_name: incoming.client_name.is_some()
+                                    && stored_for_check.client_name != incoming.client_name,
+                                refused_version: incoming.client_version.is_some()
+                                    && stored_for_check.client_version != incoming.client_version,
+                                refused_model: incoming.model.is_some()
+                                    && stored_for_check.model != incoming.model,
+                            });
+                        } else {
+                            match stored {
+                                None => {
+                                    pre_capture = port
+                                        .admit_or_enrich_run(
+                                            run_key,
+                                            capture_caller.credential(),
+                                            incoming,
+                                            capture_caller.channel(),
+                                        )
+                                        .await?;
+                                }
+                                Some(stored) => {
+                                    let (fill_name, fill_version, fill_model) =
+                                        capture_fills(&stored, &incoming);
+                                    if fill_name || fill_version || fill_model {
+                                        pre_capture = port
+                                            .admit_or_enrich_run(
+                                                run_key,
+                                                capture_caller.credential(),
+                                                incoming,
+                                                capture_caller.channel(),
+                                            )
+                                            .await?;
+                                    } else {
+                                        let refused_name = incoming.client_name.is_some()
+                                            && stored.client_name != incoming.client_name;
+                                        let refused_version = incoming.client_version.is_some()
+                                            && stored.client_version != incoming.client_version;
+                                        let refused_model = incoming.model.is_some()
+                                            && stored.model != incoming.model;
+                                        pre_capture = Some(crate::control::FirstCallOutcome {
+                                            lifecycle: crate::control::AgentRunLifecycle {
+                                                activity_id: binding.activity_id,
+                                                started_at: binding.started_at,
+                                                ended_at: binding.ended_at,
+                                                changed: false,
+                                            },
+                                            stored,
+                                            admitted: false,
+                                            enriched: false,
+                                            refused_name,
+                                            refused_version,
+                                            refused_model,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(outcome) = pre_capture.as_ref() {
+        for note in capture_refused_notes(outcome) {
+            if let Some(echo) = resolved.echo.as_object_mut() {
+                let notes = echo
+                    .entry("notes")
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(list) = notes.as_array_mut() {
+                    list.push(Value::String(note));
+                }
+            }
+        }
+    }
     let mut handler_arguments = original_arguments.clone();
     if !kind.is_some_and(ToolKind::ignores_run_context_arguments) {
         strip_run_context(&mut handler_arguments);
@@ -684,6 +990,134 @@ where
         if let Some(message) = bootstrap_size_error {
             outcome = Err(Error::engine(message));
         }
+        // First-call durability for the newly issued key: bootstrap's handler
+        // stays read-only (its zero-write body test is untouched); the wrapper
+        // admits the returned key synchronously here. A failed capture fails
+        // the call rather than acknowledging an identity that is not durable.
+        // Same gating as pre-handler: Applied capability, captured calls, MCP
+        // channel only.
+        if outcome.is_ok()
+            && run_context_stage == GovernedRequestStageDisposition::Applied
+            && capture
+            && capture_caller.channel() == crate::provenance::Channel::Mcp
+        {
+            let issued = outcome
+                .as_ref()
+                .ok()
+                .and_then(|result| result.structured.pointer("/run/run_key"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            if let Some(run_key) = issued {
+                if matches!(
+                    crate::runkey::validate_full(Some(&run_key)),
+                    crate::runkey::KeyOutcome::Valid(_)
+                ) {
+                    let incoming = capture_caller.reported_run_identity().clamped();
+                    // Read-only fast path for the echo case: a repeated
+                    // bootstrap on an already-admitted unchanged key takes no
+                    // write-pool connection, but a divergent harness is still
+                    // reported honestly from the read-only stored outcome. A
+                    // mismatched-account echo is refused explicitly rather
+                    // than handing the caller an apparently accepted
+                    // other-account run; a closed echo skips capture and
+                    // succeeds, preserving key-echo inspection.
+                    enum BootstrapCapture {
+                        Write,
+                        Skip,
+                        RefuseAccount,
+                        Conflict(crate::control::FirstCallOutcome),
+                    }
+                    let plan = match port.read_run_binding(&run_key).await {
+                        Err(_) => BootstrapCapture::Write,
+                        Ok(None) => BootstrapCapture::Write,
+                        Ok(Some(binding)) => {
+                            if binding.account_id != capture_caller.credential() {
+                                BootstrapCapture::RefuseAccount
+                            } else if binding.ended_at.is_some() {
+                                // Closed echo preserves key-echo inspection with
+                                // no fills and no writer, but a divergent
+                                // harness is still reported honestly from the
+                                // read-only stored outcome.
+                                match port.read_stored_identity(&run_key).await {
+                                    Err(_) | Ok(None) => BootstrapCapture::Skip,
+                                    Ok(Some(stored)) => BootstrapCapture::Conflict(
+                                        read_only_outcome(binding, stored, &incoming),
+                                    ),
+                                }
+                            } else {
+                                match port.read_stored_identity(&run_key).await {
+                                    Err(_) => BootstrapCapture::Write,
+                                    Ok(None) => BootstrapCapture::Write,
+                                    Ok(Some(stored)) => {
+                                        let (fill_name, fill_version, _) =
+                                            capture_fills(&stored, &incoming);
+                                        if fill_name || fill_version {
+                                            BootstrapCapture::Write
+                                        } else {
+                                            BootstrapCapture::Conflict(read_only_outcome(
+                                                binding, stored, &incoming,
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    match plan {
+                        BootstrapCapture::RefuseAccount => {
+                            outcome = Err(Error::engine(
+                                "run key is already bound to another authenticated account",
+                            ));
+                        }
+                        BootstrapCapture::Skip => {}
+                        BootstrapCapture::Conflict(read_only) => {
+                            for note in capture_refused_notes(&read_only) {
+                                if let Ok(result) = &mut outcome {
+                                    if let Some(run) = result
+                                        .structured
+                                        .pointer_mut("/run")
+                                        .and_then(Value::as_object_mut)
+                                    {
+                                        run.entry("harness_note")
+                                            .or_insert_with(|| Value::String(note.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        BootstrapCapture::Write => {
+                            match port
+                                .admit_or_enrich_run(
+                                    &run_key,
+                                    capture_caller.credential(),
+                                    incoming,
+                                    capture_caller.channel(),
+                                )
+                                .await
+                            {
+                                Ok(Some(committed)) => {
+                                    for note in capture_refused_notes(&committed) {
+                                        if let Ok(result) = &mut outcome {
+                                            if let Some(run) = result
+                                                .structured
+                                                .pointer_mut("/run")
+                                                .and_then(Value::as_object_mut)
+                                            {
+                                                run.entry("harness_note")
+                                                    .or_insert_with(|| Value::String(note.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    outcome = Err(error);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     if kind == Some(ToolKind::SetIntent) && outcome.is_ok() {
         if let Some(intent) = original_arguments.get("intent").and_then(Value::as_str) {
@@ -693,13 +1127,89 @@ where
                 // only the type is enforced), so `as_str` here only maps an
                 // explicit null or a non-string that could never have passed
                 // the handler to absence.
-                let reported = capture_caller.reported_run_identity().with_model(
+                let mut reported = capture_caller.reported_run_identity().with_model(
                     original_arguments
                         .get("model")
                         .and_then(Value::as_str)
                         .map(str::to_string),
                 );
-                if let Err(error) = port
+                // Transport harness is MCP-only: web/local callers sharing
+                // this seam never stamp client identity, but their optional
+                // model declaration enriches like any qualified set_intent.
+                if capture_caller.channel() != crate::provenance::Channel::Mcp {
+                    reported.client_name = None;
+                    reported.client_version = None;
+                }
+                // Compare the clamped declaration against the clamped stored
+                // model: an accepted over-long declaration repeats as its
+                // clamped form, so raw comparison would falsely refuse it.
+                // Display stays raw; only the comparison is clamped.
+                let declared_for_compare = reported.clone().clamped().model;
+                if run_context_stage == GovernedRequestStageDisposition::Applied
+                    && capture
+                    && matches!(
+                        crate::runkey::validate_full(Some(run_key)),
+                        crate::runkey::KeyOutcome::Valid(_)
+                    )
+                {
+                    // Unified qualified declaration path (MCP and non-MCP):
+                    // pre-handler bound the harness where applicable; the
+                    // validated model enriches now, and the acknowledgement is
+                    // shaped from the committed stored result so concurrent
+                    // first declarations report honestly.
+                    match port
+                        .admit_or_enrich_run(
+                            run_key,
+                            capture_caller.credential(),
+                            reported.clone(),
+                            capture_caller.channel(),
+                        )
+                        .await
+                    {
+                        Ok(Some(committed)) => {
+                            if let Ok(result) = &mut outcome {
+                                patch_declared_model_from_commit(
+                                    &mut result.structured,
+                                    declared_for_compare.as_deref(),
+                                    committed.stored.model.as_deref(),
+                                );
+                            }
+                            for note in capture_refused_notes(&committed) {
+                                if let Some(echo) = resolved.echo.as_object_mut() {
+                                    let notes = echo
+                                        .entry("notes")
+                                        .or_insert_with(|| Value::Array(Vec::new()));
+                                    if let Some(list) = notes.as_array_mut() {
+                                        let text = Value::String(note);
+                                        if !list.contains(&text) {
+                                            list.push(text);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Projection-less Applied backend (turso/postgres
+                            // adapters hold no `agent_runs`): retain legacy
+                            // intent persistence rather than dropping it.
+                            if let Err(error) = port
+                                .persist_intent(
+                                    run_key,
+                                    intent,
+                                    capture_caller.credential(),
+                                    reported,
+                                    capture_caller.channel(),
+                                )
+                                .await
+                            {
+                                outcome = Err(error);
+                            }
+                        }
+                        Err(error) => {
+                            outcome = Err(error);
+                        }
+                    }
+                } else if let Err(error) = port
                     .persist_intent(
                         run_key,
                         intent,

@@ -212,6 +212,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
     use LensToolPolicy::*;
     use ToolKind::*;
     match kind {
+        Some(ToolKind::OutboxStatus) => UnsupportedRead,
         Some(GetRecord | QueryRecord | Search) => FederatedRead,
         Some(
             SetIntent
@@ -228,6 +229,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ArchiveRecord
             | ManageLinks
             | ManageMessages
+            | ManageParticipants
             | ManageInterventions
             | InstantiateArtifact
             | ManageRendererBinding
@@ -244,6 +246,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
             | ManageAttributions
             | ManageBindings
             | ManageRecordPolicy
+            | ManageAccountConfig
             | ResolveExternal
             | ObserveExternal
             | ManageInstructions

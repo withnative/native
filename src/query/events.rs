@@ -355,8 +355,7 @@ fn publicize_receipt(mut event: EventRow) -> Result<EventRow> {
         .as_deref()
         .ok_or_else(|| contract_violation("aggregate Receipt payload is missing"))?;
     let payload: serde_json::Value = serde_json::from_str(raw)?;
-    let body = payload
-        .get("body")
+    let body = crate::record_body::event_body_value(&event.event_type, &payload)
         .cloned()
         .ok_or_else(|| contract_violation("aggregate Receipt body is missing"))?;
     event.event_type = "record.updated".into();

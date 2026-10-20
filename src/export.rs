@@ -19,9 +19,9 @@
 mod coordinator;
 
 pub use coordinator::binary::{
-    BinaryChunk, BinaryFailure, BinaryState, BinaryStatus, BINARY_MAX_CHUNK_BYTES,
-    BINARY_PER_PRINCIPAL_CAPACITY, BINARY_START_BUSY, BINARY_START_CAPACITY, BINARY_START_DRAINING,
-    BINARY_START_PRINCIPAL_CAPACITY,
+    BinaryChunk, BinaryDeltaMeta, BinaryFailure, BinaryState, BinaryStatus, BINARY_DELTA_TOO_LARGE,
+    BINARY_MAX_CHUNK_BYTES, BINARY_PER_PRINCIPAL_CAPACITY, BINARY_START_BUSY,
+    BINARY_START_CAPACITY, BINARY_START_DRAINING, BINARY_START_PRINCIPAL_CAPACITY,
 };
 pub use coordinator::{ExportActivity, ExportCoordinator};
 
@@ -506,6 +506,47 @@ async fn export_connection_snapshot(
                 remove_dir_off_thread(dir).await;
             }
             Err(err)
+        }
+    }
+}
+
+/// Spool already-validated bytes into a private, managed export directory.
+///
+/// The directory has the same cancellation-safe ownership as a snapshot, so the
+/// coordinator's cleanup, expiry and drain reclaim it the same way. The file
+/// name is fixed by the caller, never derived from a route or request.
+pub(crate) async fn spool_bytes_export(
+    export_root: Option<&std::path::Path>,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<Export> {
+    if let Some(root) = export_root {
+        tokio::fs::create_dir_all(root).await?;
+    }
+    let temp = match export_root {
+        Some(root) => tempfile::Builder::new()
+            .prefix("native-ce-export-")
+            .tempdir_in(root)?,
+        None => tempfile::Builder::new()
+            .prefix("native-ce-export-")
+            .tempdir()?,
+    };
+    let mut dir = ExportDir::new(temp);
+    let captured_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    match tokio::fs::write(dir.path().join(file_name), bytes).await {
+        Ok(()) => Ok(Export {
+            dir,
+            file_name: file_name.to_string(),
+            size_bytes: bytes.len() as u64,
+            snapshot_completed_at: captured_at.clone(),
+            captured_at,
+            hosted_standby_context: None,
+        }),
+        Err(err) => {
+            if let Some(dir) = dir.take() {
+                remove_dir_off_thread(dir).await;
+            }
+            Err(err.into())
         }
     }
 }

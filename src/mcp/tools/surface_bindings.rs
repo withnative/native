@@ -73,6 +73,8 @@ pub enum ManageSurfaceBindingsArgs {
         mode: Option<String>,
         #[serde(default)]
         expected_target_id: Option<String>,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
     Reset {
         surface: String,
@@ -81,6 +83,8 @@ pub enum ManageSurfaceBindingsArgs {
         subject: Option<String>,
         #[serde(default)]
         expected_target_id: Option<String>,
+        #[serde(default)]
+        idempotency_key: Option<String>,
     },
 }
 
@@ -592,7 +596,74 @@ async fn effective_resolution(
     ))
 }
 
+/// Validate a write action's optional key. Blank means no key.
+fn binding_key(key: Option<&str>) -> Result<bool> {
+    Ok(crate::mcp::tools::keyed_replay::idempotency_key(TOOL, key)?.is_some())
+}
+
+/// Rebuild a keyed `set` / `reset` receipt (after the caller has rolled back
+/// and settled the replay). Everything the command did is pinned: its
+/// outcome, `previous_seq` by act, and the removed targets from its own
+/// `link.removed` events. `resolution` is the effective binding for the
+/// caller *today*, as it was for the first call; a binding changed since is
+/// reflected.
+#[allow(clippy::too_many_arguments)]
+async fn replay_binding_receipt(
+    db: &Db,
+    caller: &Caller,
+    surface: Surface,
+    scope: Scope,
+    source_id: &str,
+    replay: &crate::mcp::tools::keyed_replay::KeyedReplay,
+    previous_seq: Option<i64>,
+    reset: bool,
+) -> Result<Value> {
+    let resolution = effective_resolution(db, caller, surface).await?;
+    let resolution = resolution_json(surface, &SurfaceRequest::environment(), &resolution);
+    if replay.is_noop() {
+        return Ok(json!({
+            "status": "unchanged",
+            "scope": scope.name(),
+            "source_id": source_id,
+            "resolution": resolution,
+        }));
+    }
+    if reset {
+        let removed = replay
+            .content()
+            .iter()
+            .filter(|event| event.event_type == "link.removed")
+            .filter_map(|event| event.payload["target_id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        echo_act(
+            json!({
+            "status": "reset",
+            "scope": scope.name(),
+            "source_id": source_id,
+            "removed_target_id": removed.first().cloned(),
+            "removed_target_ids": removed,
+            "previous_seq": previous_seq,
+            "resolution": resolution,
+            }),
+            replay.act(),
+        )
+    } else {
+        echo_act(
+            json!({
+            "status": "bound",
+            "scope": scope.name(),
+            "source_id": source_id,
+            "previous_seq": previous_seq,
+            "resolution": resolution,
+            }),
+            replay.act(),
+        )
+    }
+}
+
 async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     let args: ManageSurfaceBindingsArgs = parse_args(TOOL, arguments)?;
     match args {
         ManageSurfaceBindingsArgs::List { surface } => {
@@ -630,7 +701,9 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
             subject,
             mode,
             expected_target_id,
+            idempotency_key,
         } => {
+            let keyed = binding_key(idempotency_key.as_deref())?;
             let surface = parse_surface(&surface)?;
             let _ = parse_subject(subject.as_deref())?;
             let mode = parse_mode(mode.as_deref())?;
@@ -645,6 +718,37 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
                 scope.required_capability(),
             )
             .await?;
+            // Keyed replay: every authority check first (the target's View too,
+            // which an unkeyed call reaches only after its state checks), then
+            // the lookup, before the target-status and compare-and-set checks
+            // the first call's own effect changed.
+            if keyed {
+                require_record_in(&mut tx, &caller, TOOL, &target_id, Capability::View).await?;
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let previous_seq = replay.previous_seq_in(&mut tx, &source_id).await?;
+                    tx.rollback().await?;
+                    let receipt = replay_binding_receipt(
+                        &db,
+                        &caller,
+                        surface,
+                        scope,
+                        &source_id,
+                        &replay,
+                        previous_seq,
+                        false,
+                    )
+                    .await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             // The target must be a live artifact the caller may view. An
             // unauthorized or wrong-typed target is refused here at bind time,
             // where the person is present to be told; the read path is what
@@ -667,7 +771,13 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
                 )));
             }
             if current.as_deref() == Some(target_id.as_str()) {
-                tx.rollback().await?;
+                if keyed {
+                    // Leave the anchor a retry finds and replays as this no-op.
+                    crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                    db.commit_content(tx).await?;
+                } else {
+                    tx.rollback().await?;
+                }
                 let resolution = effective_resolution(&db, &caller, surface).await?;
                 return Ok(json!({
                     "status": "unchanged",
@@ -744,7 +854,9 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
             scope,
             subject,
             expected_target_id,
+            idempotency_key,
         } => {
+            let keyed = binding_key(idempotency_key.as_deref())?;
             let surface = parse_surface(&surface)?;
             let _ = parse_subject(subject.as_deref())?;
             let scope = Scope::parse(&scope)?;
@@ -758,6 +870,34 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
                 scope.required_capability(),
             )
             .await?;
+            // Keyed replay: after authorization, before the compare-and-set the
+            // first reset's own removal would now fail.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let previous_seq = replay.previous_seq_in(&mut tx, &source_id).await?;
+                    tx.rollback().await?;
+                    let receipt = replay_binding_receipt(
+                        &db,
+                        &caller,
+                        surface,
+                        scope,
+                        &source_id,
+                        &replay,
+                        previous_seq,
+                        true,
+                    )
+                    .await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             let existing = environment_bindings_in(&mut tx, &source_id).await?;
             // Exactly one binding is compare-and-set against the expected
             // target. Several are a repair: the caller cannot name one current
@@ -773,7 +913,12 @@ async fn manage_surface_bindings(db: Db, caller: Caller, arguments: Value) -> Re
                 }
             }
             if existing.is_empty() {
-                tx.rollback().await?;
+                if keyed {
+                    crate::mcp::tools::keyed_replay::anchor_noop_in(&mut tx).await?;
+                    db.commit_content(tx).await?;
+                } else {
+                    tx.rollback().await?;
+                }
                 let resolution = effective_resolution(&db, &caller, surface).await?;
                 return Ok(json!({
                     "status": "unchanged",
@@ -873,7 +1018,8 @@ pub fn register_surface_binding_tools(registry: &mut ToolRegistry) -> Result<()>
                         "target_id": { "type": "string", "description": "Live Document kind:artifact to bind." },
                         "subject": { "type": "string", "description": "Optional subject; only 'environment' in this slice." },
                         "mode": { "type": "string", "enum": ["isolated"], "description": "Only 'isolated' is exercised in this slice." },
-                        "expected_target_id": { "type": ["string", "null"], "description": "Current bound target (null when unbound); a compare-and-set guard." }
+                        "expected_target_id": { "type": ["string", "null"], "description": "Current bound target (null when unbound); a compare-and-set guard." },
+                        "idempotency_key": crate::mcp::tools::keyed_replay::idempotency_key_schema()
                     },
                     "required": ["action", "surface", "scope", "target_id"],
                     "additionalProperties": false
@@ -885,14 +1031,23 @@ pub fn register_surface_binding_tools(registry: &mut ToolRegistry) -> Result<()>
                         "surface": { "type": "string" },
                         "scope": { "type": "string", "enum": ["personal", "workspace"] },
                         "subject": { "type": "string", "description": "Optional subject; only 'environment' in this slice." },
-                        "expected_target_id": { "type": ["string", "null"], "description": "Current bound target; a compare-and-set guard." }
+                        "expected_target_id": { "type": ["string", "null"], "description": "Current bound target; a compare-and-set guard." },
+                        "idempotency_key": crate::mcp::tools::keyed_replay::idempotency_key_schema()
                     },
                     "required": ["action", "surface", "scope"],
                     "additionalProperties": false
                 }
             ]
         }),
-        manage_surface_bindings,
+        |db, caller, arguments| {
+            crate::mcp::tools::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_surface_bindings(
+                    db.clone(),
+                    caller.clone(),
+                    arguments.clone(),
+                ))
+            })
+        },
     )?;
     Ok(())
 }

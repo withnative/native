@@ -9,6 +9,7 @@ pub(super) enum ManageMdxModulesArgs {
         module_id: String,
         expected_source_event_id: String,
         expected_source_sha256: String,
+        idempotency_key: Option<String>,
     },
     Inspect {
         module_id: String,
@@ -23,11 +24,13 @@ pub(super) enum ManageMdxModulesArgs {
         publication_event_id: String,
         expected_status_event_seq: i64,
         replacement: Option<String>,
+        idempotency_key: Option<String>,
     },
     Withdraw {
         module_id: String,
         publication_event_id: String,
         expected_status_event_seq: i64,
+        idempotency_key: Option<String>,
     },
 }
 
@@ -1248,33 +1251,114 @@ pub(super) async fn latest_body_source_in(
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
     record_id: &str,
 ) -> Result<(String, String)> {
-    let row = sqlx::query(
-        "SELECT e.id,json_extract(e.payload,'$.body') AS body
-           FROM content_events e
-          WHERE e.record_id=? AND e.type IN ('record.created','record.updated','receipt.committed.v1')
-            AND json_type(e.payload,'$.body') IS NOT NULL
-          ORDER BY e.seq DESC LIMIT 1",
-    )
-    .bind(record_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| Error::engine("module has no authoritative body source event"))?;
+    let row =
+        crate::record_body::live_artifact::latest_present_source_on(&mut **tx, record_id, None)
+            .await?
+            .ok_or_else(|| Error::engine("module has no authoritative body source event"))?;
     Ok((row.try_get("id")?, row.try_get("body")?))
+}
+
+/// Whether a keyed write action carries a real (non-blank) idempotency key.
+fn modules_key(key: Option<&str>) -> Result<bool> {
+    Ok(crate::mcp::tools::keyed_replay::idempotency_key("manage_mdx_modules", key)?.is_some())
+}
+
+/// Rebuild a keyed `publish` receipt from the one `module.release_published`
+/// event the command appended. Every field is the command's own: the event
+/// carries the release core and digest, and its id is the publication id.
+/// Replaying re-checks View on the dependency modules the receipt names.
+async fn replay_publication_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    replay: &crate::mcp::tools::keyed_replay::KeyedReplay,
+    module_id: &str,
+) -> Result<Value> {
+    const TOOL: &str = "manage_mdx_modules";
+    let [event] = replay.content() else {
+        return Err(Error::engine(format!(
+            "{TOOL}: idempotent receipt is incomplete"
+        )));
+    };
+    let release_core = event.payload["release_core"].clone();
+    let release_sha256 = event.payload["release_sha256"].clone();
+    for entry in release_core["closure_capability_summary"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(dependency) = entry["module_record_id"].as_str() {
+            if dependency != module_id {
+                require_record_in(tx, caller, TOOL, dependency, Capability::View).await?;
+            }
+        }
+    }
+    echo_act(
+        json!({
+            "status": "published", "module_id": module_id,
+            "publication_event_id": event.event_id,
+            "local_event_seq": event.seq,
+            "source_event_id": release_core["source_event_id"],
+            "source_sha256": release_core["source_sha256"],
+            "release_sha256": release_sha256,
+            "dependency_closure_sha256": release_core["dependency_closure_sha256"],
+            "release": { "release_core": release_core, "release_sha256": release_sha256 },
+        }),
+        replay.act(),
+    )
 }
 
 pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     const TOOL: &str = "manage_mdx_modules";
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     match parse_args::<ManageMdxModulesArgs>(TOOL, arguments)? {
         ManageMdxModulesArgs::Publish {
             module_id,
             expected_source_event_id,
             expected_source_sha256,
+            idempotency_key,
         } => {
-            let _permit =
-                mdx::try_admit().map_err(|failure| mdx_v2_engine_error(&module_id, failure))?;
+            let keyed = modules_key(idempotency_key.as_deref())?;
+            // An unkeyed publish claims its compiler slot first, as ever. A
+            // keyed one claims it only once the replay lookup has missed: a
+            // replay compiles nothing, so a retry must not be refused because
+            // the compiler happens to be busy.
+            let early_permit = if keyed {
+                None
+            } else {
+                Some(
+                    super::admit_mdx_compiler()
+                        .await
+                        .map_err(|failure| mdx_v2_engine_error(&module_id, failure))?,
+                )
+            };
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
             require_record_in(&mut tx, &caller, TOOL, &module_id, Capability::Edit).await?;
+            // Keyed replay: after authorization, before the live-module and
+            // source-event checks the first publication's own event changed.
+            if keyed {
+                if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    TOOL,
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt =
+                        replay_publication_in(&mut tx, &caller, &replay, &module_id).await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
+            let _permit = match early_permit {
+                Some(permit) => permit,
+                None => super::admit_mdx_compiler()
+                    .await
+                    .map_err(|failure| mdx_v2_engine_error(&module_id, failure))?,
+            };
             let predicate = identity_predicate("r", "Program", MODULE_KIND_VALUE_ID);
             let valid: bool = sqlx::query_scalar(&format!(
                 "SELECT EXISTS(SELECT 1 FROM records r JOIN facet_values f ON f.record_id=r.id AND f.key='runtime'
@@ -1655,7 +1739,9 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
             publication_event_id,
             expected_status_event_seq,
             replacement,
+            idempotency_key,
         } => {
+            let keyed = modules_key(idempotency_key.as_deref())?;
             update_release_status(
                 &db,
                 &caller,
@@ -1664,6 +1750,7 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
                 expected_status_event_seq,
                 "module.release_deprecated",
                 replacement,
+                keyed.then_some(&provenance_arguments),
             )
             .await
         }
@@ -1671,7 +1758,9 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
             module_id,
             publication_event_id,
             expected_status_event_seq,
+            idempotency_key,
         } => {
+            let keyed = modules_key(idempotency_key.as_deref())?;
             update_release_status(
                 &db,
                 &caller,
@@ -1680,12 +1769,14 @@ pub(super) async fn manage_mdx_modules(db: Db, caller: Caller, arguments: Value)
                 expected_status_event_seq,
                 "module.release_withdrawn",
                 None,
+                keyed.then_some(&provenance_arguments),
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn update_release_status(
     db: &Db,
     caller: &Caller,
@@ -1694,6 +1785,8 @@ pub(super) async fn update_release_status(
     expected_status_event_seq: i64,
     event_type: &str,
     replacement: Option<String>,
+    // The dispatched arguments of a keyed call; `None` when unkeyed.
+    keyed_arguments: Option<&Value>,
 ) -> Result<Value> {
     let mut tx = crate::db::begin_write(db.write_pool()).await?;
     let mut act_alloc = crate::act::ActAllocation::new();
@@ -1705,6 +1798,37 @@ pub(super) async fn update_release_status(
         Capability::Edit,
     )
     .await?;
+    // Keyed replay: after authorization, before the status compare-and-set the
+    // first call's own status event would now fail.
+    if let Some(arguments) = keyed_arguments {
+        if let Some(replay) = crate::mcp::tools::keyed_replay::keyed_replay_in(
+            &mut tx,
+            caller,
+            "manage_mdx_modules",
+            arguments,
+        )
+        .await?
+        {
+            let [event] = replay.content() else {
+                return Err(Error::engine(
+                    "manage_mdx_modules: idempotent receipt is incomplete",
+                ));
+            };
+            let previous_seq = replay.previous_seq_in(&mut tx, module_id).await?;
+            let receipt = echo_act(
+                json!({
+                    "status": event.event_type.trim_start_matches("module.release_"),
+                    "module_id": module_id, "publication_event_id": publication_event_id,
+                    "replacement": event.payload["replacement"],
+                    "previous_seq": previous_seq,
+                }),
+                replay.act(),
+            )?;
+            tx.rollback().await?;
+            replay.settle();
+            return Ok(receipt);
+        }
+    }
     let current = sqlx::query(
         "SELECT status,status_event_seq,descriptor FROM module_releases WHERE module_record_id=? AND publication_event_id=?",
     )

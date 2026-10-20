@@ -19,6 +19,8 @@ use super::*;
 
 #[path = "sql_selected_write/mod.rs"]
 mod selected;
+#[path = "sql_commit.rs"]
+pub(super) mod sql_commit;
 
 const ACCESS_EXECUTOR: &str = "access_admin";
 const POLICY_GRANT_OPERATION: &str = "manage_record_policy.grant";
@@ -493,6 +495,7 @@ struct WritePlan {
 pub(super) struct WriteRuntime {
     store: Arc<PlanStore>,
     ttl_ms: i64,
+    pub(super) sql_commit_enabled: bool,
     #[cfg(test)]
     dispatch_gate: Option<Arc<DispatchGate>>,
     #[cfg(test)]
@@ -520,10 +523,15 @@ impl DispatchGate {
 }
 
 impl WriteRuntime {
+    pub(super) fn store_is_local(&self) -> bool {
+        self.store.is_local()
+    }
+
     pub(super) fn new(store: PlanStore) -> Self {
         Self {
             store: Arc::new(store),
             ttl_ms: DEFAULT_TTL_MS,
+            sql_commit_enabled: false,
             #[cfg(test)]
             dispatch_gate: None,
             #[cfg(test)]
@@ -540,6 +548,7 @@ impl WriteRuntime {
         Self {
             store,
             ttl_ms,
+            sql_commit_enabled: false,
             dispatch_gate: None,
             revalidation_gate: None,
             claim_attempts: std::sync::atomic::AtomicUsize::new(0),
@@ -632,6 +641,12 @@ async fn engine_binding(engine: &EngineHandle, caller: &Caller) -> Result<Caller
         .hosting_database()
         .unwrap_or(crate::schema::ROOT_RECORD_ID);
     let database = match engine {
+        #[cfg(feature = "v2-kernel-probe")]
+        EngineHandle::KernelV2(_) => {
+            return Err(Error::engine(
+                "kernel-v2: executor write plans are unavailable",
+            ))
+        }
         EngineHandle::Sqlite(db) => format!("sqlite:{}", crate::identity::database_id(db).await?),
         #[cfg(feature = "postgres")]
         EngineHandle::Postgres(_) => format!("postgres:{workspace}"),
@@ -747,11 +762,13 @@ fn canonical_source_arguments(executor: &str, operation: &str, arguments: Value)
                 "selection_contract",
                 "folder_id",
                 "write",
+                "sources",
+                "execution_profile",
             ]
             .contains(&field.as_str())
             {
                 return Err(Error::engine(format!(
-                    "sql_write.sql_write has no field '{field}'; known fields are statement, parameters, reason, expected_version, link_note, selection_contract, folder_id, write"
+                    "sql_write.sql_write has no field '{field}'; known fields are statement, parameters, reason, expected_version, link_note, selection_contract, folder_id, write, sources, execution_profile"
                 )));
             }
         }
@@ -985,7 +1002,7 @@ struct SqlWritePreviewArgs {
     link_note: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SqlWritePreparation {
     canonical_source_arguments: Value,
     target_id: String,
@@ -2871,6 +2888,10 @@ async fn prepare_operation(
         }
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => {
             let prepared = match engine {
+                #[cfg(feature = "v2-kernel-probe")]
+                EngineHandle::KernelV2(_) => {
+                    return Err(Error::engine("kernel-v2: executor writes are unavailable"))
+                }
                 EngineHandle::Sqlite(db) => {
                     super::super::tools::lifecycle::prepare_correct_record_type(
                         db,
@@ -2972,6 +2993,10 @@ async fn prepare_operation(
         }
         (RECORDS_DELETE_EXECUTOR, DETACH_ATTACHMENT_OPERATION) => {
             let prepared = match engine {
+                #[cfg(feature = "v2-kernel-probe")]
+                EngineHandle::KernelV2(_) => {
+                    return Err(Error::engine("kernel-v2: executor writes are unavailable"))
+                }
                 EngineHandle::Sqlite(db) => {
                     super::super::tools::attachments::prepare_manage_attachments_detach(
                         db,
@@ -3340,6 +3365,22 @@ impl ExecutorPrototypeStdioServer {
                 )
                 .await;
         }
+        if contract.executor == SQL_WRITE_EXECUTOR
+            && operation_arguments.get("execution_profile").is_some()
+        {
+            if let Err(error) = self.require_sql_commit() {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &envelope,
+                        telemetry_request.as_ref(),
+                        PlanError::new("commit_unavailable", &error.to_string(), false),
+                    )
+                    .await;
+            }
+        }
         let prepared = match prepare_operation(
             &self.engine,
             &self.caller,
@@ -3516,7 +3557,7 @@ impl ExecutorPrototypeStdioServer {
             }
         };
         let plan_id = plan.id.clone();
-        let response = json!({
+        let mut response = json!({
             "plan_id":plan.id,
             "executor":plan.executor,
             "operation":plan.operation,
@@ -3549,6 +3590,12 @@ impl ExecutorPrototypeStdioServer {
                 }
             }
         });
+        // On a lean server a continuation addressed to an operation that is
+        // not advertised directly names call_executor instead, so the
+        // returned execute step is callable as written. The plan is unchanged.
+        if let Some(direct) = &self.direct_operations {
+            super::lean::rewrite_next_call(&mut response, direct);
+        }
         let payload = match serde_json::to_value(&plan) {
             Ok(payload) => payload,
             Err(error) => {
@@ -3619,6 +3666,7 @@ impl ExecutorPrototypeStdioServer {
             self.caller.clone(),
             &envelope,
             self.registry.public_origin(),
+            self.registry.deployment_mutation_barrier(),
         )
         .await;
         let structured = attach_run_context(response, run_context);
@@ -3817,6 +3865,7 @@ impl ExecutorPrototypeStdioServer {
             self.caller.clone(),
             envelope,
             self.registry.public_origin(),
+            self.registry.deployment_mutation_barrier(),
         )
         .await;
         let structured = attach_run_context(response, run_context);
@@ -4093,6 +4142,30 @@ impl ExecutorPrototypeStdioServer {
                 )
                 .await;
         }
+        if plan.executor == SQL_WRITE_EXECUTOR
+            && plan.operation == SQL_WRITE_OPERATION
+            && plan
+                .canonical_source_arguments
+                .get("execution_profile")
+                .is_some()
+        {
+            return self
+                .execute_sql_commit(
+                    RevalidationContext {
+                        id,
+                        modern,
+                        contract: &contract,
+                        envelope: &envelope,
+                        plan_id: &plan_id,
+                        initially_loaded: &stored,
+                        plan: &plan,
+                        telemetry_request: telemetry_request.as_ref(),
+                        started,
+                    },
+                    persistence_lease,
+                )
+                .await;
+        }
         match &stored.state {
             StoredState::Completed {
                 result,
@@ -4105,6 +4178,7 @@ impl ExecutorPrototypeStdioServer {
                     *source_dispatch_count,
                     telemetry_request.as_ref(),
                     started,
+                    modern,
                 )
             }
             StoredState::Executing { started_at_ms, .. }
@@ -4419,6 +4493,7 @@ impl ExecutorPrototypeStdioServer {
                             source_dispatch_count,
                             telemetry_request.as_ref(),
                             started,
+                            modern,
                         )
                     }
                     StoredState::Executing { started_at_ms, .. }
@@ -4716,6 +4791,7 @@ impl ExecutorPrototypeStdioServer {
                         source_dispatch_count,
                         telemetry_request.as_ref(),
                         started,
+                        modern,
                     )
                 }
                 Ok(Some(StoredPlan {
@@ -4887,6 +4963,7 @@ impl ExecutorPrototypeStdioServer {
         body
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replay_write_plan(
         &self,
         id: Value,
@@ -4895,7 +4972,11 @@ impl ExecutorPrototypeStdioServer {
         source_dispatch_count: u64,
         telemetry_request: Option<&super::telemetry::TelemetryRequest>,
         started: Instant,
+        modern: bool,
     ) -> Value {
+        if modern {
+            protocol::add_modern_result_fields(&mut result);
+        }
         result["_meta"]["nativeWritePlanReplay"] = json!({
             "planId":plan.id,
             "idempotentReplay":true,
@@ -5026,6 +5107,7 @@ impl ExecutorPrototypeStdioServer {
                 source_dispatch_count,
                 telemetry_request,
                 started,
+                modern,
             ),
             StoredState::Executing { started_at_ms, .. }
             | StoredState::Indeterminate { started_at_ms, .. } => {
@@ -13815,7 +13897,26 @@ mod tests {
 
     #[tokio::test]
     async fn standby_bootstrap_preserves_provider_runtime_status() {
-        let (_provider_dir, provider) = standby_status_provider_fixture();
+        let (provider_dir, provider) = standby_status_provider_fixture();
+        let refresh_dir = provider_dir.path().join("provider/refresh");
+        std::fs::create_dir_all(&refresh_dir).unwrap();
+        let state = crate::standby::StandbyRefreshState {
+            transfer_progress: Some(crate::standby::StandbyTransferProgress {
+                stage: crate::standby::StandbyTransferStage::Download,
+                activity: crate::standby::StandbyTransferActivity::Inactive,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                bytes_completed: Some(1048576),
+                bytes_remaining: Some(1048576),
+                bytes_total: Some(2097152),
+                retained_for_resume: true,
+            }),
+            ..Default::default()
+        };
+        std::fs::write(
+            refresh_dir.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
         let mut inner = ToolRegistry::new();
         register_builtin_tools(&mut inner).unwrap();
         register_surface_tools(&mut inner).unwrap();
@@ -13842,6 +13943,14 @@ mod tests {
         assert!(response_succeeded(&modern), "{modern}");
         let runtime = &modern["result"]["structuredContent"]["tool_exposure"]["runtime"];
         assert_eq!(runtime["read_only"], json!(true));
+        assert_eq!(
+            runtime["refresh"]["transfer_progress"]["stage"],
+            json!("download")
+        );
+        assert_eq!(
+            runtime["refresh"]["transfer_progress"]["bytes_completed"],
+            json!(1048576)
+        );
         assert_eq!(runtime["writes_supported"], json!(false));
         // The status-only provider reports its own authentic mutation
         // error, not the generic standby one: assert what it generates.
@@ -13867,6 +13976,8 @@ mod tests {
         let text = legacy["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("# Local standby status"), "{text}");
         assert!(text.contains("Serving generation: none"), "{text}");
+        assert!(text.contains("Transfer: Download (Inactive)"), "{text}");
+        assert!(text.contains("1048576 completed"), "{text}");
     }
 
     #[tokio::test]

@@ -10,7 +10,8 @@ use native_ce::meta::{
     alias_value, promote_value, propose_value_with_metadata_as, VocabularyValueTerminality,
 };
 use native_ce::store::{
-    add_link_as, append, create_record as create_raw_record, create_record_as, remove_link_as,
+    add_link_as, append, archive_record as archive_record_as, create_record as create_raw_record,
+    create_record_as, delete_record_as, remove_link_as, restore_record as restore_record_as,
     AppendSpec,
 };
 use native_ce::{create_database, Db};
@@ -1795,5 +1796,730 @@ async fn reply_does_not_satisfy_action_or_decision_but_governed_evidence_does() 
     let expectation = &read["records"][0]["message_expectation_state"];
     let rendered = native_ce::mcp::render::render("get_record", &read).unwrap();
     assert!(rendered.contains(&serde_json::to_string(expectation).unwrap()));
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_mark_closes_any_expectation_for_recipient_or_sender() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    async fn mark(
+        registry: &ToolRegistry,
+        db: &Db,
+        actor: &str,
+        message_id: &str,
+        note: Value,
+        key: &str,
+    ) -> Value {
+        let mut args = json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": message_id,
+            "idempotency_key": key,
+            "reason": "Settled outside Native; closing the request without replying.",
+        });
+        if !note.is_null() {
+            args["note"] = note;
+        }
+        call(registry, db, actor, "manage_messages", args)
+            .await
+            .unwrap()
+    }
+
+    async fn unmark(
+        registry: &ToolRegistry,
+        db: &Db,
+        actor: &str,
+        message_id: &str,
+        key: &str,
+    ) -> Value {
+        call(
+            registry,
+            db,
+            actor,
+            "manage_messages",
+            json!({
+                "action": "unmark_no_longer_relevant",
+                "message_id": message_id,
+                "idempotency_key": key,
+                "reason": "Reopening; the request still stands.",
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    // A recipient mark closes every expectation value; undoing reopens it.
+    for expectation in ["ack", "reply", "action", "decision"] {
+        let source = create_message(&registry, &db, SENDER, expectation, Value::Null).await;
+        assert_eq!(
+            derive_message_expectation_state(&db, &source, RECIPIENT)
+                .await
+                .unwrap()
+                .state,
+            MessageExpectationState::Open
+        );
+        let marked = mark(
+            &registry,
+            &db,
+            RECIPIENT,
+            &source,
+            Value::Null,
+            &format!("mark-{expectation}"),
+        )
+        .await;
+        assert_eq!(marked["status"], "marked");
+        assert_eq!(marked["changed"], true);
+        let closed = derive_message_expectation_state(&db, &source, RECIPIENT)
+            .await
+            .unwrap();
+        assert_eq!(closed.state, MessageExpectationState::Satisfied);
+        let evidence = closed.evidence.unwrap();
+        assert_eq!(
+            evidence.kind,
+            MessageExpectationEvidenceKind::NoLongerRelevant
+        );
+        assert_eq!(evidence.by.as_deref(), Some("recipient"));
+        assert_eq!(
+            evidence.record_id,
+            marked["evidence_record_id"].as_str().unwrap()
+        );
+        let unmarked = unmark(
+            &registry,
+            &db,
+            RECIPIENT,
+            &source,
+            &format!("unmark-{expectation}"),
+        )
+        .await;
+        assert_eq!(unmarked["status"], "unmarked");
+        assert_eq!(unmarked["changed"], true);
+        assert_eq!(
+            derive_message_expectation_state(&db, &source, RECIPIENT)
+                .await
+                .unwrap()
+                .state,
+            MessageExpectationState::Open
+        );
+    }
+
+    // A sender mark withdraws the request; the note is stored as the body.
+    let reply_source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    let marked = mark(
+        &registry,
+        &db,
+        SENDER,
+        &reply_source,
+        json!("Settled on the call."),
+        "sender-mark",
+    )
+    .await;
+    assert_eq!(marked["changed"], true);
+    let withdrawn = derive_message_expectation_state(&db, &reply_source, RECIPIENT)
+        .await
+        .unwrap();
+    assert_eq!(withdrawn.state, MessageExpectationState::Satisfied);
+    let evidence = withdrawn.evidence.unwrap();
+    assert_eq!(
+        evidence.kind,
+        MessageExpectationEvidenceKind::NoLongerRelevant
+    );
+    assert_eq!(evidence.by.as_deref(), Some("sender"));
+    let read = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "get_record",
+        json!({ "ids": [evidence.record_id] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["records"][0]["body"], "Settled on the call.");
+
+    // A mark without a note stores an empty body.
+    let bare = create_message(&registry, &db, SENDER, "ack", Value::Null).await;
+    let marked = mark(&registry, &db, RECIPIENT, &bare, Value::Null, "bare-mark").await;
+    let evidence_id = marked["evidence_record_id"].as_str().unwrap().to_owned();
+    let read = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "get_record",
+        json!({ "ids": [evidence_id] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(read["records"][0]["body"], "");
+
+    // A third party's mark is recorded but does not satisfy, and their
+    // unmark removes only their own mark.
+    let context = json!([SENDER_PERSON, RECIPIENT_PERSON, OTHER_PERSON]);
+    let third_party_source =
+        create_message_in_context(&registry, &db, SENDER, "reply", Value::Null, context).await;
+    let other_mark = mark(
+        &registry,
+        &db,
+        OTHER,
+        &third_party_source,
+        Value::Null,
+        "other-mark",
+    )
+    .await;
+    assert_eq!(other_mark["changed"], true);
+    assert_eq!(
+        derive_message_expectation_state(&db, &third_party_source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Open
+    );
+    let other_unmark = unmark(&registry, &db, OTHER, &third_party_source, "other-unmark").await;
+    assert_eq!(other_unmark["changed"], true);
+    assert_eq!(
+        derive_message_expectation_state(&db, &third_party_source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Open
+    );
+    let _ = mark(
+        &registry,
+        &db,
+        RECIPIENT,
+        &third_party_source,
+        Value::Null,
+        "recipient-mark-after-other",
+    )
+    .await;
+    let closed = derive_message_expectation_state(&db, &third_party_source, RECIPIENT)
+        .await
+        .unwrap();
+    assert_eq!(closed.state, MessageExpectationState::Satisfied);
+    assert_eq!(closed.evidence.unwrap().by.as_deref(), Some("recipient"));
+    // Someone else's unmark removes nothing and leaves the mark closed.
+    let noop = unmark(
+        &registry,
+        &db,
+        OTHER,
+        &third_party_source,
+        "other-unmark-noop",
+    )
+    .await;
+    assert_eq!(noop["changed"], false);
+    assert_eq!(
+        derive_message_expectation_state(&db, &third_party_source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Satisfied
+    );
+
+    // Real evidence still wins when both exist.
+    let ack_source = create_message(&registry, &db, SENDER, "ack", Value::Null).await;
+    let acknowledgement = create_message(&registry, &db, RECIPIENT, "none", Value::Null).await;
+    manage_link(
+        &registry,
+        &db,
+        RECIPIENT,
+        "add",
+        &acknowledgement,
+        &ack_source,
+        "acknowledges",
+    )
+    .await;
+    let _ = mark(
+        &registry,
+        &db,
+        RECIPIENT,
+        &ack_source,
+        Value::Null,
+        "mark-after-ack",
+    )
+    .await;
+    let real_first = derive_message_expectation_state(&db, &ack_source, RECIPIENT)
+        .await
+        .unwrap();
+    assert_eq!(real_first.state, MessageExpectationState::Satisfied);
+    assert_eq!(
+        real_first.evidence.unwrap().kind,
+        MessageExpectationEvidenceKind::Acknowledgement
+    );
+
+    // A duplicate idempotency key replays the original receipt without new
+    // side effects; a reused key for a different message conflicts.
+    let first = create_message(&registry, &db, SENDER, "ack", Value::Null).await;
+    let one = mark(&registry, &db, RECIPIENT, &first, Value::Null, "dup-key").await;
+    let two = mark(&registry, &db, RECIPIENT, &first, Value::Null, "dup-key").await;
+    assert_eq!(two["changed"], true);
+    assert_eq!(one["evidence_record_id"], two["evidence_record_id"]);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM links WHERE target_id=? AND relationship='resolves' AND note='no_longer_relevant'"
+        )
+        .bind(&first)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        1
+    );
+    let second = create_message(&registry, &db, SENDER, "ack", Value::Null).await;
+    let conflict = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": second,
+            "idempotency_key": "dup-key",
+            "reason": "Reusing a key for a different message.",
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        conflict.is_idempotency_conflict(),
+        "unexpected error: {conflict}"
+    );
+    let un_one = unmark(&registry, &db, RECIPIENT, &first, "dup-unmark").await;
+    assert_eq!(un_one["changed"], true);
+    let un_two = unmark(&registry, &db, RECIPIENT, &first, "dup-unmark").await;
+    assert_eq!(un_two["changed"], true);
+
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_mark_drops_and_restores_messages_awaiting_reply() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    assert_eq!(
+        awaiting_reply(&db, RECIPIENT).await,
+        std::slice::from_ref(&source)
+    );
+    call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "awaiting-mark",
+            "reason": "Settled outside Native.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(awaiting_reply(&db, RECIPIENT).await.is_empty());
+    call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "unmark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "awaiting-unmark",
+            "reason": "Still needed after all.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        awaiting_reply(&db, RECIPIENT).await,
+        std::slice::from_ref(&source)
+    );
+
+    // A sender withdrawal drops the row for the recipient as well.
+    let withdrawn = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    call(
+        &registry,
+        &db,
+        SENDER,
+        "manage_messages",
+        json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": withdrawn,
+            "note": "Withdrawing my own request.",
+            "idempotency_key": "sender-withdraw",
+            "reason": "Withdrawing my own request.",
+        }),
+    )
+    .await
+    .unwrap();
+    let remaining = awaiting_reply(&db, RECIPIENT).await;
+    assert_eq!(remaining, std::slice::from_ref(&source));
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_replay_after_unmark_returns_the_original_receipt() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    async fn mark(registry: &ToolRegistry, db: &Db, key: &str, message_id: &str) -> Value {
+        call(
+            registry,
+            db,
+            RECIPIENT,
+            "manage_messages",
+            json!({
+                "action": "mark_no_longer_relevant",
+                "message_id": message_id,
+                "idempotency_key": key,
+                "reason": "Settled outside Native.",
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    // Scenario A: the first k1 call is a no-op over the k0 mark. Unmarking
+    // and retrying k1 must replay k1's own receipt, not an error and not
+    // live state.
+    let original = mark(&registry, &db, "replay-k0", &source).await;
+    assert_eq!(original["changed"], true);
+    let evidence_id = original["evidence_record_id"].clone();
+    let noop = mark(&registry, &db, "replay-k1", &source).await;
+    assert_eq!(noop["changed"], false);
+    assert_eq!(noop["evidence_record_id"], evidence_id);
+    let unmarked = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "unmark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "replay-unmark",
+            "reason": "Reopening.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unmarked["changed"], true);
+    assert_eq!(
+        derive_message_expectation_state(&db, &source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Open
+    );
+    let replayed = mark(&registry, &db, "replay-k1", &source).await;
+    assert_eq!(replayed, noop);
+
+    // Scenario B: re-marking under k2 creates a new record with a new id,
+    // and retrying k1 still replays k1's receipt rather than k2's.
+    let relinked = mark(&registry, &db, "replay-k2", &source).await;
+    assert_eq!(relinked["changed"], true);
+    assert_ne!(relinked["evidence_record_id"], evidence_id);
+    assert_eq!(
+        derive_message_expectation_state(&db, &source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Satisfied
+    );
+    let replayed = mark(&registry, &db, "replay-k1", &source).await;
+    assert_eq!(replayed, noop);
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_deleted_or_archived_mark_does_not_satisfy() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    for case in ["deleted", "archived"] {
+        let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+        let marked = call(
+            &registry,
+            &db,
+            RECIPIENT,
+            "manage_messages",
+            json!({
+                "action": "mark_no_longer_relevant",
+                "message_id": source,
+                "idempotency_key": format!("mark-{case}"),
+                "reason": "Settled outside Native.",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            derive_message_expectation_state(&db, &source, RECIPIENT)
+                .await
+                .unwrap()
+                .state,
+            MessageExpectationState::Satisfied
+        );
+        let evidence_id = marked["evidence_record_id"].as_str().unwrap();
+        // Stamp the removal into the log directly, as the link fixtures do:
+        // the mark clones view-only visibility, so the tools would refuse.
+        if case == "deleted" {
+            delete_record_as(&db, evidence_id, Some(RECIPIENT))
+                .await
+                .unwrap();
+        } else {
+            archive_record_as(&db, evidence_id).await.unwrap();
+        }
+        assert_eq!(
+            derive_message_expectation_state(&db, &source, RECIPIENT)
+                .await
+                .unwrap()
+                .state,
+            MessageExpectationState::Open,
+            "{case} mark still satisfies"
+        );
+        assert!(
+            awaiting_reply(&db, RECIPIENT).await.contains(&source),
+            "{case} mark disagrees with messages_awaiting_reply"
+        );
+    }
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_remark_after_removal_uses_a_fresh_record() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    async fn mark(
+        registry: &ToolRegistry,
+        db: &Db,
+        key: &str,
+        message_id: &str,
+        note: Value,
+    ) -> Value {
+        let mut args = json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": message_id,
+            "idempotency_key": key,
+            "reason": "Settled outside Native.",
+        });
+        if !note.is_null() {
+            args["note"] = note;
+        }
+        call(registry, db, RECIPIENT, "manage_messages", args)
+            .await
+            .unwrap()
+    }
+
+    async fn state(db: &Db, message_id: &str) -> MessageExpectationState {
+        derive_message_expectation_state(db, message_id, RECIPIENT)
+            .await
+            .unwrap()
+            .state
+    }
+
+    // A pre-existing unrelated record cannot block a mark: evidence ids are
+    // random, so there is nothing to squat.
+    let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    let squat = create_raw_record(
+        &db,
+        json!({ "type": "Annotation", "kind": "no_longer_relevant", "name": "squat" }),
+    )
+    .await
+    .unwrap();
+    let first = mark(&registry, &db, "fresh-k1", &source, Value::Null).await;
+    assert_eq!(first["changed"], true);
+    assert_ne!(first["evidence_record_id"].as_str().unwrap(), squat);
+    assert_eq!(
+        state(&db, &source).await,
+        MessageExpectationState::Satisfied
+    );
+
+    for (case, remove) in [("deleted", true), ("archived", false)] {
+        let message = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+        let before = mark(&registry, &db, &format!("{case}-k1"), &message, Value::Null).await;
+        let before_id = before["evidence_record_id"].as_str().unwrap().to_owned();
+        if remove {
+            delete_record_as(&db, &before_id, Some(RECIPIENT))
+                .await
+                .unwrap();
+        } else {
+            archive_record_as(&db, &before_id).await.unwrap();
+        }
+        assert_eq!(state(&db, &message).await, MessageExpectationState::Open);
+        // Re-marking succeeds on a fresh record with the new note and closes
+        // the expectation again; unmarking then reopens it.
+        let after = mark(
+            &registry,
+            &db,
+            &format!("{case}-k2"),
+            &message,
+            json!("Second thoughts, still settled."),
+        )
+        .await;
+        assert_eq!(after["changed"], true);
+        let after_id = after["evidence_record_id"].as_str().unwrap().to_owned();
+        assert_ne!(after_id, before_id);
+        assert_eq!(
+            state(&db, &message).await,
+            MessageExpectationState::Satisfied
+        );
+        let read = call(
+            &registry,
+            &db,
+            RECIPIENT,
+            "get_record",
+            json!({ "ids": [after_id] }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read["records"][0]["body"],
+            "Second thoughts, still settled."
+        );
+        let unmarked = call(
+            &registry,
+            &db,
+            RECIPIENT,
+            "manage_messages",
+            json!({
+                "action": "unmark_no_longer_relevant",
+                "message_id": message,
+                "idempotency_key": format!("{case}-unmark"),
+                "reason": "Reopening.",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unmarked["changed"], true);
+        assert_eq!(state(&db, &message).await, MessageExpectationState::Open);
+    }
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_unmark_removes_every_live_mark() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    let first = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "two-marks-k1",
+            "reason": "Settled outside Native.",
+        }),
+    )
+    .await
+    .unwrap();
+    let first_id = first["evidence_record_id"].as_str().unwrap().to_owned();
+    // Archiving hides the mark, so a re-mark mints a second record; a
+    // restore then leaves two live marks for the same caller.
+    archive_record_as(&db, &first_id).await.unwrap();
+    let second = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "mark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "two-marks-k2",
+            "reason": "Settled outside Native.",
+        }),
+    )
+    .await
+    .unwrap();
+    let second_id = second["evidence_record_id"].as_str().unwrap().to_owned();
+    assert_ne!(second_id, first_id);
+    restore_record_as(&db, &first_id).await.unwrap();
+    assert_eq!(
+        derive_message_expectation_state(&db, &source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Satisfied
+    );
+    let unmarked = call(
+        &registry,
+        &db,
+        RECIPIENT,
+        "manage_messages",
+        json!({
+            "action": "unmark_no_longer_relevant",
+            "message_id": source,
+            "idempotency_key": "two-marks-unmark",
+            "reason": "Reopening.",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(unmarked["changed"], true);
+    assert_eq!(
+        derive_message_expectation_state(&db, &source, RECIPIENT)
+            .await
+            .unwrap()
+            .state,
+        MessageExpectationState::Open
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM links WHERE target_id=? AND relationship='resolves' AND note='no_longer_relevant'"
+        )
+        .bind(&source)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn no_longer_relevant_mark_requires_message_view() {
+    let db = create_database(":memory:").await.unwrap();
+    install_accounts(&db).await;
+    let registry = registry();
+
+    // OTHER is outside this two-person direct context and cannot view the
+    // message, so both mark and unmark are refused without writing.
+    let source = create_message(&registry, &db, SENDER, "reply", Value::Null).await;
+    for action in ["mark_no_longer_relevant", "unmark_no_longer_relevant"] {
+        let error = call(
+            &registry,
+            &db,
+            OTHER,
+            "manage_messages",
+            json!({
+                "action": action,
+                "message_id": source,
+                "idempotency_key": format!("denied-{action}"),
+                "reason": "Attempting without view access.",
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not exist"), "{action}: {error}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM links WHERE target_id=? AND relationship='resolves' AND note='no_longer_relevant'"
+        )
+        .bind(&source)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
     assert!(rebuild_and_diff(&db).await.unwrap().equal);
 }

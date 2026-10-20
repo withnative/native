@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { runNode } from './helpers/run-node.mjs';
 import vm from 'node:vm';
 import { createBodyWire } from '@withnative/alpha-tab-kit/body-wire';
 const wire = createBodyWire();
@@ -15,7 +15,7 @@ const page = (text = 'é😀') => ({contract:'records.body.read.v1',record_id:'d
 const envelope = (kind, extra = {}) => ({version:'native.html.bridge.v1',type:kind,request_id:'body-1',...extra});
 
 test('owning factory/ESM/production bootstrap generation matches', () => {
-  const result = spawnSync(process.execPath, ['scripts/generate-body-wire.mjs','--check'], {cwd:new URL('..',import.meta.url),encoding:'utf8'});
+  const result = runNode(['scripts/generate-body-wire.mjs','--check'], {cwd:new URL('..',import.meta.url)});
   assert.equal(result.status,0,result.stderr);
   assert.match(result.stdout,/production bootstrap/);
   assert.doesNotMatch(readFileSync(new URL('../src/body-wire.mjs',import.meta.url),'utf8'),/import .*node:|eval\(|new Function/);

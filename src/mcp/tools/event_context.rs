@@ -145,12 +145,17 @@ async fn get_event_context(db: Db, caller: Caller, arguments: Value) -> Result<V
 
     // Authorize the event's subject FIRST. A missing event and an unauthorized
     // one produce the same refusal above and below, so this is not an oracle.
-    require_record(&db, &caller, TOOL, &selected.record_id, Capability::View).await?;
+    // The record guard's own refusal names the record, which is the very thing
+    // a hidden event must not disclose, so it is replaced by the event's.
+    let event_not_found =
+        || Error::engine(format!("{TOOL}: event {} does not exist", args.event_id));
+    match require_record(&db, &caller, TOOL, &selected.record_id, Capability::View).await {
+        Ok(()) => {}
+        Err(Error::Engine(_)) => return Err(event_not_found()),
+        Err(error) => return Err(error),
+    }
     if !event_is_visible(&db, &caller, &selected).await? {
-        return Err(Error::engine(format!(
-            "{TOOL}: event {} does not exist",
-            args.event_id
-        )));
+        return Err(event_not_found());
     }
 
     let event_created_at = selected.created_at.clone();
@@ -283,16 +288,14 @@ async fn body_delta(db: &Db, record_id: &str, event: &EventRow) -> Result<Value>
     }
     let mut tx = db.write_pool().begin().await?;
     let after = crate::attribution::body_at_event_in(&mut tx, record_id, &event.id).await?;
-    let previous: Option<String> = sqlx::query_scalar(&format!(
-        "SELECT id FROM content_events
-          WHERE record_id = ? AND seq < ? AND {}
-          ORDER BY seq DESC LIMIT 1",
-        crate::contribution::BODY_PRODUCING_EVENT_SQL
-    ))
-    .bind(record_id)
-    .bind(event.local_seq)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let previous = crate::record_body::latest_body_revision_on(
+        &mut tx,
+        record_id,
+        Some(event.local_seq - 1),
+        crate::record_body::BodyRevisionSelection::LegacyContribution,
+    )
+    .await?
+    .map(|revision| revision.event_id);
     let before = match previous.as_deref() {
         Some(previous) => {
             crate::attribution::body_at_event_in(&mut tx, record_id, previous).await?
@@ -321,7 +324,10 @@ fn is_body_producing(event: &EventRow) -> bool {
         .payload
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .is_some_and(|payload| payload.get("body").is_some())
+        .is_some_and(|payload| {
+            crate::record_body::BodyRevisionSelection::LegacyContribution
+                .matches(&event.event_type, &payload)
+        })
 }
 
 async fn neighbouring_events(

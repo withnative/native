@@ -40,6 +40,11 @@
 //! reading as empty, exactly as `SELECT body` followed by
 //! `unwrap_or_default` does.
 
+pub(crate) mod budgeted;
+pub(crate) mod context;
+pub(crate) mod live_artifact;
+pub(crate) mod pinned;
+
 use serde_json::Value;
 use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
@@ -57,6 +62,131 @@ const BODY_WRITING_TYPES: &str =
 /// the body still counts as a writer here.
 pub(crate) const BODY_CARRYING_EVENT_SQL: &str = "(type IN ('record.created','record.updated','receipt.committed.v1') AND json_type(payload,'$.body') IS NOT NULL) OR (type = 'unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL)";
 
+/// Legacy contribution/history selection. This deliberately differs from
+/// payload-bearing projection provenance: a bodyless create counts, while
+/// raw receipt and unit events do not. Public history converts receipts to
+/// updates before applying this policy. Do not widen it as a refactor.
+pub const BODY_PRODUCING_EVENT_SQL: &str = "(type = 'record.created' \
+     OR (type = 'record.updated' AND json_type(payload, '$.body') IS NOT NULL))";
+
+/// A caller's revision-selection contract, separate from body reconstruction.
+#[derive(Clone, Copy)]
+pub(crate) enum BodyRevisionSelection {
+    PayloadCarrying,
+    LegacyContribution,
+}
+
+impl BodyRevisionSelection {
+    pub(crate) fn sql(self) -> &'static str {
+        match self {
+            Self::PayloadCarrying => BODY_CARRYING_EVENT_SQL,
+            Self::LegacyContribution => BODY_PRODUCING_EVENT_SQL,
+        }
+    }
+
+    pub(crate) fn matches(self, event_type: &str, payload: &Value) -> bool {
+        match self {
+            Self::PayloadCarrying => payload_carries_body(event_type, payload),
+            Self::LegacyContribution => {
+                event_type == "record.created"
+                    || (event_type == "record.updated"
+                        && event_body_value(event_type, payload).is_some())
+            }
+        }
+    }
+}
+
+/// The payload value at a legacy body writer's path, without coercion or
+/// admission. `Some(Null)` is a carried clear; `None` is an absent value.
+/// Callers validating exact source text must retain their own type checks.
+pub(crate) fn event_body_value<'a>(event_type: &str, payload: &'a Value) -> Option<&'a Value> {
+    match event_type {
+        "record.created" | "record.updated" | "receipt.committed.v1" => payload.get("body"),
+        "unit.revision.recorded.v1" => payload.get("content")?.get("content"),
+        _ => None,
+    }
+}
+
+/// Identity of a selected revision; selection never loads the body payload.
+pub(crate) struct BodyRevision {
+    pub(crate) event_id: String,
+    pub(crate) seq: i64,
+}
+
+/// Latest legacy contribution facts, without transporting payload bytes.
+/// A bodyless create counts; raw receipts and units do not. Callers retain
+/// creation lookup, nullable fact decoding and attestation resolution order.
+pub(crate) async fn latest_revision_facts_on<'e, E>(
+    executor: E,
+    record_id: &str,
+) -> std::result::Result<Option<sqlx::sqlite::SqliteRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(&format!(
+        "SELECT id, type, run_key, actor FROM content_events
+          WHERE record_id = ? AND {}
+          ORDER BY seq DESC LIMIT 1",
+        BodyRevisionSelection::LegacyContribution.sql()
+    ))
+    .bind(record_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Materialized body and its latest payload-carrying event in one statement.
+/// The joined row keeps body bytes and event id/seq atomic. Missing records
+/// return None; a record without a carrier retains its body and null identity.
+/// No transaction, authorization, JSON normalization or body cap is added.
+pub(crate) async fn stored_body_with_revision_on<'e, E>(
+    executor: E,
+    record_id: &str,
+) -> std::result::Result<Option<sqlx::sqlite::SqliteRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    sqlx::query(&format!(
+        "SELECT r.body AS body, e.id AS body_event_id, e.seq AS body_event_seq
+           FROM records r
+           LEFT JOIN content_events e
+             ON e.record_id = r.id
+            AND e.seq = (SELECT MAX(seq) FROM content_events
+                          WHERE record_id = r.id AND ({}))
+          WHERE r.id = ?",
+        BodyRevisionSelection::PayloadCarrying.sql()
+    ))
+    .bind(record_id)
+    .fetch_optional(executor)
+    .await
+}
+
+/// Latest revision for one record, optionally at an inclusive sequence horizon.
+/// A delete/restore or metadata-only update does not advance this identity.
+/// Body bytes are resolved separately by the historical fold below.
+pub(crate) async fn latest_body_revision_on(
+    conn: &mut SqliteConnection,
+    record_id: &str,
+    through: Option<i64>,
+    selection: BodyRevisionSelection,
+) -> Result<Option<BodyRevision>> {
+    let row = sqlx::query(&format!(
+        "SELECT id,seq FROM content_events
+          WHERE record_id=? AND seq<=? AND ({}) ORDER BY seq DESC LIMIT 1",
+        selection.sql()
+    ))
+    .bind(record_id)
+    .bind(through.unwrap_or(i64::MAX))
+    .fetch_optional(conn)
+    .await?;
+    row.map(|row| {
+        Ok(BodyRevision {
+            event_id: row.try_get("id")?,
+            seq: row.try_get("seq")?,
+        })
+    })
+    .transpose()
+}
+
 /// Whether a body-writing event's payload actually carries a body value, so
 /// its projection overwrites `records.body`.
 ///
@@ -67,16 +197,7 @@ pub(crate) const BODY_CARRYING_EVENT_SQL: &str = "(type IN ('record.created','re
 /// `body` key (any JSON type, including `null`), and a
 /// `unit.revision.recorded.v1` writes `content.content`.
 pub(crate) fn payload_carries_body(event_type: &str, payload: &Value) -> bool {
-    match event_type {
-        "record.created" | "record.updated" | "receipt.committed.v1" => {
-            payload.get("body").is_some()
-        }
-        "unit.revision.recorded.v1" => payload
-            .get("content")
-            .and_then(|content| content.get("content"))
-            .is_some(),
-        _ => false,
-    }
+    event_body_value(event_type, payload).is_some()
 }
 
 /// Coerce an event-payload `body` value the way the projector stores it.
@@ -201,13 +322,15 @@ fn strip_frac_zeros(mut frac: String) -> String {
 /// Otherwise returns the new body, with `None` standing for SQL `NULL` — a
 /// missing key on create, or an explicit null — which the projector stores as
 /// `NULL` and every reader coerces to empty.
-fn projected_body(event_type: &str, payload: &Value) -> Option<Option<String>> {
+pub(crate) fn projected_body(event_type: &str, payload: &Value) -> Option<Option<String>> {
     match event_type {
-        "record.created" => Some(coerce_body(payload.get("body").unwrap_or(&Value::Null))),
-        "record.updated" | "receipt.committed.v1" => payload.get("body").map(coerce_body),
-        "unit.revision.recorded.v1" => payload
-            .get("content")
-            .and_then(|content| content.get("content"))
+        "record.created" => Some(coerce_body(
+            event_body_value(event_type, payload).unwrap_or(&Value::Null),
+        )),
+        "record.updated" | "receipt.committed.v1" => {
+            event_body_value(event_type, payload).map(coerce_body)
+        }
+        "unit.revision.recorded.v1" => event_body_value(event_type, payload)
             .and_then(Value::as_str)
             .map(|content| Some(content.to_owned())),
         _ => None,
@@ -275,4 +398,236 @@ pub(crate) async fn body_at_seq_in(
     seq: i64,
 ) -> Result<Option<Vec<u8>>> {
     body_at_seq_on(tx, record_id, seq).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // Read-contract fixtures only: this table does not admit events through
+    // the store. Full projector equivalence lives in anchored_body_fold.
+    async fn log() -> SqliteConnection {
+        use sqlx::Connection;
+        let mut conn = SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query("CREATE TABLE content_events(seq INTEGER PRIMARY KEY,id TEXT,record_id TEXT,type TEXT,payload TEXT)")
+            .execute(&mut conn).await.unwrap();
+        conn
+    }
+
+    async fn insert(conn: &mut SqliteConnection, seq: i64, event_type: &str, payload: Value) {
+        sqlx::query("INSERT INTO content_events VALUES(?,?,'record',?,?)")
+            .bind(seq)
+            .bind(format!("event-{seq}"))
+            .bind(event_type)
+            .bind(payload.to_string())
+            .execute(conn)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revision_policies_preserve_sql_and_payload_semantics() {
+        let mut conn = log().await;
+        // Carrying, legacy contribution, projected body: these are distinct
+        // contracts. A malformed unit value may carry a payload without
+        // yielding a body; an absent create still projects SQL NULL.
+        let cases = [
+            ("record.created", json!({}), false, true, Some(None)),
+            (
+                "record.created",
+                json!({"body":null}),
+                true,
+                true,
+                Some(None),
+            ),
+            (
+                "record.updated",
+                json!({"name":"metadata"}),
+                false,
+                false,
+                None,
+            ),
+            (
+                "record.updated",
+                json!({"body":null}),
+                true,
+                true,
+                Some(None),
+            ),
+            (
+                "record.updated",
+                json!({"body":""}),
+                true,
+                true,
+                Some(Some(String::new())),
+            ),
+            (
+                "record.updated",
+                json!({"body":true}),
+                true,
+                true,
+                Some(Some("1".into())),
+            ),
+            (
+                "record.updated",
+                json!({"body":{"a":1}}),
+                true,
+                true,
+                Some(Some("{\"a\":1}".into())),
+            ),
+            (
+                "receipt.committed.v1",
+                json!({"body":"receipt"}),
+                true,
+                false,
+                Some(Some("receipt".into())),
+            ),
+            ("receipt.committed.v1", json!({}), false, false, None),
+            (
+                "unit.revision.recorded.v1",
+                json!({"content":{"content":"unit"}}),
+                true,
+                false,
+                Some(Some("unit".into())),
+            ),
+            (
+                "unit.revision.recorded.v1",
+                json!({"content":{"content":null}}),
+                true,
+                false,
+                None,
+            ),
+            (
+                "unit.revision.recorded.v1",
+                json!({"content":{}}),
+                false,
+                false,
+                None,
+            ),
+            (
+                "record.deleted",
+                json!({"body":"ignored"}),
+                false,
+                false,
+                None,
+            ),
+            (
+                "record.restored",
+                json!({"body":"ignored"}),
+                false,
+                false,
+                None,
+            ),
+            (
+                "record.body_appended",
+                json!({"body":"ignored","text":"tail"}),
+                false,
+                false,
+                None,
+            ),
+        ];
+        for (index, (event_type, payload, carrying, contribution, projected)) in
+            cases.into_iter().enumerate()
+        {
+            let seq = index as i64 + 1;
+            insert(&mut conn, seq, event_type, payload.clone()).await;
+            assert_eq!(
+                projected_body(event_type, &payload),
+                projected,
+                "{event_type}: {payload}"
+            );
+            for (policy, expected) in [
+                (BodyRevisionSelection::PayloadCarrying, carrying),
+                (BodyRevisionSelection::LegacyContribution, contribution),
+            ] {
+                let sql = format!("SELECT ({}) FROM content_events WHERE seq=?", policy.sql());
+                let selected: bool = sqlx::query_scalar(&sql)
+                    .bind(seq)
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+                assert_eq!(selected, expected, "SQL {event_type}: {payload}");
+                assert_eq!(
+                    policy.matches(event_type, &payload),
+                    expected,
+                    "Rust {event_type}: {payload}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_identity_and_historical_bytes_preserve_order_and_clears() {
+        let mut conn = log().await;
+        let events = [
+            ("record.created", json!({})),
+            ("record.updated", json!({"body":"same"})),
+            ("record.updated", json!({"name":"metadata"})),
+            ("record.updated", json!({"body":null})),
+            ("record.updated", json!({"body":""})),
+            ("record.updated", json!({"body":"same"})),
+            ("record.deleted", json!({})),
+            ("record.restored", json!({})),
+            ("receipt.committed.v1", json!({"body":"receipt"})),
+            (
+                "unit.revision.recorded.v1",
+                json!({"content":{"content":"unit"}}),
+            ),
+        ];
+        for (index, (event_type, payload)) in events.into_iter().enumerate() {
+            insert(&mut conn, index as i64 + 1, event_type, payload).await;
+        }
+        for (through, carrying_seq, contribution_seq, bytes) in [
+            (0, None, None, None),
+            (1, None, Some(1), Some("")),
+            (3, Some(2), Some(2), Some("same")),
+            (4, Some(4), Some(4), Some("")),
+            (5, Some(5), Some(5), Some("")),
+            (8, Some(6), Some(6), Some("same")),
+            (9, Some(9), Some(6), Some("receipt")),
+            (10, Some(10), Some(6), Some("unit")),
+        ] {
+            for (policy, expected) in [
+                (BodyRevisionSelection::PayloadCarrying, carrying_seq),
+                (BodyRevisionSelection::LegacyContribution, contribution_seq),
+            ] {
+                let revision = latest_body_revision_on(&mut conn, "record", Some(through), policy)
+                    .await
+                    .unwrap();
+                assert_eq!(revision.as_ref().map(|revision| revision.seq), expected);
+                assert_eq!(
+                    revision.map(|revision| revision.event_id),
+                    expected.map(|seq| format!("event-{seq}"))
+                );
+            }
+            assert_eq!(
+                body_at_seq_on(&mut conn, "record", through).await.unwrap(),
+                bytes.map(|text| text.as_bytes().to_vec())
+            );
+        }
+        let latest = latest_body_revision_on(
+            &mut conn,
+            "record",
+            None,
+            BodyRevisionSelection::PayloadCarrying,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest.seq, 10);
+        assert!(latest_body_revision_on(
+            &mut conn,
+            "missing",
+            None,
+            BodyRevisionSelection::PayloadCarrying
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            body_at_seq_on(&mut conn, "missing", 10).await.unwrap(),
+            None
+        );
+    }
 }

@@ -225,6 +225,26 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "declaration_event_seq",
             "updated_at",
         ],
+        "personas" => &[
+            "persona_id",
+            "owner_person_id",
+            "owner_principal",
+            "state",
+            "registered_event_seq",
+            "retired_event_seq",
+            "updated_at",
+        ],
+        "message_speakers" => &[
+            "message_id",
+            "speaker_kind",
+            "persona_id",
+            "agent_key",
+            "session_hint",
+            "owner_principal",
+            "assurance",
+            "stamp",
+            "event_seq",
+        ],
         "message_origin_principals" => &["message_id", "principal_id", "event_seq", "created_at"],
         "message_conversations" => &[
             "message_id",
@@ -582,6 +602,34 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "number_text",
             "bool_value",
         ],
+        "facet_observation_json_nodes" => &[
+            "observation_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+        ],
+        "record_body_json_nodes" => &[
+            "record_id",
+            "ordinal",
+            "path",
+            "parent_path",
+            "parent_ordinal",
+            "member_key",
+            "array_index",
+            "depth",
+            "node_type",
+            "text_value",
+            "number_text",
+            "bool_value",
+        ],
         "workspace_rule_installations" => &[
             "root",
             "namespace",
@@ -623,6 +671,7 @@ fn columns_for(table: &str) -> &'static [&'static str] {
             "reported_mcp_client_version",
             "reported_model",
         ],
+        "account_configs" => &["account_id", "kind", "record_id", "created_at"],
         "member_contexts" => &[
             "account_id",
             "person_record_id",
@@ -1062,14 +1111,28 @@ pub struct RebuildDiffResult {
 pub(crate) async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
     // `pub(crate)` for the test-only v2 kernel replay path
     // (`crate::kernel::replay_all_projections`); no non-test caller.
-    let rows = sqlx::query(
-        "SELECT seq, id, record_id, type, payload, actor,
-                run_key, parent_key, intent, created_at, act,
-                causal_envelope_version, causal_status
-           FROM content_events ORDER BY seq",
-    )
-    .fetch_all(&mut *conn)
-    .await?;
+    read_events_of_types(conn, &[]).await
+}
+
+/// Read only selected sealed lanes for additive projection recovery. Empty
+/// selects the full log for the existing conformance/replay caller.
+pub(crate) async fn read_events_of_types(
+    conn: &mut SqliteConnection,
+    types: &[&str],
+) -> Result<Vec<EventRow>> {
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act,causal_envelope_version,causal_status FROM content_events"
+    );
+    if !types.is_empty() {
+        query.push(" WHERE type IN (");
+        let mut separated = query.separated(",");
+        for kind in types {
+            separated.push_bind(*kind);
+        }
+        separated.push_unseparated(")");
+    }
+    query.push(" ORDER BY seq");
+    let rows = query.build().fetch_all(&mut *conn).await?;
     // try_get, not get: these values are database-controlled, and the suite's
     // contract is a report + exit code, never a crash — a malformed log (e.g. a
     // TEXT `seq`) must surface as a reportable error, not a decode panic.
@@ -1154,6 +1217,8 @@ async fn dump_table_where(
         "message_audiences" => "message_id, principal_id, source, grant_id",
         "message_origin_state" => "message_id",
         "message_origin_principals" => "message_id, principal_id",
+        "personas" => "persona_id",
+        "message_speakers" => "message_id",
         "message_conversations" => "message_id, conversation_id",
         "message_mentions" => "message_id, mention_id",
         "record_mentions" => "source_id, occurrence_ix",
@@ -1163,11 +1228,14 @@ async fn dump_table_where(
         "vocabulary_value_json_nodes" => "value_id, ordinal",
         "schema_config_json_nodes" => "config_id, ordinal",
         "facet_value_json_nodes" => "facet_id, ordinal",
+        "facet_observation_json_nodes" => "observation_id, ordinal",
+        "record_body_json_nodes" => "record_id, ordinal",
         "workspace_rule_installations" => "root, namespace, name",
         "record_policies" => "record_id",
         "policy_entries" => "policy_anchor_id, subject_kind, subject_id, effect, capability",
         "agent_runs" => "activity_id",
         "member_contexts" => "account_id",
+        "account_configs" => "account_id, kind",
         "onboarding_programme_sources" => "programme_id, position, source_record_id",
         "member_obligations" => "account_id, programme_id, generation",
         "member_obligation_progress" => "account_id, programme_id, generation",
@@ -1243,14 +1311,19 @@ async fn dump_table_where(
                         "vocabulary_value_json_nodes"
                             | "schema_config_json_nodes"
                             | "facet_value_json_nodes"
+                            | "facet_observation_json_nodes"
+                            | "record_body_json_nodes"
                     ) && matches!(*column, "ordinal" | "depth"))
                         || (matches!(
                             table,
                             "facet_observations"
                                 | "message_audiences"
                                 | "message_origin_principals"
+                                | "message_speakers"
                                 | "message_conversations"
                         ) && *column == "event_seq")
+                        || (table == "personas"
+                            && matches!(*column, "registered_event_seq" | "retired_event_seq"))
                         || (table == "message_mentions"
                             && matches!(
                                 *column,
@@ -1365,6 +1438,8 @@ async fn dump_table_where(
                         "vocabulary_value_json_nodes"
                             | "schema_config_json_nodes"
                             | "facet_value_json_nodes"
+                            | "facet_observation_json_nodes"
+                            | "record_body_json_nodes"
                     ) && matches!(
                         *column,
                         "parent_ordinal" | "array_index" | "bool_value"
@@ -1860,12 +1935,33 @@ pub async fn rebuild_and_diff_relationship(live: &Db) -> Result<RebuildDiffResul
 pub async fn rebuild_and_diff_control(live: &Db) -> Result<RebuildDiffResult> {
     let mut snapshot = live.write_pool().begin().await?;
     let events = read_all_control_events(&mut snapshot).await?;
+    let engine_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *snapshot)
+        .await?;
     let mut live_dumps: Vec<(&str, Vec<String>)> = Vec::new();
     for table in CONTROL_PROJECTION_TABLES {
-        live_dumps.push((
-            table,
-            dump_table(&mut snapshot, table, columns_for(table)).await?,
-        ));
+        let introduced_later = crate::schema::step_down::ADDITIONS.iter().any(|addition| {
+            addition.version > engine_version
+                && addition.added.iter().any(|object| {
+                    matches!(object, crate::schema::step_down::Added::Table(name) if *name == table)
+                })
+        });
+        let absent_before_introduction = introduced_later
+            && !sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?)",
+            )
+            .bind(table)
+            .fetch_one(&mut *snapshot)
+            .await?;
+        // Historical schemas have an empty live projection for a table that
+        // did not exist yet. Replay still includes it: retained later events
+        // therefore report drift, rather than disappearing from the check.
+        let rows = if absent_before_introduction {
+            Vec::new()
+        } else {
+            dump_table(&mut snapshot, table, columns_for(table)).await?
+        };
+        live_dumps.push((table, rows));
     }
     snapshot.rollback().await?;
 
@@ -1878,6 +1974,8 @@ pub async fn rebuild_and_diff_control(live: &Db) -> Result<RebuildDiffResult> {
             for key in [
                 "person_record_id",
                 "root_record_id",
+                "record_id",
+                "previous_record_id",
                 "source_record_id",
                 "artifact_id",
             ] {
@@ -2022,6 +2120,76 @@ mod tests {
         append_derivation_event_in, DerivationEventPayload, DerivationSeriesCreated,
         NewDerivationEvent,
     };
+
+    #[tokio::test]
+    async fn control_rebuild_requires_tables_only_after_their_introduction() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 88)
+            .await
+            .unwrap();
+        drop(conn);
+        let historical = rebuild_and_diff_control(&db).await.unwrap();
+        assert!(historical.equal, "{historical:?}");
+        assert!(historical
+            .tables
+            .iter()
+            .any(|table| table.table == "account_configs"));
+
+        sqlx::query("PRAGMA user_version=89")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let missing_current = rebuild_and_diff_control(&db).await.unwrap_err().to_string();
+        assert!(
+            missing_current.contains("account_configs"),
+            "{missing_current}"
+        );
+
+        sqlx::query("PRAGMA user_version=88")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE member_contexts")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let missing_older = rebuild_and_diff_control(&db).await.unwrap_err().to_string();
+        assert!(missing_older.contains("member_contexts"), "{missing_older}");
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn control_rebuild_reports_retained_later_events_as_historical_drift() {
+        let db = crate::db::create_database(":memory:").await.unwrap();
+        let account = "acct_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let record = "c07f0000-0000-4000-8000-000000000099";
+        let payload = json!({"account_id":account,"kind":"focus_preferences",
+            "record_id":record,"created_at":"2026-08-03T12:00:00Z"});
+        // A structurally valid retained control log is enough to exercise the
+        // replay/diff boundary; this test makes no creation-policy claim.
+        sqlx::query("INSERT INTO control_events(id,idempotency_key,type,schema_version,aggregate_kind,aggregate_id,actor,reason,payload,created_at) VALUES(?,?,'account_config.provisioned',1,'account_config',?,?,'retained event test',?,'2026-08-03T12:00:00Z')")
+            .bind("c07f0000-0000-4000-8000-000000000098")
+            .bind(format!("provision:v1:account-config:{account}:focus_preferences"))
+            .bind(account).bind(account).bind(payload.to_string())
+            .execute(db.write_pool()).await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 88)
+            .await
+            .unwrap();
+        drop(conn);
+        let drift = rebuild_and_diff_control(&db).await.unwrap();
+        assert!(!drift.equal, "{drift:?}");
+        let mapping = drift
+            .tables
+            .iter()
+            .find(|table| table.table == "account_configs")
+            .unwrap();
+        assert_eq!(mapping.live, 0);
+        assert_eq!(mapping.rebuilt, 1);
+        assert!(!mapping.mismatches.is_empty());
+        db.close().await;
+    }
 
     #[tokio::test]
     async fn derivation_rebuild_is_equal_and_detects_projection_drift() {

@@ -8,12 +8,18 @@
 
 mod common;
 
+#[path = "tools/act_receipts.rs"]
+mod act_receipts;
 #[path = "tools/action_evidence.rs"]
 mod action_evidence;
 #[path = "tools/alpha_tabs.rs"]
 mod alpha_tabs;
 #[path = "tools/alpha_tabs_subscribe.rs"]
 mod alpha_tabs_subscribe;
+#[path = "tools/app_attribution.rs"]
+mod app_attribution;
+#[path = "tools/app_undo.rs"]
+mod app_undo;
 #[path = "tools/authoring_context.rs"]
 mod authoring_context;
 
@@ -37,8 +43,12 @@ mod bootstrap_instructions;
 mod canvas;
 #[path = "tools/capability_dispatch.rs"]
 mod capability_dispatch;
+#[path = "tools/comment_reply_recipe.rs"]
+mod comment_reply_recipe;
 #[path = "tools/conformance.rs"]
 mod conformance;
+#[path = "tools/counter_guard.rs"]
+mod counter_guard;
 #[path = "tools/create_idempotency.rs"]
 mod create_idempotency;
 #[path = "tools/create_many.rs"]
@@ -53,18 +63,26 @@ mod export_snapshot;
 mod facet_observations_tool;
 #[path = "tools/fetch_guard.rs"]
 mod fetch_guard;
+#[path = "tools/foci_private_create.rs"]
+mod foci_private_create;
 #[path = "tools/history_summary.rs"]
 mod history_summary;
 #[path = "tools/instruction_controls.rs"]
 mod instruction_controls;
 #[path = "tools/intent.rs"]
 mod intent;
+#[path = "tools/keyed_replay.rs"]
+mod keyed_replay;
+#[path = "tools/keyed_replay_a2.rs"]
+mod keyed_replay_a2;
 #[path = "tools/mcp.rs"]
 mod mcp;
 #[path = "tools/mcp_apps.rs"]
 mod mcp_apps;
 #[path = "tools/overlap_measurement.rs"]
 mod overlap_measurement;
+#[path = "tools/position_inputs.rs"]
+mod position_inputs;
 #[path = "tools/programs.rs"]
 mod programs;
 #[path = "tools/query_guest_footing.rs"]
@@ -81,6 +99,8 @@ mod records_read_format;
 mod relationships;
 #[path = "tools/resolve_many.rs"]
 mod resolve_many;
+#[path = "tools/saved_sessions_s4.rs"]
+mod saved_sessions_s4;
 #[path = "tools/similar_existing.rs"]
 mod similar_existing;
 #[path = "tools/source_basis.rs"]

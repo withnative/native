@@ -20,6 +20,23 @@ pub struct AnnotationTargetInput {
     pub source_slot: SourceSlot,
     pub selectors: Vec<SelectorInput>,
     pub purpose: Option<String>,
+    /// Optional exact persisted-body source pin. When present on a body
+    /// target, `capture_target_in` requires the stored body to still be this
+    /// exact revision — both the body-carrying event id and the SHA-256 of the
+    /// stored body — checked in the same transaction before any selector is
+    /// validated. Absent keeps today's unpinned semantics.
+    #[serde(default)]
+    pub source_pin: Option<BodySourcePin>,
+}
+
+/// Optional exact persisted-body source revision, named after
+/// [`crate::attribution::ExactBodyTargetInput`]. Both fields are required
+/// together: a partial pin is a parse error, never a silently dropped one.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BodySourcePin {
+    pub source_event_id: String,
+    pub source_body_sha256: String,
 }
 
 /// Backward-compatible name retained for the citation-specific management
@@ -122,6 +139,55 @@ struct Representation {
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Verify an optional exact body source pin against the stored body inside the
+/// caller's write transaction. The pinned revision is the latest event whose
+/// projection writes `records.body` — the shared
+/// [`crate::record_body::BODY_CARRYING_EVENT_SQL`] contract — so an unrelated
+/// metadata or record update does not invalidate a pin, while a delete/reinsert
+/// or a changed-then-restored body does, even when the bytes are identical. A
+/// blob target cannot carry a body pin and refuses rather than discarding it.
+async fn verify_body_source_pin_in(
+    tx: &mut Transaction<'static, Sqlite>,
+    target_record_id: &str,
+    source_slot: SourceSlot,
+    current_sha256: &str,
+    pin: &BodySourcePin,
+) -> Result<()> {
+    if source_slot != SourceSlot::Body {
+        return Err(Error::engine(
+            "annotation target source pin is only supported for body targets",
+        ));
+    }
+    if !is_lower_hex_sha256(&pin.source_body_sha256) {
+        return Err(Error::engine(
+            "annotation target source pin body sha256 must be a lowercase SHA-256 digest",
+        ));
+    }
+    let revision_event_id = crate::record_body::latest_body_revision_on(
+        tx,
+        target_record_id,
+        None,
+        crate::record_body::BodyRevisionSelection::PayloadCarrying,
+    )
+    .await?
+    .map(|revision| revision.event_id);
+    if revision_event_id.as_deref() != Some(pin.source_event_id.as_str())
+        || current_sha256 != pin.source_body_sha256
+    {
+        return Err(Error::engine(
+            "annotation target exact source pin does not match the stored body revision",
+        ));
+    }
+    Ok(())
 }
 
 async fn body_at(
@@ -1258,6 +1324,17 @@ pub async fn capture_target_in(
             (bytes, None, Some(blob_id), sha)
         }
     };
+
+    if let Some(pin) = input.source_pin.as_ref() {
+        verify_body_source_pin_in(
+            &mut *tx,
+            &input.target_record_id,
+            input.source_slot,
+            &source_sha256,
+            pin,
+        )
+        .await?;
+    }
 
     let selectors = canonicalize_selectors(input.selectors, &bytes)?;
     Ok(AnnotationTargetSetPayload {

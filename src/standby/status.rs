@@ -17,8 +17,16 @@ use super::{
 
 pub const STANDBY_STATUS_CONTRACT: &str = "native.standby-status.v1";
 pub const STANDBY_RPO_SECONDS: u64 = 300;
-pub const STANDBY_REFRESH_INTERVAL_SECONDS: u64 = 120;
+pub const STANDBY_REFRESH_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_STATUS_RETAINED_GENERATIONS: usize = 8;
+/// Deltas deferred this many consecutive ticks (about ten minutes at the
+/// default cadence) for want of an upgraded reader, or because a local read
+/// kept the copy open, are reported as degraded.
+const DEFERRED_DELTA_AFTER_TICKS: u32 = 10;
+const READER_NOT_UPGRADED_ACTION: &str =
+    "restart the local Native connection so the new build serves this copy";
+const DATABASE_BUSY_ACTION: &str =
+    "a local read has held the copy open for a long time; restart the local Native connection";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,14 +55,25 @@ pub struct StandbyFreshness {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StandbyGenerationStatus {
     pub generation_id: String,
+    /// When the checkpoint snapshot was captured.
     pub captured_at: String,
     pub snapshot_completed_at: String,
     pub promoted_at: Option<String>,
+    /// The checkpoint snapshot's frontier; `head_act` moves past it.
     pub frontier: CanonicalFrontierV1,
+    /// The act this copy holds, advanced in place by deltas.
     pub head_act: Option<i64>,
+    /// `snapshot` until the first delta is applied in place, then `delta`.
     pub materialization: StandbyGenerationMaterialization,
+    /// When hosted Native was last observed at `head_act`, if ever.
+    pub synced_at: Option<String>,
+    /// Whether the history before the checkpoint is known to be complete:
+    /// `exhaustive`, `unknown`, or `unavailable` when it cannot be read.
+    pub source_history: &'static str,
     pub engine: StandbySnapshotEngineIdentity,
     pub consumer: StandbyConsumerIdentity,
+    /// Local acceptance by a replacement binary; original consumer stays above.
+    pub consumer_rebind: Option<super::ConsumerRebind>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -71,6 +90,7 @@ pub struct StandbyRefreshStatus {
     pub controller_available: bool,
     pub diagnostics: StandbyRefreshDiagnosticsState,
     pub refresh_active: Option<bool>,
+    pub transfer_progress: Option<super::StandbyTransferProgress>,
     pub manual_refresh_pending: Option<bool>,
     pub last_attempt_at: Option<String>,
     pub last_attempt_cause: Option<super::RefreshCause>,
@@ -85,6 +105,24 @@ pub struct StandbyRefreshStatus {
     pub last_failure: Option<String>,
     pub last_delta_fallback_class: Option<super::refresh::DeltaFallbackClass>,
     pub last_delta_fallback: Option<String>,
+    /// Why the last attempt changed nothing without failing, as a closed token
+    /// (for example `full_refresh_interval`: a whole snapshot was needed but
+    /// the previous one started too recently).
+    pub last_deferral: Option<&'static str>,
+    /// Start of the most recent whole-snapshot attempt of an existing copy.
+    pub last_full_refresh_at: Option<String>,
+    /// When a whole snapshot deferred by `full_refresh_interval` next becomes
+    /// eligible, if that is why the last attempt deferred.
+    pub next_full_refresh_eligible_at: Option<String>,
+    /// Retained whole-snapshot failure, projected even after a later delta
+    /// or throttle attempt clears the latest failure. Time, cause and class
+    /// come from typed state; the message and detail are closed projections,
+    /// so legacy raw detail in old state files can never surface here.
+    pub last_full_failure_at: Option<String>,
+    pub last_full_failure_cause: Option<super::RefreshCause>,
+    pub last_full_failure_class: Option<super::RefreshFailureClass>,
+    pub last_full_failure: Option<String>,
+    pub last_full_failure_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -118,6 +156,9 @@ pub struct StandbyStatus {
     pub consumer_compatible: Option<bool>,
     pub retained_generation_ids: Vec<String>,
     pub retained_generation_count: usize,
+    /// Candidates with no matching completed device-check observation.
+    pub unverified_candidate_count: usize,
+    pub unusable_candidate_count: usize,
     pub retained_generation_ids_truncated: bool,
     pub startup_fallback: Option<StandbyStartupReason>,
     pub startup_fallback_diagnostics_available: bool,
@@ -142,6 +183,13 @@ pub struct StandbyResponseContext {
     pub read_only: bool,
     pub writes_supported: bool,
     pub serving_generation_id: Option<String>,
+    /// The act the serving copy holds; deltas advance it in place.
+    pub serving_head_act: Option<i64>,
+    pub serving_materialization: Option<StandbyGenerationMaterialization>,
+    /// `exhaustive`, `unknown` or `unavailable` (see the full status).
+    pub serving_source_history: Option<&'static str>,
+    /// Present when this consumer locally re-admitted the original checkpoint.
+    pub serving_consumer_rebound_at: Option<String>,
     pub freshness: StandbyFreshness,
     pub freshness_degraded: bool,
     pub degraded_reasons: Vec<&'static str>,
@@ -151,13 +199,28 @@ pub struct StandbyResponseContext {
 #[derive(Clone, Debug)]
 struct ServingGeneration {
     generation_id: String,
+    snapshot_path: std::path::PathBuf,
     captured_at: String,
     snapshot_completed_at: String,
     frontier: CanonicalFrontierV1,
     head_act: Option<i64>,
     materialization: StandbyGenerationMaterialization,
+    synced_at: Option<String>,
+    reader_deferrals: u32,
+    busy_deferrals: u32,
     engine: StandbySnapshotEngineIdentity,
     consumer: StandbyConsumerIdentity,
+    consumer_rebound_at: Option<String>,
+}
+
+impl ServingGeneration {
+    fn reader_not_upgraded(&self) -> bool {
+        self.reader_deferrals > DEFERRED_DELTA_AFTER_TICKS
+    }
+
+    fn database_busy(&self) -> bool {
+        self.busy_deferrals > DEFERRED_DELTA_AFTER_TICKS
+    }
 }
 
 /// Read-only source for the shared bootstrap and system/status projection.
@@ -186,19 +249,29 @@ impl StandbyStatusProvider {
         refresh_configured: bool,
         refresh_available: bool,
     ) -> Self {
+        let consumer_rebound_at = store
+            .consumer_rebind(&active.generation.id, &observed)
+            .ok()
+            .flatten()
+            .map(|acceptance| acceptance.accepted_at);
         Self {
             runtime,
             store,
             observed: Some(observed),
             serving: Some(ServingGeneration {
                 generation_id: active.generation.id.clone(),
+                snapshot_path: active.generation.snapshot_path.clone(),
                 captured_at: active.generation.manifest.captured_at.clone(),
                 snapshot_completed_at: active.generation.manifest.snapshot_completed_at.clone(),
                 frontier: active.generation.manifest.frontier.clone(),
                 head_act: active.generation.manifest.head_act,
                 materialization: active.generation.manifest.materialization,
+                synced_at: None,
+                reader_deferrals: 0,
+                busy_deferrals: 0,
                 engine: active.generation.manifest.engine.clone(),
                 consumer: active.generation.manifest.consumer.clone(),
+                consumer_rebound_at,
             }),
             status_only: None,
             refresh_configured,
@@ -257,15 +330,22 @@ impl StandbyStatusProvider {
     }
 
     pub async fn status(&self) -> StandbyStatus {
-        self.status_at(Utc::now()).await
+        self.collect_status(None).await
     }
 
     pub fn response_context(&self) -> StandbyResponseContext {
-        self.response_context_at(Utc::now())
+        self.response_context_observed(None)
     }
 
+    #[cfg(test)]
     fn response_context_at(&self, now: DateTime<Utc>) -> StandbyResponseContext {
-        let freshness = freshness(self.serving.as_ref(), now);
+        self.response_context_observed(Some(now))
+    }
+
+    fn response_context_observed(&self, now: Option<DateTime<Utc>>) -> StandbyResponseContext {
+        let live_serving = self.live_serving();
+        let now = now.unwrap_or_else(Utc::now);
+        let freshness = freshness(live_serving.as_ref(), now);
         let mut degraded_reasons = Vec::new();
         if self.serving.is_none() {
             degraded_reasons.push("no_usable_serving_generation");
@@ -277,6 +357,18 @@ impl StandbyStatusProvider {
                     degraded_reasons.push("snapshot_age_unavailable")
                 }
             }
+            if live_serving
+                .as_ref()
+                .is_some_and(ServingGeneration::reader_not_upgraded)
+            {
+                degraded_reasons.push("reader_not_upgraded");
+            }
+            if live_serving
+                .as_ref()
+                .is_some_and(ServingGeneration::database_busy)
+            {
+                degraded_reasons.push("database_busy");
+            }
         }
         let next_safe_action = if self.serving.is_none() {
             Some(if self.connected_handoff {
@@ -284,6 +376,10 @@ impl StandbyStatusProvider {
             } else {
                 "refresh the standby, then restart it after a verified generation is accepted"
             })
+        } else if degraded_reasons.contains(&"reader_not_upgraded") {
+            Some(READER_NOT_UPGRADED_ACTION)
+        } else if degraded_reasons.contains(&"database_busy") {
+            Some(DATABASE_BUSY_ACTION)
         } else if matches!(freshness.state, StandbyFreshnessState::BeyondRpo) {
             Some("restore hosted connectivity or authentication and run the supported refresh command")
         } else if matches!(freshness.state, StandbyFreshnessState::Unavailable) {
@@ -306,6 +402,19 @@ impl StandbyStatusProvider {
                 .serving
                 .as_ref()
                 .map(|generation| generation.generation_id.clone()),
+            serving_head_act: live_serving
+                .as_ref()
+                .and_then(|generation| generation.head_act),
+            serving_materialization: live_serving
+                .as_ref()
+                .map(|generation| generation.materialization),
+            serving_source_history: live_serving
+                .as_ref()
+                .map(|generation| source_history(&generation.snapshot_path)),
+            serving_consumer_rebound_at: self
+                .serving
+                .as_ref()
+                .and_then(|serving| serving.consumer_rebound_at.clone()),
             freshness,
             freshness_degraded: !degraded_reasons.is_empty(),
             degraded_reasons,
@@ -313,13 +422,33 @@ impl StandbyStatusProvider {
         }
     }
 
+    /// The serving generation with its live head: deltas advance the leased
+    /// generation in place, so its act and freshness are re-read on each use.
+    fn live_serving(&self) -> Option<ServingGeneration> {
+        let mut serving = self.serving.clone()?;
+        if let Ok(Some(head)) = self.store.generation_head(&serving.generation_id) {
+            serving.head_act = Some(head.head_act);
+            serving.materialization = head.materialization;
+            serving.synced_at = Some(head.synced_at);
+        }
+        let counts = self.store.deferral_counts(&serving.generation_id);
+        serving.reader_deferrals = counts.reader_not_upgraded;
+        serving.busy_deferrals = counts.database_busy;
+        Some(serving)
+    }
+
+    #[cfg(test)]
     async fn status_at(&self, now: DateTime<Utc>) -> StandbyStatus {
+        self.collect_status(Some(now)).await
+    }
+
+    async fn collect_status(&self, now: Option<DateTime<Utc>>) -> StandbyStatus {
         let store_status = match &self.observed {
             Some(observed) => self.store.inspect_status(observed).await,
             None => unavailable_store_status(),
         };
         let refresh_observation = observe_refresh_state(&self.runtime.replica_root);
-        build_status(self, store_status, refresh_observation, now)
+        build_status_observed(self, store_status, refresh_observation, now)
     }
 }
 
@@ -330,16 +459,19 @@ fn unavailable_store_status() -> GenerationStoreStatus {
         retained_generation_ids: Vec::new(),
         candidate_count: 0,
         unusable_candidate_count: 0,
+        unverified_candidate_count: 0,
         startup_reason: None,
         startup_reason_available: false,
     }
 }
 
 fn generation_status(
-    generation_id: String,
-    manifest: &crate::standby_snapshot::StandbySnapshotManifest,
+    generation: &super::InstalledGeneration,
+    head: Option<super::GenerationHead>,
     refresh: Option<&StandbyRefreshState>,
 ) -> StandbyGenerationStatus {
+    let generation_id = generation.id.clone();
+    let manifest = &generation.manifest;
     let promoted_at = refresh
         .filter(|state| state.installed_generation_id.as_deref() == Some(&generation_id))
         .and_then(|state| state.promoted_at.as_deref())
@@ -350,10 +482,38 @@ fn generation_status(
         snapshot_completed_at: normalized_timestamp(&manifest.snapshot_completed_at),
         promoted_at,
         frontier: manifest.frontier.clone(),
-        head_act: manifest.head_act,
-        materialization: manifest.materialization,
+        head_act: head
+            .as_ref()
+            .map(|head| head.head_act)
+            .or(manifest.head_act),
+        materialization: head
+            .as_ref()
+            .map_or(manifest.materialization, |head| head.materialization),
+        synced_at: head.map(|head| normalized_timestamp(&head.synced_at)),
+        source_history: source_history(&generation.snapshot_path),
         engine: manifest.engine.clone(),
         consumer: manifest.consumer.clone(),
+        consumer_rebind: None,
+    }
+}
+
+/// Read the source-history marker (`PRAGMA application_id`) straight from the
+/// SQLite header. A history-unknown snapshot stays reported as `unknown` after
+/// any number of deltas: they extend it from its checkpoint, never relabel it.
+fn source_history(path: &std::path::Path) -> &'static str {
+    use std::io::Read as _;
+    let mut header = [0_u8; 72];
+    let read = std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut header));
+    if read.is_err() || &header[..16] != b"SQLite format 3\0" {
+        return "unavailable";
+    }
+    let marker = i32::from_be_bytes([header[68], header[69], header[70], header[71]]);
+    if i64::from(marker)
+        == crate::interchange::source_history_application_id(crate::interchange::REVISION)
+    {
+        "exhaustive"
+    } else {
+        "unknown"
     }
 }
 
@@ -364,18 +524,28 @@ fn normalized_timestamp(value: &str) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+#[cfg(test)]
 fn build_status(
     provider: &StandbyStatusProvider,
     store: GenerationStoreStatus,
     refresh_observation: RefreshStateObservation,
     now: DateTime<Utc>,
 ) -> StandbyStatus {
-    let observed_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    build_status_observed(provider, store, refresh_observation, Some(now))
+}
+
+fn build_status_observed(
+    provider: &StandbyStatusProvider,
+    store: GenerationStoreStatus,
+    refresh_observation: RefreshStateObservation,
+    now: Option<DateTime<Utc>>,
+) -> StandbyStatus {
     let refresh_state = match &refresh_observation {
         RefreshStateObservation::Available(state) => Some(state.as_ref()),
         RefreshStateObservation::NeverRecorded | RefreshStateObservation::Unavailable => None,
     };
-    let serving_generation = provider.serving.as_ref().map(|serving| {
+    let live_serving = provider.live_serving();
+    let serving_generation = live_serving.as_ref().map(|serving| {
         let promoted_at = refresh_state
             .filter(|state| {
                 state.installed_generation_id.as_deref() == Some(&serving.generation_id)
@@ -390,27 +560,54 @@ fn build_status(
             frontier: serving.frontier.clone(),
             head_act: serving.head_act,
             materialization: serving.materialization,
+            synced_at: serving.synced_at.as_deref().map(normalized_timestamp),
+            source_history: source_history(&serving.snapshot_path),
             engine: serving.engine.clone(),
             consumer: serving.consumer.clone(),
+            consumer_rebind: provider.observed.as_ref().and_then(|observed| {
+                provider
+                    .store
+                    .consumer_rebind(&serving.generation_id, observed)
+                    .ok()
+                    .flatten()
+            }),
         }
     });
     let accepted_generation = store.current.as_ref().map(|generation| {
-        generation_status(generation.id.clone(), &generation.manifest, refresh_state)
+        let head = provider
+            .store
+            .generation_head(&generation.id)
+            .ok()
+            .flatten();
+        let mut status = generation_status(generation, head, refresh_state);
+        status.consumer_rebind = provider.observed.as_ref().and_then(|observed| {
+            provider
+                .store
+                .consumer_rebind(&generation.id, observed)
+                .ok()
+                .flatten()
+        });
+        status
     });
-    let freshness = freshness(provider.serving.as_ref(), now);
+    // Sample after every head read used in this response. A delta can land
+    // during collection; its sync timestamp must not follow our observation.
+    let now = now.unwrap_or_else(Utc::now);
+    let observed_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let freshness = freshness(live_serving.as_ref(), now);
     let refresh = refresh_status(
         refresh_observation,
         provider.refresh_configured,
         provider.refresh_available,
+        now,
     );
     let consumer_compatible = match (&provider.observed, &provider.serving, &accepted_generation) {
         (Some(observed), Some(serving), _) => Some(
-            serving
-                .consumer
-                .validate_observed_installed(observed)
+            provider
+                .store
+                .consumer_rebind(&serving.generation_id, observed)
                 .is_ok(),
         ),
-        // `inspect_status` only returns an accepted generation after deep
+        // `inspect_status` only returns an accepted generation after device
         // verification against this observed consumer identity.
         (Some(_), None, Some(_)) => Some(true),
         _ => None,
@@ -430,6 +627,9 @@ fn build_status(
         }
         GenerationProvenanceStatus::Unavailable => {
             degraded_reasons.push("accepted_generation_provenance_unavailable")
+        }
+        GenerationProvenanceStatus::Unverified => {
+            degraded_reasons.push("accepted_generation_unverified")
         }
     }
     if !store.startup_reason_available {
@@ -470,6 +670,18 @@ fn build_status(
     if provider.refresh_configured && !provider.refresh_available {
         degraded_reasons.push("refresh_controller_unavailable");
     }
+    if live_serving
+        .as_ref()
+        .is_some_and(ServingGeneration::reader_not_upgraded)
+    {
+        degraded_reasons.push("reader_not_upgraded");
+    }
+    if live_serving
+        .as_ref()
+        .is_some_and(ServingGeneration::database_busy)
+    {
+        degraded_reasons.push("database_busy");
+    }
     match freshness.state {
         StandbyFreshnessState::Fresh => {}
         StandbyFreshnessState::BeyondRpo => degraded_reasons.push("snapshot_beyond_rpo"),
@@ -506,11 +718,11 @@ fn build_status(
                 .as_ref()
                 .map(|generation| &generation.generation_id);
     let next_safe_action = if pending_handoff {
-        Some("the connected session will attempt full verification and readiness; inspect aggregate handoff diagnostics if serving does not advance")
+        Some("the connected session will attempt device verification and readiness; inspect aggregate handoff diagnostics if serving does not advance")
     } else if provider.serving.is_none() && accepted_generation_available {
         Some("restart the standby to activate the verified accepted generation")
     } else if provider.serving.is_none() && provider.connected_handoff {
-        Some("run a verified external refresh; the connected session will attempt full handoff")
+        Some("run a verified external refresh; the connected session will attempt device handoff")
     } else if provider.serving.is_none() {
         Some("refresh the standby, then restart it after a verified generation is accepted")
     } else if degraded_reasons.contains(&"refresh_authentication_failing") {
@@ -519,6 +731,8 @@ fn build_status(
         // credential is being refused. Naming connectivity or provenance first
         // would send someone round a loop that cannot terminate.
         Some("reissue the standby snapshot credential and run the supported refresh command")
+    } else if store.current_provenance == GenerationProvenanceStatus::Unverified {
+        Some("wait for local generation verification to finish; inspect node diagnostics if it remains unavailable")
     } else if matches!(
         store.current_provenance,
         GenerationProvenanceStatus::Missing
@@ -528,6 +742,10 @@ fn build_status(
         Some("inspect standby provenance and run a verified refresh before relying on accepted state")
     } else if degraded_reasons.contains(&"accepted_generation_pending_restart") {
         Some("restart the standby to activate the newer accepted generation")
+    } else if degraded_reasons.contains(&"reader_not_upgraded") {
+        Some(READER_NOT_UPGRADED_ACTION)
+    } else if degraded_reasons.contains(&"database_busy") {
+        Some(DATABASE_BUSY_ACTION)
     } else if matches!(freshness.state, StandbyFreshnessState::BeyondRpo)
         || refresh.consecutive_failure_count.unwrap_or(0) > 0
     {
@@ -573,6 +791,7 @@ fn build_status(
             GenerationProvenanceStatus::Missing => "missing",
             GenerationProvenanceStatus::Invalid => "invalid",
             GenerationProvenanceStatus::Unavailable => "unavailable",
+            GenerationProvenanceStatus::Unverified => "unverified",
         },
         freshness,
         refresh,
@@ -580,6 +799,8 @@ fn build_status(
         consumer_compatible,
         retained_generation_ids,
         retained_generation_count,
+        unverified_candidate_count: store.unverified_candidate_count,
+        unusable_candidate_count: store.unusable_candidate_count,
         retained_generation_ids_truncated: retained_generation_count
             > MAX_STATUS_RETAINED_GENERATIONS,
         startup_fallback: store.startup_reason,
@@ -617,10 +838,17 @@ fn freshness(serving: Option<&ServingGeneration>, now: DateTime<Utc>) -> Standby
     let Some(serving) = serving else {
         return unavailable_freshness();
     };
+    // A copy is as fresh as the later of its checkpoint capture and the last
+    // time hosted Native was observed at the act it holds.
     let Ok(captured) = DateTime::parse_from_rfc3339(&serving.captured_at) else {
         return unavailable_freshness();
     };
-    let age = now.signed_duration_since(captured.with_timezone(&Utc));
+    let synced = serving
+        .synced_at
+        .as_deref()
+        .and_then(|synced| DateTime::parse_from_rfc3339(synced).ok());
+    let basis = synced.map_or(captured, |synced| synced.max(captured));
+    let age = now.signed_duration_since(basis.with_timezone(&Utc));
     let Ok(age_seconds) = u64::try_from(age.num_seconds()) else {
         return unavailable_freshness();
     };
@@ -652,6 +880,7 @@ fn refresh_status(
     observation: RefreshStateObservation,
     configured: bool,
     controller_available: bool,
+    now: DateTime<Utc>,
 ) -> StandbyRefreshStatus {
     let (diagnostics, state) = match observation {
         RefreshStateObservation::Available(state) => {
@@ -667,6 +896,10 @@ fn refresh_status(
         controller_available,
         diagnostics,
         refresh_active: state.as_ref().map(|state| state.refresh_active),
+        transfer_progress: state
+            .as_ref()
+            .and_then(|state| state.transfer_progress.clone())
+            .map(|progress| progress.observed(Some(now))),
         manual_refresh_pending: state.as_ref().map(|state| state.manual_refresh_pending),
         last_attempt_at: state
             .as_ref()
@@ -711,17 +944,68 @@ fn refresh_status(
             .and_then(|state| state.last_delta_fallback_class)
             .map(safe_delta_fallback_message)
             .map(str::to_owned),
+        last_deferral: state
+            .as_ref()
+            .and_then(|state| state.last_deferral.as_deref())
+            .and_then(super::refresh::sanitize_deferral),
+        last_full_refresh_at: state
+            .as_ref()
+            .and_then(|state| state.last_full_refresh_at.as_deref())
+            .map(normalized_timestamp),
+        next_full_refresh_eligible_at: state
+            .as_ref()
+            .filter(|state| {
+                state.last_deferral.as_deref()
+                    == Some(super::refresh::DEFERRED_FULL_REFRESH_INTERVAL)
+            })
+            .and_then(|state| state.next_full_refresh_eligible_at.as_deref())
+            .map(normalized_timestamp),
+        last_full_failure_at: state
+            .as_ref()
+            .and_then(|state| state.last_full_failure_at.as_deref())
+            .map(normalized_timestamp),
+        last_full_failure_cause: state
+            .as_ref()
+            .and_then(|state| state.last_full_failure_cause),
+        last_full_failure_class: state
+            .as_ref()
+            .and_then(|state| state.last_full_failure_class),
+        last_full_failure: state
+            .as_ref()
+            .and_then(|state| state.last_full_failure_class)
+            .map(safe_refresh_failure_message)
+            .map(str::to_owned),
+        last_full_failure_detail: state
+            .as_ref()
+            .map(|state| {
+                super::refresh::sanitize_retained_detail(state.last_full_failure_detail.as_deref())
+            })
+            // Omit the slot when nothing was ever retained, so an empty
+            // projection cannot be mistaken for a classified outcome.
+            .filter(|_| {
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.last_full_failure_class.is_some())
+            })
+            .map(str::to_owned),
     }
 }
 
 fn safe_delta_fallback_message(class: super::refresh::DeltaFallbackClass) -> &'static str {
     use super::refresh::DeltaFallbackClass::*;
     match class {
-        HeadCompatibility => "delta head was incompatible; whole snapshot used",
-        DeltaUnavailable => "delta was unavailable; whole snapshot used",
-        IntegrityOrApplyRefusal => "delta integrity or apply check refused; whole snapshot used",
-        RemoteHeadRegression => "delta authority head regressed; whole snapshot used",
-        UntrustedLocalBase => "local delta base was not trusted; whole snapshot used",
+        HeadCompatibility => "delta head was incompatible; a whole snapshot is required",
+        DeltaUnavailable => "delta was unavailable; a whole snapshot is required",
+        IntegrityOrApplyRefusal => {
+            "delta integrity or apply check refused; a whole snapshot is required"
+        }
+        RemoteHeadRegression => "delta authority head regressed; a whole snapshot is required",
+        UntrustedLocalBase => "local copy could not take a delta; a whole snapshot is required",
+        AuditFailed => "an audit of the local copy failed; a whole snapshot is required",
+        ConsumerChanged => "installed consumer changed; a whole snapshot is required",
+        DeltaTooLarge => {
+            "the catch-up is too large for a delta transfer; a whole snapshot is required"
+        }
     }
 }
 
@@ -737,6 +1021,12 @@ fn safe_refresh_failure_message(class: super::RefreshFailureClass) -> &'static s
         super::RefreshFailureClass::Compatibility => "standby refresh compatibility check failed",
         super::RefreshFailureClass::Timeout => "standby refresh exceeded its time bound",
         super::RefreshFailureClass::LocalIo => "standby refresh local storage failed",
+        super::RefreshFailureClass::Throttled => {
+            "standby refresh held back by its minimum interval"
+        }
+        super::RefreshFailureClass::RevisionUnsupported => {
+            "standby refresh paused: hosted uses a newer interchange revision"
+        }
     }
 }
 
@@ -820,6 +1110,7 @@ mod tests {
             retained_generation_ids,
             candidate_count: 1,
             unusable_candidate_count: 0,
+            unverified_candidate_count: 0,
             startup_reason: None,
             startup_reason_available: true,
         }
@@ -850,13 +1141,18 @@ mod tests {
             }),
             serving: Some(ServingGeneration {
                 generation_id: "c".repeat(64),
+                snapshot_path: directory.join("missing-snapshot.db"),
                 captured_at: captured_at.into(),
                 snapshot_completed_at: captured_at.into(),
                 frontier: frontier(),
                 head_act: Some(0),
                 materialization: StandbyGenerationMaterialization::Snapshot,
+                synced_at: None,
+                reader_deferrals: 0,
+                busy_deferrals: 0,
                 engine: manifest(captured_at, captured_at).engine,
                 consumer: consumer(),
+                consumer_rebound_at: None,
             }),
             status_only: None,
             refresh_configured: true,
@@ -888,6 +1184,34 @@ mod tests {
         assert!(future
             .degraded_reasons
             .contains(&"snapshot_age_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn freshness_and_head_follow_the_last_sync_after_deltas() {
+        let provider = provider("2026-09-02T12:00:00Z");
+        let generation = super::super::InstalledGeneration {
+            id: "c".repeat(64),
+            snapshot_path: provider.serving.as_ref().unwrap().snapshot_path.clone(),
+            manifest: manifest("2026-09-02T12:00:00Z", "2026-09-02T12:00:00Z"),
+        };
+        provider
+            .store
+            .record_synced(&generation, 7, "2026-09-02T13:00:00Z")
+            .unwrap();
+        let status = provider
+            .status_at("2026-09-02T13:04:00Z".parse().unwrap())
+            .await;
+        assert_eq!(status.freshness.state, StandbyFreshnessState::Fresh);
+        assert_eq!(status.freshness.age_seconds, Some(240));
+        let serving = status.serving_generation.unwrap();
+        assert_eq!(serving.head_act, Some(7));
+        assert_eq!(
+            serving.synced_at.as_deref(),
+            Some("2026-09-02T13:00:00.000Z")
+        );
+        assert_eq!(serving.captured_at, "2026-09-02T12:00:00.000Z");
+        // The test serves a path with no database: say so, never guess.
+        assert_eq!(serving.source_history, "unavailable");
     }
 
     #[tokio::test]
@@ -1017,6 +1341,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_full_failure_projects_after_latest_clears_and_legacy_detail_sanitizes() {
+        let provider = provider("2026-09-02T12:00:00Z");
+        let refresh = provider.runtime.replica_root.join("refresh");
+        std::fs::create_dir_all(&refresh).unwrap();
+        // Latest failure cleared while the retained FULL slot still names
+        // its cause. The stored detail is legacy raw text: the projection
+        // must not disclose it.
+        let state = StandbyRefreshState {
+            last_attempt_at: Some("2026-09-02T12:00:01Z".into()),
+            last_attempt_cause: Some(super::super::RefreshCause::Scheduled),
+            last_full_failure_at: Some("2026-09-02T11:00:00Z".into()),
+            last_full_failure_cause: Some(super::super::RefreshCause::Manual),
+            last_full_failure_class: Some(super::super::RefreshFailureClass::Verification),
+            last_full_failure: Some("downloaded snapshot was not admitted".into()),
+            last_full_failure_detail: Some(
+                "standby snapshot conformance failed: row 0: live={\"body\":\"x\"}".into(),
+            ),
+            ..StandbyRefreshState::default()
+        };
+        std::fs::write(
+            refresh.join("state.json"),
+            serde_jcs::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let status = provider
+            .status_at("2026-09-02T12:00:03Z".parse().unwrap())
+            .await;
+        assert_eq!(
+            status.refresh.diagnostics,
+            StandbyRefreshDiagnosticsState::Available
+        );
+        assert_eq!(status.refresh.last_failure_class, None);
+        assert_eq!(
+            status.refresh.last_full_failure_class,
+            Some(super::super::RefreshFailureClass::Verification)
+        );
+        assert_eq!(
+            status.refresh.last_full_failure.as_deref(),
+            Some("standby refresh verification failed")
+        );
+        assert_eq!(
+            status.refresh.last_full_failure_cause,
+            Some(super::super::RefreshCause::Manual)
+        );
+        assert_eq!(
+            status.refresh.last_full_failure_detail.as_deref(),
+            Some("unclassified")
+        );
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("row 0"));
+        assert!(!serialized.contains("live={"));
+    }
+
+    #[tokio::test]
+    async fn too_large_deferral_projects_the_stale_reason_the_deferral_and_next_eligibility() {
+        let provider = provider("2026-09-02T12:00:00Z");
+        let refresh = provider.runtime.replica_root.join("refresh");
+        std::fs::create_dir_all(&refresh).unwrap();
+        let state = StandbyRefreshState {
+            last_attempt_at: Some("2026-09-02T12:00:01Z".into()),
+            last_attempt_cause: Some(super::super::RefreshCause::Scheduled),
+            last_delta_fallback_class: Some(
+                super::super::refresh::DeltaFallbackClass::DeltaTooLarge,
+            ),
+            last_delta_fallback: Some("anything the state file says".into()),
+            last_full_refresh_at: Some("2026-09-02T09:00:00Z".into()),
+            last_deferral: Some("full_refresh_interval".into()),
+            next_full_refresh_eligible_at: Some("2026-09-02T15:00:00Z".into()),
+            ..StandbyRefreshState::default()
+        };
+        std::fs::write(
+            refresh.join("state.json"),
+            serde_jcs::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let status = provider
+            .status_at("2026-09-02T12:00:03Z".parse().unwrap())
+            .await;
+        let refresh = status.refresh;
+        assert_eq!(
+            refresh.last_delta_fallback_class,
+            Some(super::super::refresh::DeltaFallbackClass::DeltaTooLarge)
+        );
+        let message = refresh.last_delta_fallback.unwrap();
+        assert!(message.contains("too large"), "{message}");
+        assert!(
+            !message.contains("installed") && !message.contains("used"),
+            "{message}"
+        );
+        assert_eq!(refresh.last_deferral, Some("full_refresh_interval"));
+        assert_eq!(
+            refresh.last_full_refresh_at.as_deref(),
+            Some("2026-09-02T09:00:00.000Z")
+        );
+        assert_eq!(
+            refresh.next_full_refresh_eligible_at.as_deref(),
+            Some("2026-09-02T15:00:00.000Z")
+        );
+
+        // An unknown deferral token is never echoed, and the eligibility only
+        // projects while that deferral is the reason.
+        let state = StandbyRefreshState {
+            last_deferral: Some("free-form prose".into()),
+            next_full_refresh_eligible_at: Some("2026-09-02T15:00:00Z".into()),
+            ..StandbyRefreshState::default()
+        };
+        std::fs::write(
+            provider
+                .runtime
+                .replica_root
+                .join("refresh")
+                .join("state.json"),
+            serde_jcs::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        let status = provider
+            .status_at("2026-09-02T12:00:03Z".parse().unwrap())
+            .await;
+        assert_eq!(status.refresh.last_deferral, None);
+        assert_eq!(status.refresh.next_full_refresh_eligible_at, None);
+    }
+
+    #[tokio::test]
     async fn refresh_diagnostics_are_reread_and_missing_is_not_reported_as_success() {
         let provider = provider("2026-09-02T12:00:00Z");
         let before = provider
@@ -1031,6 +1478,8 @@ mod tests {
 
         let refresh_dir = provider.runtime.replica_root.join("refresh");
         std::fs::create_dir_all(&refresh_dir).unwrap();
+        let attempt_owner = std::fs::File::create(refresh_dir.join("attempt.lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&attempt_owner).unwrap();
         let state = StandbyRefreshState {
             refresh_active: true,
             last_attempt_at: Some("2026-09-02T12:00:01Z".into()),
@@ -1132,6 +1581,62 @@ mod tests {
         assert!(!serde_json::to_string(&status)
             .unwrap()
             .contains("not-disclosed.db"));
+    }
+
+    /// Deltas that stay blocked for more than ten ticks - by a reader that
+    /// never upgraded, or by a local read that keeps the copy open - are a
+    /// degraded state with a plain next step, in both the bounded context and
+    /// the full status.
+    #[test]
+    fn persistently_blocked_deltas_are_degraded_with_a_next_step() {
+        use super::super::generation_store::DeltaDeferral;
+
+        let now: DateTime<Utc> = "2026-09-02T12:00:30Z".parse().unwrap();
+        let provider = provider("2026-09-02T12:00:00Z");
+        let id = "c".repeat(64);
+        for (cause, reason, action) in [
+            (
+                DeltaDeferral::ReaderNotUpgraded,
+                "reader_not_upgraded",
+                READER_NOT_UPGRADED_ACTION,
+            ),
+            (
+                DeltaDeferral::DatabaseBusy,
+                "database_busy",
+                DATABASE_BUSY_ACTION,
+            ),
+        ] {
+            provider.store.note_deferral(&id, cause, false);
+            for (ticks, degraded) in [(0, false), (10, false), (11, true)] {
+                let have = match cause {
+                    DeltaDeferral::ReaderNotUpgraded => {
+                        provider.store.deferral_counts(&id).reader_not_upgraded
+                    }
+                    DeltaDeferral::DatabaseBusy => {
+                        provider.store.deferral_counts(&id).database_busy
+                    }
+                };
+                for _ in have..ticks {
+                    provider.store.note_deferral(&id, cause, true);
+                }
+                let context = provider.response_context_at(now);
+                let status = build_status(
+                    &provider,
+                    store_status(None, GenerationProvenanceStatus::Available),
+                    RefreshStateObservation::NeverRecorded,
+                    now,
+                );
+                for (reasons, next) in [
+                    (&context.degraded_reasons, context.next_safe_action),
+                    (&status.degraded_reasons, status.next_safe_action),
+                ] {
+                    assert_eq!(reasons.contains(&reason), degraded, "{reason} {ticks}");
+                    assert_eq!(next == Some(action), degraded, "{reason} {ticks}");
+                }
+            }
+            provider.store.note_deferral(&id, cause, false);
+            assert_eq!(provider.store.deferral_counts(&id), Default::default());
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ const MAX_HISTORY = 128;
 const REQUEST_TIMEOUT_MS = 5000;
 const LIFETIME_MS = 30000;
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
-const SOURCE_PATHS = ["src/coedit/registry.rs", "src/coedit/refusal.rs"] as const;
+const SOURCE_PATHS = ["src/coedit/registry.rs", "src/coedit/refusal.rs", "src/coedit/span_map.rs", "src/coedit/text_diff.rs"] as const;
 
 type ObjectValue = Record<string, unknown>;
 type Control =

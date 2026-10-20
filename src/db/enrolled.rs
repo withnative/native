@@ -636,7 +636,9 @@ unsafe extern "C" fn authorize(
         | SQLITE_CREATE_TEMP_VIEW
         | SQLITE_DROP_TEMP_VIEW
         | SQLITE_CREATE_TEMP_INDEX
-        | SQLITE_DROP_TEMP_INDEX => temp,
+        | SQLITE_DROP_TEMP_INDEX
+        // SQLite also authorizes the initial index fill as REINDEX.
+        | SQLITE_REINDEX => temp,
         SQLITE_INSERT if main && *role == Role::Capture => unsafe {
             equals(first, b"read_log_calls")
                 || equals(first, b"read_log_record_ids")
@@ -737,9 +739,22 @@ unsafe extern "C" fn authorize(
         {
             true
         }
+        // TEMP relation staging finishes by tightening this disposable query
+        // connection. Permit only enabling read-only mode, never disabling it.
+        SQLITE_PRAGMA
+            if *role == Role::Ordinary
+                && unsafe {
+                    equals(first, b"query_only")
+                        && (equals(second, b"ON") || equals(second, b"on") || equals(second, b"1"))
+                } =>
+        {
+            true
+        }
         SQLITE_PRAGMA if second.is_null() => unsafe {
             [
                 b"user_version".as_slice(),
+                // Engine classification is a read; the setter remains denied.
+                b"application_id",
                 b"schema_version",
                 b"foreign_keys",
                 b"query_only",
@@ -1346,6 +1361,19 @@ pub(crate) fn admit_body_arguments(arguments: &serde_json::Value) -> Result<()> 
     let object = arguments
         .as_object()
         .ok_or_else(|| Error::engine("update_record arguments must be an object"))?;
+    // Keyed replay (task 8bef361) is not wired through enrolled custody: the
+    // document job has its own commit lane, and a replay on it is unproven.
+    // Refuse a real key by name rather than with the generic grammar error. A
+    // blank or null key is no key, as it is on every other path, and passes.
+    if object.get("idempotency_key").is_some_and(|key| match key {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(key) => !key.trim().is_empty(),
+        _ => true,
+    }) {
+        return Err(Error::engine(
+            "enrolled update_record does not accept idempotency_key yet; retry without a key",
+        ));
+    }
     let allowed = [
         "id",
         "record_id",
@@ -1359,6 +1387,8 @@ pub(crate) fn admit_body_arguments(arguments: &serde_json::Value) -> Result<()> 
         "if_unmodified_since",
         "response_mode",
         "format",
+        // Only a blank or null key reaches the grammar check: it means no key.
+        "idempotency_key",
         "run_key",
         "parent_key",
         "agent_key",
@@ -1406,6 +1436,36 @@ pub(crate) async fn phase(_phase: Phase) {
         }
     }
 }
+#[cfg(test)]
+mod admission_key_tests {
+    use super::admit_body_arguments;
+    use serde_json::json;
+
+    #[test]
+    fn a_keyed_body_update_is_refused_by_name_and_a_blank_or_absent_key_admitted() {
+        let unkeyed = json!({"id": "r", "body_append": "x", "reason": "why"});
+        admit_body_arguments(&unkeyed).unwrap();
+        let mut keyed = unkeyed.clone();
+        keyed["idempotency_key"] = json!("k");
+        // appHost's body-save fallback (task 8bef361 Phase 2) reads this off
+        // the plain HTTP tool route, which sends an `Error::Engine` as 400
+        // `{"error": <message>}`: pin the variant and the exact text.
+        let error = admit_body_arguments(&keyed).unwrap_err();
+        assert!(matches!(error, crate::error::Error::Engine(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "enrolled update_record does not accept idempotency_key yet; retry without a key"
+        );
+        // A blank or null key is no key, as on every other path.
+        for no_key in [json!(null), json!(""), json!("   ")] {
+            keyed["idempotency_key"] = no_key;
+            admit_body_arguments(&keyed).unwrap();
+        }
+        keyed["idempotency_key"] = json!(7);
+        admit_body_arguments(&keyed).unwrap_err();
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct TestGate {
     pub(crate) phase: Phase,

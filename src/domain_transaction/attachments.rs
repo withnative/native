@@ -623,7 +623,7 @@ async fn blob_meta<E: DomainStatementExecutor>(
         .transpose()
 }
 
-fn is_text_mime(mime: &str) -> bool {
+pub(crate) fn is_text_mime(mime: &str) -> bool {
     let essence = mime.split(';').next().unwrap_or("").trim().to_lowercase();
     essence.starts_with("text/")
         || essence.ends_with("+json")

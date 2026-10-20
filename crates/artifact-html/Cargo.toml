@@ -29,6 +29,7 @@ axum = { version = "0.8.4", default-features = false, features = [
 ] }
 base64 = "0.23.0"
 hex = "0.4"
+hmac = "0.12"
 percent-encoding = "2"
 rand = "0.9"
 regex = "1"
@@ -50,6 +51,7 @@ swc_ecma_transforms_base = "=16.0.0"
 swc_ecma_visit = "=12.0.0"
 sha2 = "0.10"
 url = "2"
+uuid = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

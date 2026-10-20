@@ -54,7 +54,7 @@ function receiveRefusal(link: FixtureLink): Extract<ServerMsg, { op: "session.re
 describe("actual Rust registry ↔ SDK (opt-in, ephemeral)", () => {
   it("consumes a Rust seed and exchanges exact astral/CJK/combining/CRLF insert/delete bytes", async () => {
     const a = await open(), b = await open();
-    expect(Object.keys(home().sourceHashes).sort()).toEqual(["src/coedit/refusal.rs", "src/coedit/registry.rs"]);
+    expect(Object.keys(home().sourceHashes).sort()).toEqual(["src/coedit/refusal.rs", "src/coedit/registry.rs", "src/coedit/span_map.rs", "src/coedit/text_diff.rs"]);
     expect(a.link.opened.session).toBe(b.link.opened.session);
     expect(a.link.opened.peer).not.toBe(b.link.opened.peer);
     await converged("A😀漢e\u0301\r\nZ", a, b);

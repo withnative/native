@@ -26,6 +26,7 @@ use crate::authorization::{
 };
 use crate::db::{create_database, open_database, Db};
 use crate::events::{FacetSetPayload, LinkAddedPayload};
+use crate::mcp::counter_fence::{is_counter_key, is_counter_value};
 use crate::meta::schema_config::{write_user_schema_config, SchemaConfigOptions};
 use crate::query::sql::query_sql;
 use crate::query::{sql::workspace_visible_set, QueryPrincipal};
@@ -1282,14 +1283,16 @@ pub(crate) mod prefix_gate {
 /// workspace-wide counter-bearing *metadata* field appears. `context` names
 /// the response under test; failures carry the JSON path (`$.a[0].act`).
 ///
-/// Banned metadata: keys `act`, `head_act`, `frontier`; any key equal to `seq`
-/// or ending in `_seq` (covers `as_of_seq`, `content_head_seq`,
-/// `previous_seq`, `local_seq`, `event_seq`, `content_seq` in any position,
-/// and the dropped `source_event_seq` / `meta_event_seq` /
-/// `declaration_event_seq` / `creation_event_seq` columns of §3.2); any key
-/// starting `authorization_revision`; key `acts` with a non-null value
-/// (`acts: null` is the member replacement and is allowed); any string
-/// value matching `^rec:\d+$` or `^obs:\d+$`. Allowed and exercised by the
+/// Banned metadata is [`crate::mcp::counter_fence`]'s list, shared with the
+/// member-copy scrub and the non-owner guard so the three cannot drift: keys
+/// `act`, `acts` (non-null), `head_act`, `frontier`, `causal_frontier`, `seq`,
+/// `heads`, `content_head`, `authorization_epoch`; any key ending in `_seq`
+/// (covers `as_of_seq`, `content_head_seq`, `previous_seq`, `local_seq`,
+/// `event_seq`, `content_seq`, `resolved_content_seq`, and the dropped
+/// `source_event_seq` / `meta_event_seq` / `declaration_event_seq` /
+/// `creation_event_seq` columns of §3.2); any key starting
+/// `authorization_revision`; and counter-shaped string values `rec:<n>`,
+/// `obs:<n>`, `canvas:<n>` or `schema-state-v1:`. Allowed and exercised by the
 /// clean test: `acts: null`, scoped `ordering.ordinal`,
 /// `caller_write_ordinal`, and opaque `revision_digest` strings.
 ///
@@ -1320,17 +1323,6 @@ const USER_PAYLOAD_KEYS: &[&str] = &[
 ];
 
 pub(crate) fn assert_no_counter_fields(value: &Value, context: &str) {
-    const BANNED_KEYS: &[&str] = &["act", "head_act", "frontier"];
-
-    fn is_counter_seq_key(key: &str) -> bool {
-        key == "seq" || key.ends_with("_seq")
-    }
-
-    fn is_version_token(s: &str) -> bool {
-        let rest = s.strip_prefix("rec:").or_else(|| s.strip_prefix("obs:"));
-        rest.is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-    }
-
     fn walk(value: &Value, path: &str, context: &str) {
         match value {
             Value::Object(map) => {
@@ -1340,11 +1332,10 @@ pub(crate) fn assert_no_counter_fields(value: &Value, context: &str) {
                         // Authored payload: shipped verbatim, not a counter.
                         continue;
                     }
-                    let banned = BANNED_KEYS.contains(&key.as_str())
-                        || is_counter_seq_key(key)
-                        || key.starts_with("authorization_revision")
-                        || (key == "acts" && !child.is_null());
-                    assert!(!banned, "{context}: counter-bearing field at {child_path}");
+                    assert!(
+                        !is_counter_key(key, child),
+                        "{context}: counter-bearing field at {child_path}"
+                    );
                     walk(child, &child_path, context);
                 }
             }
@@ -1355,7 +1346,7 @@ pub(crate) fn assert_no_counter_fields(value: &Value, context: &str) {
             }
             Value::String(s) => {
                 assert!(
-                    !is_version_token(s),
+                    !is_counter_value(s),
                     "{context}: counter-bearing version token at {path}: {s}"
                 );
             }
@@ -1389,6 +1380,45 @@ mod counter_scan_tests {
     #[should_panic(expected = "$.frontier")]
     fn rejects_frontier() {
         assert_no_counter_fields(&json!({"frontier": {"a": 1}}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.causal_frontier")]
+    fn rejects_causal_frontier() {
+        assert_no_counter_fields(&json!({"causal_frontier": ["a"]}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.heads")]
+    fn rejects_heads() {
+        assert_no_counter_fields(&json!({"heads": {"a": 1}}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.content_head")]
+    fn rejects_content_head() {
+        assert_no_counter_fields(&json!({"content_head": 4}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.authorization_epoch")]
+    fn rejects_authorization_epoch() {
+        assert_no_counter_fields(&json!({"authorization_epoch": 3}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.version")]
+    fn rejects_canvas_token() {
+        assert_no_counter_fields(&json!({"version": "canvas:7"}), "t");
+    }
+
+    #[test]
+    #[should_panic(expected = "$.schema_state_revision")]
+    fn rejects_schema_state_token() {
+        assert_no_counter_fields(
+            &json!({"schema_state_revision": "schema-state-v1:meta:1:content:2"}),
+            "t",
+        );
     }
 
     #[test]

@@ -571,6 +571,8 @@ pub enum SubscriptionLifecycle {
 /// teardown takes (grabbed by the caller holding the registry lock).
 #[derive(Clone, Debug)]
 pub struct SubscriptionRecord {
+    #[cfg(feature = "v2-kernel-probe")]
+    pub app_data_gate: Option<crate::realtime::v2::AppDataGate>,
     pub binding: SurfaceBinding,
     pub need: String,
     pub params_digest: String,
@@ -839,6 +841,8 @@ impl NeedRegistry {
         entry.subscriptions.insert(
             id.clone(),
             SubscriptionRecord {
+                #[cfg(feature = "v2-kernel-probe")]
+                app_data_gate: None,
                 binding,
                 need: need.to_string(),
                 params_digest: params_digest.to_string(),
@@ -1189,6 +1193,52 @@ impl NeedRegistry {
         id: &SubscriptionId,
     ) -> Option<SubscriptionRecord> {
         self.record(token, id).cloned()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn pin_app_data_gate(
+        &mut self,
+        token: &ConnectionToken,
+        id: &SubscriptionId,
+        request: &crate::realtime::v2::AppDataRequest,
+        gate: crate::realtime::v2::AppDataGate,
+    ) -> bool {
+        let Some(entry) = self
+            .connections
+            .iter_mut()
+            .find_map(|(candidate, entry)| candidate.equals_ct(token).then_some(entry))
+        else {
+            return false;
+        };
+        let Some(record) = entry.subscriptions.get_mut(id) else {
+            return false;
+        };
+        if record.app_data_gate.is_some()
+            || !entry.access_valid
+            || record.binding.package != request.package
+            || record.binding.install_event_id != request.expected_install_event_id
+        {
+            return false;
+        }
+        record.app_data_gate = Some(gate);
+        true
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn app_data_subscription_ids(&self, token: &ConnectionToken) -> Vec<SubscriptionId> {
+        self.find(token)
+            .map(|entry| {
+                entry
+                    .subscriptions
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.app_data_gate.is_some()
+                            || record.lifecycle == SubscriptionLifecycle::Active
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Associate a completed governed keyed read with the caller's active

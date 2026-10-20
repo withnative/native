@@ -5,6 +5,29 @@
 //! dependency-failure propagation. Each admitted item is dispatched through
 //! the ordinary `create_record` handler, so its authorization, validation,
 //! provenance, projection and transaction boundaries remain authoritative.
+//!
+//! # Keyed calls (task 8bef361, slice A2)
+//!
+//! One `idempotency_key` covers the whole call, on the `batch_write` model,
+//! but the items here commit separately, so each item's attestation carries
+//! its own command identity, `sha256({create_many_key, item})`, under the
+//! whole call's action digest. Each item's `create_record` transaction looks
+//! that identity up after the item's own authorization and, on a hit,
+//! replays the record the first call created instead of creating another.
+//!
+//! - **Ids.** A dependant is bound to the id its dependency actually has,
+//!   not to the one this attempt reserved, so a retry links, homes and
+//!   mentions the records the first call minted.
+//! - **Partial results are never replayed as complete.** Only created items
+//!   leave a row. A retry replays those and attempts the rest again, so the
+//!   key reports `ok: true` only once every item exists, each exactly once.
+//!   There is no whole-call anchor: an item that failed wrote nothing, and
+//!   its error describes a moment the retry cannot pin.
+//! - **Reuse with different records** is refused up front: every item row
+//!   this key left is compared before any item runs. The comparison reads
+//!   only the caller's own command rows, and discloses no record. A key
+//!   whose first call created nothing left no row, so reusing it is a first
+//!   call: nothing was ever written under it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +53,20 @@ struct CreateManyArgs {
     records: Vec<Map<String, Value>>,
     #[serde(default)]
     response_mode: ResponseMode,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// A keyed call: its key and the exact dispatched arguments, which every
+/// item's attestation and lookup compare as the whole call's action.
+struct KeyedCall {
+    key: String,
+    arguments: Value,
+}
+
+/// One item's command identity: the call's key bound to the item index.
+fn item_command_identity(key: &str, index: usize) -> String {
+    crate::provenance::digest_json(&json!({"create_many_key": key, "item": index}))
 }
 
 #[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
@@ -58,12 +95,13 @@ enum ItemState {
 pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::CreateMany,
-        "Create up to 25 non-Message records as one dependency graph. Local refs support parent_ref, links[].target_ref, and [[ref]] body mentions. The graph is cycle-checked before writes; items then use create_record semantics in stable topological order. Failures block only dependants, and receipts preserve input positions with null ids for failures. Use response_mode=verbose for created record shapes.",
+        "Create up to 25 non-Message records as one dependency graph. Local refs support parent_ref, links[].target_ref, and [[ref]] body mentions. The graph is cycle-checked before writes; items then use create_record semantics in stable topological order. Failures block only dependants, and receipts preserve input positions with null ids for failures. Use response_mode=verbose for created record shapes. With idempotency_key, retry with identical arguments: created items replay, failed ones are tried again; changed arguments are refused.",
         json!({
             "type": "object",
             "properties": {
                 "reason": { "type": "string", "minLength": 1, "description": REASON_DESCRIPTION },
                 "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" },
+                "idempotency_key": super::keyed_replay::idempotency_key_schema(),
                 "records": {
                     "type": "array",
                     "minItems": 1,
@@ -136,6 +174,9 @@ pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
 }
 
 async fn create_many(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The digests run over the raw arguments: ids this attempt reserves must
+    // never enter the conflict detector.
+    let provenance_arguments = arguments.clone();
     let args: CreateManyArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
     if args.records.is_empty() {
@@ -149,9 +190,79 @@ async fn create_many(db: Db, caller: Caller, arguments: Value) -> Result<Value> 
         )));
     }
 
+    let key = super::keyed_replay::idempotency_key(TOOL, args.idempotency_key.as_deref())?;
     let prepared = preflight(args.records, &args.reason)?;
     let order = topological_order(&prepared)?;
-    execute(db, caller, prepared, order, args.response_mode).await
+    let keyed = match key {
+        Some(key) => {
+            refuse_reused_key(&db, &caller, &key, &provenance_arguments).await?;
+            Some(KeyedCall {
+                key,
+                arguments: provenance_arguments,
+            })
+        }
+        None => None,
+    };
+    execute(
+        db,
+        caller,
+        prepared,
+        order,
+        args.response_mode,
+        keyed.as_ref(),
+    )
+    .await
+}
+
+/// Refuse a key this caller already used with different records or under a
+/// different intent, before any item runs. An item can only detect reuse at
+/// its own index, so without this an index the first call failed to create
+/// would be created afresh from the new records under the old key.
+async fn refuse_reused_key(db: &Db, caller: &Caller, key: &str, arguments: &Value) -> Result<()> {
+    let mut tx = db.pool().begin().await?;
+    for index in 0..MAX_CREATE_MANY {
+        crate::provenance::lookup_authorized_command_identity_in(
+            &mut tx,
+            caller.credential(),
+            TOOL,
+            &item_command_identity(key, index),
+            arguments,
+            caller.intent(),
+        )
+        .await?;
+    }
+    tx.rollback().await?;
+    Ok(())
+}
+
+/// Bind a dependant to the ids its dependencies actually have. They differ
+/// from the ids this attempt reserved only when a dependency replayed a
+/// record an earlier attempt with the same key created.
+fn rebind_dependencies(arguments: &mut Value, rebound: &[(&str, &str)]) {
+    if rebound.is_empty() {
+        return;
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    for (reserved, actual) in rebound {
+        if object.get("home_id").and_then(Value::as_str) == Some(reserved) {
+            object.insert("home_id".into(), json!(actual));
+        }
+        for link in object
+            .get_mut("links")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if link.get("target_id").and_then(Value::as_str) == Some(reserved) {
+                link["target_id"] = json!(actual);
+            }
+        }
+        if let Some(Value::String(body)) = object.get_mut("body") {
+            *body = body.replace(&format!("[[{reserved}]]"), &format!("[[{actual}]]"));
+        }
+    }
 }
 
 fn preflight(records: Vec<Map<String, Value>>, reason: &str) -> Result<Vec<PreparedRecord>> {
@@ -164,6 +275,17 @@ fn preflight(records: Vec<Map<String, Value>>, reason: &str) -> Result<Vec<Prepa
     {
         return Err(Error::engine(format!(
             "{TOOL}: records[{index}].body_encoding is not supported; create_many bodies are plain UTF-8 text — use create_record for an encoded body"
+        )));
+    }
+    // `access_policy` belongs to singular create_record only: it is neither
+    // advertised nor honoured here, so refuse it rather than let the singular
+    // dispatch below install a privacy boundary this tool never offered.
+    if let Some(index) = records
+        .iter()
+        .position(|record| record.contains_key("access_policy"))
+    {
+        return Err(Error::engine(format!(
+            "{TOOL}: records[{index}].access_policy is not supported; use create_record for an atomic account-only policy"
         )));
     }
     let mut ref_indexes = BTreeMap::new();
@@ -412,6 +534,7 @@ async fn execute(
     records: Vec<PreparedRecord>,
     order: Vec<usize>,
     response_mode: ResponseMode,
+    keyed: Option<&KeyedCall>,
 ) -> Result<Value> {
     let mut states = vec![ItemState::Pending; records.len()];
     let mut ids = vec![Value::Null; records.len()];
@@ -471,17 +594,42 @@ async fn execute(
             continue;
         }
 
+        let mut arguments = record.arguments.clone();
+        let rebound = record
+            .dependencies
+            .iter()
+            .filter_map(|dependency| {
+                let reserved = records[*dependency].arguments.get("id")?.as_str()?;
+                let actual = ids[*dependency].as_str()?;
+                (reserved != actual).then_some((reserved, actual))
+            })
+            .collect::<Vec<_>>();
+        rebind_dependencies(&mut arguments, &rebound);
+        let materialized_body = arguments
+            .get("body")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| record.materialized_body.clone());
+
         // create_many owns its own response_mode contract. It needs the full
         // singular shape to preserve its existing verbose item results, even
         // though public create_record now defaults to a compact receipt.
-        match lifecycle::create_record_verbose_excluding(
-            db.clone(),
-            caller.clone(),
-            record.arguments.clone(),
-            &batch_ids,
-        )
-        .await
-        {
+        let outcome = match keyed {
+            None => {
+                lifecycle::create_record_verbose_excluding(
+                    db.clone(),
+                    caller.clone(),
+                    arguments,
+                    &batch_ids,
+                    None,
+                )
+                .await
+            }
+            Some(keyed) => {
+                create_keyed_item(&db, &caller, arguments, keyed, index, response_mode).await
+            }
+        };
+        match outcome {
             Ok(created) => {
                 states[index] = ItemState::Succeeded;
                 let id = created
@@ -493,7 +641,7 @@ async fn execute(
                 if let Some(act) = created.get("act").and_then(Value::as_i64) {
                     acts.push(json!({ "index": index, "id": id, "act": act }));
                 }
-                if let Some(body) = &record.materialized_body {
+                if let Some(body) = &materialized_body {
                     if let Some(digest) = created.get("body_digest").and_then(Value::as_str) {
                         body_digests.push(json!({
                             "index": index,
@@ -529,6 +677,23 @@ async fn execute(
                     }));
                 }
             }
+            // An item that committed but whose receipt hit a replay bound is
+            // not a failed item: reporting `create_failed` would read as a
+            // refusal. Fail the call itself with the retryable error, stated
+            // as partial: the items that succeeded before it are confirmed, but the
+            // items after it were never reached and may not exist, so the
+            // error must not claim the whole call applied. Every item already
+            // created or replayed keeps its attestation, so a retry with the
+            // same key resumes and creates each remaining item exactly once.
+            Err(error) if error.is_replay_bounded() => {
+                // Confirmed committed: every item that succeeded so far, and
+                // this one, which committed and only missed its receipt.
+                let confirmed = 1 + states
+                    .iter()
+                    .filter(|state| **state == ItemState::Succeeded)
+                    .count();
+                return Err(error.into_partial_replay(confirmed, records.len()));
+            }
             Err(error) => {
                 states[index] = ItemState::Failed;
                 errors.push(item_error(record, "create_failed", error.to_string(), None));
@@ -561,6 +726,47 @@ async fn execute(
         object.insert("acts".into(), Value::Array(acts));
     }
     Ok(result)
+}
+
+/// Create, or replay, one item of a keyed call under the item's own command
+/// identity. The identity rides on a dispatch scoped to this item, so the
+/// item's attestation carries it; the item's `create_record` transaction looks
+/// it up after its own authorization. A unique violation on the authority
+/// index means a concurrent call with this key created the item first, and
+/// the second attempt replays it.
+async fn create_keyed_item(
+    db: &Db,
+    caller: &Caller,
+    arguments: Value,
+    keyed: &KeyedCall,
+    index: usize,
+    response_mode: ResponseMode,
+) -> Result<Value> {
+    let identity = item_command_identity(&keyed.key, index);
+    let dispatch = crate::provenance::current_dispatch()
+        .map(|dispatch| dispatch.with_command_identity(Some(identity.clone())));
+    super::keyed_replay::with_race_replay(|| {
+        let create = lifecycle::create_record_verbose_excluding(
+            db.clone(),
+            caller.clone(),
+            arguments.clone(),
+            &[],
+            Some(lifecycle::KeyedCreateItem {
+                operation: TOOL,
+                command_identity_digest: identity.clone(),
+                action_arguments: &keyed.arguments,
+                receipt_only: response_mode == ResponseMode::Summary,
+            }),
+        );
+        let dispatch = dispatch.clone();
+        async move {
+            match dispatch {
+                Some(dispatch) => dispatch.scope(create).await,
+                None => create.await,
+            }
+        }
+    })
+    .await
 }
 
 fn item_error(

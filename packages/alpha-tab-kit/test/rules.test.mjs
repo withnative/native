@@ -152,3 +152,51 @@ test("the fake host answers artifact.render.v1 from the render fixture", async (
     await host.close();
   }
 });
+
+test("records.body.current.v1 params are bounded as the engine bounds them", () => {
+  for (const params of [{ record_id: "r1" }, { record_id: " r1 " }, { record_id: "r1", include_body: false }, { record_id: "r1", include_body: true }]) {
+    assert.equal(hostNeedRefusal("records.body.current.v1", params, LIMITS), null, JSON.stringify(params));
+  }
+  const refused = [
+    {},
+    { record_id: "" },
+    { record_id: "   " },
+    { record_id: 7 },
+    { record_id: "r".repeat(LIMITS.reads.record_id_max_chars + 1) },
+    { record_id: "r1", include_body: "yes" },
+    { record_id: "r1", include_body: null },
+    { record_id: "r1", cursor: "c" },
+    ["r1"],
+  ];
+  for (const params of refused) assert.equal(hostNeedRefusal("records.body.current.v1", params, LIMITS), "invalid_params", JSON.stringify(params));
+});
+
+test("the fake host answers records.body.current.v1 from the bodyCurrent fixture, alone or batched", async () => {
+  const found = { status: "found", record_id: "r1", body_digest: "b".repeat(64), body_bytes: 5, body: "Hello" };
+  const host = await startFakeHost({
+    descriptor: { package: "agent.docs", version: "0.1.0", declaration: { needs: ["records.body.current.v1"], effects: [] } },
+    html: "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Docs</title></head><body></body></html>",
+    fixtures: {
+      bodyCurrent: ({ record_id, include_body }) =>
+        record_id === "r1"
+          ? include_body === false ? { ...found, body: null, body_omitted: "not_requested" } : found
+          : { status: "not_found", record_id },
+    },
+    latencyMs: 0,
+  });
+  try {
+    assert.deepEqual(host.plan.onRequestHost, ["records.body.current.v1"]);
+    const read = async (body) => (await fetch(`${host.origin}/__host/read`, { method: "POST", body: JSON.stringify(body) })).json();
+    assert.deepEqual(await read({ need: "records.body.current.v1", params: { record_id: "r1" } }), { result: found });
+    assert.deepEqual(await read({ need: "records.body.current.v1", params: { record_id: "r1", include_body: "no" } }), { error: "invalid_params" });
+    assert.deepEqual(await read({ reads: [
+      { need: "records.body.current.v1", params: { record_id: "r1", include_body: false } },
+      { need: "records.body.current.v1", params: { record_id: "r2" } },
+    ] }), { results: [
+      { need: "records.body.current.v1", result: { ...found, body: null, body_omitted: "not_requested" } },
+      { need: "records.body.current.v1", result: { status: "not_found", record_id: "r2" } },
+    ] });
+  } finally {
+    await host.close();
+  }
+});

@@ -29,14 +29,15 @@ use super::{
     alpha_tab_bundle_digest, alpha_tab_declaration_digest, alpha_tab_digest,
     alpha_tab_sample_input, parse_sql_need_entry, require_declaration, require_package,
     require_reason, require_version, ALPHA_TAB_DIGEST_VERSION, ARTIFACT_RENDER_NEED,
-    ARTIFACT_RENDER_RESULT_MAX_CHARS, ATTENTION_QUERY_NEED, CANVAS_ID_MAX_CHARS,
-    CANVAS_SCENE_LIMIT_MAX, CANVAS_SCENE_NEED, CANVAS_SCENE_PAGE_MAX_CHARS,
-    RECORDS_RESOLVE_REFERENCE_NEED, RECORDS_SEARCH_NEED, RECORD_CHANGES_LIMIT_MAX,
-    RECORD_CHANGES_NEED, RECORD_CHANGES_PAGE_MAX_CHARS, RECORD_ID_MAX_CHARS, REFERENCE_MAX_CHARS,
-    SEARCH_LIMIT_MAX, SEARCH_QUERY_MAX_CHARS, SQL_NEED_RESULT_FIELDS,
-    SQL_PARAM_TEXT_DEFAULT_MAX_LEN, SQL_PARAM_TEXT_HARD_CAP, SQL_SNAPSHOT_KEY_MAX_CHARS,
-    SQL_SNAPSHOT_LABEL_MAX_CHARS, SQL_SNAPSHOT_MAX_NEEDS, SQL_SNAPSHOT_MAX_PARAMS,
-    SQL_SNAPSHOT_NEED, SQL_SNAPSHOT_ROW_CAP, SQL_SNAPSHOT_SQL_MAX_BYTES,
+    ARTIFACT_RENDER_RESULT_MAX_CHARS, ATTENTION_QUERY_NEED, BODY_CURRENT_MAX_BODY_BYTES,
+    BODY_CURRENT_RESULT_MAX_CHARS, CANVAS_ID_MAX_CHARS, CANVAS_SCENE_LIMIT_MAX, CANVAS_SCENE_NEED,
+    CANVAS_SCENE_PAGE_MAX_CHARS, RECORDS_BODY_CURRENT_NEED, RECORDS_RESOLVE_REFERENCE_NEED,
+    RECORDS_SEARCH_NEED, RECORD_CHANGES_LIMIT_MAX, RECORD_CHANGES_NEED,
+    RECORD_CHANGES_PAGE_MAX_CHARS, RECORD_ID_MAX_CHARS, REFERENCE_MAX_CHARS, SEARCH_LIMIT_MAX,
+    SEARCH_QUERY_MAX_CHARS, SQL_NEED_RESULT_FIELDS, SQL_PARAM_TEXT_DEFAULT_MAX_LEN,
+    SQL_PARAM_TEXT_HARD_CAP, SQL_SNAPSHOT_KEY_MAX_CHARS, SQL_SNAPSHOT_LABEL_MAX_CHARS,
+    SQL_SNAPSHOT_MAX_NEEDS, SQL_SNAPSHOT_MAX_PARAMS, SQL_SNAPSHOT_NEED, SQL_SNAPSHOT_ROW_CAP,
+    SQL_SNAPSHOT_SQL_MAX_BYTES,
 };
 use crate::artifact_html as html;
 use crate::query::sql_contract as contract;
@@ -88,6 +89,8 @@ fn names(path: &str) -> BTreeSet<String> {
 const ASSERTED: &[&str] = &[
     "digest.version",
     "install.runtime",
+    "install.package_facet_key",
+    "install.package_facet_value",
     "install.body_encodings",
     "install.package_max_bytes",
     "install.package_label_max_bytes",
@@ -135,6 +138,8 @@ const ASSERTED: &[&str] = &[
     "reads.record_changes_field_max_chars",
     "reads.record_changes_reason_max_chars",
     "reads.artifact_render_result_max_chars",
+    "reads.body_current_max_body_bytes",
+    "reads.body_current_result_max_chars",
     "reads.truncation_hint",
     "sql.max_sql_bytes",
     "sql.max_placeholder",
@@ -149,6 +154,7 @@ const ASSERTED: &[&str] = &[
     "sql.forbidden_words",
     "sql.clock_keywords",
     "html.body_max_bytes",
+    "html.package_body_max_bytes",
     "html.data_asset_max_bytes",
     "html.data_assets_total_max_bytes",
     "html.dom_node_max",
@@ -167,6 +173,35 @@ const ASSERTED: &[&str] = &[
     "bridge.read_params_max_chars",
     "bridge.answer_max_chars",
     "bridge.view_state_max_chars",
+    "bridge.pending_call_cap",
+    "bridge.call_args_max_chars",
+    "bridge.call_answer_max_chars",
+    "bridge.call_operation_max_chars",
+    "bridge.pending_session_cap",
+    "bridge.session_frame_max_chars",
+    "bridge.session_record_id_max_chars",
+    "bridge.session_queue_cap",
+    "bridge.session_queue_max_bytes",
+    "bridge.pending_query_cap",
+    "bridge.query_max_chars",
+    "bridge.query_result_max_chars",
+    "bridge.pending_subscription_cap",
+    "bridge.pending_ask_cap",
+    "bridge.ask_agent_id_max_chars",
+    "bridge.ask_comment_id_max_chars",
+    "bridge.agent_list_max_chars",
+    "bridge.ask_result_max_chars",
+    "bridge.agent_status_max_chars",
+    "bridge.agent_sessions_follow_cap",
+    "bridge.agent_sessions_inflight_cap",
+    "bridge.agent_sessions_send_max_bytes",
+    "bridge.agent_sessions_result_max_chars",
+    "bridge.agent_sessions_page_max_items",
+    "bridge.agent_sessions_hosts_max_items",
+    "bridge.agent_sessions_timeline_max_items",
+    "bridge.agent_sessions_id_max_chars",
+    "bridge.agent_sessions_cursor_max_chars",
+    "bridge.agent_sessions_result_timeout_ms",
     "bridge.csp",
     "sample_input",
 ];
@@ -373,7 +408,8 @@ fn install_and_declaration_limits_match_the_engine() {
             RECORDS_RESOLVE_REFERENCE_NEED,
             CANVAS_SCENE_NEED,
             RECORD_CHANGES_NEED,
-            ARTIFACT_RENDER_NEED
+            ARTIFACT_RENDER_NEED,
+            RECORDS_BODY_CURRENT_NEED
         ]),
         "the host need names",
     );
@@ -476,6 +512,16 @@ fn install_and_declaration_limits_match_the_engine() {
         "reads.artifact_render_result_max_chars",
         json!(ARTIFACT_RENDER_RESULT_MAX_CHARS),
         "ARTIFACT_RENDER_RESULT_MAX_CHARS",
+    );
+    same(
+        "reads.body_current_max_body_bytes",
+        json!(BODY_CURRENT_MAX_BODY_BYTES),
+        "BODY_CURRENT_MAX_BODY_BYTES",
+    );
+    same(
+        "reads.body_current_result_max_chars",
+        json!(BODY_CURRENT_RESULT_MAX_CHARS),
+        "BODY_CURRENT_RESULT_MAX_CHARS",
     );
     same(
         "reads.truncation_hint",
@@ -647,6 +693,27 @@ fn rule_of(source: &str) -> Option<String> {
 fn html_policy_matches_the_engine() {
     same("html.body_max_bytes", json!(html::BODY_LIMIT), "BODY_LIMIT");
     same(
+        "html.package_body_max_bytes",
+        json!(html::PACKAGE_BODY_LIMIT),
+        "PACKAGE_BODY_LIMIT",
+    );
+    same(
+        "install.package_facet_key",
+        json!(html::PACKAGE_FACET_KEY),
+        "PACKAGE_FACET_KEY",
+    );
+    same(
+        "install.package_facet_value",
+        json!(html::PACKAGE_FACET_VALUE),
+        "PACKAGE_FACET_VALUE",
+    );
+    // Behaviour, not just the numbers: a body between the two limits is
+    // refused as an ordinary document and accepted as a package.
+    let big = document(&format!("<!--{}-->", "a".repeat(html::BODY_LIMIT)));
+    assert!(big.len() > html::BODY_LIMIT && big.len() < html::PACKAGE_BODY_LIMIT);
+    assert_eq!(rule_of(&big).as_deref(), Some("html_source_too_large"));
+    assert!(html::validate_with_limit(&big, html::PACKAGE_BODY_LIMIT).is_ok());
+    same(
         "html.data_asset_max_bytes",
         json!(html::DATA_ASSET_EACH_LIMIT),
         "DATA_ASSET_EACH_LIMIT",
@@ -756,6 +823,35 @@ fn vendored_bridge_is_the_engine_bootstrap() {
         "read_params_max_chars",
         "answer_max_chars",
         "view_state_max_chars",
+        "pending_call_cap",
+        "call_args_max_chars",
+        "call_answer_max_chars",
+        "call_operation_max_chars",
+        "pending_session_cap",
+        "session_frame_max_chars",
+        "session_record_id_max_chars",
+        "session_queue_cap",
+        "session_queue_max_bytes",
+        "pending_query_cap",
+        "query_max_chars",
+        "query_result_max_chars",
+        "pending_subscription_cap",
+        "pending_ask_cap",
+        "ask_agent_id_max_chars",
+        "ask_comment_id_max_chars",
+        "agent_list_max_chars",
+        "ask_result_max_chars",
+        "agent_status_max_chars",
+        "agent_sessions_follow_cap",
+        "agent_sessions_inflight_cap",
+        "agent_sessions_send_max_bytes",
+        "agent_sessions_result_max_chars",
+        "agent_sessions_page_max_items",
+        "agent_sessions_hosts_max_items",
+        "agent_sessions_timeline_max_items",
+        "agent_sessions_id_max_chars",
+        "agent_sessions_cursor_max_chars",
+        "agent_sessions_result_timeout_ms",
     ] {
         let literal = limits["bridge"][leaf]["bootstrap_literal"]
             .as_str()

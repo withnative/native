@@ -12,7 +12,7 @@ pub(crate) enum StandbyTableKind {
     SequencedCanonicalLog,
     /// Canonical history stamped by act but positioned by a compound key.
     NonSequencedActStampedCanonicalLog,
-    /// Immutable canonical rows carried by joining from delta log rows.
+    /// Immutable authority rows carried by joining from delta log rows.
     ImmutableCanonicalCompanion,
     /// Small canonical state requiring a table-specific carry, comparison, or
     /// seed-equality rule in the delta protocol.
@@ -52,6 +52,7 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("provenance_attestation_validity_events", ActLog),
     ("awareness_command_intents", ActLog),
     ("external_observations", ActLog),
+    ("sql_write_receipts", ActLog),
     // Immutable canonical companions selected from delta-log identities.
     ("content_event_causal_frontier", Companion),
     ("content_event_sources", Companion),
@@ -60,8 +61,14 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("replicated_message_references", Companion),
     ("provenance_interaction_receipts", Companion),
     ("provenance_action_attestations", Companion),
+    // Same-database authenticated standby copies preserve issuance authority,
+    // like FULL snapshots. This is deliberately NOT portable interchange.
+    ("provenance_local_attestation_authority", Companion),
     ("provenance_action_events", Companion),
     ("provenance_action_outputs", Companion),
+    // Host-asserted app attribution (v83), keyed by the attestation it
+    // annotates and carried with it.
+    ("provenance_action_app_attributions", Companion),
     ("relationship_federation_events", Companion),
     ("relationship_foreign_action_attestations", Companion),
     ("relationship_foreign_action_outputs", Companion),
@@ -92,6 +99,8 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("message_audiences", Fold),
     ("message_origin_state", Fold),
     ("message_origin_principals", Fold),
+    ("personas", Fold),
+    ("message_speakers", Fold),
     ("message_conversations", Fold),
     ("message_mentions", Fold),
     ("module_releases", Fold),
@@ -140,6 +149,7 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("relationship_endpoint_activity", Fold),
     ("agent_runs", Fold),
     ("member_contexts", Fold),
+    ("account_configs", Fold),
     ("instruction_bindings", Fold),
     ("onboarding_programmes", Fold),
     ("onboarding_programme_sources", Fold),
@@ -177,6 +187,13 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     // event that writes the value row (v82). The receiver regenerates it from
     // the value cell rather than copying node rows.
     ("facet_value_json_nodes", Fold),
+    // Physical projection of `facet_observations.value`, folded by the same
+    // content event that writes the observation row (v85).
+    ("facet_observation_json_nodes", Fold),
+    // Physical projection of `records.body`, folded by the same content
+    // event that writes the body cell (v86). The receiver regenerates it
+    // from the body cell rather than copying node rows.
+    ("record_body_json_nodes", Fold),
     // Trigger-maintained search indexes are folds too, not transported state.
     ("records_fts", Fold),
     ("records_name_idx", Fold),
@@ -185,7 +202,6 @@ pub(crate) const TABLE_CLASSIFICATIONS: &[(&str, StandbyTableKind)] = &[
     ("content_event_claim_meta", Fold),
     ("content_event_reaction_meta", Fold),
     // Receiver-local, operational, or disposable state.
-    ("provenance_local_attestation_authority", Excluded),
     ("webhook_deliveries", Excluded),
     ("relationship_local_admissions", Excluded),
     ("effective_relationships", Excluded),

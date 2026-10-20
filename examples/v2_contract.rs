@@ -12,10 +12,15 @@
 //! `package-disable`, `consumer-register`, `consumer-retire`,
 //! `package-preview-adopt`, `package-preview-disable`,
 //! `definition-preview-adopt`, `definition-preview-disable`, `describe`,
-//! `create`, `link`, `query`, `consumer-list`, `package-surface-read`,
-//! `revise`, `read`, `history`.
+//! `create`, `link`, `link-prepare`, `link-commit`, `query`, `consumer-list`, `package-surface-read`,
+//! `package-describe`, `package-call`, `revise`, `read`, `history`.
 //! JSON payloads come from `--json <file | ->`. Package manifests arrive as
 //! the canonical manifest JSON value (`native.package-manifest@1`).
+//! `tools --as <binding>` discovers generated typed descriptors; `call <tool>
+//! --as <binding> '<json>'` dispatches them. `call` also accepts `--json <file|->`.
+//! Optional `--scope <home>` restricts typed discovery to that visible home.
+//! `describe --record <id>` discovers links from the retained record binding.
+//! `link-prepare` and `link-commit` expose the /4 optimistic retry contract.
 //! Consumer commands call `native_ce::dependency` (preview, register,
 //! retire, list); definition previews take `--scope` or `--global true`.
 
@@ -29,6 +34,7 @@ struct Args {
     as_binding: Option<String>,
     cmd: String,
     flags: HashMap<String, String>,
+    positional: Vec<String>,
 }
 
 fn fail(message: String) -> ! {
@@ -42,6 +48,7 @@ fn parse_args() -> Args {
     let mut as_binding = None;
     let mut cmd = None;
     let mut flags = HashMap::new();
+    let mut positional = Vec::new();
     while let Some(arg) = raw.next() {
         if arg == "--db" {
             db = raw.next();
@@ -55,6 +62,8 @@ fn parse_args() -> Args {
             flags.insert(key, value);
         } else if cmd.is_none() {
             cmd = Some(arg);
+        } else if cmd.as_deref() == Some("call") && positional.len() < 2 {
+            positional.push(arg);
         } else {
             fail(format!("unexpected argument '{arg}'"));
         }
@@ -64,6 +73,7 @@ fn parse_args() -> Args {
         as_binding,
         cmd: cmd.unwrap_or_else(|| fail("missing <subcommand>".to_string())),
         flags,
+        positional,
     }
 }
 
@@ -91,6 +101,9 @@ fn read_json_bytes(args: &Args) -> Vec<u8> {
 fn read_json_value(args: &Args) -> serde_json::Value {
     let bytes = read_json_bytes(args);
     serde_json::from_slice(&bytes).unwrap_or_else(|e| fail(format!("invalid JSON: {e}")))
+}
+fn read_fields_text(args: &Args) -> String {
+    String::from_utf8(read_json_bytes(args)).unwrap_or_else(|e| fail(format!("invalid UTF-8: {e}")))
 }
 
 fn read_json_object(args: &Args) -> serde_json::Map<String, serde_json::Value> {
@@ -403,16 +416,143 @@ async fn run_admin(args: &Args, db: &Db, actor: &str) -> serde_json::Value {
 
 async fn run_data(args: &Args, db: &Db, caller: &str) -> serde_json::Value {
     match args.cmd.as_str() {
-        "describe" => kernel::describe_world_as(db, caller)
+        "tools" => {
+            let tools = native_ce::definition_shape::typed_tools_for(
+                db,
+                caller,
+                args.flags.get("scope").map(String::as_str),
+            )
+            .await
+            .unwrap_or_else(|e| fail(e.to_string()));
+            serde_json::json!({"rules":native_ce::definition_shape::TYPED_TOOL_RULES,"tools":tools})
+        }
+        "call" => {
+            let name = args
+                .positional
+                .first()
+                .unwrap_or_else(|| fail("missing call <tool>".into()));
+            let raw = args
+                .positional
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| read_fields_text(args));
+            native_ce::definition_shape::dispatch_typed_tool(
+                db,
+                caller,
+                args.flags.get("scope").map(String::as_str),
+                name,
+                &raw,
+            )
+            .await
+            .unwrap_or_else(|e| fail(e.to_string()))
+        }
+        "describe" => {
+            if let Some(record) = args.flags.get("record") {
+                kernel::describe_record_links_as(db, caller, record)
+                    .await
+                    .unwrap_or_else(|e| fail(e.to_string()))
+            } else {
+                kernel::describe_world_as(db, caller)
+                    .await
+                    .unwrap_or_else(|e| fail(e.to_string()))
+            }
+        }
+        "relation-prepare" => {
+            let command = serde_json::from_value(read_json_value(args))
+                .unwrap_or_else(|e| fail(e.to_string()));
+            serde_json::to_value(
+                kernel::prepare_provider_as(
+                    db,
+                    caller,
+                    &flag(args, "anchor"),
+                    &flag(args, "counterpart"),
+                    &flag(args, "operation-key"),
+                    command,
+                )
+                .await
+                .unwrap_or_else(|e| fail(e.to_string())),
+            )
+            .unwrap()
+        }
+        "relation-commit" => {
+            let request = serde_json::from_value(read_json_value(args))
+                .unwrap_or_else(|e| fail(e.to_string()));
+            serde_json::to_value(
+                kernel::commit_provider_as(db, caller, &request)
+                    .await
+                    .unwrap_or_else(|e| fail(e.to_string())),
+            )
+            .unwrap()
+        }
+        "relations" => serde_json::to_value(
+            kernel::relations_as(db, caller, &flag(args, "id"))
+                .await
+                .unwrap_or_else(|e| fail(e.to_string())),
+        )
+        .unwrap(),
+        "link-prepare" => serde_json::to_value(
+            kernel::prepare_link4_as(
+                db,
+                caller,
+                &flag(args, "source"),
+                &flag(args, "predicate"),
+                &flag(args, "target"),
+                &flag(args, "operation-key"),
+            )
             .await
             .unwrap_or_else(|e| fail(e.to_string())),
+        )
+        .unwrap(),
+        "link-commit" => {
+            let request: kernel::Link4Request = serde_json::from_value(read_json_value(args))
+                .unwrap_or_else(|e| fail(e.to_string()));
+            serde_json::to_value(
+                kernel::link4_as(db, caller, &request)
+                    .await
+                    .unwrap_or_else(|e| fail(e.to_string())),
+            )
+            .unwrap()
+        }
+        "package-describe" => native_ce::package_operations::describe_package_operations_as(
+            db,
+            caller,
+            &flag(args, "scope"),
+            &flag(args, "namespace"),
+            &flag(args, "name"),
+        )
+        .await
+        .unwrap_or_else(|e| fail(e.to_string())),
+        "package-call" => {
+            let request = read_json_object(args);
+            if request.len() != 1 || !request.contains_key("record_id") {
+                fail("package-call --json must be exactly {\"record_id\": \"...\"}".to_string());
+            }
+            let record_id = request
+                .get("record_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| {
+                    fail("package-call --json must hold {\"record_id\": \"...\"}".to_string())
+                })
+                .to_string();
+            let outcome = native_ce::package_operations::call_package_operation_as(
+                db,
+                caller,
+                &flag(args, "namespace"),
+                &flag(args, "name"),
+                &flag(args, "operation"),
+                &record_id,
+            )
+            .await
+            .unwrap_or_else(|e| fail(e.to_string()));
+            serde_json::to_value(&outcome).unwrap_or_else(|e| fail(e.to_string()))
+        }
         "create" => {
-            let id = kernel::create_as(
+            let id = kernel::create_json_as(
                 db,
                 caller,
                 &flag(args, "family"),
                 &flag(args, "kind"),
-                &read_json_object(args),
+                &read_fields_text(args),
                 &flag(args, "home"),
             )
             .await
@@ -560,9 +700,20 @@ async fn run_data(args: &Args, db: &Db, caller: &str) -> serde_json::Value {
             serde_json::to_value(&view).unwrap_or_else(|e| fail(e.to_string()))
         }
         "revise" => {
-            kernel::revise_as(db, caller, &flag(args, "id"), &read_json_object(args))
-                .await
-                .unwrap_or_else(|e| fail(e.to_string()));
+            let expected_revision = args.flags.get("expected-seq").map(|value| {
+                value
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| fail("bad --expected-seq".to_string()))
+            });
+            kernel::revise_json_as_expected(
+                db,
+                caller,
+                &flag(args, "id"),
+                &read_fields_text(args),
+                expected_revision,
+            )
+            .await
+            .unwrap_or_else(|e| fail(e.to_string()));
             serde_json::json!({"ok": true})
         }
         "read" => {

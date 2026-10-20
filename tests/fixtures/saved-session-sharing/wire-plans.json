@@ -1,0 +1,388 @@
+{
+  "version": 1,
+  "ids": {
+    "ownerId": "50a00000-0000-4000-8000-000000000001",
+    "rootId": "50a00000-0000-4000-8000-000000000002",
+    "folderId": "50a00000-0000-4000-8000-000000000003",
+    "recordId": "50a00000-0000-4000-8000-000000000004",
+    "channelId": "50a00000-0000-4000-8000-000000000005",
+    "cardId": "50a00000-0000-4000-8000-000000000006",
+    "viewerOwned": "50a00000-0000-4000-8000-000000000014",
+    "exception": "50a00000-0000-4000-8000-000000000018"
+  },
+  "creates": [
+    {
+      "id": "50a00000-0000-4000-8000-000000000002",
+      "type": "Collection",
+      "kind": "folder",
+      "name": "Saved sessions",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "50a00000-0000-4000-8000-000000000005",
+      "type": "Collection",
+      "kind": "folder",
+      "name": "Fixture channel",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "50a00000-0000-4000-8000-000000000003",
+      "type": "Collection",
+      "kind": "folder",
+      "name": "Fixture session",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "50a00000-0000-4000-8000-000000000004",
+      "type": "Document",
+      "kind": "agent-session",
+      "name": "Saved record",
+      "body": "Owner saved text",
+      "home_id": "50a00000-0000-4000-8000-000000000003",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "50a00000-0000-4000-8000-000000000006",
+      "type": "Document",
+      "kind": "agent-session-share",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Fixture session",
+      "body": "Please review",
+      "reason": "Prepare session share",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000007:card",
+      "facets": {
+        "native.share.state": "pending",
+        "native.share.transition_id": "50a00000-0000-4000-8000-000000000007",
+        "native.share.post_transition_id": "50a00000-0000-4000-8000-000000000007",
+        "native.share.owner_label": "Fixture owner",
+        "native.share.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.session_record_id": "50a00000-0000-4000-8000-000000000004",
+        "native.share.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.shared_at": "2026-10-18T22:00:00Z",
+        "native.share.title": "Fixture session",
+        "native.share.host_label": "Fixture host",
+        "native.share.provider": "claude",
+        "native.share.expected_access_version": 0
+      },
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "type": "Document",
+      "kind": "agent-session-share-event",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Session sharing transition",
+      "body": "{\"version\":1,\"kind\":\"shared\",\"transitionId\":\"50a00000-0000-4000-8000-000000000007\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000006\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"50a00000-0000-4000-8000-000000000001\",\"from\":0,\"to\":1,\"previousCardTransition\":null,\"ownerLabel\":\"Fixture owner\",\"title\":\"Fixture session\",\"hostLabel\":\"Fixture host\",\"provider\":\"claude\",\"note\":\"Please review\"}",
+      "reason": "Prepare session sharing event",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000007:event",
+      "facets": {
+        "native.share.event.state": "pending",
+        "native.share.event.type": "shared",
+        "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000007",
+        "native.share.event.at": "2026-10-18T22:00:00Z",
+        "native.share.event.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.event.card_id": "50a00000-0000-4000-8000-000000000006",
+        "native.share.event.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.event.from_v": 0,
+        "native.share.event.to_v": 1
+      },
+      "id": "50a00000-0000-4000-8000-000000000008",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "type": "Document",
+      "kind": "agent-session-share-event",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Session sharing transition",
+      "body": "{\"version\":1,\"kind\":\"stopped\",\"transitionId\":\"50a00000-0000-4000-8000-000000000009\",\"activeTransition\":\"50a00000-0000-4000-8000-000000000007\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000006\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"50a00000-0000-4000-8000-000000000001\",\"from\":1,\"to\":2}",
+      "reason": "Prepare session sharing event",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000009:event",
+      "facets": {
+        "native.share.event.state": "pending",
+        "native.share.event.type": "stopped",
+        "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000009",
+        "native.share.event.at": "2026-10-18T22:00:00Z",
+        "native.share.event.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.event.card_id": "50a00000-0000-4000-8000-000000000006",
+        "native.share.event.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.event.from_v": 1,
+        "native.share.event.to_v": 2
+      },
+      "id": "50a00000-0000-4000-8000-000000000010",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "type": "Document",
+      "kind": "agent-session-share-event",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Session sharing transition",
+      "body": "{\"version\":1,\"kind\":\"shared_again\",\"transitionId\":\"50a00000-0000-4000-8000-000000000011\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000006\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"50a00000-0000-4000-8000-000000000001\",\"from\":2,\"to\":3,\"previousCardTransition\":\"50a00000-0000-4000-8000-000000000007\",\"ownerLabel\":\"Fixture owner\",\"title\":\"Fixture session\",\"hostLabel\":\"Fixture host\",\"provider\":\"claude\",\"note\":\"Please review\"}",
+      "reason": "Prepare session sharing event",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000011:event",
+      "facets": {
+        "native.share.event.state": "pending",
+        "native.share.event.type": "shared_again",
+        "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000011",
+        "native.share.event.at": "2026-10-18T22:00:00Z",
+        "native.share.event.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.event.card_id": "50a00000-0000-4000-8000-000000000006",
+        "native.share.event.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.event.from_v": 2,
+        "native.share.event.to_v": 3
+      },
+      "id": "50a00000-0000-4000-8000-000000000012",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "id": "50a00000-0000-4000-8000-000000000015",
+      "type": "Document",
+      "kind": "agent-session-share",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Fixture session",
+      "body": "Please review",
+      "reason": "Prepare session share",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000016:card",
+      "facets": {
+        "native.share.state": "pending",
+        "native.share.transition_id": "50a00000-0000-4000-8000-000000000016",
+        "native.share.post_transition_id": "50a00000-0000-4000-8000-000000000016",
+        "native.share.owner_label": "Fixture owner",
+        "native.share.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.session_record_id": "50a00000-0000-4000-8000-000000000004",
+        "native.share.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.shared_at": "2026-10-18T22:00:00Z",
+        "native.share.title": "Fixture session",
+        "native.share.host_label": "Fixture host",
+        "native.share.provider": "claude",
+        "native.share.expected_access_version": 0
+      },
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    },
+    {
+      "type": "Document",
+      "kind": "agent-session-share-event",
+      "home_id": "50a00000-0000-4000-8000-000000000002",
+      "name": "Session sharing transition",
+      "body": "{\"version\":1,\"kind\":\"shared\",\"transitionId\":\"50a00000-0000-4000-8000-000000000016\",\"at\":\"2026-10-18T22:00:00Z\",\"folderId\":\"50a00000-0000-4000-8000-000000000003\",\"cardId\":\"50a00000-0000-4000-8000-000000000015\",\"rootId\":\"50a00000-0000-4000-8000-000000000002\",\"channelId\":\"50a00000-0000-4000-8000-000000000005\",\"recordId\":\"50a00000-0000-4000-8000-000000000004\",\"ownerId\":\"50a00000-0000-4000-8000-000000000001\",\"from\":0,\"to\":1,\"previousCardTransition\":null,\"ownerLabel\":\"Fixture owner\",\"title\":\"Fixture session\",\"hostLabel\":\"Fixture host\",\"provider\":\"claude\",\"note\":\"Please review\"}",
+      "reason": "Prepare session sharing event",
+      "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000016:event",
+      "facets": {
+        "native.share.event.state": "pending",
+        "native.share.event.type": "shared",
+        "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000016",
+        "native.share.event.at": "2026-10-18T22:00:00Z",
+        "native.share.event.session_folder_id": "50a00000-0000-4000-8000-000000000003",
+        "native.share.event.card_id": "50a00000-0000-4000-8000-000000000015",
+        "native.share.event.channel_id": "50a00000-0000-4000-8000-000000000005",
+        "native.share.event.from_v": 0,
+        "native.share.event.to_v": 1
+      },
+      "id": "50a00000-0000-4000-8000-000000000017",
+      "owner_id": "50a00000-0000-4000-8000-000000000001"
+    }
+  ],
+  "first": {
+    "reason": "Share saved session",
+    "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000007:move",
+    "items": [
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000003",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.session.active_transition": "50a00000-0000-4000-8000-000000000007",
+          "native.session.access_version": 1
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.session.access_version": null
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000006",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.state": "shared",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000007",
+          "native.share.shared_at": "2026-10-18T22:00:00Z",
+          "native.share.expected_access_version": 0
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.state": "pending",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000007"
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000008",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.event.state": "committed"
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.event.state": "pending",
+          "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000007"
+        }
+      }
+    ]
+  },
+  "stop": {
+    "reason": "Stop sharing saved session",
+    "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000009:stop",
+    "items": [
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000003",
+        "home_id": "50a00000-0000-4000-8000-000000000002",
+        "facets": {
+          "native.session.active_transition": "none",
+          "native.session.access_version": 2
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000005",
+        "if_facets": {
+          "native.session.access_version": 1,
+          "native.session.active_transition": "50a00000-0000-4000-8000-000000000007"
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000006",
+        "facets": {
+          "native.share.state": "stopped"
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000005",
+        "if_facets": {
+          "native.share.state": "shared",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000007"
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000010",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.event.state": "committed"
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.event.state": "pending",
+          "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000009"
+        }
+      }
+    ]
+  },
+  "again": {
+    "reason": "Share saved session",
+    "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000011:move",
+    "items": [
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000003",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.session.active_transition": "50a00000-0000-4000-8000-000000000011",
+          "native.session.access_version": 3
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.session.access_version": 2
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000006",
+        "facets": {
+          "native.share.state": "shared",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000011",
+          "native.share.shared_at": "2026-10-18T22:00:00Z",
+          "native.share.expected_access_version": 2
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000005",
+        "if_facets": {
+          "native.share.state": "stopped",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000007"
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000012",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.event.state": "committed"
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.event.state": "pending",
+          "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000011"
+        }
+      }
+    ]
+  },
+  "competitor": {
+    "reason": "Share saved session",
+    "idempotency_key": "nss3:share:50a00000-0000-4000-8000-000000000016:move",
+    "items": [
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000003",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.session.active_transition": "50a00000-0000-4000-8000-000000000016",
+          "native.session.access_version": 1
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.session.access_version": null
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000015",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.state": "shared",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000016",
+          "native.share.shared_at": "2026-10-18T22:00:00Z",
+          "native.share.expected_access_version": 0
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.state": "pending",
+          "native.share.transition_id": "50a00000-0000-4000-8000-000000000016"
+        }
+      },
+      {
+        "op": "update",
+        "id": "50a00000-0000-4000-8000-000000000017",
+        "home_id": "50a00000-0000-4000-8000-000000000005",
+        "facets": {
+          "native.share.event.state": "committed"
+        },
+        "if_home_id": "50a00000-0000-4000-8000-000000000002",
+        "if_facets": {
+          "native.share.event.state": "pending",
+          "native.share.event.transition_id": "50a00000-0000-4000-8000-000000000016"
+        }
+      }
+    ]
+  },
+  "authenticatedOwnerQuery": {
+    "sql": "SELECT r.id,r.name,b.identifier AS account FROM bindings b JOIN records r ON r.id=b.record_id WHERE b.system='account' AND b.identifier=current_principal() AND b.is_canonical=1 AND r.type='Entity' AND r.kind='person' AND r.deleted_at IS NULL LIMIT 2"
+  },
+  "viewerCardOwnerQuery": {
+    "sql": "SELECT r.id,r.name,a.actor AS account FROM actors a JOIN records r ON r.id=a.person_id WHERE r.id=?1 AND a.actor=?2 AND r.type='Entity' AND r.kind='person' AND r.deleted_at IS NULL LIMIT 2",
+    "parameters": [
+      "50a00000-0000-4000-8000-000000000001",
+      "acct:alice"
+    ]
+  },
+  "pendingIntentScan": {
+    "sql": "SELECT id FROM records WHERE type='Document' AND kind='agent-session-share-event' AND home_id=?1 AND deleted_at IS NULL AND archived=0 ORDER BY id LIMIT 201",
+    "parameters": [
+      "50a00000-0000-4000-8000-000000000002"
+    ]
+  }
+}

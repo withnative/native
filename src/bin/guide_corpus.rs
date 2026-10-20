@@ -92,12 +92,56 @@ fn render_guide(root: &Path, guide: GuideSpec) -> Result<String> {
             output.push_str(&native_ce::mcp::product_model::guide_markdown());
             Ok(output)
         }
+        GuideSource::SuppliedKitRelease => render_supplied_kit(root, guide.topic),
         GuideSource::FrozenSqliteDdl => render_sql_schema(),
         GuideSource::CompleteToolRegistry => {
             let registry = production_registry()?;
             render_capabilities(&registry)
         }
     }
+}
+
+fn render_supplied_kit(root: &Path, topic: &str) -> Result<String> {
+    let (version, manifest_text, types) = match topic {
+        "app-kit-core-1.0.0" => (
+            "1.0.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.0.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.0.0/core.d.ts"),
+        ),
+        "app-kit-core-1.1.0" => (
+            "1.1.0",
+            include_str!("../../crates/artifact-html/kit-releases/1.1.0/manifest.json"),
+            include_str!("../../crates/artifact-html/kit-releases/1.1.0/core.d.ts"),
+        ),
+        _ => return Err(Error::engine("unknown supplied kit guide")),
+    };
+    let manifest: serde_json::Value = serde_json::from_str(manifest_text)?;
+    use sha2::{Digest, Sha256};
+    let types_hash = format!("{:x}", Sha256::digest(types.as_bytes()));
+    if manifest["version"] != version
+        || manifest["major"] != 1
+        || manifest["layer"] != "core"
+        || manifest["factory"] != "native.app-kit.core.factory.v1"
+        || manifest["bridge"] != "native.html.bridge.v1"
+        || manifest["types"]["bytes"] != types.len()
+        || manifest["types"]["sha256"] != types_hash
+    {
+        return Err(Error::engine(
+            "canonical supplied-kit types/identity drift; run npm --prefix web/apps run kit:check",
+        ));
+    }
+    let prose = fs::read_to_string(root.join(format!("{topic}.md.in")))?;
+    let mut output = generated_header(&format!(
+        "canonical core {version} manifest/types and versioned prose template"
+    ));
+    output.push_str(&prose);
+    write!(output, "\nRelease `{}`, major `{}`, layer `{}`. Factory `{}`; bridge `{}`.\n\nJS SHA-256: `{}`\n\nTypes SHA-256: `{}`\n\n```typescript\n{types}```\n",
+        manifest["version"].as_str().unwrap_or_default(),
+        manifest["major"], manifest["layer"].as_str().unwrap_or_default(),
+        manifest["factory"].as_str().unwrap_or_default(), manifest["bridge"].as_str().unwrap_or_default(),
+        manifest["js"]["sha256"].as_str().unwrap_or_default(), manifest["types"]["sha256"].as_str().unwrap_or_default()
+    ).unwrap();
+    Ok(output)
 }
 
 fn render_template(topic: &str, template: &str) -> Result<String> {
@@ -178,6 +222,7 @@ fn render_sql_schema() -> Result<String> {
     output.push_str(
         "This is native-ce's exact ordered SQLite DDL contract for a fresh database. It is not Native App's PostgreSQL schema. Projections are rebuildable; the event logs named by the DDL remain their authorities. Use `describe_schema` for a live structured view and `query_sql` only through its documented logical catalog.\n\n",
     );
+    output.push_str("`main.message_speakers` below is the physical projection, with frozen owner and event provenance columns. The caller-visible TEMP view named `message_speakers` is a different logical relation: message_id, speaker_kind, speaker_address, display_name and assurance, restricted to visible Messages. `query_sql` exposes only that view; physical tables and private persona profiles are not granted by an utterance.\n\n");
     output.push_str("## Contract identity\n\n");
     writeln!(
         output,
@@ -409,7 +454,10 @@ mod tests {
             let template = root.join(format!("{}.md.in", guide.topic));
             assert_eq!(
                 template.is_file(),
-                guide.source == GuideSource::HandwrittenTemplate,
+                matches!(
+                    guide.source,
+                    GuideSource::HandwrittenTemplate | GuideSource::SuppliedKitRelease
+                ),
                 "template presence must agree with the canonical source for {}",
                 guide.topic
             );

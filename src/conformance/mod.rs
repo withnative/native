@@ -290,7 +290,14 @@ pub(crate) async fn run_conformance_with_progress(
     db: &Db,
     on_check: impl FnMut(&str, Option<u128>),
 ) -> ConformanceReport {
-    run_conformance_with_profile_and_progress(db, ConformanceProfile::Full, on_check).await
+    // FULL includes tool dispatch; do not carry that verification future through
+    // provisioning/authentication wrappers on a normal Tokio worker stack.
+    Box::pin(run_conformance_with_profile_and_progress(
+        db,
+        ConformanceProfile::Full,
+        on_check,
+    ))
+    .await
 }
 
 /// Select a verification profile explicitly; [`run_conformance`] remains FULL.
@@ -298,7 +305,12 @@ pub async fn run_conformance_with_profile(
     db: &Db,
     profile: ConformanceProfile,
 ) -> ConformanceReport {
-    run_conformance_with_profile_and_progress(db, profile, |_, _| {}).await
+    Box::pin(run_conformance_with_profile_and_progress(
+        db,
+        profile,
+        |_, _| {},
+    ))
+    .await
 }
 
 pub(crate) async fn run_conformance_with_profile_and_progress(
@@ -918,6 +930,9 @@ mod standby_admission_tests {
     }
 
     async fn verify_with_progress(readonly: &Db) -> ConformanceReport {
+        let _capture_guard = crate::standby::generation_store::test_diagnostics::LOG_CAPTURE_LOCK
+            .lock()
+            .await;
         let mut progress = Vec::new();
         let logs = crate::standby::generation_store::test_diagnostics::Capture::default();
         let report = run_standby_admission_conformance_with_progress(readonly, |name, elapsed| {

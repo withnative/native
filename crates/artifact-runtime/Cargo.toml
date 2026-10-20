@@ -16,6 +16,7 @@ test-support = []
 base64 = "0.23.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 hex = "0.4"
+hmac = "0.12"
 markdown = "=1.0.0"
 # The genuine-MDX adapter is deliberately pinned as one runtime contract. A
 # compiler or executor upgrade changes observable syntax/sandbox semantics and
@@ -32,3 +33,4 @@ swc_ecma_visit = "=12.0.0"
 tokio = { version = "1", features = ["sync"] }
 url = "2"
 uuid = { version = "1" }
+zeroize = "1"

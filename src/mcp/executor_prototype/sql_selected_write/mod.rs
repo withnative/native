@@ -1,5 +1,6 @@
-//! Versioned SQL-selected preview. There is deliberately no mutation adapter.
+//! Qualified SQL-selected preview and internal transaction-owned commit foundations.
 //! Frozen contract: f4d38d6ce3ac3b1975616917a3d0998a6ae6d8f6.
+pub(super) mod commit;
 mod evidence;
 mod predicate;
 mod snapshot;
@@ -16,6 +17,8 @@ use serde_json::{json, Value};
 use snapshot::{denial, Tx};
 use sqlx::Row;
 use std::collections::BTreeMap;
+
+const MAX_VISITED_CHILDREN: usize = 2_000;
 
 pub(super) const CONTRACT: &str = "native.sql-write-selection.v1";
 const VERSIONS: [(&str, &str); 8] = [
@@ -47,12 +50,16 @@ enum Write {
 #[serde(deny_unknown_fields)]
 struct Request {
     selection_contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_profile: Option<String>,
     folder_id: String,
     statement: String,
     #[serde(default)]
     parameters: Vec<Parameter>,
     write: Write,
     reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sources: Option<Vec<crate::mcp::tools::lifecycle::SourceBasisInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_version: Option<i64>,
 }
@@ -103,6 +110,19 @@ pub(super) fn validate(arguments: Value) -> Result<()> {
 
 fn parse(arguments: Value) -> Result<(Request, predicate::Program)> {
     if arguments
+        .get("execution_profile")
+        .is_some_and(Value::is_null)
+    {
+        return Err(denial(
+            "execution_profile must be the documented commit profile or omitted",
+        ));
+    }
+    if arguments.get("sources").is_some_and(Value::is_null) {
+        return Err(denial(
+            "sources must be an array; use [] to declare none or omit to leave undeclared",
+        ));
+    }
+    if arguments
         .get("expected_version")
         .is_some_and(Value::is_null)
     {
@@ -123,6 +143,12 @@ fn parse(arguments: Value) -> Result<(Request, predicate::Program)> {
         return Err(denial(
             "unsupported selection contract; prepare using native.sql-write-selection.v1",
         ));
+    }
+    if r.execution_profile
+        .as_deref()
+        .is_some_and(|p| p != commit::PROFILE)
+    {
+        return Err(denial("unsupported execution profile"));
     }
     validate_id(&r.folder_id)?;
     if r.reason.trim().is_empty()
@@ -182,7 +208,9 @@ pub(super) async fn prepare(
     arguments: Value,
 ) -> Result<super::SqlWritePreparation> {
     let (request, program) = parse(arguments)?;
-    if matches!(request.write, Write::SetFacet { .. }) && db.is_enrolled() {
+    if (request.execution_profile.is_some() || matches!(request.write, Write::SetFacet { .. }))
+        && db.is_enrolled()
+    {
         return Err(denial(
             "unsupported enrolled/coedit facet path; use the public singular tool",
         ));
@@ -190,7 +218,7 @@ pub(super) async fn prepare(
     let mut tx = db.write_pool().begin().await.map_err(|_| {
         Error::engine("sql_write: workspace snapshot could not start; repair storage before retry")
     })?;
-    let result = prepare_in(&mut tx, caller, request, program).await;
+    let result = prepare_parsed_in(&mut tx, caller, request, program).await;
     match result {
         Ok(value) => {
             tx.rollback().await.map_err(|_| {
@@ -212,13 +240,32 @@ tokio::task_local! {
     pub(super) static SNAPSHOT_GATE: std::sync::Arc<super::DispatchGate>;
 }
 
-async fn prepare_in(
+pub(super) async fn prepare_in(
+    tx: &mut Tx,
+    caller: &Caller,
+    arguments: Value,
+) -> Result<super::SqlWritePreparation> {
+    let (request, program) = parse(arguments)?;
+    prepare_parsed_in(tx, caller, request, program).await
+}
+
+async fn prepare_parsed_in(
     tx: &mut Tx,
     caller: &Caller,
     request: Request,
     program: predicate::Program,
 ) -> Result<super::SqlWritePreparation> {
     let mut budget = Budget::default();
+    let source_basis = crate::mcp::tools::lifecycle::resolve_source_basis_in(
+        tx,
+        caller,
+        "sql_write",
+        request.sources.as_deref(),
+    )
+    .await?;
+    if let Some(basis) = &source_basis {
+        budget.include(basis)?;
+    }
     let folder = snapshot::visible(tx, caller, &request.folder_id, &mut budget)
         .await?
         .ok_or_else(|| {
@@ -271,6 +318,7 @@ async fn prepare_in(
     let mut schema_evidence = Vec::new();
     let mut selected = Vec::new();
     let mut cursor: Option<String> = None;
+    let mut visited = 0;
     loop {
         let page:Vec<String>=sqlx::query_scalar("SELECT id FROM records WHERE home_id=? AND deleted_at IS NULL AND id<>? AND (? IS NULL OR id>? COLLATE BINARY) ORDER BY id COLLATE BINARY LIMIT 128")
             .bind(&request.folder_id).bind(&request.folder_id).bind(&cursor).bind(&cursor).fetch_all(&mut **tx).await?;
@@ -278,6 +326,12 @@ async fn prepare_in(
             break;
         }
         for id in &page {
+            if visited == MAX_VISITED_CHILDREN {
+                return Err(denial(
+                    "folder scan exceeds 2000 visited children; narrow folder scope",
+                ));
+            }
+            visited += 1;
             let Some(visible) = snapshot::visible(tx, caller, id, &mut budget).await? else {
                 continue;
             };
@@ -486,7 +540,15 @@ async fn prepare_in(
             "operation":op,"before":op["before"],"after":op["after"],"state_changed":op["state_changed"],
             "would_append":op["would_append"],"event_intent":op["event_intent"],"ops":[op]}));
     }
-    let effect = json!({"kind":"sql_write_preview","selection_contract":CONTRACT,"target_count":targets.len(),"op_count":targets.len(),"targets":targets,"reason":request.reason,"preview_only":true});
+    let mut effect = json!({"kind":"sql_write_preview","selection_contract":CONTRACT,"target_count":targets.len(),"op_count":targets.len(),"targets":targets,"reason":request.reason,"preview_only":true});
+    if request.execution_profile.is_some() {
+        effect["kind"] = json!("sql_write_commit");
+        effect["preview_only"] = json!(false);
+        effect["execution_profile"] = json!(commit::PROFILE);
+    }
+    if let Some(basis) = &source_basis {
+        effect["basis"] = basis.clone();
+    }
     let summary = approval_summary(&effect)?;
     let approval = json!({"effect":effect,"effect_summary":summary});
     budget.include(&approval)?;
@@ -515,6 +577,11 @@ async fn prepare_in(
         "approval":approval,"selection":selection}),
     )?;
     let target_state_digest = hash("selected-versions", &json!(versions));
+    let mut operation_evidence = json!({"kind":"sql_write_preview","selection":selection,"targets":versions,"target_count":targets.len(),"op_count":targets.len()});
+    if request.execution_profile.is_some() {
+        operation_evidence["kind"] = effect["kind"].clone();
+        operation_evidence["execution_profile"] = json!(commit::PROFILE);
+    }
     Ok(super::SqlWritePreparation {
         canonical_source_arguments: canonical_arguments,
         target_id: if targets.len() == 1 {
@@ -522,12 +589,19 @@ async fn prepare_in(
         } else {
             format!("sql-write-target-set:{target_state_digest}")
         },
-        target: format!("{} records [{target_state_digest}]", targets.len()),
+        target: if request.execution_profile.is_some() {
+            format!(
+                "Commit to {} records [{target_state_digest}]",
+                targets.len()
+            )
+        } else {
+            format!("{} records [{target_state_digest}]", targets.len())
+        },
         state_revision: format!("content-seq-set:{target_state_digest}"),
         target_state_digest,
-        effect,
+        effect: effect.clone(),
         effect_summary: summary,
-        operation_evidence: json!({"kind":"sql_write_preview","selection":selection,"targets":versions,"target_count":targets.len(),"op_count":targets.len()}),
+        operation_evidence,
     })
 }
 
@@ -550,11 +624,19 @@ fn approval_summary(effect: &Value) -> Result<String> {
     let targets = effect["targets"]
         .as_array()
         .ok_or_else(|| Error::engine("invalid approval target array"))?;
-    let mut lines = vec![format!(
-        "Preview only: {} targets / {} operations. No commit, claim or dispatch.",
-        targets.len(),
-        targets.len()
-    )];
+    let mut lines = vec![if effect["preview_only"] == false {
+        format!(
+            "Commit atomically in SQLite: {} targets / {} operations; durable receipt.",
+            targets.len(),
+            targets.len()
+        )
+    } else {
+        format!(
+            "Preview only: {} targets / {} operations. No commit, claim or dispatch.",
+            targets.len(),
+            targets.len()
+        )
+    }];
     lines.push(format!(
         "Reason: {}",
         display(
@@ -863,7 +945,7 @@ mod snapshot_interleaving_tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        let old = prepare_in(&mut tx, &Caller::local(), req, program)
+        let old = prepare_parsed_in(&mut tx, &Caller::local(), req, program)
             .await
             .unwrap();
         assert_eq!(old.effect["targets"][0]["record_id"], a);

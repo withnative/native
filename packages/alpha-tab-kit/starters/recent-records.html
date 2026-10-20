@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recent records</title>
+<script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script>
+<style>body{font:16px system-ui;margin:2rem;max-width:55rem;color:#243047}input,button{font:inherit;padding:.5rem}li{margin:.6rem 0}.kit-error{color:#9c2630}.kit-record-link{cursor:pointer}</style>
+</head><body><main id="app">Opening Native…</main>
+<script type="module">
+const kit = window.native?.kit;
+const root = document.getElementById('app');
+if (!kit?.preact) root.textContent = 'Open in Native with core kit 1.1.0.';
+else {
+  const { html, render, useState, useFeed, Loading, Empty, ErrorState, RecordLink } = kit.preact;
+  function App() {
+    const [filter, setFilter] = useState('');
+    const feed = useFeed('records.recent');
+    const result = feed.status === 'ready' ? feed.result : feed.last;
+    const rows = (result?.rows || []).filter(row => (row.name || '').toLowerCase().includes(filter.toLowerCase()));
+    return html`<section><h1>Recent records</h1>
+      <p>Newest 100 delivered records. Filtering covers only this snapshot.</p>
+      <label>Filter <input id="filter" value=${filter} onInput=${e => setFilter(e.currentTarget.value)} /></label>
+      ${feed.status === 'loading' && html`<${Loading} what="records" />`}
+      ${feed.status === 'error' && html`<${ErrorState} error=${feed.error} />`}
+      ${feed.status === 'error' && result && html`<p>Last good rows; may be out of date.</p>`}
+      ${result && html`<p>${kit.countLabel(result)} delivered</p>`}
+      ${rows.length ? html`<ul>${rows.map(row => html`<li key=${row.id}><${RecordLink} id=${row.id}>${row.name || row.id}<//> — ${row.type}</li>`)}</ul>` : result && html`<${Empty}>No matching records.<//>`}
+    </section>`;
+  }
+  try { await kit.ready; root.textContent = ''; render(html`<${App} />`, root); }
+  catch { root.textContent = 'Native could not initialize this app.'; }
+  addEventListener('pagehide', () => render(null, root), { once: true });
+}
+</script></body></html>

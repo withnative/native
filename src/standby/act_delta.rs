@@ -13,7 +13,7 @@
 //! The document is deliberately narrow. It carries exactly a closed
 //! manifest/contract header, the authority head evidence, the
 //! from-exclusive/to-inclusive act bounds, the thirteen act-stamped sections in
-//! [`crate::act::ACT_STAMPED_TABLES`] order, and the thirteen immutable
+//! [`crate::act::ACT_STAMPED_TABLES`] order, and the bounded immutable
 //! companion sections in
 //! [`crate::standby::companion_closure::COMPANION_TABLES`] order. It carries no
 //! projection rows, no pinned table inventory, no file artifact digest, and no
@@ -31,7 +31,7 @@
 //!
 //! # Provenance honesty
 //!
-//! The native revision-5 declarations and `content_sha256` are **structural and
+//! The native revision-8 declarations and `content_sha256` are **structural and
 //! integrity only**. They declare the format a producer claims and detect
 //! accidental or after-the-fact edits to the document bytes; they are **not**
 //! authenticity, authorship or a signature. `content_sha256` is unsigned and
@@ -76,9 +76,9 @@ use crate::standby::authority_probe::{
 };
 
 /// Closed contract identity for the canonical authority act-delta document.
-pub(crate) const AUTHORITY_ACT_DELTA_CONTRACT: &str = "native.standby-authority-act-delta.v1";
+pub(crate) const AUTHORITY_ACT_DELTA_CONTRACT: &str = "native.standby-authority-act-delta.v2";
 /// The only document version this core understands.
-pub(crate) const AUTHORITY_ACT_DELTA_VERSION: u32 = 1;
+pub(crate) const AUTHORITY_ACT_DELTA_VERSION: u32 = 2;
 
 /// The authority head evidence carried by a delta document: the closed
 /// [`AuthorityActHeadV2`] contract minus its advisory `source_engine_schema`.
@@ -94,7 +94,6 @@ pub(crate) const AUTHORITY_ACT_DELTA_VERSION: u32 = 1;
 /// replicate, and it never reconstructs a full [`AuthorityActHeadV2`] from the
 /// wire.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct AuthorityActDeltaHeadV1 {
     contract: String,
     version: u32,
@@ -460,12 +459,12 @@ pub(crate) fn validate_authority_act_delta(bytes: &[u8]) -> Result<ValidatedAuth
         companion_sections,
     );
 
-    // 7. Cut structural validation: exact 13/13 inventory and order, revision-5
+    // 7. Cut structural validation: exact current inventory and order, revision-8
     //    shape with strictly increasing primary keys, exact in-range acts, the
     //    whole-act coverage proof, and companion classification/portability.
     act_cut.validate()?;
 
-    // 8. Native revision 5 everywhere, tied to the head's own revision.
+    // 8. Native revision 8 everywhere, tied to the head's own revision.
     for section in act_cut.sections().iter().chain(act_cut.companions()) {
         require(
             section.revision == authority_head.native_interchange_revision,
@@ -822,7 +821,10 @@ mod tests {
                 "contract",
                 serde_json::json!("native.standby-authority-act-delta.v9"),
             ),
-            ("version", serde_json::json!(2)),
+            (
+                "version",
+                serde_json::json!(AUTHORITY_ACT_DELTA_VERSION + 1),
+            ),
             ("from_exclusive_act", serde_json::json!(base + 5)),
             ("to_inclusive_act", serde_json::json!(base + 9)),
             ("authority_head", serde_json::json!({"tampered": true})),
@@ -1024,9 +1026,10 @@ mod tests {
         assert_refuses(&reordered);
 
         // Alternate number spelling for an integer field.
-        let alternate = String::from_utf8(bytes.clone())
-            .unwrap()
-            .replace("\"version\":1", "\"version\":1.0");
+        let alternate = String::from_utf8(bytes.clone()).unwrap().replace(
+            &format!("\"version\":{AUTHORITY_ACT_DELTA_VERSION}"),
+            &format!("\"version\":{AUTHORITY_ACT_DELTA_VERSION}.0"),
+        );
         assert_refuses(alternate.as_bytes());
 
         db.close().await;
@@ -1042,7 +1045,11 @@ mod tests {
         let (_cut, bytes) = empty_delta(&db).await;
         let original = String::from_utf8(bytes.clone()).unwrap();
 
-        let top_level = original.replacen("\"version\":1", "\"version\":1,\"version\":1", 1);
+        // In v2 the nested head has the same version as the document. The
+        // canonical top-level version is last, so duplicate that occurrence.
+        let version = format!("\"version\":{AUTHORITY_ACT_DELTA_VERSION}");
+        let (prefix, suffix) = original.rsplit_once(&version).unwrap();
+        let top_level = format!("{prefix}{version},{version}{suffix}");
         assert!(serde_json::from_slice::<AuthorityActDeltaDocument>(top_level.as_bytes()).is_err());
         assert_refuses(top_level.as_bytes());
 
@@ -1091,15 +1098,22 @@ mod tests {
         let db = fresh_authority().await;
         let (_cut, bytes) = empty_delta(&db).await;
 
-        // A head that carries a revision other than 5 refuses.
+        // A head that carries a revision other than 7 refuses.
         let mut rev4_head = value_of(&bytes);
         rev4_head["authority_head"]["native_interchange_revision"] = serde_json::json!(4);
         resign(&mut rev4_head);
         assert_refuses(&canonical(&rev4_head));
 
-        // A rev5-shaped section with a rev4 revision refuses, even though the
+        // Historical release envelopes can carry revision 6. That does not
+        // widen the current delta wire, even with a freshly valid self digest.
+        let mut rev6_head = value_of(&bytes);
+        rev6_head["authority_head"]["native_interchange_revision"] = serde_json::json!(6);
+        resign(&mut rev6_head);
+        assert_refuses(&canonical(&rev6_head));
+
+        // A rev6-shaped section with a rev4 revision refuses, even though the
         // document otherwise looks current: the source revision is preserved
-        // honestly and never upgraded to 5.
+        // honestly and never upgraded.
         let mut rev4_section = value_of(&bytes);
         rev4_section["companion_sections"][0]["revision"] = serde_json::json!(4);
         resign(&mut rev4_section);
@@ -1108,13 +1122,42 @@ mod tests {
         // A document claiming the delta contract but a different version is
         // not silently accepted.
         let mut wrong_version = value_of(&bytes);
-        wrong_version["version"] = serde_json::json!(2);
+        wrong_version["version"] = serde_json::json!(AUTHORITY_ACT_DELTA_VERSION + 1);
         resign(&mut wrong_version);
         assert_refuses(&canonical(&wrong_version));
 
         // The revision-4 head is not relabelled: the same bytes with an
-        // in-range revision of 5 is the only shape that validates.
+        // original current revision is the only shape that validates.
         assert!(validate_authority_act_delta(&bytes).is_ok());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn v1_delta_without_authority_companion_is_not_upgraded() {
+        let db = fresh_authority().await;
+        let (_, bytes) = empty_delta(&db).await;
+        let mut legacy = value_of(&bytes);
+        legacy["contract"] = serde_json::json!("native.standby-authority-act-delta.v1");
+        legacy["version"] = serde_json::json!(1);
+        legacy["companion_sections"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|section| section["name"] != "provenance_local_attestation_authority");
+        resign(&mut legacy);
+        let error = validate_authority_act_delta(&canonical(&legacy))
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown authority act delta contract"),
+            "{error}"
+        );
+        // Merely relabelling old bytes cannot hide the missing required section.
+        legacy["contract"] = serde_json::json!(AUTHORITY_ACT_DELTA_CONTRACT);
+        legacy["version"] = serde_json::json!(AUTHORITY_ACT_DELTA_VERSION);
+        resign(&mut legacy);
+        assert_refuses(&canonical(&legacy));
         db.close().await;
     }
 
@@ -1191,12 +1234,12 @@ mod tests {
         );
 
         // The wire says the delta document version and the authority-head
-        // protocol accurately: a v1 delta carrying a v2 head.
+        // protocol accurately: a v2 delta carrying a v2 head.
         assert_eq!(
             value["contract"],
-            serde_json::json!("native.standby-authority-act-delta.v1")
+            serde_json::json!("native.standby-authority-act-delta.v2")
         );
-        assert_eq!(value["version"], serde_json::json!(1));
+        assert_eq!(value["version"], serde_json::json!(2));
         assert_eq!(
             value["authority_head"]["contract"],
             serde_json::json!("native.standby-authority-act-head.v2")
@@ -1401,6 +1444,6 @@ mod tests {
         };
         assert_eq!(section.format, crate::interchange::SECTION_FORMAT);
         assert_eq!(section.revision, crate::interchange::REVISION);
-        assert_eq!(crate::interchange::REVISION, 5);
+        assert_eq!(crate::interchange::REVISION, 8);
     }
 }

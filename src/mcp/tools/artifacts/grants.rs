@@ -902,13 +902,15 @@ pub(super) async fn manage_artifact_module_grants(
     .ok_or_else(|| Error::engine("artifact grant-read source attestation is missing"))?;
     let source_descriptor: Value = serde_json::from_str(&source_descriptor_text)?;
     if source_descriptor.get("runtime").and_then(Value::as_str) == Some(HTML_RUNTIME) {
+        let body_limit = super::html_body_limit_in(&mut snapshot, &artifact_id).await?;
         let manifest =
-            crate::artifact_html::validate_cached(&artifact_source).map_err(|failure| {
-                Error::engine(format!(
-                    "native.html.v1 grant-read source is invalid: {} [{}]",
-                    failure.message, failure.code
-                ))
-            })?;
+            crate::artifact_html::validate_cached_with_limit(&artifact_source, body_limit)
+                .map_err(|failure| {
+                    Error::engine(format!(
+                        "native.html.v1 grant-read source is invalid: {} [{}]",
+                        failure.message, failure.code
+                    ))
+                })?;
         if !manifest.named_inputs_declared {
             return Ok(json!({ "status": "ok", "artifact_id": artifact_id,
                 "subjects": [{

@@ -60,8 +60,17 @@ const NOT_NULL_OVERRIDES: &[(&str, &str)] = &[("annotation_targets", "target_rec
 
 /// The pinned digest of the compiled `member-read-v1` schema. Re-bless only
 /// with a profile-minor justification (see module docs).
+///
+/// Re-blessed for engine 89 (task `5b5bfa5`): add the CallerBound
+/// account_configs table and its shipped columns/FK. Profile-minor
+/// justification: existing tables, columns and relative order are unchanged;
+/// only the caller's visible canonical mapping ships. Main's engine-88
+/// message_preferences column is excluded from member-read-v1 and does not
+/// change this digest. An earlier
+/// consumer compiled before it will see a different schema digest and refuse
+/// the copy until it is upgraded, so this needs release coordination.
 pub(crate) const MEMBER_SCHEMA_DIGEST_GOLDEN: &str =
-    "ae44bffff97794ded06b3c25bf1490d89a2aa54a08a4db22f278660070343eec";
+    "1e7a45a79636d9a3106f4a1ebc4de32cbf402d4704d4191025d2d9d148d5dece";
 
 /// Tables that ship rows in the member profile, in digest order.
 pub(crate) fn shipped_tables() -> Vec<&'static str> {

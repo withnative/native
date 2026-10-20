@@ -316,11 +316,13 @@ enum ManageLinksArgs {
         target_id: String,
         relationship: String,
         note: Option<String>,
+        idempotency_key: Option<String>,
     },
     Remove {
         source_id: String,
         target_id: String,
         relationship: String,
+        idempotency_key: Option<String>,
     },
     List {
         record_id: String,
@@ -376,14 +378,86 @@ fn write_response(
     echo_act(compatibility, act)
 }
 
+/// Replay renderer for a keyed `manage_links.add`/`remove` (keyed-replay
+/// contract, `keyed_replay`). Every field is rebuilt from the attested
+/// outputs or the request itself, so it matches the first call's receipt
+/// whatever has happened to the link since.
+async fn replay_link_write_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    replay: &super::keyed_replay::KeyedReplay,
+    action: &str,
+    source_id: &str,
+    target_id: &str,
+    relationship: &str,
+) -> Result<Value> {
+    let status = if action == "add" { "added" } else { "removed" };
+    let previous_seq = replay.previous_seq_in(tx, source_id).await?;
+    if let [event] = replay.content() {
+        let receipt = json!({
+            "kind":"content_event",
+            "event":{
+                "seq":event.seq,
+                "event_id":event.event_id,
+                "record_id":event.record_id,
+                "event_type":event.event_type,
+                "created_at":event.created_at,
+            }
+        });
+        return write_response(
+            json!({"status":status,"source_id":source_id,"target_id":target_id,"relationship":relationship}),
+            action,
+            previous_seq,
+            replay.act(),
+            receipt,
+        );
+    }
+    let outputs = replay.relationship();
+    let assertion = outputs
+        .iter()
+        .find(|output| output.stream_kind == "assertion")
+        .filter(|_| replay.content().is_empty());
+    let Some(assertion) = assertion else {
+        return Err(Error::engine(
+            "manage_links: idempotent receipt is incomplete",
+        ));
+    };
+    let compatibility = json!({
+        "status":status,"source_id":source_id,"target_id":target_id,
+        "relationship":relationship,
+        "relationship_origin_db_id":assertion.relationship_origin_db_id,
+        "relationship_id":assertion.relationship_id,
+        "assertion_id":assertion.stream_id,
+        "action_attestation_id":replay.attestation_id(),
+        "output_events":outputs.iter().map(|output| json!({
+            "domain":"relationship",
+            "issuer_origin_db_id":output.issuer_origin_db_id,
+            "event_id":output.event_id,
+        })).collect::<Vec<_>>(),
+    });
+    let write_receipt = normalize_relationship_receipt(&compatibility)?;
+    write_response(
+        compatibility,
+        action,
+        previous_seq,
+        replay.act(),
+        write_receipt,
+    )
+}
+
 async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    // The exact dispatched arguments: a keyed lookup recomputes their digest.
+    let provenance_arguments = arguments.clone();
     match parse_args("manage_links", arguments)? {
         ManageLinksArgs::Add {
             source_id,
             target_id,
             relationship,
             note,
+            idempotency_key,
         } => {
+            let keyed =
+                super::keyed_replay::idempotency_key("manage_links", idempotency_key.as_deref())?
+                    .is_some();
             if relationship.trim().is_empty() {
                 return Err(Error::engine(
                     "link relationship must contain non-whitespace text",
@@ -408,6 +482,31 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
                 Capability::View,
             )
             .await?;
+            // Keyed replay: after both endpoint checks, before the state
+            // checks below that the first call's own effect would now fail.
+            if keyed {
+                if let Some(replay) = super::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    "manage_links",
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt = replay_link_write_in(
+                        &mut tx,
+                        &replay,
+                        "add",
+                        &source_id,
+                        &target_id,
+                        &relationship,
+                    )
+                    .await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             crate::comments::assert_bearer_immutable_on(
                 &mut tx,
                 "manage_links",
@@ -465,6 +564,7 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
                     content_event_receipt(&event),
                 )
             };
+            super::keyed_replay::anchor_noop_in(&mut tx).await?;
             db.commit_content(tx).await?;
             Ok(receipt?)
         }
@@ -472,7 +572,11 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
             source_id,
             target_id,
             relationship,
+            idempotency_key,
         } => {
+            let keyed =
+                super::keyed_replay::idempotency_key("manage_links", idempotency_key.as_deref())?
+                    .is_some();
             refuse_reserved_surface_binding("manage_links", &relationship)?;
             let mut tx = crate::db::begin_write(db.write_pool()).await?;
             let mut act_alloc = crate::act::ActAllocation::new();
@@ -492,6 +596,31 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
                 Capability::View,
             )
             .await?;
+            // Keyed replay: after both endpoint checks, before the state
+            // checks below that the first call's own effect would now fail.
+            if keyed {
+                if let Some(replay) = super::keyed_replay::keyed_replay_in(
+                    &mut tx,
+                    &caller,
+                    "manage_links",
+                    &provenance_arguments,
+                )
+                .await?
+                {
+                    let receipt = replay_link_write_in(
+                        &mut tx,
+                        &replay,
+                        "remove",
+                        &source_id,
+                        &target_id,
+                        &relationship,
+                    )
+                    .await?;
+                    tx.rollback().await?;
+                    replay.settle();
+                    return Ok(receipt);
+                }
+            }
             crate::comments::assert_bearer_immutable_on(
                 &mut tx,
                 "manage_links",
@@ -547,6 +676,7 @@ async fn manage_links(db: Db, caller: Caller, arguments: Value) -> Result<Value>
                     content_event_receipt(&event),
                 )
             };
+            super::keyed_replay::anchor_noop_in(&mut tx).await?;
             db.commit_content(tx).await?;
             Ok(receipt?)
         }
@@ -788,6 +918,7 @@ pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
             "additionalProperties": false
         }),
     );
+    let idempotency_key = super::keyed_replay::idempotency_key_schema();
     let action_schema = json!({
         "type": "object",
         "oneOf": [
@@ -798,7 +929,8 @@ pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "source_id": { "type": "string" },
                     "target_id": { "type": "string" },
                     "relationship": { "type": "string" },
-                    "note": { "type": "string", "description": "Optional link note." }
+                    "note": { "type": "string", "description": "Optional link note." },
+                    "idempotency_key": idempotency_key.clone()
                 },
                 "required": ["action", "source_id", "target_id", "relationship"],
                 "additionalProperties": false
@@ -809,7 +941,8 @@ pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "action": { "const": "remove" },
                     "source_id": { "type": "string" },
                     "target_id": { "type": "string" },
-                    "relationship": { "type": "string" }
+                    "relationship": { "type": "string" },
+                    "idempotency_key": idempotency_key
                 },
                 "required": ["action", "source_id", "target_id", "relationship"],
                 "additionalProperties": false
@@ -825,7 +958,11 @@ pub fn register_link_tools(registry: &mut ToolRegistry) -> Result<()> {
          viewer-relative live page. {PREVIOUS_SEQ_DESCRIPTION}"
         ),
         action_schema,
-        manage_links,
+        |db, caller, arguments| {
+            super::keyed_replay::with_race_replay(move || {
+                Box::pin(manage_links(db.clone(), caller.clone(), arguments.clone()))
+            })
+        },
     )?;
     Ok(())
 }

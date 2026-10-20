@@ -613,7 +613,20 @@ pub(crate) async fn resolve_identity_with<E: DomainStatementExecutor>(
         .await
         .map_err(|error| crate::domain_transaction::stable_storage_error("resolve kind", &error))?;
 
-    let Some(row) = rows.first() else {
+    resolve_identity_row(record_type, raw_kind, rows.first())
+}
+
+/// Shared interpretation of a joined kind/canonical row. The v1 statement
+/// executor and sealed v2 catalogue adapter supply facts to the same reducer.
+pub(crate) fn resolve_identity_row(
+    record_type: &str,
+    raw_kind: &str,
+    row: Option<&NormalizedRow>,
+) -> Result<KindResolution> {
+    if raw_kind.is_empty() {
+        return Err(Error::engine("kind must not be empty"));
+    }
+    let Some(row) = row else {
         return Ok(KindResolution {
             record_type: record_type.into(),
             raw_kind: raw_kind.into(),

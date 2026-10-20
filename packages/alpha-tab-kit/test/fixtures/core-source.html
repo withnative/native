@@ -1,0 +1,28 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Core source acceptance</title><script type="application/json" id="native-app-kit">{"schema":"native.app-kit.v1","major":1}</script><style>body{font:16px system-ui}a{display:block}</style></head><body><main><h1>Recent records</h1><p id="state">Loading</p><div id="records"></div></main><script>
+const kit=window.native&&window.native.kit;
+window.firstKit=!!kit;
+window.preNegotiation=kit&&['call','session','query','subscribe','agents','agentSessions','presentation'].every(key=>window.native[key]===undefined);
+if(!kit){document.getElementById('state').textContent='Native core kit major 1 unavailable; open in a compatible host';}
+else {
+  window.states=[];
+  window.stopRecent=kit.subscribe('records.recent',state=>{
+    window.states.push(state);
+    document.getElementById('state').textContent=state.status==='ready'?kit.countLabel(state.result):state.status==='error'?kit.errorText(state.error)+(state.last?' — Last good: '+kit.countLabel(state.last):''):'Loading';
+    if(state.status==='ready'){
+      const target=document.getElementById('records');target.replaceChildren();
+      for(const row of state.result.rows){const link=document.createElement('a');link.textContent=row.name||row.id;const attrs=kit.recordLink(row.id);for(const key of Object.keys(attrs))link.setAttribute(key,attrs[key]);target.appendChild(link);}
+    }
+  });
+  window.missing=kit.read('not.declared').then(()=>null,error=>error.code);
+}
+</script><div id="preact-app"></div><script type="module">
+const {html,render,useFeed,Loading,Markdown,Avatar,RecordLink}=window.native.kit.preact||{};
+function PreactApp(){
+  const feed=useFeed('records.recent');
+  return html`<section><h2>Supplied Preact</h2><${Markdown} source=${'**Inline module works** &amp; safe <img onerror=x>'}/><${Avatar} name="Ada Lovelace"/>
+    ${feed.status==='loading'?html`<${Loading}/>`:html`<p id="preact-feed">${feed.status}</p>`}
+    ${feed.status==='ready'&&feed.result.rows.map(row=>html`<${RecordLink} key=${row.id} id=${row.id}>${row.name}<//>`)}
+  </section>`;
+}
+if(window.native.kit.preact){render(html`<${PreactApp}/>`,document.getElementById('preact-app'));addEventListener('pagehide',()=>render(null,document.getElementById('preact-app')),{once:true});}
+</script></body></html>

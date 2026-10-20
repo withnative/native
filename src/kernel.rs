@@ -34,6 +34,125 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 use uuid::Uuid;
 
+pub(crate) mod claims_port;
+mod commit_port;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod historical;
+pub mod hosted_identity;
+pub(crate) mod legacy_history;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use legacy_history::visible as legacy_history_visible;
+pub(crate) mod run_ledger;
+pub(crate) mod slots;
+pub mod v1_state;
+// The batch and driver have no non-test caller until the Foci host lands (G6).
+#[allow(dead_code)]
+pub(crate) mod slots_batch;
+#[cfg(test)]
+mod slots_batch_tests;
+// The evaluator and gate have no non-test caller until the operations land.
+#[cfg(test)]
+mod home_admission_tests;
+#[allow(dead_code)]
+pub(crate) mod slots_eval;
+#[cfg(test)]
+mod slots_eval_tests;
+#[cfg(test)]
+mod slots_gate_tests;
+#[cfg(test)]
+mod slots_home_for_tests;
+// The gated host operations have no non-test caller until the Foci host lands.
+#[allow(dead_code)]
+pub(crate) mod slots_host;
+// The operations have no non-test caller until the host wiring (G6) lands.
+#[allow(dead_code)]
+pub(crate) mod slots_ops;
+#[cfg(test)]
+mod slots_ops_tests;
+#[cfg(test)]
+mod slots_record_tests;
+// The recovery helpers have no non-test caller until G6's rehome batch lands.
+#[allow(dead_code)]
+pub(crate) mod slots_recovery;
+#[cfg(test)]
+mod slots_recovery_tests;
+#[cfg(test)]
+mod slots_tests;
+pub use claims_port::{
+    claims_as, commit_claim_as, prepare_claim_as, ClaimRead, ClaimReceipt, ClaimRequest,
+    ClaimResult,
+};
+pub use run_ledger::{
+    finish_run_as, mint_run_as, open_run_as, run_intent_as, run_witness_as, set_run_intent_as,
+    RunContext, Witness as RunWitness,
+};
+pub(crate) mod provider_catalogue;
+#[cfg(test)]
+mod rebind_v2;
+pub(crate) mod relates_to_port;
+#[cfg(test)]
+pub(crate) use rebind_v2::project as project_kernel_record_rebound;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+use rebind_v2::rebind_record_as;
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub mod app_installs;
+pub(crate) mod app_state;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod claims_port_tests;
+// Default tests retain projector plumbing; the comment read/write helpers
+// are exercised by the named v2 lane. Keep that lane's linting strict.
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod comments_v2;
+pub(crate) mod messaging;
+pub(crate) mod notifications;
+pub use messaging::{is_message_record, MessageRules, MessageState};
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod commit_port_tests;
+pub(crate) mod generic_links;
+pub(crate) mod hq;
+pub(crate) mod record_metadata;
+pub use record_metadata::{ensure_record_metadata, set_record_metadata_as, RecordMetadata};
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+// Default tests need index/projector plumbing; query entry points are exercised
+// by the probe lane. Keep dead-code linting strict when that lane is enabled.
+#[cfg_attr(all(test, not(feature = "v2-kernel-probe")), allow(dead_code))]
+pub(crate) mod search_v2;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub use search_v2::ensure_search_index;
+pub(crate) mod deletion;
+pub(crate) mod instruction_bindings;
+pub use generic_links::*;
+pub use instruction_bindings::{
+    import_instruction_binding_as, ImportInstructionBinding, InstructionBindingImportResult,
+};
+mod links_v2;
+pub(crate) use commit_port::admit as admit_provider_event;
+pub(crate) use commit_port::project as project_provider_outcome;
+pub use commit_port::InterpretationPins;
+pub use hq::*;
+pub(crate) mod blobs;
+pub mod workspace_metadata;
+pub use relates_to_port::{
+    commit_provider_as, prepare_provider_as, relations_as, ProviderReceipt, ProviderRequest,
+};
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod links_v2_tests;
+pub(crate) use links_v2::{
+    admit_link_event, check_link4_projection_authority, project_link4_added, refuse_legacy_defn4,
+};
+pub use links_v2::{
+    describe_record_links_as, link4_as, prepare_link4_as, Link4Receipt, Link4Request,
+};
+
+/// Discover the closed W1 provider port independently of a package-specific client.
+pub fn provider_port_contract() -> serde_json::Value {
+    relates_to_port::contract()
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod file_tests;
+
 const LOCAL_ACTOR: &str = "test:bare-kernel";
 
 /// Row-shape aliases for the test-only kernel paths (clippy `type_complexity`).
@@ -189,10 +308,21 @@ pub const KERNEL_DEFINITION_INTERPRETER_V2: &str =
 pub const KERNEL_DEFINITION_INTERPRETER_V3: &str =
     crate::meta::definition_artifact::DEFN3_INTERPRETER;
 
-/// Interpreter a new record event must carry for these artifact bytes: `/3`
-/// when the envelope declares it, else `/2`, else `/1`. Unknown markers fail
-/// loudly via the shared envelope parse.
+/// Fourth language: closed structural link selectors, inheriting `/3` fields.
+pub const KERNEL_DEFINITION_INTERPRETER_V4: &str =
+    crate::meta::definition_artifact::DEFN4_INTERPRETER;
+
+/// Interpreter carried by new events, selected from immutable envelope bytes.
 fn interpreter_for_bytes(artifact_bytes: &str) -> Result<&'static str> {
+    if let Some(marker) = crate::structured_values::declared_language(artifact_bytes)? {
+        return Ok(marker);
+    }
+    let doc: serde_json::Value = serde_json::from_str(artifact_bytes)?;
+    if doc.get("interpreter").and_then(serde_json::Value::as_str)
+        == Some(KERNEL_DEFINITION_INTERPRETER_V4)
+    {
+        return Ok(KERNEL_DEFINITION_INTERPRETER_V4);
+    }
     if crate::meta::definition_artifact::envelope_is_defn3(artifact_bytes)? {
         Ok(KERNEL_DEFINITION_INTERPRETER_V3)
     } else if crate::meta::definition_artifact::envelope_is_defn2(artifact_bytes)? {
@@ -223,6 +353,14 @@ pub async fn apply_kernel_schema(db: &Db) -> Result<()> {
     for ddl in V2_KERNEL_TABLES {
         sqlx::query(ddl).execute(db.write_pool()).await?;
     }
+    // Probe-only (S7a) search index, scan covering index and version
+    // marker, like `apply_v2_schema` above. Idempotent.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    {
+        let mut tx = begin_write(db.write_pool()).await?;
+        search_v2::apply_search_schema(&mut tx).await?;
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -237,12 +375,24 @@ fn event_payload<T: serde::de::DeserializeOwned>(event: &EventRow) -> Result<T> 
 /// Content-only fold: the immutable pin tuple is carried on the event.
 /// Admission checks the selected artifact before append; replay does not
 /// consult mutable adoption state.
+fn is_record_replacement(event: &EventRow) -> bool {
+    (cfg!(test) && event.event_type == "kernel.record_rebound.v1")
+        || event.event_type == "kernel.import_state_delta.v1"
+}
+
 pub(crate) async fn project_kernel_record_created(
     conn: &mut SqliteConnection,
     event: &EventRow,
 ) -> Result<()> {
     let p: KernelRecordPayload = event_payload(event)?;
-    if Uuid::parse_str(&event.record_id).is_err() {
+    // Legacy named identities (for example native:workspace-agent-instructions)
+    // are admitted exclusively by the sealed host import event. Ordinary record
+    // creation retains its UUID contract; replay retains the recorded identity.
+    if event.record_id.trim().is_empty()
+        || (Uuid::parse_str(&event.record_id).is_err()
+            && event.event_type != "kernel.import_record_created.v1"
+            && event.event_type != "kernel.import_state_delta.v1")
+    {
         return Err(Error::engine("invalid kernel record identity or home"));
     }
     let home_exists: bool =
@@ -295,6 +445,9 @@ pub(crate) async fn project_kernel_record_created(
             Some(KERNEL_DEFINITION_INTERPRETER_V1)
                 | Some(KERNEL_DEFINITION_INTERPRETER_V2)
                 | Some(KERNEL_DEFINITION_INTERPRETER_V3)
+                | Some(KERNEL_DEFINITION_INTERPRETER_V4)
+                | Some(crate::structured_values::INTERPRETER)
+                | Some(crate::structured_values::INTERPRETER_V6)
         ) {
             return Err(Error::engine(format!(
                 "unknown definition interpreter for kernel record {} pin {}@{}",
@@ -366,7 +519,13 @@ pub(crate) async fn project_kernel_record_created(
     // Generic fields validate before the record row and project after it
     // (FK): re-validated here so replay of a tampered log fails loudly
     // instead of storing lies.
-    let field_rows: Vec<(String, String)> = match &p.fields {
+    let empty_fields = serde_json::Map::new();
+    let fields = p.fields.as_ref().or_else(|| {
+        crate::meta::definition_artifact::language_capabilities(p.interpreter.as_deref())
+            .supports_structured_values
+            .then_some(&empty_fields)
+    });
+    let field_rows: Vec<(String, String)> = match fields {
         None => Vec::new(),
         Some(fields) => {
             let pin = p.pin.as_ref().ok_or_else(|| {
@@ -392,13 +551,51 @@ pub(crate) async fn project_kernel_record_created(
                 .0
         }
     };
-    sqlx::query("INSERT INTO kernel_records (id, home_id, owner_id, primary_type, kind, accession, pin_family, pin_version, pin_digest, interpreter, created_seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-        .bind(&event.record_id).bind(&p.home_id).bind(p.owner_id).bind(p.primary_type).bind(p.kind).bind(p.accession)
+    if is_record_replacement(event) {
+        sqlx::query("DELETE FROM kernel_record_fields WHERE record_id=?")
+            .bind(&event.record_id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let created_seq = if event.event_type == "kernel.import_state_delta.v1" {
+        hq::require_import(conn, event.actor.as_deref().unwrap_or_default()).await?;
+        sqlx::query_scalar("SELECT created_seq FROM kernel_records WHERE id=?")
+            .bind(&event.record_id)
+            .fetch_one(&mut *conn)
+            .await?
+    } else {
+        event.local_seq
+    };
+    let created_at = if is_record_replacement(event) {
+        sqlx::query_scalar::<_, String>("SELECT created_at FROM kernel_records WHERE id=?")
+            .bind(&event.record_id)
+            .fetch_one(&mut *conn)
+            .await?
+    } else {
+        event.created_at.clone()
+    };
+    let query = if is_record_replacement(event) {
+        "UPDATE kernel_records SET id=?,home_id=?,owner_id=?,primary_type=?,kind=?,accession=?,pin_family=?,pin_version=?,pin_digest=?,interpreter=?,created_seq=?,created_at=? WHERE id=?"
+    } else {
+        "INSERT INTO kernel_records (id, home_id, owner_id, primary_type, kind, accession, pin_family, pin_version, pin_digest, interpreter, created_seq, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    };
+    let mut query = sqlx::query(query)
+        .bind(&event.record_id)
+        .bind(&p.home_id)
+        .bind(p.owner_id)
+        .bind(p.primary_type)
+        .bind(p.kind)
+        .bind(p.accession)
         .bind(p.pin.as_ref().map(|x| x.family.as_str()))
         .bind(p.pin.as_ref().map(|x| x.version as i64))
         .bind(p.pin.as_ref().map(|x| x.digest.as_str()))
         .bind(p.interpreter)
-        .bind(event.local_seq).bind(&event.created_at).execute(&mut *conn).await?;
+        .bind(created_seq)
+        .bind(&created_at);
+    if is_record_replacement(event) {
+        query = query.bind(&event.record_id);
+    }
+    query.execute(&mut *conn).await?;
     for (name, value_json) in field_rows {
         sqlx::query(
             "INSERT INTO kernel_record_fields (record_id, name, value_json, created_seq) VALUES (?, ?, ?, ?)",
@@ -410,6 +607,9 @@ pub(crate) async fn project_kernel_record_created(
         .execute(&mut *conn)
         .await?;
     }
+    // S7a probe index follows the projection in the same transaction.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    search_v2::refresh_search_row(&mut *conn, &event.record_id).await?;
     Ok(())
 }
 
@@ -751,6 +951,15 @@ pub(crate) async fn project_kernel_principal_created(
     event: &EventRow,
 ) -> Result<()> {
     let p: KernelPrincipalPayload = event_payload(event)?;
+    refuse_caller_host_binding(&p.auth_binding)?;
+    project_kernel_principal_payload(conn, event, p).await
+}
+
+async fn project_kernel_principal_payload(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    p: KernelPrincipalPayload,
+) -> Result<()> {
     if Uuid::parse_str(&event.record_id).is_err()
         || !matches!(p.kind.as_str(), "account" | "agent" | "run")
         || p.display_label.trim().is_empty()
@@ -868,7 +1077,14 @@ async fn create_kernel_record(
 /// bytes), then content. The single replay entry point every replay test
 /// uses, so ordering can never silently differ between tests.
 pub async fn replay_all_projections(db: &Db) -> Result<()> {
+    messaging::migrate_command_receipts(db).await?;
     let mut tx = begin_write(db.write_pool()).await?;
+    blobs::ensure_schema(&mut tx).await?;
+    v1_state::ensure_schema(&mut tx).await?;
+    hq::ensure_tombstones(&mut tx).await?;
+    app_state::ensure_schema(&mut tx).await?;
+    app_installs::ensure_schema(&mut tx).await?;
+    legacy_history::ensure_schema(&mut tx).await?;
     let content = crate::conformance::rebuild::read_all_events(&mut tx).await?;
     #[allow(clippy::type_complexity)]
     let meta_rows: Vec<(i64, String, String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
@@ -891,9 +1107,46 @@ pub async fn replay_all_projections(db: &Db) -> Result<()> {
         )
         .collect();
     for table in [
+        "kernel_app_actions",
+        "kernel_app_package_sources",
+        "kernel_app_install_outcomes",
+        "kernel_app_installs",
+        "kernel_app_consent_revocations",
+        "kernel_app_state",
+        "kernel_slot_lineage",
+        "kernel_slots",
+        "kernel_instruction_bindings",
+        "kernel_v1_state",
+        "kernel_runs",
+        "kernel_provider_receipts",
+        "kernel_provider_subjects",
+        "kernel_provider_state",
+        "kernel_link4_edges",
         "kernel_links",
         "kernel_package_selections",
         "kernel_record_fields",
+        "kernel_attachment_blobs",
+        "kernel_blob_handles",
+        "kernel_legacy_subjects",
+        "kernel_legacy_sql_events",
+        "kernel_legacy_sql_progress",
+        "kernel_legacy_history",
+        "kernel_facets",
+        "kernel_generic_links",
+        "kernel_record_bodies",
+        "kernel_record_metadata",
+        "kernel_import_tombstones",
+        "kernel_lifecycle",
+        "kernel_message_receipts",
+        "kernel_message_candidates",
+        "kernel_message_candidate_events",
+        "kernel_message_candidate_import_frontiers",
+        "kernel_message_interactions",
+        "kernel_personas",
+        "kernel_message_destinations",
+        "kernel_message_people",
+        "kernel_messages",
+        "kernel_comment_anchors",
         "kernel_records",
         "kernel_adoptions",
         "kernel_policy_entries",
@@ -914,8 +1167,40 @@ pub async fn replay_all_projections(db: &Db) -> Result<()> {
     }
     crate::projector::meta::replay_meta(&mut tx, &meta).await?;
     for event in &content {
-        crate::projector::project(&mut tx, event).await?;
+        // Explicit retained-outcome route: no live write authority during replay.
+        #[cfg(test)]
+        if event.event_type == "kernel.record_rebound.v1" {
+            rebind_v2::project(&mut tx, event, true).await?;
+            record_metadata::touch_event(&mut tx, event).await?;
+            continue;
+        }
+        if event.event_type == commit_port::PROVIDER_OUTCOME_EVENT {
+            crate::projector::replay_kernel_provider(&mut tx, event).await?;
+        } else if event.event_type == "kernel.link_added.v1" {
+            refuse_legacy_defn4(&mut tx, event).await?;
+            project_kernel_link_added(&mut tx, event).await?;
+        } else if event.event_type == "kernel.link_added.v2" {
+            crate::projector::replay_kernel_link4(&mut tx, event).await?;
+        } else if matches!(
+            event.event_type.as_str(),
+            "kernel.message_created.v1"
+                | "kernel.message_state.v1"
+                | "kernel.message_destination_set.v1"
+        ) {
+            messaging::replay(&mut tx, event).await?;
+        } else {
+            crate::projector::project(&mut tx, event).await?;
+        }
+        if matches!(
+            event.event_type.as_str(),
+            "kernel.provider_outcome.v1" | "kernel.link_added.v1" | "kernel.link_added.v2"
+        ) {
+            record_metadata::touch_event(&mut tx, event).await?;
+        }
     }
+    // S7a: rebuild the probe search index from the replayed projections.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    search_v2::rebuild_search_index(&mut tx).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -926,6 +1211,128 @@ pub async fn replay_all_projections(db: &Db) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::type_complexity)]
 pub struct KernelTableDump {
+    pub message_candidates: Vec<(String, String, String, String, i64)>,
+    pub message_candidate_events: Vec<(i64, String, String, String, String)>,
+    pub message_candidate_import_frontiers: Vec<(String, i64)>,
+    pub message_receipts: Vec<(String, String, String, String)>,
+    pub message_interactions: Vec<(String, String, String)>,
+    pub personas: Vec<(String, String, i64)>,
+    pub message_destinations: Vec<(String, String, String, i64, bool)>,
+    pub messages: Vec<(String, String, i64)>,
+    pub message_people: Vec<(String, String)>,
+    pub metadata: Vec<(String, String, Option<String>, String, i64)>,
+    pub instruction_bindings: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        bool,
+        String,
+        Option<String>,
+        i64,
+    )>,
+    pub bodies: Vec<(String, String, i64)>,
+    pub generic_links: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        bool,
+        i64,
+        bool,
+    )>,
+    pub facets: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    )>,
+    pub lifecycle: Vec<(String, bool)>,
+    pub import_tombstones: Vec<(String, Option<String>, i64)>,
+    pub comment_anchors: Vec<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+    )>,
+    pub runs: Vec<(String, String, String, i64, i64, bool)>,
+    pub app_state: Vec<(String, String, String, i64)>,
+    pub app_installs: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        i64,
+    )>,
+    pub app_package_sources: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+    )>,
+    pub app_consent_revocations: Vec<(String, i64)>,
+    pub app_install_outcomes: Vec<(String, String, String, String, String, i64)>,
+    pub app_actions: Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+    )>,
+    pub legacy_sql_progress: Vec<(i64, i64)>,
+    pub legacy_sql_events: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    )>,
+
+    pub v1_state: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    )>,
     pub roots: Vec<RootDumpRow>,
     pub principals: Vec<(String, String, String, String)>,
     pub bootstrap: Vec<(String, i64)>,
@@ -944,6 +1351,12 @@ pub struct KernelTableDump {
         Option<String>,
     )>,
     pub links: Vec<(String, String, String, i64)>,
+    pub link4_edges: Vec<(String, String, String, String, String, String, String, i64)>,
+    pub provider_state: Vec<(String, String, String, String, i64)>,
+    pub provider_receipts: Vec<(String, String, String, String, String, i64)>,
+    pub provider_subjects: Vec<(String, String)>,
+    pub slots: Vec<(String, String, String, i64, i64)>,
+    pub slot_lineage: Vec<(String, String, i64, String, Option<String>, i64)>,
     pub record_fields: Vec<(String, String, String, i64)>,
     pub artifacts: Vec<(String, i64, String, String, String)>,
     pub adoptions: Vec<(String, Option<i64>, Option<String>, i64)>,
@@ -998,6 +1411,34 @@ pub struct InstallationDumpRow {
 pub async fn dump_all_kernel_tables(db: &Db) -> Result<KernelTableDump> {
     let pool = db.write_pool();
     Ok(KernelTableDump {
+        legacy_sql_progress: sqlx::query_as("SELECT singleton,scanned_seq FROM kernel_legacy_sql_progress ORDER BY singleton").fetch_all(pool).await?,
+        legacy_sql_events: sqlx::query_as("SELECT seq,source_id,record_id,event_type,actor,run_key,parent_key,created_at,source_stream FROM kernel_legacy_sql_events ORDER BY seq").fetch_all(pool).await?,
+        app_installs: sqlx::query_as("SELECT principal,package,row_json,source_body,generation,status,executable,refusal,previous_generation,event_seq FROM kernel_app_installs ORDER BY principal,package").fetch_all(db.write_pool()).await?,
+        app_package_sources: sqlx::query_as("SELECT package,version,digest,artifact_id,source_revision,declaration_digest,pin_json,source_body,event_seq FROM kernel_app_package_sources ORDER BY package,version,digest,artifact_id,source_revision,declaration_digest").fetch_all(pool).await?,
+        app_consent_revocations: sqlx::query_as("SELECT principal,event_seq FROM kernel_app_consent_revocations ORDER BY principal").fetch_all(db.write_pool()).await?,
+        app_install_outcomes: sqlx::query_as("SELECT principal,operation_key,operation,request_json,event_id,event_seq FROM kernel_app_install_outcomes ORDER BY principal,operation_key").fetch_all(pool).await?,
+        app_actions: sqlx::query_as("SELECT event_id,admitted_event_id,principal,package,version,install_generation,revocation_epoch,operation,request_digest,outputs_json,event_seq FROM kernel_app_actions ORDER BY event_seq").fetch_all(pool).await?,
+        app_state: sqlx::query_as("SELECT record_id,origin,payload,event_seq FROM kernel_app_state ORDER BY record_id").fetch_all(db.write_pool()).await?,
+
+        message_candidates:sqlx::query_as("SELECT candidate_id,principal_id,message_id,state,event_seq FROM kernel_message_candidates ORDER BY candidate_id").fetch_all(pool).await?,
+        message_candidate_events:sqlx::query_as("SELECT seq,event_key,principal_id,candidate_id,state FROM kernel_message_candidate_events ORDER BY seq").fetch_all(pool).await?,
+        message_candidate_import_frontiers:sqlx::query_as("SELECT message_id,source_seq FROM kernel_message_candidate_import_frontiers ORDER BY message_id").fetch_all(pool).await?,
+        message_receipts:sqlx::query_as("SELECT principal_id,operation_key,request,receipt FROM kernel_message_receipts ORDER BY principal_id,operation_key").fetch_all(pool).await?,
+        message_interactions:sqlx::query_as("SELECT principal_id,nonce,operation_key FROM kernel_message_interactions ORDER BY principal_id,nonce").fetch_all(pool).await?,
+        personas:sqlx::query_as("SELECT persona_id,state,event_seq FROM kernel_personas ORDER BY persona_id").fetch_all(pool).await?,
+        message_destinations:sqlx::query_as("SELECT principal_id,collection_id,state,event_seq,imported FROM kernel_message_destinations ORDER BY principal_id,collection_id").fetch_all(pool).await?,
+        messages: sqlx::query_as("SELECT message_id,state,event_seq FROM kernel_messages ORDER BY message_id").fetch_all(pool).await?,
+        message_people: sqlx::query_as("SELECT person_id,principal_id FROM kernel_message_people ORDER BY person_id").fetch_all(pool).await?,
+        metadata: sqlx::query_as("SELECT record_id,persistence,maturity,last_activity_at,event_seq FROM kernel_record_metadata ORDER BY record_id").fetch_all(pool).await?,
+        instruction_bindings: sqlx::query_as("SELECT id,scope_kind,scope_id,account_principal,source_record_id,position,enabled,created_at,legacy_actor,event_seq FROM kernel_instruction_bindings ORDER BY id").fetch_all(pool).await?,
+        generic_links: sqlx::query_as("SELECT link_id,source_id,target_id,relationship,note,created_at,actor,active,event_seq,imported FROM kernel_generic_links ORDER BY link_id").fetch_all(pool).await?,
+        bodies: sqlx::query_as("SELECT record_id,body,event_seq FROM kernel_record_bodies ORDER BY record_id").fetch_all(pool).await?,
+        facets: sqlx::query_as("SELECT record_id,key,value,CAST(value_num AS TEXT),vocab_ref,as_of,event_seq FROM kernel_facets ORDER BY record_id,key").fetch_all(pool).await?,
+        import_tombstones:sqlx::query_as("SELECT record_id,deleted_at,event_seq FROM kernel_import_tombstones ORDER BY record_id").fetch_all(pool).await?,
+        lifecycle: sqlx::query_as("SELECT record_id,archived FROM kernel_lifecycle ORDER BY record_id").fetch_all(pool).await?,
+        comment_anchors: sqlx::query_as("SELECT annotation_id,target_record_id,source_slot,selectors,body_revision,body_revision_source,body_sha256,purpose,created_at,actor,event_seq FROM kernel_comment_anchors ORDER BY annotation_id").fetch_all(pool).await?,
+        v1_state: sqlx::query_as("SELECT section,source_id,origin,payload,account_principal,record_id,observed_at,event_seq FROM kernel_v1_state ORDER BY section,source_id").fetch_all(pool).await?,
+        runs: sqlx::query_as("SELECT id,owner_principal,run_principal,opened_seq,head,closed FROM kernel_runs ORDER BY id").fetch_all(db.pool()).await?,
         roots: sqlx::query_as(
             "SELECT root_id, parent_id, owner_id, created_seq, created_at FROM kernel_roots ORDER BY root_id",
         )
@@ -1032,6 +1473,13 @@ pub async fn dump_all_kernel_tables(db: &Db) -> Result<KernelTableDump> {
         )
         .fetch_all(pool)
         .await?,
+        link4_edges: sqlx::query_as("SELECT edge_id, principal_id, operation_key, source_id, target_id, predicate, witness_json, created_seq FROM kernel_link4_edges ORDER BY edge_id")
+            .fetch_all(pool).await?,
+        provider_state: sqlx::query_as("SELECT id,provider_key,subjects_json,state_json,head FROM kernel_provider_state ORDER BY id").fetch_all(db.pool()).await?,
+        provider_subjects: sqlx::query_as("SELECT subject_id,aggregate_id FROM kernel_provider_subjects ORDER BY subject_id,aggregate_id").fetch_all(db.pool()).await?,
+        provider_receipts: sqlx::query_as("SELECT principal_id,operation,operation_key,request_json,assertion_id,event_seq FROM kernel_provider_receipts ORDER BY principal_id,operation,operation_key").fetch_all(db.pool()).await?,
+        slots: sqlx::query_as("SELECT principal_id,slot,target_id,generation,set_seq FROM kernel_slots ORDER BY principal_id,slot").fetch_all(pool).await?,
+        slot_lineage: sqlx::query_as("SELECT principal_id,slot,generation,target_id,previous_target_id,event_seq FROM kernel_slot_lineage ORDER BY principal_id,slot,generation").fetch_all(pool).await?,
         record_fields: sqlx::query_as(
             "SELECT record_id, name, value_json, created_seq FROM kernel_record_fields
              ORDER BY record_id, name",
@@ -1219,6 +1667,50 @@ const EXPECTED_V2_RULE_INSTALLATION_STATEMENTS: usize = 2;
 /// and principals; records/links/policies land now so the constructor stays
 /// stable while later increments add their events and folds.
 const V2_KERNEL_TABLES: &[&str] = &[
+    app_state::DDL,
+    app_installs::SOURCES_DDL,
+    app_installs::INSTALLS_DDL,
+    app_installs::REVOCATIONS_DDL,
+    app_installs::IMPORT_CLOSED_INDEX,
+    app_installs::OUTCOMES_DDL,
+    app_installs::ACTIONS_DDL,
+    instruction_bindings::DDL,
+    v1_state::DDL,
+    v1_state::RUN_INDEX,
+    v1_state::ACCOUNT_INDEX,
+    generic_links::DDL,
+    "CREATE UNIQUE INDEX idx_kernel_generic_links_active_triple ON kernel_generic_links(source_id,target_id,relationship) WHERE active=1",
+    "CREATE INDEX idx_kernel_generic_links_source_page ON kernel_generic_links(source_id,link_id)",
+    "CREATE INDEX idx_kernel_generic_links_target_page ON kernel_generic_links(target_id,link_id)",
+    "CREATE INDEX idx_kernel_generic_links_source ON kernel_generic_links(source_id,relationship,link_id)",
+    "CREATE INDEX idx_kernel_generic_links_target ON kernel_generic_links(target_id,relationship,link_id)",
+    record_metadata::DDL,
+    blobs::BYTES_DDL,
+    blobs::HANDLES_DDL,
+    blobs::REFS_DDL,
+    hq::BODIES_DDL,
+    hq::FACETS_DDL,
+    legacy_history::DDL,
+    legacy_history::SUBJECTS_DDL,
+    legacy_history::SQL_EVENTS_DDL,
+    legacy_history::SQL_PROGRESS_DDL,
+    legacy_history::SQL_EVENTS_INDEX_DDL,
+    hq::LIFECYCLE_DDL,
+    hq::TOMBSTONES_DDL,
+    messaging::DDL,
+    notifications::EVENTS_DDL,
+    notifications::FRONTIER_DDL,
+    notifications::DDL,
+    notifications::INDEX,
+    notifications::EVENT_INDEX,
+    messaging::RECEIPTS_DDL,
+    messaging::INTERACTIONS_DDL,
+    messaging::PERSONAS_DDL,
+    hosted_identity::EVENT_INDEX_DDL,
+    messaging::DEST_DDL,
+    messaging::PEOPLE_DDL,
+    comments_v2::DDL,
+    comments_v2::TARGET_INDEX_DDL,
     KERNEL_ROOTS_DDL,
     KERNEL_PRINCIPALS_DDL,
     KERNEL_ROOT_BOOTSTRAP_DDL,
@@ -1227,14 +1719,33 @@ const V2_KERNEL_TABLES: &[&str] = &[
     KERNEL_RECORDS_DDL,
     KERNEL_RECORD_FIELDS_DDL,
     KERNEL_LINKS_DDL,
+    generic_links::LEGACY_TARGET_INDEX,
+    links_v2::LINK4_DDL,
+    run_ledger::DDL,
+    run_ledger::OWNER_INDEX_DDL,
+    commit_port::STATE_DDL,
+    commit_port::RECEIPT_DDL,
+    commit_port::SUBJECT_DDL,
+    generic_links::PROVIDER_AGGREGATE_INDEX,
+    "CREATE INDEX idx_kernel_link4_edges_created_seq ON kernel_link4_edges(created_seq)",
     KERNEL_ADOPTIONS_DDL,
     KERNEL_PACKAGE_SELECTIONS_DDL,
+    slots::SLOTS_DDL,
+    slots::LINEAGE_DDL,
+    slots::HOME_OWNER_INDEX_DDL,
 ];
 
 /// Apply the v2 owned schema: subset store tables plus kernel tables. The
 /// frozen v1 `DDL_STATEMENTS` are only read, never modified.
 pub async fn apply_v2_schema(db: &Db) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
+    let objects: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'")
+            .fetch_one(&mut *tx)
+            .await?;
+    if objects != 0 {
+        return Err(Error::engine("v2 creation requires an empty database; use explicit v2 preparation for existing files"));
+    }
     let mut store_count = 0usize;
     for statement in DDL_STATEMENTS {
         if V2_STORE_PREFIXES
@@ -1308,13 +1819,254 @@ pub async fn apply_v2_schema(db: &Db) -> Result<()> {
     for ddl in V2_KERNEL_TABLES {
         sqlx::query(ddl).execute(&mut *tx).await?;
     }
+    // Probe-only (S7a) search index and scan covering index. The frozen
+    // `V2_KERNEL_TABLES` above stay untouched; this block is idempotent.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    search_v2::apply_search_schema(&mut tx).await?;
+    sqlx::query(&format!(
+        "PRAGMA application_id = {}",
+        crate::db::V2_APPLICATION_ID
+    ))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
 
+/// Explicit preparation for legacy/imported v2 files. Serving never runs these
+/// repairs; import and creation own the ready-to-serve schema.
+pub async fn prepare_v2_database(db: &Db) -> Result<()> {
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(db.pool())
+        .await?;
+    if marker != 0 && marker != crate::db::V2_APPLICATION_ID {
+        return Err(Error::engine(
+            "v2 preparation refuses a foreign application_id",
+        ));
+    }
+    // A legacy v2 file must already have its owned root/principal schema.
+    sqlx::query("SELECT root_id FROM kernel_roots LIMIT 0")
+        .execute(db.pool())
+        .await?;
+    sqlx::query("SELECT principal_id, auth_binding FROM kernel_principals LIMIT 0")
+        .execute(db.pool())
+        .await?;
+    let mut tx = begin_write(db.write_pool()).await?;
+    blobs::ensure_schema(&mut tx).await?;
+    v1_state::ensure_schema(&mut tx).await?;
+    app_state::ensure_schema(&mut tx).await?;
+    for ddl in [messaging::DDL, messaging::DEST_DDL, messaging::PEOPLE_DDL] {
+        sqlx::query(&ddl.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+            .execute(&mut *tx)
+            .await?;
+    }
+    app_installs::ensure_schema(&mut tx).await?;
+    tx.commit().await?;
+    ensure_record_metadata(db).await?;
+    ensure_search_index(db).await?;
+    ensure_link_read_indexes(db).await?;
+    verify_v2_ready(db).await?;
+    sqlx::query(&format!(
+        "PRAGMA application_id = {}",
+        crate::db::V2_APPLICATION_ID
+    ))
+    .execute(db.write_pool())
+    .await?;
+    Ok(())
+}
+
+/// Cheap, read-only readiness check. Missing/old projections require explicit
+/// import/preparation, never a repair during serving.
+pub async fn verify_v2_ready(db: &Db) -> Result<()> {
+    let mut connection = db.pool().acquire().await?;
+    verify_v2_ready_on(&mut connection).await
+}
+
+async fn verify_v2_ready_on(connection: &mut SqliteConnection) -> Result<()> {
+    let required = [
+        ("table", "kernel_roots"),
+        ("table", "kernel_principals"),
+        ("table", "kernel_blobs"),
+        ("table", "kernel_blob_handles"),
+        ("table", "kernel_attachment_blobs"),
+        ("table", "kernel_record_metadata"),
+        ("table", "kernel_import_tombstones"),
+        ("table", "kernel_legacy_history"),
+        ("table", "kernel_legacy_subjects"),
+        ("table", "kernel_v1_state"),
+        ("table", "kernel_app_state"),
+        ("table", "kernel_app_installs"),
+        ("table", "kernel_app_install_outcomes"),
+        ("table", "kernel_app_actions"),
+        ("table", "kernel_app_consent_revocations"),
+        ("table", "kernel_app_package_sources"),
+        ("index", "idx_kernel_import_closed"),
+        ("table", "kernel_legacy_sql_events"),
+        ("table", "kernel_legacy_sql_progress"),
+        ("table", "kernel_messages"),
+        ("table", "kernel_message_receipts"),
+        ("table", "kernel_message_interactions"),
+        ("table", "kernel_personas"),
+        ("table", "kernel_message_destinations"),
+        ("table", "kernel_message_people"),
+        ("table", "kernel_search_fts"),
+        ("table", "kernel_search_meta"),
+        ("index", "idx_kernel_links_target"),
+        ("index", "idx_kernel_provider_subjects_aggregate"),
+        ("index", "idx_kernel_records_family_kind_accession"),
+        ("index", "idx_kernel_v1_state_run"),
+        ("index", "idx_kernel_v1_state_account"),
+        ("index", "idx_kernel_hosted_event_lookup"),
+    ];
+    for (kind, name) in required {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=? AND name=?)",
+        )
+        .bind(kind)
+        .bind(name)
+        .fetch_one(&mut *connection)
+        .await?;
+        if !exists {
+            return Err(Error::engine(format!("v2 database is not ready: missing {name}; run explicit v2 import/preparation before serving")));
+        }
+    }
+    let gap_free: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info('kernel_legacy_sql_progress') WHERE name='gap_free')")
+        .fetch_one(&mut *connection).await?;
+    if !gap_free {
+        return Err(Error::engine("v2 database is not ready: legacy SQL frontier format; run explicit v2 import/preparation before serving"));
+    }
+    let provenance_headers: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_table_info('kernel_legacy_sql_progress') WHERE name='provenance_headers')")
+        .fetch_one(&mut *connection).await?;
+    if !provenance_headers {
+        return Err(Error::engine("v2 database is not ready: legacy provenance header format; run explicit v2 import/preparation before serving"));
+    }
+    let pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM kernel_legacy_sql_progress WHERE provenance_headers!=1)",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if pending {
+        return Err(Error::engine("v2 database is not ready: legacy provenance headers need backfill; run explicit v2 import/preparation before serving"));
+    }
+    let version: Option<i64> = sqlx::query_scalar("SELECT version FROM kernel_search_meta LIMIT 1")
+        .fetch_optional(&mut *connection)
+        .await?;
+    if version != Some(search_v2::SEARCH_INDEX_VERSION) {
+        return Err(Error::engine("v2 database is not ready: search index version; run explicit v2 import/preparation before serving"));
+    }
+    Ok(())
+}
+
+/// Verify a marked target without opening a writable pool or creating schema.
+pub async fn verify_marked_v2_file_read_only(path: &std::path::Path) -> Result<()> {
+    use sqlx::Connection;
+    let mut connection = SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true),
+    )
+    .await?;
+    let result = async {
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&mut connection)
+            .await?;
+        if marker != crate::db::V2_APPLICATION_ID {
+            return Err(Error::engine("cutover target requires NKV2 marker"));
+        }
+        verify_v2_ready_on(&mut connection).await
+    }
+    .await;
+    connection.close().await?;
+    result
+}
+
+/// Open an existing v2 file. Legacy unmarked files are stamped after readiness
+/// verification; no open-time schema creation or projection rebuild is allowed.
+pub async fn open_v2_database(path: &str) -> Result<Db> {
+    open_v2_database_inner(path, true).await
+}
+
+/// Hosted routing requires an explicitly prepared and marked v2 file. Unlike
+/// the local compatibility opener, this path never upgrades a legacy marker.
+pub async fn open_marked_v2_database(path: &str) -> Result<Db> {
+    open_v2_database_inner(path, false).await
+}
+
+async fn open_v2_database_inner(path: &str, allow_legacy: bool) -> Result<Db> {
+    use sqlx::Connection;
+
+    if !std::path::Path::new(path).is_file() {
+        return Err(Error::engine(
+            "v2 serving requires an existing database file",
+        ));
+    }
+    // Serving admission checks the engine marker and small schema metadata,
+    // not every database page. Deep integrity verification belongs to explicit
+    // backup/restore qualification. Do not negotiate WAL or repair a legacy
+    // file before its readiness has been established read-only.
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    let ready: Result<()> = async {
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(&mut connection)
+            .await?;
+        if marker != 0 && marker != crate::db::V2_APPLICATION_ID {
+            return Err(Error::engine(
+                "refusing v2 open: foreign application_id; expected an existing v2 database",
+            ));
+        }
+        if marker == 0 && !allow_legacy {
+            return Err(Error::engine("hosted v2 open requires a marked v2 database; prepare legacy files explicitly before serving"));
+        }
+        if marker == 0 {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut connection)
+                .await?;
+            if version != 0 {
+                return Err(Error::engine(
+                    "refusing v2 open: expected an unmarked legacy v2 database, not a v1 schema",
+                ));
+            }
+        }
+        verify_v2_ready_on(&mut connection).await
+    }
+    .await;
+    let closed = connection.close().await;
+    ready?;
+    closed?;
+    let db = crate::db::open_existing_v2_file(path).await?;
+    let result = async {
+        verify_v2_ready(&db).await?;
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+            .fetch_one(db.pool())
+            .await?;
+        if marker == 0 && allow_legacy {
+            sqlx::query(&format!(
+                "PRAGMA application_id = {}",
+                crate::db::V2_APPLICATION_ID
+            ))
+            .execute(db.write_pool())
+            .await?;
+        } else if marker != crate::db::V2_APPLICATION_ID {
+            return Err(Error::engine("v2 open refuses a foreign application_id"));
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = result {
+        db.close().await;
+        return Err(error);
+    }
+    Ok(db)
+}
+
 /// v2 genesis: owned subset schema, one neutral root, one initial
-/// root-admin principal, and the attributed single-shot bootstrap — all three
-/// events in one genesis transaction. There is no first-come window: any
+/// root-admin principal, attributed single-shot bootstrap and reserved host
+/// transform and import principals — all five events in one genesis transaction. There is no first-come window: any
 /// later bootstrap refuses with no event. Plain commit, not `commit_content`:
 /// the subset database has no provenance tables for attestation issuance.
 pub async fn create_v2_database(
@@ -1323,6 +2075,7 @@ pub async fn create_v2_database(
     admin_label: &str,
     admin_binding: &str,
 ) -> Result<(Db, String)> {
+    refuse_caller_host_binding(admin_binding)?;
     let db = open_database(url).await?;
     apply_v2_schema(&db).await?;
     let admin_id = Uuid::new_v4().to_string();
@@ -1370,7 +2123,22 @@ pub async fn create_v2_database(
         &mut acts,
     )
     .await?;
+    // The reserved transform identity is minted inside genesis, before callers
+    // can compete for its UNIQUE binding. It receives no grants automatically.
+    append_in(&db, &mut tx, AppendSpec {
+        record_id: Uuid::new_v4().to_string(),
+        event_type: HOST_TRANSFORM_CREATED_EVENT.into(),
+        payload: serde_json::json!({"kind":"agent","display_label":"Relationship host transform","auth_binding":relates_to_port::HOST_TRANSFORM_BINDING}),
+        actor: Some(KERNEL_GENESIS_ACTOR.into()),
+    }, &mut acts).await?;
+    append_in(&db, &mut tx, AppendSpec {
+        record_id: Uuid::new_v4().to_string(),
+        event_type: "kernel.host_import_created.v1".into(),
+        payload: serde_json::json!({"kind":"agent","display_label":"V1 host importer","auth_binding":HOST_IMPORT_BINDING}),
+        actor: Some(KERNEL_GENESIS_ACTOR.into()),
+    }, &mut acts).await?;
     tx.commit().await?;
+    prepare_v2_database(&db).await?;
     Ok((db, admin_id))
 }
 
@@ -1383,6 +2151,7 @@ pub async fn create_principal(
     auth_binding: &str,
     actor: &str,
 ) -> Result<String> {
+    refuse_caller_host_binding(auth_binding)?;
     let id = Uuid::new_v4().to_string();
     let mut tx = begin_write(db.write_pool()).await?;
     let mut acts = crate::act::ActAllocation::new();
@@ -1406,6 +2175,29 @@ pub async fn create_principal(
     Ok(id)
 }
 
+pub(crate) const HOST_TRANSFORM_CREATED_EVENT: &str = "kernel.host_transform_created.v1";
+fn refuse_caller_host_binding(binding: &str) -> Result<()> {
+    if binding.starts_with("host:") {
+        return Err(Error::engine(
+            "host: auth bindings are reserved for kernel-owned principals",
+        ));
+    }
+    Ok(())
+}
+pub(crate) async fn project_host_transform_created(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+) -> Result<()> {
+    let p: KernelPrincipalPayload = event_payload(event)?;
+    if event.actor.as_deref() != Some(KERNEL_GENESIS_ACTOR)
+        || p.kind != "agent"
+        || p.auth_binding != relates_to_port::HOST_TRANSFORM_BINDING
+    {
+        return Err(Error::engine("invalid kernel host transform envelope"));
+    }
+    project_kernel_principal_payload(conn, event, p).await
+}
+
 /// Resolve `(principal_id, kind, display_label)` from an auth binding.
 pub async fn resolve_principal_by_binding(
     db: &Db,
@@ -1418,6 +2210,21 @@ pub async fn resolve_principal_by_binding(
     .fetch_optional(db.write_pool())
     .await?;
     Ok(row)
+}
+
+/// Transport callers can never authenticate as a reserved host principal.
+/// Internal sealed seams continue to use the low-level binding lookup.
+#[cfg(feature = "v2-kernel-probe")]
+pub async fn resolve_caller_principal_by_binding(
+    db: &Db,
+    auth_binding: &str,
+) -> Result<Option<(String, String, String)>> {
+    if auth_binding.starts_with("host:") {
+        return Err(Error::engine(
+            "kernel-v2: host bindings cannot authenticate callers",
+        ));
+    }
+    resolve_principal_by_binding(db, auth_binding).await
 }
 
 /// Exactly-once marker for the explicit root-admin bootstrap. Authority never
@@ -1441,10 +2248,12 @@ struct KernelHomeEntryPayload {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KernelHomeCreatedPayload {
+    /// Logical folder identity; uses the same deterministic child-home binding as import.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_record_id: Option<String>,
     parent_id: String,
-    /// Owner principal id, set by the write path to the creating principal
-    /// in the same event that creates the home. Principal-keyed, never an
-    /// auth binding.
+    /// Owner principal: the creator for an ordinary home, or the existing
+    /// folder owner for a child-home binding. Never an auth binding.
     owner_id: String,
     /// `Some` (possibly empty) installs an own policy anchor on the home;
     /// `None` leaves the home anchorless so it inherits its nearest ancestor.
@@ -1516,6 +2325,86 @@ pub(crate) async fn project_kernel_home_created(
     Ok(())
 }
 
+/// Shared home admission (Foci v2 G6 increment 3b; design note 681a449 §3.3,
+/// §4.2, §7). Runs at admission only, from `append_prepared_admitted` and
+/// explicitly from `append_migration_on`, so no append route skips it; the
+/// folds stay permissive and replay of an existing log is unaffected.
+///
+/// 1. Generic home creation refuses owner ≠ actor except a folder binding,
+///    which preserves its live folder's existing owner and requires folder
+///    Edit. Other delegated ownership uses sealed `home_created_for`.
+/// 2. The record and home id spaces stay disjoint: a record id may not already
+///    be a home, and a home id may not already be a record. The count and
+///    probe queries of the rehome batch rely on this (§4.2).
+///
+/// Other event types pass through.
+pub(crate) async fn admit_home_event(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    hq::admit(conn, event).await?;
+    blobs::admit(conn, event).await?;
+    generic_links::admit(conn, event).await?;
+    comments_v2::admit(conn, event).await?;
+    match event.event_type.as_str() {
+        KERNEL_HOME_CREATED_EVENT => {
+            let p: KernelHomeCreatedPayload = event_payload(event)?;
+            if let Some(folder) = &p.source_record_id {
+                let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r JOIN kernel_record_fields t ON t.record_id=r.id AND t.name='v1_type' AND t.value_json='\"Collection\"' JOIN kernel_record_fields k ON k.record_id=r.id AND k.name='v1_kind' AND k.value_json='\"folder\"' WHERE r.id=? AND r.home_id=? AND r.owner_id=? AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle life WHERE life.record_id=r.id AND life.archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id))")
+                    .bind(folder).bind(&p.parent_id).bind(&p.owner_id).fetch_one(&mut *conn).await?;
+                if !valid || event.record_id != v1_import_home_id(folder) || p.entries.is_some() {
+                    return Err(Error::engine("invalid folder home binding"));
+                }
+                if !kernel_effective_capability_on(
+                    conn,
+                    event.actor.as_deref().unwrap_or_default(),
+                    folder,
+                )
+                .await?
+                .allows(Capability::Edit)
+                {
+                    return Err(Error::engine(HIDDEN_OR_MISSING));
+                }
+                validate_move_parent(
+                    conn,
+                    &MoveHomeParent {
+                        home_id: event.record_id.clone(),
+                        parent_id: p.parent_id.clone(),
+                    },
+                )
+                .await?;
+            } else if event.actor.as_deref() != Some(p.owner_id.as_str()) {
+                return Err(Error::engine(
+                    "a home can be created for another owner only through the sealed home_created_for route",
+                ));
+            }
+            refuse_taken_by_record(conn, &event.record_id).await
+        }
+        slots::HOME_CREATED_FOR => refuse_taken_by_record(conn, &event.record_id).await,
+        "kernel.record_created.v1" => {
+            let is_home: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
+                    .bind(&event.record_id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            if is_home {
+                return Err(Error::engine("record id is already a home"));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn refuse_taken_by_record(conn: &mut SqliteConnection, id: &str) -> Result<()> {
+    let is_record: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id = ?)")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await?;
+    if is_record {
+        return Err(Error::engine("home id is not fresh"));
+    }
+    Ok(())
+}
+
 /// Evaluate one kernel record or home for one principal.
 ///
 /// The anchor is the target's nearest ancestor with an own policy: the
@@ -1536,19 +2425,74 @@ const MAX_HOME_DEPTH: usize = 100;
 /// The one refusal for every write/capability check against a record, home
 /// or principal the caller cannot View: missing and hidden are
 /// indistinguishable, and no id or title of the target leaks.
-const HIDDEN_OR_MISSING: &str = "kernel target missing or hidden";
+pub(crate) const HIDDEN_OR_MISSING: &str = "kernel target missing or hidden";
 
 pub(crate) async fn kernel_effective_capability_on(
     conn: &mut SqliteConnection,
     principal_id: &str,
     target_id: &str,
 ) -> Result<Capability> {
+    if !hosted_identity::admitted(conn, principal_id).await? {
+        return Ok(Capability::None);
+    }
     let is_home: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
             .bind(target_id)
             .fetch_one(&mut *conn)
             .await?;
-    let mut anchor: String = if is_home {
+    if !is_home && hq::tombstoned_on(conn, target_id).await? {
+        return Ok(Capability::None);
+    }
+    if !is_home && !messaging::audience_allows(conn, principal_id, target_id).await? {
+        return Ok(Capability::None);
+    }
+    if !is_home && comments_v2::is_derived_on(conn, target_id).await? {
+        // All annotations and attachment documents inherit their terminal
+        // bearer's authority, including its owner floor; never their own.
+        let Some(terminal) = comments_v2::derived_terminal_on(conn, target_id).await? else {
+            return Ok(Capability::None);
+        };
+        return kernel_effective_capability_on_terminal(conn, principal_id, &terminal, false).await;
+    }
+    kernel_effective_capability_on_terminal(conn, principal_id, target_id, is_home).await
+}
+
+/// Home-policy evaluation with the owner's floor, for a record already
+/// proven not to derive (a home, an ordinary record, or a comment's
+/// non-comment terminal). Split out so comment derivation terminates in
+/// one hop without async recursion.
+async fn kernel_effective_capability_on_terminal(
+    conn: &mut SqliteConnection,
+    principal_id: &str,
+    target_id: &str,
+    is_home: bool,
+) -> Result<Capability> {
+    if !is_home && hq::tombstoned_on(conn, target_id).await? {
+        return Ok(Capability::None);
+    }
+    if !is_home {
+        if let Some(capability) = messaging::capability(conn, principal_id, target_id).await? {
+            // Missing message state and reserved maintenance identities fail closed.
+            if capability == Capability::None {
+                return Ok(Capability::None);
+            }
+            let base = kernel_base_capability_on(conn, principal_id, target_id, false).await?;
+            return Ok(if base.allows(capability) {
+                capability
+            } else {
+                base
+            });
+        }
+    }
+    kernel_base_capability_on(conn, principal_id, target_id, is_home).await
+}
+async fn kernel_base_capability_on(
+    conn: &mut SqliteConnection,
+    principal_id: &str,
+    target_id: &str,
+    is_home: bool,
+) -> Result<Capability> {
+    let anchor: String = if is_home {
         target_id.to_string()
     } else {
         sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id = ?")
@@ -1557,49 +2501,7 @@ pub(crate) async fn kernel_effective_capability_on(
             .await?
             .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?
     };
-    let mut depth = 0usize;
-    loop {
-        let anchored: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_policies WHERE root_id = ?)")
-                .bind(&anchor)
-                .fetch_one(&mut *conn)
-                .await?;
-        if anchored {
-            break;
-        }
-        depth += 1;
-        if depth > MAX_HOME_DEPTH {
-            return Err(Error::engine(HIDDEN_OR_MISSING));
-        }
-        anchor = sqlx::query_scalar("SELECT parent_id FROM kernel_roots WHERE root_id = ?")
-            .bind(&anchor)
-            .fetch_optional(&mut *conn)
-            .await?
-            .flatten()
-            .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
-    }
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT subject_kind, subject_id, effect, capability FROM kernel_policy_entries WHERE root_id = ?",
-    )
-    .bind(&anchor)
-    .fetch_all(&mut *conn)
-    .await?;
-    let evaluation_entries: Vec<PolicyEvaluationEntry<'_>> = rows
-        .iter()
-        .map(|row| PolicyEvaluationEntry {
-            subject_kind: &row.0,
-            subject_id: &row.1,
-            effect: &row.2,
-            capability: &row.3,
-        })
-        .collect();
-    let policy_capability = evaluate_policy_grants(
-        PolicyEvaluationPrincipal::new(Some(principal_id), false),
-        &evaluation_entries,
-    )
-    // Fail closed without naming the anchor: malformed stored policy must not
-    // become an oracle for ancestor-home existence either.
-    .map_err(|_| Error::engine(HIDDEN_OR_MISSING))?;
+    let policy_capability = kernel_policy_capability_on(conn, principal_id, &anchor).await?;
     // Owner floor, composed last: records compare their `owner_id`, homes
     // compare the home's own `owner_id` — both principal ids, never auth
     // bindings. An emptied home stays recoverable by its owner.
@@ -1622,6 +2524,147 @@ pub(crate) async fn kernel_effective_capability_on(
     ))
 }
 
+/// Resolve the nearest explicit policy boundary, with the shared depth limit.
+pub(crate) async fn kernel_policy_anchor_on(
+    conn: &mut SqliteConnection,
+    home: &str,
+) -> Result<String> {
+    let mut anchor = home.to_owned();
+    let mut depth = 0usize;
+    loop {
+        let anchored: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_policies WHERE root_id = ?)")
+                .bind(&anchor)
+                .fetch_one(&mut *conn)
+                .await?;
+        if anchored {
+            break;
+        }
+        depth += 1;
+        if depth > MAX_HOME_DEPTH {
+            return Err(Error::engine(HIDDEN_OR_MISSING));
+        }
+        anchor = sqlx::query_scalar("SELECT parent_id FROM kernel_roots WHERE root_id = ?")
+            .bind(&anchor)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten()
+            .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+    }
+    Ok(anchor)
+}
+
+/// Policy only; record and home owner floors are composed separately.
+async fn kernel_policy_capability_on(
+    conn: &mut SqliteConnection,
+    principal_id: &str,
+    home: &str,
+) -> Result<Capability> {
+    if !hosted_identity::admitted(conn, principal_id).await? {
+        return Ok(Capability::None);
+    }
+    let anchor = kernel_policy_anchor_on(conn, home).await?;
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT subject_kind, subject_id, effect, capability FROM kernel_policy_entries WHERE root_id = ?",
+    )
+    .bind(&anchor)
+    .fetch_all(&mut *conn)
+    .await?;
+    let rows = hosted_identity::policy_rows(conn, principal_id, &anchor)
+        .await?
+        .unwrap_or(rows);
+    let evaluation_entries: Vec<PolicyEvaluationEntry<'_>> = rows
+        .iter()
+        .map(|row| PolicyEvaluationEntry {
+            subject_kind: &row.0,
+            subject_id: &row.1,
+            effect: &row.2,
+            capability: &row.3,
+        })
+        .collect();
+    let policy_capability = evaluate_policy_grants(
+        PolicyEvaluationPrincipal::new(Some(principal_id), false),
+        &evaluation_entries,
+    )
+    // Fail closed without naming the anchor: malformed stored policy must not
+    // become an oracle for ancestor-home existence either.
+    .map_err(|_| Error::engine(HIDDEN_OR_MISSING))?;
+    Ok(policy_capability)
+}
+
+/// SQL-filterable visibility terms evaluated in the caller's snapshot.
+/// A record is visible iff its home has `policy_valid` and either `policy_view`
+/// or the caller owns that record. Home ownership alone does not admit records.
+/// Broken anchors fail closed before the owner floor, as single-target checks do.
+pub(crate) struct VisibleHomeAnchor {
+    pub home_id: String,
+    pub policy_valid: bool,
+    pub policy_view: bool,
+    /// Visibility of the home itself, including its own owner floor.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub home_view: bool,
+}
+pub(crate) struct VisibleHomeAnchors {
+    pub homes: Vec<VisibleHomeAnchor>,
+    pub failed_homes: usize,
+}
+pub(crate) async fn visible_home_anchors_as(
+    conn: &mut SqliteConnection,
+    principal: &str,
+) -> Result<VisibleHomeAnchors> {
+    if !hosted_identity::admitted(conn, principal).await? {
+        return Ok(VisibleHomeAnchors {
+            homes: Vec::new(),
+            failed_homes: 0,
+        });
+    }
+    let homes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT h.root_id,h.owner_id FROM kernel_roots h UNION ALL SELECT DISTINCT r.home_id,NULL FROM kernel_records r WHERE NOT EXISTS(SELECT 1 FROM kernel_roots h WHERE h.root_id=r.home_id)",
+    ).fetch_all(&mut *conn).await?;
+    let mut result = VisibleHomeAnchors {
+        homes: Vec::new(),
+        failed_homes: 0,
+    };
+    for row in homes {
+        #[cfg(feature = "v2-kernel-probe")]
+        let (home, owner) = row;
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let (home, _) = row;
+        match kernel_policy_capability_on(conn, principal, &home).await {
+            Ok(capability) => {
+                let view = capability.allows(Capability::View);
+                result.homes.push(VisibleHomeAnchor {
+                    home_id: home,
+                    policy_valid: true,
+                    policy_view: view,
+                    #[cfg(feature = "v2-kernel-probe")]
+                    home_view: view || owner.as_deref() == Some(principal),
+                });
+            }
+            Err(Error::Engine(message)) if message == HIDDEN_OR_MISSING => {
+                result.failed_homes += 1;
+                result.homes.push(VisibleHomeAnchor {
+                    home_id: home,
+                    policy_valid: false,
+                    policy_view: false,
+                    #[cfg(feature = "v2-kernel-probe")]
+                    home_view: false,
+                });
+            }
+            // Storage failures (including interruption, BUSY, IO and NOMEM)
+            // are not authority refusals and must reach the caller.
+            Err(error) => return Err(error),
+        }
+    }
+    if result.failed_homes > 0 {
+        tracing::warn!(
+            failed_homes = result.failed_homes,
+            "bulk kernel visibility omitted broken policy scopes"
+        );
+    }
+    Ok(result)
+}
+
 /// Snapshot-scoped evaluation for callers without their own transaction.
 pub async fn kernel_effective_capability(
     db: &Db,
@@ -1635,7 +2678,7 @@ pub async fn kernel_effective_capability(
 }
 
 #[allow(clippy::explicit_auto_deref)]
-async fn kernel_require(
+pub(crate) async fn kernel_require(
     tx: &mut Transaction<'_, Sqlite>,
     principal_id: &str,
     target_id: &str,
@@ -1647,6 +2690,84 @@ async fn kernel_require(
     let capability = kernel_effective_capability_on(&mut **tx, principal_id, target_id).await?;
     if !capability.allows(required) {
         return Err(Error::engine(HIDDEN_OR_MISSING));
+    }
+    Ok(())
+}
+
+/// Bind a live logical folder to its deterministic, policy-inheriting child
+/// home. Existing imported bindings are reused; older native folders are bound
+/// on their first member write. Never called by read paths.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn folder_home_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    actor: &str,
+    requested: &str,
+) -> Result<()> {
+    let logical: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
+        .bind(requested).fetch_optional(&mut **tx).await?;
+    let folder = logical.as_deref().unwrap_or(requested);
+    let is_home: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
+            .bind(folder)
+            .fetch_one(&mut **tx)
+            .await?;
+    if is_home || folder == "native:root" {
+        return Ok(());
+    }
+    let capability = kernel_effective_capability_on(tx, actor, folder).await?;
+    if !capability.allows(Capability::View) {
+        return Err(Error::engine(HIDDEN_OR_MISSING));
+    }
+    let row = read_record_on(tx, actor, folder)
+        .await?
+        .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+    if row.archived
+        || row
+            .fields
+            .get("v1_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("Collection")
+        || row
+            .fields
+            .get("v1_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("folder")
+    {
+        return Err(Error::engine("home_id must name a live unarchived folder"));
+    }
+    if !capability.allows(Capability::Edit) {
+        return Err(Error::engine("Edit on the destination folder is required"));
+    }
+    let home = v1_import_home_id(folder);
+    let bound: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id')=?)")
+        .bind(&home).bind(folder).fetch_one(&mut **tx).await?;
+    if !bound {
+        // The member-facing view may redact another principal's identity.
+        // This is authority state, read only after the folder Edit gate.
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_id FROM kernel_records WHERE id=?")
+                .bind(folder)
+                .fetch_one(&mut **tx)
+                .await?;
+        append_in(
+            db,
+            tx,
+            AppendSpec {
+                record_id: home,
+                event_type: KERNEL_HOME_CREATED_EVENT.into(),
+                payload: serde_json::to_value(KernelHomeCreatedPayload {
+                    source_record_id: Some(folder.into()),
+                    parent_id: row.home_id,
+                    owner_id: owner.ok_or_else(|| Error::engine("folder has no owner"))?,
+                    entries: None,
+                })?,
+                actor: Some(actor.into()),
+            },
+            acts,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1688,6 +2809,7 @@ pub async fn create_home(
             record_id: id.clone(),
             event_type: KERNEL_HOME_CREATED_EVENT.into(),
             payload: serde_json::to_value(KernelHomeCreatedPayload {
+                source_record_id: None,
                 parent_id: parent_id.to_string(),
                 owner_id: actor_principal_id.to_string(),
                 entries: payload_entries,
@@ -1828,6 +2950,26 @@ pub async fn link_records_as(
     source_id: &str,
     target_id: &str,
 ) -> Result<()> {
+    if links_v2::source_supports_closed_links(db, source_id).await? {
+        let request = prepare_link4_as(
+            db,
+            creator_principal_id,
+            source_id,
+            "relates_to",
+            target_id,
+            &links_v2::wrapper_operation_key(
+                db,
+                creator_principal_id,
+                source_id,
+                "relates_to",
+                target_id,
+            )
+            .await?,
+        )
+        .await?;
+        link4_as(db, creator_principal_id, &request).await?;
+        return Ok(());
+    }
     let mut tx = begin_write(db.write_pool()).await?;
     check_link_endpoints(&mut tx, creator_principal_id, source_id, target_id).await?;
     let mut acts = crate::act::ActAllocation::new();
@@ -1865,6 +3007,26 @@ pub async fn link_as(
 ) -> Result<()> {
     if predicate.trim().is_empty() {
         return Err(Error::engine("link predicate must not be empty"));
+    }
+    if links_v2::source_supports_closed_links(db, source_id).await? {
+        let request = prepare_link4_as(
+            db,
+            creator_principal_id,
+            source_id,
+            predicate,
+            target_id,
+            &links_v2::wrapper_operation_key(
+                db,
+                creator_principal_id,
+                source_id,
+                predicate,
+                target_id,
+            )
+            .await?,
+        )
+        .await?;
+        link4_as(db, creator_principal_id, &request).await?;
+        return Ok(());
     }
     let mut tx = begin_write(db.write_pool()).await?;
     check_link_endpoints(&mut tx, creator_principal_id, source_id, target_id).await?;
@@ -2058,9 +3220,17 @@ async fn query_as_pinned(
     let mut text_params: Vec<String> = Vec::new();
     for (name, value) in field_equals {
         sql.push_str(
-            " AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id = r.id AND f.name = ? AND f.value_json = ?)",
+            " AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id = r.id AND f.name = ? AND ((r.interpreter IN (?, ?) AND f.value_json = ?) OR (r.interpreter NOT IN (?, ?) AND f.value_json = ?)))",
         );
+        // Both structured markers match on the normalised form.
         text_params.push(name.to_string());
+        text_params.push(crate::structured_values::INTERPRETER.to_string());
+        text_params.push(crate::structured_values::INTERPRETER_V6.to_string());
+        text_params.push(serde_json::to_string(
+            &crate::structured_values::normalize(value),
+        )?);
+        text_params.push(crate::structured_values::INTERPRETER.to_string());
+        text_params.push(crate::structured_values::INTERPRETER_V6.to_string());
         text_params.push(serde_json::to_string(value)?);
     }
     if let Some((predicate, linked_id, direction)) = linked_to {
@@ -2207,8 +3377,11 @@ pub(crate) async fn project_kernel_home_policy_replaced(
 }
 
 /// Replace a home's whole policy as an attributed event. Requires Manage on
-/// the home (the owner floor supplies it for owned records, never for the
-/// home itself — homes have no owner). The actor stamped is the principal id.
+/// the home. A home has an owner (`kernel_roots.owner_id`, stamped when it is
+/// created), and the owner floor composes last for homes exactly as for
+/// records, so the owner keeps Manage whatever the policy says. A later
+/// Manage grantee can replace the policy too. The actor stamped is the
+/// principal id.
 pub async fn replace_home_policy(
     db: &Db,
     actor_principal_id: &str,
@@ -2385,30 +3558,80 @@ pub async fn rehome_record_as(
     new_home_id: &str,
 ) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
+    let mut acts = crate::act::ActAllocation::new();
+    rehome_record_in(
+        db,
+        &mut tx,
+        &mut acts,
+        actor_principal_id,
+        record_id,
+        new_home_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// The `_in` form of `rehome_record_as`: every rehome check and the existing
+/// rehome event, on the caller's transaction. It never begins or commits, so
+/// a caller that fails must abort its own transaction. A home is not a
+/// record, and the destination must be a home.
+pub(crate) async fn rehome_record_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    actor_principal_id: &str,
+    record_id: &str,
+    new_home_id: &str,
+) -> Result<()> {
     let is_home: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
             .bind(record_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(false);
     if is_home {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
-    kernel_require(&mut tx, actor_principal_id, record_id, Capability::Edit).await?;
+    kernel_require(tx, actor_principal_id, record_id, Capability::Edit).await?;
     let dest_is_home: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
             .bind(new_home_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(false);
     if !dest_is_home {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
-    kernel_require(&mut tx, actor_principal_id, new_home_id, Capability::Manage).await?;
-    let mut acts = crate::act::ActAllocation::new();
+    kernel_require(tx, actor_principal_id, new_home_id, Capability::Manage).await?;
+    let old_home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(record_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if old_home != new_home_id {
+        // This primitive does not carry dependents. Refuse derived artifacts
+        // and their bearers; member moves use the atomic cohort path below.
+        let derived: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM kernel_records c WHERE c.id=? AND {})",
+            sql_is_derived_artifact("c")
+        ))
+        .bind(record_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let children_sql = format!("SELECT EXISTS(SELECT 1 FROM kernel_generic_links l JOIN kernel_records c ON c.id=l.source_id WHERE l.target_id=? AND l.relationship='part_of' AND l.active=1 AND {})", sql_is_derived_artifact("c"));
+        let has_dependents: bool = sqlx::query_scalar(&children_sql)
+            .bind(record_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        if derived || has_dependents {
+            return Err(Error::engine(
+                "v2 rehoming records with comments or derived artifacts requires the atomic member move; nothing moved",
+            ));
+        }
+    }
     append_in(
         db,
-        &mut tx,
+        tx,
         AppendSpec {
             record_id: record_id.into(),
             event_type: KERNEL_REHOMED_EVENT.into(),
@@ -2417,10 +3640,218 @@ pub async fn rehome_record_as(
             })?,
             actor: Some(actor_principal_id.into()),
         },
-        &mut acts,
+        acts,
     )
     .await?;
-    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelMovePayload {
+    new_home_id: String,
+    logical_home_id: String,
+    parent_update: Option<MoveHomeParent>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MoveHomeParent {
+    home_id: String,
+    parent_id: String,
+}
+
+async fn validate_move_parent(conn: &mut SqliteConnection, change: &MoveHomeParent) -> Result<()> {
+    let mut current = Some(change.parent_id.clone());
+    let mut depth = 0;
+    while let Some(id) = current {
+        if id == change.home_id || depth > MAX_HOME_DEPTH {
+            return Err(Error::engine(
+                "move would create a home cycle or exceed the home depth limit; nothing moved",
+            ));
+        }
+        let row: Option<Option<String>> =
+            sqlx::query_scalar("SELECT parent_id FROM kernel_roots WHERE root_id=?")
+                .bind(&id)
+                .fetch_optional(&mut *conn)
+                .await?;
+        current = row.ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+        depth += 1;
+    }
+    let height: i64=sqlx::query_scalar("WITH RECURSIVE subtree(id,depth) AS (SELECT root_id,0 FROM kernel_roots WHERE root_id=? UNION ALL SELECT r.root_id,s.depth+1 FROM kernel_roots r JOIN subtree s ON r.parent_id=s.id WHERE s.depth<=?) SELECT coalesce(max(depth),0) FROM subtree")
+        .bind(&change.home_id).bind(MAX_HOME_DEPTH as i64).fetch_one(conn).await?;
+    if depth as i64 + height > MAX_HOME_DEPTH as i64 {
+        return Err(Error::engine(
+            "move would exceed the home depth limit; nothing moved",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn project_kernel_record_moved(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+) -> Result<()> {
+    let p: KernelMovePayload = event_payload(event)?;
+    let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id=?) AND EXISTS(SELECT 1 FROM kernel_roots WHERE root_id=?)")
+        .bind(&event.record_id).bind(&p.new_home_id).fetch_one(&mut *conn).await?;
+    if !exists || p.logical_home_id.trim().is_empty() {
+        return Err(Error::engine("invalid kernel move"));
+    }
+    if let Some(change) = &p.parent_update {
+        let bound: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id')=?)")
+            .bind(&change.home_id).bind(&event.record_id).fetch_one(&mut *conn).await?;
+        if !bound {
+            return Err(Error::engine("move home is not bound to its record"));
+        }
+        validate_move_parent(conn, change).await?;
+        let updated = sqlx::query(
+            "UPDATE kernel_roots SET parent_id=? WHERE root_id=? AND parent_id IS NOT NULL",
+        )
+        .bind(&change.parent_id)
+        .bind(&change.home_id)
+        .execute(&mut *conn)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(Error::engine("move cannot reparent the workspace root"));
+        }
+    }
+    sqlx::query("UPDATE kernel_records SET home_id=? WHERE id=?")
+        .bind(&p.new_home_id)
+        .bind(&event.record_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+// V1 authorization_target's derived-artifact rule. Keep raw rehome refusal
+// and the atomic move cohort on the same predicate.
+pub(crate) fn sql_is_derived_artifact(alias: &str) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM kernel_record_fields t \
+         LEFT JOIN kernel_record_fields k ON k.record_id=t.record_id AND k.name='v1_kind' \
+         WHERE t.record_id={alias}.id AND t.name='v1_type' \
+           AND (t.value_json='\"Annotation\"' OR (t.value_json='\"Document\"' AND k.value_json='\"attachment\"')))"
+    )
+}
+
+/// Member-facing relocation: v1 source Manage + destination Edit. Validate
+/// every retained derived artifact before emitting any event, then move all records
+/// in the caller's transaction/act. Raw rehome paths retain their own guard.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn move_record_with_comments_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    actor: &str,
+    record: &str,
+    home: &str,
+) -> Result<()> {
+    kernel_require(tx, actor, record, Capability::Manage).await?;
+    kernel_require(tx, actor, home, Capability::Edit).await?;
+    let derived: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS(SELECT 1 FROM kernel_records c WHERE c.id=? AND {})",
+        sql_is_derived_artifact("c")
+    ))
+    .bind(record)
+    .fetch_one(&mut **tx)
+    .await?;
+    if derived {
+        return Err(Error::engine(
+            "a derived artifact moves only with its terminal bearer",
+        ));
+    }
+    let old: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(record)
+        .fetch_one(&mut **tx)
+        .await?;
+    // Keep a record-local ACL on its existing home. Its browse parent moves
+    // independently; folder children inherit through their reparented home.
+    let self_policy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id')=?)")
+        .bind(&old).bind(record).fetch_one(&mut **tx).await?;
+    // Imported and native folders share a deterministic child-home binding.
+    // Older native folders without children can still move without a binding.
+    let folder_home = v1_import_home_id(record);
+    let bound_folder: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e JOIN kernel_roots h ON h.root_id=e.record_id WHERE e.record_id=? AND e.type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(e.payload,'$.source_record_id')=?)")
+        .bind(&folder_home).bind(record).fetch_one(&mut **tx).await?;
+    let physical_home = if self_policy { old.as_str() } else { home };
+    let moving_home = if self_policy {
+        Some(old.clone())
+    } else if bound_folder {
+        Some(folder_home)
+    } else {
+        None
+    };
+    let parent_update = moving_home.map(|home_id| MoveHomeParent {
+        home_id,
+        parent_id: home.to_owned(),
+    });
+    if let Some(change) = &parent_update {
+        validate_move_parent(tx, change).await?;
+    }
+    let logical_home: Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
+        .bind(home).fetch_optional(&mut **tx).await?;
+    let imported_root:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type='kernel.import_home_policy.v1')")
+        .bind(KERNEL_ROOT_ID).fetch_one(&mut **tx).await?;
+    let logical_home = logical_home.unwrap_or_else(|| {
+        if home == KERNEL_ROOT_ID && imported_root {
+            "native:root".into()
+        } else {
+            home.to_owned()
+        }
+    });
+    let mut cohort = vec![record.to_owned()];
+    let mut depths = vec![0usize];
+    let mut seen = std::collections::HashSet::from([record.to_owned()]);
+    let mut index = 0;
+    while index < cohort.len() {
+        // Match v1 authorization_target: every Annotation (not only comments)
+        // and every Document/attachment follows its unique part_of bearer.
+        // Ordinary records with part_of links retain independent placement.
+        let children: Vec<String> = sqlx::query_scalar(&format!("SELECT DISTINCT l.source_id FROM kernel_generic_links l JOIN kernel_records c ON c.id=l.source_id WHERE l.target_id=? AND l.relationship='part_of' AND l.active=1 AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=c.id) AND {} ORDER BY c.id", sql_is_derived_artifact("c")))
+            .bind(&cohort[index]).fetch_all(&mut **tx).await?;
+        for child in children {
+            let bearers = comments_v2::bearer_on(tx, &child).await?;
+            if !seen.insert(child.clone())
+                || bearers.as_slice() != [cohort[index].as_str()]
+                || depths[index] >= crate::authorization::MAX_DERIVED_BEARER_DEPTH
+            {
+                return Err(Error::engine(
+                    "invalid comment thread or derived artifact bearer; nothing moved",
+                ));
+            }
+            // Authority is the terminal bearer's Manage, as in v1. A derived
+            // artifact's own historical home does not grant independent access.
+            depths.push(depths[index] + 1);
+            cohort.push(child);
+        }
+        index += 1;
+    }
+    for id in cohort {
+        let update = if id == record {
+            parent_update.as_ref().map(|p| MoveHomeParent {
+                home_id: p.home_id.clone(),
+                parent_id: p.parent_id.clone(),
+            })
+        } else {
+            None
+        };
+        append_in(
+            db,
+            tx,
+            AppendSpec {
+                record_id: id,
+                event_type: "kernel.record_rehomed.v2".into(),
+                payload: serde_json::to_value(KernelMovePayload {
+                    new_home_id: physical_home.into(),
+                    logical_home_id: logical_home.clone(),
+                    parent_update: update,
+                })?,
+                actor: Some(actor.into()),
+            },
+            acts,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -2432,6 +3863,10 @@ pub const KERNEL_REHOMED_EVENT: &str = "kernel.record_rehomed.v1";
 /// `/2` definition (all `None` on bare records).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KernelRecordView {
+    pub metadata: RecordMetadata,
+    /// First-class record text, separate from definition fields.
+    pub body: Option<String>,
+    pub archived: bool,
     pub id: String,
     pub home_id: String,
     pub owner_id: Option<String>,
@@ -2440,6 +3875,10 @@ pub struct KernelRecordView {
     pub kind: Option<String>,
     pub pin: Option<RevisionIdentity>,
     pub interpreter: Option<String>,
+    /// Compare-and-swap token for this record: the greatest content-event
+    /// `seq` for the record in the same snapshot. `revise_as_expected` refuses
+    /// with `Error::Conflict` when the caller's token no longer matches.
+    pub revision: i64,
 }
 
 pub async fn read_record_as(
@@ -2448,6 +3887,47 @@ pub async fn read_record_as(
     record_id: &str,
 ) -> Result<Option<KernelRecordView>> {
     let mut snapshot = db.write_pool().begin().await?;
+    #[cfg(feature = "v2-kernel-probe")]
+    app_installs::admit_dispatched_on(&mut snapshot, principal_id).await?;
+    let view = read_record_on(&mut snapshot, principal_id, record_id).await?;
+    snapshot.rollback().await?;
+    Ok(view)
+}
+
+/// `read_record_as` on a connection the caller already holds: no snapshot of
+/// its own, so a host operation can gate and read in one transaction. The
+/// caller owns the transaction and ends it.
+pub(crate) async fn read_record_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    record_id: &str,
+) -> Result<Option<KernelRecordView>> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id = ?)")
+            .bind(record_id)
+            .fetch_optional(&mut *snapshot)
+            .await?
+            .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    };
+    let capability =
+        kernel_effective_capability_on(&mut *snapshot, principal_id, record_id).await?;
+    if !capability.allows(Capability::View) {
+        return Ok(None);
+    }
+    read_record_unchecked_on(snapshot, principal_id, record_id).await
+}
+
+/// Field hydration after the caller has established visibility through its
+/// own gate — the home-policy check above, or a comment's derived bearer
+/// chain. Hidden records still yield `None` (missing row); only the
+/// authorization decision is the caller's.
+pub(crate) async fn read_record_unchecked_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    record_id: &str,
+) -> Result<Option<KernelRecordView>> {
     let row: Option<RecordViewRow> = sqlx::query_as(
         "SELECT id, home_id, owner_id, kind, pin_family, pin_version, pin_digest, interpreter
          FROM kernel_records WHERE id = ?",
@@ -2457,18 +3937,12 @@ pub async fn read_record_as(
     .await?;
     let Some((id, home_id, owner_id, kind, pin_family, pin_version, pin_digest, interpreter)) = row
     else {
-        snapshot.rollback().await?;
         return Ok(None);
     };
-    let capability = kernel_effective_capability_on(&mut snapshot, principal_id, record_id).await?;
-    if !capability.allows(Capability::View) {
-        snapshot.rollback().await?;
-        return Ok(None);
-    }
-    let root_visible = kernel_effective_capability_on(&mut snapshot, principal_id, KERNEL_ROOT_ID)
+    let root_visible = kernel_effective_capability_on(&mut *snapshot, principal_id, KERNEL_ROOT_ID)
         .await?
         .allows(Capability::View);
-    // Fields and pin ride along only after the View gate above: hidden
+    // Fields and pin ride along only after the caller's View gate: hidden
     // records yield `None` before any of this runs.
     let field_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT name, value_json FROM kernel_record_fields WHERE record_id = ? ORDER BY name",
@@ -2489,9 +3963,21 @@ pub async fn read_record_as(
         _ => None,
     };
     let family = pin.as_ref().map(|p| p.family.clone());
-    snapshot.rollback().await?;
+    // The CAS token is the latest content event for the record, read in the
+    // same snapshot as the fields it describes.
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(seq), 0) FROM main.content_events WHERE record_id = ?",
+    )
+    .bind(record_id)
+    .fetch_one(&mut *snapshot)
+    .await?;
     let owner_id = disclose_owner(principal_id, owner_id, root_visible);
+    let archived = hq::archived_on(&mut *snapshot, &id).await?;
+    let body = hq::body_on(&mut *snapshot, &id).await?;
     Ok(Some(KernelRecordView {
+        metadata: record_metadata::read_on(snapshot, &id).await?,
+        body,
+        archived,
         id,
         home_id,
         owner_id,
@@ -2500,6 +3986,7 @@ pub async fn read_record_as(
         kind,
         pin,
         interpreter,
+        revision,
     }))
 }
 
@@ -2562,6 +4049,7 @@ pub async fn links_from_as(
             visible.push((target_id, relationship));
         }
     }
+    visible.extend(relates_to_port::active_links_in(&mut snapshot, principal_id, source_id).await?);
     snapshot.rollback().await?;
     Ok(visible)
 }
@@ -2577,44 +4065,100 @@ pub async fn list_records_as(db: &Db, principal_id: &str) -> Result<Vec<KernelRe
     .fetch_all(&mut *snapshot)
     .await?;
     let root_visible = kernel_effective_capability_on(&mut snapshot, principal_id, KERNEL_ROOT_ID)
-        .await?
+        .await
+        .unwrap_or(Capability::None)
         .allows(Capability::View);
-    let mut visible = Vec::new();
-    for (id, home_id, owner_id, kind, pin_family, pin_version, pin_digest, interpreter) in rows {
-        if kernel_effective_capability_on(&mut snapshot, principal_id, &id)
+    let scope = visible_home_anchors_as(&mut snapshot, principal_id).await?;
+    let homes: std::collections::BTreeMap<_, _> = scope
+        .homes
+        .into_iter()
+        .map(|home| (home.home_id, (home.policy_valid, home.policy_view)))
+        .collect();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(_, home, owner, ..)| {
+            homes.get(home).is_some_and(|(valid, view)| {
+                *valid && (*view || owner.as_deref() == Some(principal_id))
+            })
+        })
+        .collect();
+    let mut admitted = Vec::new();
+    for row in rows {
+        if kernel_effective_capability_on(&mut snapshot, principal_id, &row.0)
             .await?
             .allows(Capability::View)
         {
-            let field_rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT name, value_json FROM kernel_record_fields WHERE record_id = ? ORDER BY name",
-            )
-            .bind(&id)
+            admitted.push(row);
+        }
+    }
+    let rows = admitted;
+    let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+    let mut all_fields: std::collections::BTreeMap<
+        String,
+        serde_json::Map<String, serde_json::Value>,
+    > = std::collections::BTreeMap::new();
+    let mut state = std::collections::BTreeMap::new();
+    // Return-all API: batch the values it must return, instead of four round
+    // trips per record. Every bind is from the snapshot's admitted ID set.
+    for batch in ids.chunks(500) {
+        let mut fields_sql = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT record_id,name,value_json FROM kernel_record_fields WHERE record_id IN (",
+        );
+        let mut args = fields_sql.separated(",");
+        for id in batch {
+            args.push_bind(id);
+        }
+        args.push_unseparated(")");
+        let fields: Vec<(String, String, String)> = fields_sql
+            .build_query_as()
             .fetch_all(&mut *snapshot)
             .await?;
-            let mut fields = serde_json::Map::new();
-            for (name, value_json) in field_rows {
-                fields.insert(name, serde_json::from_str(&value_json)?);
-            }
-            let pin = match (pin_family, pin_version, pin_digest) {
-                (Some(family), Some(version), Some(digest)) => Some(RevisionIdentity {
-                    family,
-                    version: u32::try_from(version).unwrap_or(0),
-                    digest,
-                }),
-                _ => None,
-            };
-            let family = pin.as_ref().map(|p| p.family.clone());
-            visible.push(KernelRecordView {
-                id,
-                home_id,
-                owner_id: disclose_owner(principal_id, owner_id, root_visible),
-                fields,
-                family,
-                kind,
-                pin,
-                interpreter,
-            });
+        for (id, name, value) in fields {
+            all_fields
+                .entry(id)
+                .or_default()
+                .insert(name, serde_json::from_str(&value)?);
         }
+        let mut state_sql = sqlx::QueryBuilder::<Sqlite>::new("SELECT r.id,b.body,coalesce(l.archived,0),(SELECT coalesce(max(seq),0) FROM main.content_events e WHERE e.record_id=r.id) FROM kernel_records r LEFT JOIN kernel_record_bodies b ON b.record_id=r.id LEFT JOIN kernel_lifecycle l ON l.record_id=r.id WHERE r.id IN (");
+        let mut args = state_sql.separated(",");
+        for id in batch {
+            args.push_bind(id);
+        }
+        args.push_unseparated(")");
+        let values: Vec<(String, Option<String>, bool, i64)> =
+            state_sql.build_query_as().fetch_all(&mut *snapshot).await?;
+        for (id, body, archived, revision) in values {
+            state.insert(id, (body, archived, revision));
+        }
+    }
+    let mut visible = Vec::new();
+    for (id, home_id, owner_id, kind, pin_family, pin_version, pin_digest, interpreter) in rows {
+        let fields = all_fields.remove(&id).unwrap_or_default();
+        let pin = match (pin_family, pin_version, pin_digest) {
+            (Some(family), Some(version), Some(digest)) => Some(RevisionIdentity {
+                family,
+                version: u32::try_from(version).unwrap_or(0),
+                digest,
+            }),
+            _ => None,
+        };
+        let family = pin.as_ref().map(|p| p.family.clone());
+        let (body, archived, revision) =
+            state.remove(&id).expect("admitted record in same snapshot");
+        visible.push(KernelRecordView {
+            metadata: record_metadata::read_on(&mut snapshot, &id).await?,
+            body,
+            archived,
+            id,
+            home_id,
+            owner_id: disclose_owner(principal_id, owner_id, root_visible),
+            fields,
+            family,
+            kind,
+            pin,
+            interpreter,
+            revision,
+        });
     }
     snapshot.rollback().await?;
     Ok(visible)
@@ -2627,10 +4171,17 @@ pub async fn list_records_as(db: &Db, principal_id: &str) -> Result<Vec<KernelRe
 /// events and no signal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct KernelHistoryEvent {
+    /// Retained v1 interpretation; payloads redacted at read time, source withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_legacy: Option<serde_json::Value>,
+    pub id: String,
+    pub run_key: Option<String>,
+    pub causal_status: String,
     pub seq: i64,
     pub event_type: String,
     pub record_id: String,
     pub actor: Option<String>,
+    pub actor_name: Option<String>,
     pub created_at: String,
 }
 
@@ -2639,7 +4190,17 @@ pub async fn history_as(
     principal_id: &str,
     record_id: &str,
 ) -> Result<Vec<KernelHistoryEvent>> {
-    history_for_subject_as(db, principal_id, record_id).await
+    history_page_as(
+        db,
+        principal_id,
+        record_id,
+        None,
+        false,
+        usize::MAX,
+        true,
+        false,
+    )
+    .await
 }
 
 /// History for a record, home, or principal id (slice-2 carry-over: homes
@@ -2649,81 +4210,507 @@ pub async fn history_as(
 /// or hidden subjects yield the empty result — the same answer records
 /// already gave — never a distinguishing refusal. Actors disclose under the
 /// slice-1 rule in all three cases.
-async fn history_for_subject_as(
+#[derive(sqlx::FromRow)]
+struct HistoryReadRow {
+    seq: i64,
+    event_type: String,
+    record_id: String,
+    actor: Option<String>,
+    created_at: String,
+    id: String,
+    run_key: Option<String>,
+    causal_status: String,
+    legacy_type: Option<String>,
+    subjects: Option<String>,
+    legacy_owner: Option<String>,
+    hidden: Option<bool>,
+    payload: Option<String>,
+    acknowledgement: bool,
+    actor_name: Option<String>,
+    restricted: Option<bool>,
+    claim_sensitive: Option<bool>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn history_page_as(
     db: &Db,
     principal_id: &str,
     subject_id: &str,
+    after: Option<i64>,
+    newest: bool,
+    limit: usize,
+    full: bool,
+    include_import_receipts: bool,
+) -> Result<Vec<KernelHistoryEvent>> {
+    history_page_in_range_as(
+        db,
+        principal_id,
+        subject_id,
+        after,
+        newest,
+        limit,
+        full,
+        include_import_receipts,
+        (0, i64::MAX),
+    )
+    .await
+}
+
+/// Canonical disclosure restricted to a caller-selected sequence window.
+/// Freshness consumers bound their raw scan AND these nested history reads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn history_page_in_range_as(
+    db: &Db,
+    principal_id: &str,
+    subject_id: &str,
+    after: Option<i64>,
+    newest: bool,
+    limit: usize,
+    full: bool,
+    include_import_receipts: bool,
+    range: (i64, i64),
+) -> Result<Vec<KernelHistoryEvent>> {
+    history_page_selected_as(
+        db,
+        principal_id,
+        subject_id,
+        after,
+        newest,
+        limit,
+        full,
+        include_import_receipts,
+        range,
+        None,
+    )
+    .await
+}
+
+/// Hydrate an already bounded header window with the ordinary history disclosure
+/// rules. One authority snapshot and subject cache, rather than one request and
+/// provenance lookup per event. Each subject is independently authorized here.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn history_headers_as(
+    db: &Db,
+    principal_id: &str,
+    sequences: &[i64],
+    full: bool,
+) -> Result<Vec<KernelHistoryEvent>> {
+    if sequences.len() > 1000 {
+        return Err(Error::engine("history header window exceeds 1000"));
+    }
+    if sequences.is_empty() {
+        return Ok(Vec::new());
+    }
+    history_page_selected_as(
+        db,
+        principal_id,
+        "",
+        None,
+        false,
+        sequences.len(),
+        full,
+        false,
+        (0, i64::MAX),
+        Some(sequences),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn history_page_selected_as(
+    db: &Db,
+    principal_id: &str,
+    subject_id: &str,
+    after: Option<i64>,
+    newest: bool,
+    limit: usize,
+    full: bool,
+    include_import_receipts: bool,
+    range: (i64, i64),
+    selected: Option<&[i64]>,
 ) -> Result<Vec<KernelHistoryEvent>> {
     let mut snapshot = db.write_pool().begin().await?;
-    let is_record: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id = ?)")
-            .bind(subject_id)
-            .fetch_optional(&mut *snapshot)
-            .await?
-            .unwrap_or(false);
-    let is_home: bool = if is_record {
-        false
-    } else {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
-            .bind(subject_id)
-            .fetch_optional(&mut *snapshot)
-            .await?
-            .unwrap_or(false)
-    };
-    let is_principal: bool = if is_record || is_home {
-        false
-    } else {
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_principals WHERE principal_id = ?)")
-            .bind(subject_id)
-            .fetch_optional(&mut *snapshot)
-            .await?
-            .unwrap_or(false)
-    };
-    if !is_record && !is_home && !is_principal {
-        snapshot.rollback().await?;
+    let result = history_page_selected_on(
+        &mut snapshot,
+        principal_id,
+        subject_id,
+        after,
+        newest,
+        limit,
+        full,
+        include_import_receipts,
+        range,
+        selected,
+    )
+    .await;
+    snapshot.rollback().await?;
+    result
+}
+
+/// Existing history disclosure on the caller's read snapshot.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn history_page_in_range_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    subject_id: &str,
+    after: Option<i64>,
+    newest: bool,
+    limit: usize,
+    full: bool,
+    include_import_receipts: bool,
+    range: (i64, i64),
+) -> Result<Vec<KernelHistoryEvent>> {
+    history_page_selected_on(
+        snapshot,
+        principal_id,
+        subject_id,
+        after,
+        newest,
+        limit,
+        full,
+        include_import_receipts,
+        range,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn history_page_selected_on(
+    snapshot: &mut SqliteConnection,
+    principal_id: &str,
+    subject_id: &str,
+    after: Option<i64>,
+    newest: bool,
+    limit: usize,
+    full: bool,
+    include_import_receipts: bool,
+    range: (i64, i64),
+    selected: Option<&[i64]>,
+) -> Result<Vec<KernelHistoryEvent>> {
+    #[cfg(feature = "v2-kernel-probe")]
+    app_installs::admit_dispatched_on(snapshot, principal_id).await?;
+    if !hosted_identity::admitted(snapshot, principal_id).await? {
         return Ok(Vec::new());
     }
-    let visible = if is_principal {
-        subject_id == principal_id
-            || kernel_effective_capability_on(&mut snapshot, principal_id, KERNEL_ROOT_ID)
+    let acknowledgement = legacy_history::sql_acknowledgement("r");
+    if selected.is_none() {
+        let record_ack: Option<bool> = sqlx::query_scalar(&format!(
+            "SELECT COALESCE({acknowledgement},0) FROM kernel_records r WHERE r.id=?"
+        ))
+        .bind(subject_id)
+        .fetch_optional(&mut *snapshot)
+        .await?;
+        let is_record = record_ack.is_some();
+        if record_ack == Some(true) {
+            return Ok(Vec::new());
+        }
+        let is_home: bool = if is_record {
+            false
+        } else {
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
+                .bind(subject_id)
+                .fetch_optional(&mut *snapshot)
+                .await?
+                .unwrap_or(false)
+        };
+        let is_principal: bool = if is_record || is_home {
+            false
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM kernel_principals WHERE principal_id = ?)",
+            )
+            .bind(subject_id)
+            .fetch_optional(&mut *snapshot)
+            .await?
+            .unwrap_or(false)
+        };
+        if !is_record && !is_home && !is_principal {
+            return Ok(Vec::new());
+        }
+        let visible = if is_principal {
+            subject_id == principal_id
+                || kernel_effective_capability_on(snapshot, principal_id, KERNEL_ROOT_ID)
+                    .await?
+                    .allows(Capability::View)
+        } else {
+            kernel_effective_capability_on(snapshot, principal_id, subject_id)
                 .await?
                 .allows(Capability::View)
-    } else {
-        kernel_effective_capability_on(&mut snapshot, principal_id, subject_id)
+        };
+        if !visible {
+            return Ok(Vec::new());
+        }
+        if is_record
+            && !legacy_history::visible(
+                snapshot,
+                principal_id,
+                subject_id,
+                &mut std::collections::BTreeMap::new(),
+            )
             .await?
-            .allows(Capability::View)
-    };
-    if !visible {
-        snapshot.rollback().await?;
-        return Ok(Vec::new());
+        {
+            return Ok(Vec::new());
+        }
     }
-    let root_visible = kernel_effective_capability_on(&mut snapshot, principal_id, KERNEL_ROOT_ID)
+    let root_visible = kernel_effective_capability_on(snapshot, principal_id, KERNEL_ROOT_ID)
         .await?
         .allows(Capability::View);
-    let rows: Vec<(i64, String, String, Option<String>, String)> = sqlx::query_as(
-        "SELECT seq, type, record_id, actor, created_at FROM content_events WHERE record_id = ? ORDER BY seq",
-    )
-    .bind(subject_id)
-    .fetch_all(&mut *snapshot)
-    .await?;
-    snapshot.rollback().await?;
-    Ok(rows
-        .into_iter()
-        .map(|(seq, event_type, record_id, actor, created_at)| {
-            let disclosed = match actor {
-                None => None,
-                Some(token) if token == principal_id => Some(token),
-                Some(token) if root_visible => Some(token),
-                Some(_) => None,
-            };
-            KernelHistoryEvent {
-                seq,
-                event_type,
-                record_id,
-                actor: disclosed,
-                created_at,
+    let root_admin = kernel_effective_capability_on(snapshot, principal_id, KERNEL_ROOT_ID)
+        .await?
+        .allows(Capability::Manage);
+    let binding: Option<String> =
+        sqlx::query_scalar("SELECT auth_binding FROM kernel_principals WHERE principal_id=?")
+            .bind(principal_id)
+            .fetch_optional(&mut *snapshot)
+            .await?;
+    let mut visible_rows = Vec::new();
+    let mut subject_visibility = if selected.is_some() {
+        std::collections::BTreeMap::new()
+    } else {
+        std::collections::BTreeMap::from([(subject_id.to_owned(), true)])
+    };
+    let selected_json = selected.map(serde_json::to_string).transpose()?;
+    let mut cursor = after.unwrap_or(if newest { i64::MAX } else { 0 });
+    let direction = if newest { "DESC" } else { "ASC" };
+    let comparison = if newest { "<" } else { ">" };
+    let batch = limit.min(256) as i64;
+    loop {
+        // Both arms seek indexed ranges. Payloads are never selected in metadata
+        // mode; authorization uses small replayed facts instead of JSON envelopes.
+        let selection = if selected.is_some() {
+            format!("e.seq {comparison} ?2 AND e.seq IN (SELECT CAST(value AS INTEGER) FROM json_each(?10))")
+        } else {
+            format!("e.seq IN (SELECT seq FROM main.content_events WHERE record_id=?1 AND seq {comparison} ?2 AND seq BETWEEN ?8 AND ?9 UNION SELECT seq FROM kernel_legacy_subjects WHERE subject_id=?1 AND seq {comparison} ?2 AND seq BETWEEN ?8 AND ?9) AND ?10 IS NULL")
+        };
+        let sql = format!("SELECT e.seq,e.type AS event_type,e.record_id,e.actor,e.created_at,e.id,e.run_key,e.causal_status,
+        h.event_type AS legacy_type,h.subjects,h.owner AS legacy_owner,h.hidden,
+        CASE WHEN ?4 THEN e.payload ELSE NULL END AS payload,
+        COALESCE({acknowledgement},0) AS acknowledgement,
+        p.display_label AS actor_name,h.restricted,h.claim_sensitive
+        FROM main.content_events e
+        LEFT JOIN main.content_events receipt_legacy
+          ON receipt_legacy.id=CASE WHEN ?5 AND e.type='kernel.import_receipt.v1'
+             THEN json_extract(e.payload,'$.legacy_event_id') END
+          AND receipt_legacy.type='kernel.legacy_recorded.v1'
+          AND receipt_legacy.record_id=e.record_id AND receipt_legacy.act=e.act AND receipt_legacy.seq>e.seq
+        LEFT JOIN kernel_legacy_history h
+          ON h.seq=CASE WHEN e.type='kernel.import_receipt.v1' THEN receipt_legacy.seq ELSE e.seq END
+        LEFT JOIN kernel_principals p ON p.principal_id=e.actor
+        LEFT JOIN kernel_records r ON r.id=e.record_id
+        WHERE {selection}
+        AND e.type NOT IN ('kernel.v1_state_imported.v1','kernel.message_state.v1','kernel.message_command_committed.v1','kernel.message_destination_imported.v1','kernel.message_destination_set.v1')
+        AND (e.type!='kernel.import_receipt.v1' OR (?5 AND receipt_legacy.seq IS NOT NULL))
+        AND (h.seq IS NULL OR (NOT h.hidden AND (?6 OR NOT h.restricted OR h.owner=?7)))
+        ORDER BY e.seq {direction} LIMIT ?3");
+        let rows: Vec<HistoryReadRow> = sqlx::query_as(&sql)
+            .bind(subject_id)
+            .bind(cursor)
+            .bind(batch)
+            .bind(full)
+            .bind(include_import_receipts)
+            .bind(root_admin)
+            .bind(&binding)
+            .bind(range.0)
+            .bind(range.1)
+            .bind(&selected_json)
+            .fetch_all(&mut *snapshot)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let fetched = rows.len();
+        for row in rows {
+            cursor = row.seq;
+            if selected.is_some()
+                && (row.acknowledgement
+                    || !legacy_history::visible(
+                        snapshot,
+                        principal_id,
+                        &row.record_id,
+                        &mut subject_visibility,
+                    )
+                    .await?)
+            {
+                continue;
             }
-        })
+            let mut retained_legacy = None;
+            if let Some(event_type) = &row.legacy_type {
+                if row.hidden == Some(true) || row.acknowledgement {
+                    continue;
+                }
+                let subjects: Vec<String> =
+                    serde_json::from_str(row.subjects.as_deref().unwrap_or("[]"))?;
+                if row.restricted == Some(true)
+                    && !root_admin
+                    && !row
+                        .legacy_owner
+                        .as_deref()
+                        .is_some_and(|owner| Some(owner) == binding.as_deref())
+                {
+                    continue;
+                }
+                let mut allowed = true;
+                for subject in subjects {
+                    if !legacy_history::visible(
+                        snapshot,
+                        principal_id,
+                        &subject,
+                        &mut subject_visibility,
+                    )
+                    .await?
+                    {
+                        allowed = false;
+                        break;
+                    }
+                }
+                if !allowed {
+                    continue;
+                }
+                // Receipts inherit disclosure facts from their witnessed row,
+                // but stay native migration events, never duplicate legacy rows.
+                if row.event_type == "kernel.legacy_recorded.v1" {
+                    let specialized = event_type == crate::canvas::CANVAS_BATCH_EVENT_TYPE
+                        || event_type.starts_with("agent_run.");
+                    retained_legacy = Some(if full && root_visible && !specialized {
+                        let mut envelope: serde_json::Value = serde_json::from_str(
+                            row.payload
+                                .as_deref()
+                                .ok_or_else(|| Error::engine("missing retained envelope"))?,
+                        )?;
+                        let mut legacy = envelope["legacy"].take();
+                        let holder = legacy["actor"]
+                            .as_str()
+                            .is_some_and(|a| Some(a) == binding.as_deref());
+                        legacy_history::redact(
+                            snapshot,
+                            principal_id,
+                            &mut legacy,
+                            holder,
+                            &mut subject_visibility,
+                        )
+                        .await?;
+                        legacy
+                    } else {
+                        legacy_history::marker(event_type)
+                    });
+                }
+            }
+            // Retained app capsules can include other accounts' install consent
+            // and references to independently protected records. They are custody,
+            // not ordinary record history or an executable app grant.
+            if row.event_type == app_state::IMPORTED_EVENT {
+                continue;
+            }
+            if row.event_type == commit_port::PROVIDER_OUTCOME_EVENT {
+                let payload: String =
+                    sqlx::query_scalar("SELECT payload FROM main.content_events WHERE seq=?")
+                        .bind(row.seq)
+                        .fetch_one(&mut *snapshot)
+                        .await?;
+                let payload = serde_json::from_str(&payload)?;
+                let entry = provider_catalogue::recorded(&payload)?;
+                let decoded = (entry.decode)(&payload)?;
+                let mut all_visible = true;
+                for subject in &decoded.facts.subjects {
+                    if !kernel_effective_capability_on(snapshot, principal_id, subject)
+                        .await?
+                        .allows(Capability::View)
+                    {
+                        all_visible = false;
+                        break;
+                    }
+                }
+                if !all_visible {
+                    continue;
+                }
+            }
+            if matches!(
+                row.event_type.as_str(),
+                "kernel.generic_link_note_updated.v1"
+                    | "kernel.generic_link_note_imported.v1"
+                    | "kernel.generic_link_added.v1"
+                    | "kernel.generic_link_imported.v1"
+                    | "kernel.generic_link_removed.v1"
+                    | "kernel.generic_link_removal_imported.v1"
+            ) && !generic_links::history_visible(snapshot, principal_id, row.seq).await?
+            {
+                continue;
+            }
+            if row.event_type == "kernel.link_added.v2" {
+                let target: Option<String> = sqlx::query_scalar(
+                    "SELECT target_id FROM kernel_link4_edges WHERE created_seq = ?",
+                )
+                .bind(row.seq)
+                .fetch_optional(&mut *snapshot)
+                .await?;
+                let target =
+                    target.ok_or_else(|| Error::engine("missing directed-link history witness"))?;
+                if !kernel_effective_capability_on(snapshot, principal_id, &target)
+                    .await?
+                    .allows(Capability::View)
+                {
+                    continue;
+                }
+            }
+            let claim_holder =
+                row.actor.as_deref().and_then(|a| a.strip_prefix("v1:")) == binding.as_deref();
+            let run_key = if row.claim_sensitive == Some(true) && !claim_holder {
+                None
+            } else {
+                row.run_key.clone()
+            };
+            let provenance = (
+                row.id.clone(),
+                run_key,
+                row.causal_status.clone(),
+                row.actor_name.clone(),
+            );
+            let compact = (
+                row.seq,
+                row.event_type,
+                row.record_id,
+                row.actor,
+                row.created_at,
+            );
+            visible_rows.push((compact, provenance, retained_legacy));
+            if visible_rows.len() >= limit {
+                break;
+            }
+        }
+        if visible_rows.len() >= limit || fetched < batch as usize {
+            break;
+        }
+    }
+    Ok(visible_rows
+        .into_iter()
+        .map(
+            |(
+                (seq, event_type, record_id, actor, created_at),
+                (id, run_key, causal_status, actor_name),
+                retained_legacy,
+            )| {
+                let disclosed = match actor {
+                    None => None,
+                    Some(token) if token == principal_id => Some(token),
+                    Some(token) if root_visible => Some(token),
+                    Some(_) => None,
+                };
+                KernelHistoryEvent {
+                    retained_legacy,
+                    id,
+                    run_key: if root_visible { run_key } else { None },
+                    causal_status,
+                    seq,
+                    event_type,
+                    record_id,
+                    actor_name: disclosed.as_ref().and(actor_name),
+                    actor: disclosed,
+                    created_at,
+                }
+            },
+        )
         .collect())
 }
 
@@ -2875,6 +4862,11 @@ pub async fn describe_world_as(db: &Db, principal_id: &str) -> Result<serde_json
             .and_then(|pin| supplied.get(&(family.clone(), pin.version, pin.digest.clone())))
             .cloned()
             .unwrap_or(serde_json::Value::Null);
+        let structured_language = bytes
+            .as_deref()
+            .map(crate::structured_values::declared_language)
+            .transpose()?
+            .flatten();
         // No bytes at all (disabled without any install): one null-kind
         // entry carrying the disabled state, so the tombstone is visible.
         let (primary_type, defn2, kinds): DescribedKinds = match bytes {
@@ -2886,8 +4878,8 @@ pub async fn describe_world_as(db: &Db, principal_id: &str) -> Result<serde_json
                     .get("interpreter")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|marker| {
-                        marker == crate::meta::definition_artifact::DEFN2_INTERPRETER
-                            || marker == crate::meta::definition_artifact::DEFN3_INTERPRETER
+                        crate::meta::definition_artifact::language_capabilities(Some(marker))
+                            .supports_fields
                     });
                 let primary_type = doc
                     .get("primary_type")
@@ -2961,10 +4953,96 @@ pub async fn describe_world_as(db: &Db, principal_id: &str) -> Result<serde_json
                 "adoption": {"state": state, "resolved_in": resolved_in, "pin": pin_value, "creatable_homes": creatable},
                 "operations": operations,
             }));
+            if let Some(marker) = structured_language {
+                let entry = definitions.last_mut().unwrap();
+                entry["interpreter"] = marker.into();
+                entry["value_contract"] = crate::structured_values::contract(marker);
+            }
+        }
+    }
+    // Visible callable operations: resolve each package selection adopted in a
+    // home the caller can see through the same fail-closed activation gate a
+    // call uses, and advertise its operations. A displaced, disabled, or
+    // unreadable selection is skipped rather than advertised. The key is
+    // omitted entirely when there is nothing callable, so an old
+    // definitions-only world keeps its exact describe shape.
+    let mut package_operations: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<(String, String, String, u32, String, String)> =
+        std::collections::BTreeSet::new();
+    let selection_rows: Vec<(String, String, String, i64, String, i64)> = sqlx::query_as(
+        "SELECT scope_home, namespace, name, selected_version, selected_digest, event_seq
+           FROM kernel_package_selections
+          WHERE selected_version IS NOT NULL
+          ORDER BY namespace, name, scope_home",
+    )
+    .fetch_all(&mut *snapshot)
+    .await?;
+    for (scope_home, namespace, name, _version, _digest, _event_seq) in selection_rows {
+        if !visible_homes.iter().any(|home| home == &scope_home) {
+            continue;
+        }
+        let Ok((selection, manifest)) =
+            require_package_active_in(&mut snapshot, &scope_home, &namespace, &name).await
+        else {
+            continue;
+        };
+        let Some(selected) = selection.selected.as_ref() else {
+            continue;
+        };
+        for operation in &manifest.operations {
+            let key = (
+                scope_home.clone(),
+                namespace.clone(),
+                name.clone(),
+                selected.version,
+                selected.digest.clone(),
+                operation.name.clone(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut descriptor = serde_json::json!({
+                "name":operation.name,"description":operation.description,"provider":operation.provider,
+                "family":operation.family,"kind":operation.kind,"source_field":operation.source_field,
+                "reads":operation.reads,"effects":operation.effects,
+            });
+            if operation.targets_any_record() {
+                let object = descriptor.as_object_mut().expect("descriptor object");
+                for selector in ["family", "kind", "source_field"] {
+                    object.remove(selector);
+                }
+                object.insert("target".into(), serde_json::json!("any-record"));
+            }
+            package_operations.push(serde_json::json!({
+                "scope_home": scope_home,
+                "namespace": namespace,
+                "name": name,
+                "version": selected.version,
+                "package_digest": selected.digest,
+                "ack_event_seq": selection.event_seq,
+                "operation": descriptor,
+            }));
         }
     }
     snapshot.rollback().await?;
-    Ok(serde_json::json!({"definitions": definitions}))
+    let mut output = serde_json::json!({
+        "definitions": definitions,
+        "namespace_policy": crate::v2_standard::namespace_policy(),
+        "directed_links": links_v2::contract(),
+    });
+    if package_operations
+        .iter()
+        .any(|op| op["operation"]["provider"] == crate::v2_standard::relates_to::PROVIDER)
+    {
+        output["governed_relationships"] = relates_to_port::contract();
+    }
+    if !package_operations.is_empty() {
+        output.as_object_mut().expect("describe object").insert(
+            "package_operations".to_string(),
+            serde_json::Value::Array(package_operations),
+        );
+    }
+    Ok(output)
 }
 
 /// One describe entry's kind detail: full `/2` semantics when the envelope
@@ -3027,6 +5105,11 @@ pub async fn install_definition_as(
         Capability::Manage,
     )
     .await?;
+    if crate::v2_standard::is_reserved_namespace(family) {
+        return Err(Error::engine(
+            "reserved namespace: native and native.* definition names (ignoring ASCII case) must be installed through an exact first-party package compiled into this binary. Use your own definition family.",
+        ));
+    }
     // Kernel-side language gate (test-only): `/2` semantics and unknown
     // markers refuse here, before anything is appended. The shared registry
     // parse stays language-blind.
@@ -3435,6 +5518,16 @@ pub(crate) async fn read_package_selection_in(
     namespace: &str,
     name: &str,
 ) -> Result<Option<StoredPackageSelection>> {
+    read_package_selection_before(conn, scope_home, namespace, name, i64::MAX).await
+}
+
+async fn read_package_selection_before(
+    conn: &mut SqliteConnection,
+    scope_home: &str,
+    namespace: &str,
+    name: &str,
+    before: i64,
+) -> Result<Option<StoredPackageSelection>> {
     let row: Option<PackageSelectionProjectionRow> = sqlx::query_as(
         "SELECT selected_version, selected_digest, ack_actor, ack_reads, event_seq
            FROM kernel_package_selections
@@ -3453,13 +5546,14 @@ pub(crate) async fn read_package_selection_in(
     // and the triple match runs inside SQLite (json_extract) rather than by
     // loading every package event in the scope.
     let event: Option<(String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT payload, seq, actor FROM content_events
-          WHERE record_id = ? AND type = 'kernel.package_adopted.v1'
+        "SELECT payload, seq, actor FROM main.content_events
+          WHERE record_id = ? AND type = 'kernel.package_adopted.v1' AND seq < ?
             AND json_extract(payload, '$.namespace') = ?
             AND json_extract(payload, '$.name') = ?
           ORDER BY seq DESC LIMIT 1",
     )
     .bind(scope_home)
+    .bind(before)
     .bind(namespace)
     .bind(name)
     .fetch_optional(&mut *conn)
@@ -3520,10 +5614,22 @@ pub(crate) async fn resolve_effective_package_selection(
     namespace: &str,
     name: &str,
 ) -> Result<Option<StoredPackageSelection>> {
+    resolve_effective_package_selection_before(conn, scope_home, namespace, name, i64::MAX).await
+}
+
+async fn resolve_effective_package_selection_before(
+    conn: &mut SqliteConnection,
+    scope_home: &str,
+    namespace: &str,
+    name: &str,
+    before: i64,
+) -> Result<Option<StoredPackageSelection>> {
     let mut scope = scope_home.to_string();
     let mut depth = 0usize;
     loop {
-        if let Some(stored) = read_package_selection_in(conn, &scope, namespace, name).await? {
+        if let Some(stored) =
+            read_package_selection_before(conn, &scope, namespace, name, before).await?
+        {
             return Ok(Some(stored));
         }
         depth += 1;
@@ -3711,7 +5817,7 @@ async fn latest_selected_payload(
     name: &str,
 ) -> Option<KernelPackageAdoptedPayload> {
     sqlx::query_as::<_, (String,)>(
-        "SELECT payload FROM content_events
+        "SELECT payload FROM main.content_events
           WHERE record_id = ? AND type = 'kernel.package_adopted.v1'
             AND json_extract(payload, '$.namespace') = ?
             AND json_extract(payload, '$.name') = ?
@@ -3734,7 +5840,7 @@ async fn has_tombstone(
     name: &str,
 ) -> bool {
     sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM content_events
+        "SELECT COUNT(*) FROM main.content_events
           WHERE record_id = ? AND type = 'kernel.package_adopted.v1'
             AND json_extract(payload, '$.namespace') = ?
             AND json_extract(payload, '$.name') = ?
@@ -3934,7 +6040,7 @@ pub async fn surface_read_as(
     }
     let rechecked = require_package_active_in(&mut conn, scope_home, namespace, name).await;
     let served_content_seq: i64 =
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM content_events")
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM main.content_events")
             .fetch_one(&mut *conn)
             .await?;
     drop(conn);
@@ -4281,6 +6387,11 @@ struct KindDescriptor {
     /// `/3` rule: a required `text` value must be non-blank. `/2` keeps
     /// accepting a blank required string.
     non_blank_required_text: bool,
+    structured_fields: Option<serde_json::Value>,
+    /// The retained language marker, stamped on revise events, and its
+    /// capabilities, which select the value rules (`/5` trim, `/6` W).
+    interpreter: Option<String>,
+    capabilities: crate::meta::definition_artifact::LanguageCapabilities,
     /// Declared outgoing links: (predicate, target primary_type, target
     /// kind, direction). Install-time validation guarantees the shape.
     links: Vec<(String, String, String, String)>,
@@ -4303,9 +6414,10 @@ fn kind_descriptor(artifact_bytes: &str, kind: &str) -> Result<Option<KindDescri
     let doc: serde_json::Value = serde_json::from_str(artifact_bytes)
         .map_err(|_| Error::engine("definition artifact bytes must be a JSON envelope object"))?;
     let marker = doc.get("interpreter").and_then(serde_json::Value::as_str);
-    let is_v3 = marker == Some(crate::meta::definition_artifact::DEFN3_INTERPRETER);
-    let is_structured =
-        is_v3 || marker == Some(crate::meta::definition_artifact::DEFN2_INTERPRETER);
+    let capabilities = crate::meta::definition_artifact::language_capabilities(marker);
+    let is_new = capabilities.supports_structured_values;
+    let is_v3 = capabilities.supports_record_identity;
+    let is_structured = capabilities.supports_fields;
     if !is_structured {
         return Ok(None);
     }
@@ -4422,6 +6534,9 @@ fn kind_descriptor(artifact_bytes: &str, kind: &str) -> Result<Option<KindDescri
             fields,
             identity,
             non_blank_required_text: is_v3,
+            structured_fields: is_new.then(|| obj["fields"].clone()),
+            interpreter: marker.map(str::to_string),
+            capabilities,
             links,
         }));
     }
@@ -4435,7 +6550,7 @@ fn kind_descriptor(artifact_bytes: &str, kind: &str) -> Result<Option<KindDescri
 fn field_value_matches(value: &serde_json::Value, field: &FieldDescriptor) -> bool {
     match field.field_type.as_str() {
         "text" => value.is_string(),
-        "integer" => value.is_i64() || value.is_u64(),
+        "integer" => integer_spelling_matches(value),
         "number" => value.is_number(),
         "boolean" => value.is_boolean(),
         "time" => value
@@ -4449,9 +6564,17 @@ fn field_value_matches(value: &serde_json::Value, field: &FieldDescriptor) -> bo
     }
 }
 
+/// Integer writes accept only integer JSON representations, never decimal or
+/// exponent spellings such as `1.0` or `1e0`. `-0` parses as floating
+/// negative zero and is refused too (pre-existing serde_json behaviour). Keep this shared by admission
+/// and projection so equality cannot disagree with a coerced integer write.
+pub(crate) fn integer_spelling_matches(value: &serde_json::Value) -> bool {
+    value.is_i64() || value.is_u64()
+}
+
 /// `YYYY-MM-DD` (strictly zero-padded, so parsing round-trips) or an RFC 3339
 /// date-time, matching v1's "date or date-time".
-fn is_calendar_date_or_rfc3339(s: &str) -> bool {
+pub(crate) fn is_calendar_date_or_rfc3339(s: &str) -> bool {
     let calendar_date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map(|date| date.format("%Y-%m-%d").to_string() == s)
         .unwrap_or(false);
@@ -4489,6 +6612,16 @@ fn validate_record_fields(
         }
         return Ok(IdentityOutcome::Legacy);
     };
+    if let Some(shape) = &descriptor.structured_fields {
+        crate::structured_values::validate_values(shape, fields, &descriptor.capabilities)?;
+        return match &descriptor.identity {
+            IdentityKind::Record => Ok(IdentityOutcome::Record),
+            IdentityKind::Field(name) => Ok(IdentityOutcome::Field(
+                name.clone(),
+                serde_json::to_string(&fields[name])?,
+            )),
+        };
+    }
     for (name, value) in fields {
         if value.is_null() {
             continue;
@@ -4556,6 +6689,21 @@ fn validate_record_fields(
 /// class as a unique constraint); see the design note's remaining gates.
 pub const IDENTITY_UNAVAILABLE: &str = "identity value unavailable";
 
+// Called under the same serialized write transaction as creation. Keep the
+// SQL UNIQUE constraint as a backstop without exposing its raw SQL error or
+// the identity/placement of the conflicting record to ordinary callers.
+async fn require_available_accession(conn: &mut SqliteConnection, accession: &str) -> Result<()> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE accession=?)")
+            .bind(accession)
+            .fetch_one(conn)
+            .await?;
+    if exists {
+        return Err(Error::engine(IDENTITY_UNAVAILABLE));
+    }
+    Ok(())
+}
+
 /// Validate a field payload and build its projection rows, enforcing
 /// workspace-wide identity uniqueness per family+kind. Shared by the write
 /// path (event-free refusal) and the fold (loud replay), so both agree.
@@ -4574,7 +6722,15 @@ async fn validated_field_rows(
         if value.is_null() {
             continue;
         }
-        rows.push((name.clone(), serde_json::to_string(value)?));
+        let value = if descriptor
+            .as_ref()
+            .is_some_and(|d| d.structured_fields.is_some())
+        {
+            crate::structured_values::normalize(value)
+        } else {
+            value.clone()
+        };
+        rows.push((name.clone(), serde_json::to_string(&value)?));
     }
     if let IdentityOutcome::Field(identity_name, canonical) = &identity {
         let clash: bool = sqlx::query_scalar(
@@ -4685,7 +6841,7 @@ pub(crate) async fn read_scoped_adoption_verified(
     .fetch_optional(&mut *conn)
     .await?;
     let event: Option<(String, i64)> = sqlx::query_as(
-        "SELECT payload, seq FROM content_events
+        "SELECT payload, seq FROM main.content_events
           WHERE record_id = ? AND type = ?
             AND json_extract(payload, '$.family') = ?
           ORDER BY seq DESC LIMIT 1",
@@ -4928,6 +7084,19 @@ pub async fn create_package_record_as(
     .await?
     .ok_or_else(|| Error::engine("selected primary definition artifact is missing"))?;
     let interpreter = interpreter_for_bytes(&artifact.bytes)?;
+    if crate::meta::definition_artifact::language_capabilities(Some(interpreter))
+        .supports_structured_values
+    {
+        validated_field_rows(
+            &mut tx,
+            &artifact.bytes,
+            family,
+            kind,
+            &serde_json::Map::new(),
+        )
+        .await?;
+    }
+    require_available_accession(&mut tx, accession).await?;
     let id = Uuid::new_v4().to_string();
     let mut acts = crate::act::ActAllocation::new();
     append_in(
@@ -4955,6 +7124,48 @@ pub async fn create_package_record_as(
     Ok(id)
 }
 
+pub(crate) enum FieldInput<'a> {
+    Parsed(&'a serde_json::Map<String, serde_json::Value>),
+    Raw(&'a str),
+}
+impl<'a> FieldInput<'a> {
+    fn parse(
+        self,
+        structured: bool,
+    ) -> Result<std::borrow::Cow<'a, serde_json::Map<String, serde_json::Value>>> {
+        match self {
+            Self::Parsed(_) if structured => Err(Error::engine(
+                "raw_json_required: use create_json_as or revise_json_as_expected for structured values",
+            )),
+            Self::Parsed(fields) => Ok(std::borrow::Cow::Borrowed(fields)),
+            Self::Raw(raw) => {
+                let value = if structured {
+                    crate::structured_values::parse_json(raw)?
+                } else {
+                    serde_json::from_str(raw)?
+                };
+                match value {
+                    serde_json::Value::Object(map) => Ok(std::borrow::Cow::Owned(map)),
+                    _ => Err(Error::engine("fields must be a JSON object")),
+                }
+            }
+        }
+    }
+}
+
+/// Raw-field create ingress. The selected interpreter owns its parser:
+/// structured requests are bounded and reject duplicate keys before Value.
+pub async fn create_json_as(
+    db: &Db,
+    actor: &str,
+    family: &str,
+    kind: &str,
+    raw: &str,
+    home: &str,
+) -> Result<String> {
+    create_input_as(db, actor, family, kind, FieldInput::Raw(raw), home).await
+}
+
 /// Generic create (slice 2, increment 3a): validate a field payload against
 /// the in-scope `/2` kind and store it. Resolves the adoption in scope for
 /// the home (scoped, else root) and refuses when none; needs Edit on the
@@ -4968,20 +7179,134 @@ pub async fn create_as(
     fields: &serde_json::Map<String, serde_json::Value>,
     home_id: &str,
 ) -> Result<String> {
-    let mut tx = begin_write(db.write_pool()).await?;
+    create_input_as(
+        db,
+        creator_principal_id,
+        family,
+        kind,
+        FieldInput::Parsed(fields),
+        home_id,
+    )
+    .await
+}
+/// `create_input_as` on a transaction the caller already holds: no begin or
+/// commit of its own, so a host operation can create and register in one
+/// transaction with one shared act allocation. The caller owns the
+/// transaction and ends it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_input_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    creator_principal_id: &str,
+    family: &str,
+    kind: &str,
+    input: FieldInput<'_>,
+    home_id: &str,
+) -> Result<String> {
+    create_input_admitted_in(
+        db,
+        tx,
+        acts,
+        creator_principal_id,
+        family,
+        kind,
+        input,
+        home_id,
+        None,
+        true,
+        None,
+    )
+    .await
+}
+
+/// Attachment creation has v1's bearer Edit admission, rather than home Edit.
+/// This narrow route admits only the fixed compat attachment shape and the
+/// bearer's canonical placement; it cannot create arbitrary records elsewhere.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn create_attachment_input_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    actor: &str,
+    bearer: &str,
+    input: FieldInput<'_>,
+    home: &str,
+) -> Result<String> {
+    create_input_admitted_in(
+        db,
+        tx,
+        acts,
+        actor,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        input,
+        home,
+        Some(bearer),
+        true,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_input_admitted_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    creator_principal_id: &str,
+    family: &str,
+    kind: &str,
+    input: FieldInput<'_>,
+    home_id: &str,
+    attachment_bearer: Option<&str>,
+    require_home_edit: bool,
+    requested_id: Option<&str>,
+) -> Result<String> {
     let home_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
             .bind(home_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await?
             .unwrap_or(false);
     if !home_exists {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
-    kernel_require(&mut tx, creator_principal_id, home_id, Capability::Edit).await?;
-    let pin = resolve_adoption_pin_only(&mut tx, family, home_id).await?;
+    if let Some(bearer) = attachment_bearer {
+        kernel_require(tx, creator_principal_id, bearer, Capability::Edit).await?;
+        let parent = read_record_on(tx, creator_principal_id, bearer)
+            .await?
+            .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+        let folder = parent.family.as_deref() == Some(crate::v2_standard::v1_compat::FAMILY)
+            && parent
+                .fields
+                .get("v1_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("Collection")
+            && parent
+                .fields
+                .get("v1_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("folder");
+        let expected = if folder {
+            if parent.archived {
+                return Err(Error::engine("attachment folder is archived"));
+            }
+            crate::v1_import::derived(bearer)
+        } else {
+            parent.home_id
+        };
+        if home_id != expected {
+            return Err(Error::engine(
+                "attachment home differs from bearer placement",
+            ));
+        }
+    } else if require_home_edit {
+        kernel_require(&mut *tx, creator_principal_id, home_id, Capability::Edit).await?;
+    }
+    let pin = resolve_adoption_pin_only(tx, family, home_id).await?;
     let artifact = crate::definition_registry::read_definition_artifact_on(
-        &mut tx,
+        tx,
         family,
         pin.version,
         &pin.digest,
@@ -4997,9 +7322,32 @@ pub async fn create_as(
         return Err(Error::engine("kind is absent from selected definition"));
     }
     let interpreter = interpreter_for_bytes(&artifact.bytes)?;
-    let id = Uuid::new_v4().to_string();
+    let parsed = input.parse(
+        crate::meta::definition_artifact::language_capabilities(Some(interpreter))
+            .supports_structured_values,
+    )?;
+    let fields = parsed.as_ref();
+    if attachment_bearer.is_some()
+        && (fields.get("v1_type").and_then(serde_json::Value::as_str) != Some("Document")
+            || fields.get("v1_kind").and_then(serde_json::Value::as_str) != Some("attachment"))
+    {
+        return Err(Error::engine(
+            "attachment admission requires Document/attachment",
+        ));
+    }
+
+    let id = if let Some(id) = requested_id {
+        let parsed = Uuid::parse_str(id).map_err(|_| Error::engine("message id must be a UUID"))?;
+        if parsed.to_string() != id {
+            return Err(Error::engine("message id must be canonical"));
+        }
+        hq::refuse_message_collision(tx, id).await?;
+        id.to_owned()
+    } else {
+        Uuid::new_v4().to_string()
+    };
     let (_field_rows, identity) =
-        validated_field_rows(&mut tx, &artifact.bytes, family, kind, fields).await?;
+        validated_field_rows(tx, &artifact.bytes, family, kind, fields).await?;
     // Accession namespaces the identity per family+kind so the (global)
     // column constraint backstops exactly the specified rule. Record-identity
     // kinds have no identity value, so the record id supplies one and the
@@ -5011,10 +7359,26 @@ pub async fn create_as(
         IdentityOutcome::Record => format!("{family}:{kind}:{id}"),
         IdentityOutcome::Legacy => format!("{family}:{kind}:"),
     };
-    let mut acts = crate::act::ActAllocation::new();
+    require_available_accession(tx, &accession).await?;
+    let event_fields = if crate::meta::definition_artifact::language_capabilities(Some(interpreter))
+        .supports_structured_values
+    {
+        crate::structured_values::normalize(&serde_json::Value::Object(
+            fields
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ))
+        .as_object()
+        .unwrap()
+        .clone()
+    } else {
+        fields.clone()
+    };
     append_in(
         db,
-        &mut tx,
+        &mut *tx,
         AppendSpec {
             record_id: id.clone(),
             event_type: "kernel.record_created.v1".into(),
@@ -5026,11 +7390,35 @@ pub async fn create_as(
                 accession: Some(accession),
                 pin: Some(pin),
                 interpreter: Some(interpreter.into()),
-                fields: Some(fields.clone()),
+                fields: Some(event_fields),
             })?,
             actor: Some(creator_principal_id.into()),
         },
+        acts,
+    )
+    .await?;
+    Ok(id)
+}
+
+async fn create_input_as(
+    db: &Db,
+    creator_principal_id: &str,
+    family: &str,
+    kind: &str,
+    input: FieldInput<'_>,
+    home_id: &str,
+) -> Result<String> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    let mut acts = crate::act::ActAllocation::new();
+    let id = create_input_in(
+        db,
+        &mut tx,
         &mut acts,
+        creator_principal_id,
+        family,
+        kind,
+        input,
+        home_id,
     )
     .await?;
     tx.commit().await?;
@@ -5046,6 +7434,43 @@ pub const KERNEL_REVISED_EVENT: &str = "kernel.record_revised.v1";
 #[serde(deny_unknown_fields)]
 struct KernelRevisePayload {
     fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Guarded structured edit: retained pin plus base token and normalization.
+pub const KERNEL_STRUCTURED_REVISED_EVENT: &str = "kernel.record_revised.v2";
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredRevisePayload {
+    fields: serde_json::Map<String, serde_json::Value>,
+    base_revision: i64,
+    pin: RevisionIdentity,
+    interpreter: String,
+    normalization: String,
+}
+
+fn validate_structured_patch(
+    descriptor: Option<&KindDescriptor>,
+    patch: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    if let Some(shape) = descriptor.and_then(|d| d.structured_fields.as_ref()) {
+        crate::structured_values::validate_value_budget(patch)?;
+        let mut names: Vec<_> = patch.keys().collect();
+        names.sort();
+        for name in names {
+            if !shape
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["name"].as_str() == Some(name))
+            {
+                return Err(Error::engine(format!(
+                    "unknown_member at {}",
+                    crate::structured_values::pointer("", name)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Merge a patch over stored fields: explicit nulls delete, other values
@@ -5083,7 +7508,18 @@ pub(crate) async fn project_kernel_record_revised(
     conn: &mut SqliteConnection,
     event: &EventRow,
 ) -> Result<()> {
-    let p: KernelRevisePayload = event_payload(event)?;
+    let guarded = if event.event_type == KERNEL_STRUCTURED_REVISED_EVENT {
+        Some(event_payload::<StructuredRevisePayload>(event)?)
+    } else {
+        None
+    };
+    let p = if let Some(p) = &guarded {
+        KernelRevisePayload {
+            fields: p.fields.clone(),
+        }
+    } else {
+        event_payload::<KernelRevisePayload>(event)?
+    };
     let row: Option<RevisePinRow> =
         sqlx::query_as(
             "SELECT kind, pin_family, pin_version, pin_digest, interpreter FROM kernel_records WHERE id = ?",
@@ -5129,7 +7565,33 @@ pub(crate) async fn project_kernel_record_revised(
             event.record_id
         )));
     }
+    if crate::meta::definition_artifact::language_capabilities(Some(expected))
+        .supports_structured_values
+    {
+        let guard = guarded
+            .as_ref()
+            .ok_or_else(|| Error::engine("structured edits require guarded event"))?;
+        let prior: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM main.content_events WHERE record_id = ? AND seq < ?",
+        )
+        .bind(&event.record_id)
+        .bind(event.local_seq)
+        .fetch_one(&mut *conn)
+        .await?;
+        if guard.base_revision != prior
+            || guard.pin.family != pin_family
+            || i64::from(guard.pin.version) != pin_version
+            || guard.pin.digest != pin_digest
+            || guard.interpreter != expected
+            || guard.normalization != crate::structured_values::NORMALIZATION
+        {
+            return Err(Error::engine("guarded revision basis mismatch"));
+        }
+    } else if guarded.is_some() {
+        return Err(Error::engine("guarded event requires structured language"));
+    }
     let descriptor = kind_descriptor(&stored_bytes, &kind)?;
+    validate_structured_patch(descriptor.as_ref(), &p.fields)?;
     let stored_rows: Vec<(String, String)> =
         sqlx::query_as("SELECT name, value_json FROM kernel_record_fields WHERE record_id = ?")
             .bind(&event.record_id)
@@ -5161,12 +7623,15 @@ pub(crate) async fn project_kernel_record_revised(
             )
             .bind(&event.record_id)
             .bind(name)
-            .bind(serde_json::to_string(value)?)
+            .bind(serde_json::to_string(&if guarded.is_some() { crate::structured_values::normalize(value) } else { value.clone() })?)
             .bind(event.local_seq)
             .execute(&mut *conn)
             .await?;
         }
     }
+    // S7a probe index follows the projection in the same transaction.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    search_v2::refresh_search_row(&mut *conn, &event.record_id).await?;
     Ok(())
 }
 
@@ -5182,17 +7647,85 @@ pub async fn revise_as(
     record_id: &str,
     patch: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
-    let mut tx = begin_write(db.write_pool()).await?;
+    revise_as_expected(db, actor_principal_id, record_id, patch, None).await
+}
+
+/// Generic revise with an optional compare-and-swap precondition.
+///
+/// The authority check runs first, then the latest-revision check, then the
+/// append: a caller that supplies `expected_revision` (the `revision` from a
+/// prior [`read_record_as`]) has its write refused with [`Error::Conflict`]
+/// before any event is appended when another editor has moved the record on.
+/// `revise_as` is the unconditional compatibility wrapper (`None`).
+pub async fn revise_as_expected(
+    db: &Db,
+    actor_principal_id: &str,
+    record_id: &str,
+    patch: &serde_json::Map<String, serde_json::Value>,
+    expected_revision: Option<i64>,
+) -> Result<()> {
+    revise_input_as(
+        db,
+        actor_principal_id,
+        record_id,
+        FieldInput::Parsed(patch),
+        expected_revision,
+    )
+    .await
+}
+/// Raw-field guarded revise ingress, parsed under the record's retained pin.
+pub async fn revise_json_as_expected(
+    db: &Db,
+    actor: &str,
+    record_id: &str,
+    raw: &str,
+    expected_revision: Option<i64>,
+) -> Result<()> {
+    revise_input_as(
+        db,
+        actor,
+        record_id,
+        FieldInput::Raw(raw),
+        expected_revision,
+    )
+    .await
+}
+/// `revise_input_as` on a transaction the caller already holds: no begin or
+/// commit of its own, so a host operation can revise and register in one
+/// transaction with one shared act allocation. The caller owns the
+/// transaction and ends it.
+pub(crate) async fn revise_input_in(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut crate::act::ActAllocation,
+    actor_principal_id: &str,
+    record_id: &str,
+    input: FieldInput<'_>,
+    expected_revision: Option<i64>,
+) -> Result<()> {
     let row: Option<KindPinRow> = sqlx::query_as(
         "SELECT kind, pin_family, pin_version, pin_digest FROM kernel_records WHERE id = ?",
     )
     .bind(record_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some((kind, pin_family, pin_version, pin_digest)) = row else {
         return Err(Error::engine(HIDDEN_OR_MISSING));
     };
-    kernel_require(&mut tx, actor_principal_id, record_id, Capability::Edit).await?;
+    kernel_require(&mut *tx, actor_principal_id, record_id, Capability::Edit).await?;
+    if let Some(expected) = expected_revision {
+        let current: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) FROM main.content_events WHERE record_id = ?",
+        )
+        .bind(record_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if current != expected {
+            return Err(Error::conflict(format!(
+                "record revision mismatch: expected {expected}, found {current}"
+            )));
+        }
+    }
     let (kind, pin_family, pin_version, pin_digest) =
         match (kind, pin_family, pin_version, pin_digest) {
             (Some(k), Some(f), Some(v), Some(d)) => (k, f, v, d),
@@ -5201,7 +7734,7 @@ pub async fn revise_as(
     let version_u32 =
         u32::try_from(pin_version).map_err(|_| Error::engine("invalid record pin version"))?;
     let artifact = crate::definition_registry::read_definition_artifact_on(
-        &mut tx,
+        tx,
         &pin_family,
         version_u32,
         &pin_digest,
@@ -5209,10 +7742,20 @@ pub async fn revise_as(
     .await?
     .ok_or_else(|| Error::engine("selected primary definition artifact is missing"))?;
     let descriptor = kind_descriptor(&artifact.bytes, &kind)?;
+    let structured = descriptor
+        .as_ref()
+        .is_some_and(|d| d.structured_fields.is_some());
+    let parsed = input.parse(structured)?;
+    if structured && expected_revision.is_none() {
+        return Err(Error::engine("expected_revision_required"));
+    }
+    let patch = parsed.as_ref();
+    validate_structured_patch(descriptor.as_ref(), patch)?;
+
     let stored_rows: Vec<(String, String)> =
         sqlx::query_as("SELECT name, value_json FROM kernel_record_fields WHERE record_id = ?")
             .bind(record_id)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?;
     let mut stored = serde_json::Map::new();
     for (name, value_json) in stored_rows {
@@ -5225,21 +7768,79 @@ pub async fn revise_as(
         patch,
     )?;
     validate_record_fields(descriptor.as_ref(), &kind, &merged)?;
-    let mut acts = crate::act::ActAllocation::new();
+    let payload = if structured {
+        serde_json::to_value(StructuredRevisePayload {
+            fields: crate::structured_values::normalize(&serde_json::Value::Object(patch.clone()))
+                .as_object()
+                .unwrap()
+                .clone(),
+            base_revision: expected_revision.unwrap(),
+            pin: RevisionIdentity {
+                family: pin_family,
+                version: version_u32,
+                digest: pin_digest,
+            },
+            interpreter: descriptor
+                .as_ref()
+                .and_then(|d| d.interpreter.clone())
+                .ok_or_else(|| Error::engine("structured revise requires a retained language"))?,
+            normalization: crate::structured_values::NORMALIZATION.to_string(),
+        })?
+    } else {
+        serde_json::to_value(KernelRevisePayload {
+            fields: patch.clone(),
+        })?
+    };
     append_in(
         db,
-        &mut tx,
+        &mut *tx,
         AppendSpec {
             record_id: record_id.into(),
-            event_type: KERNEL_REVISED_EVENT.into(),
-            payload: serde_json::to_value(KernelRevisePayload {
-                fields: patch.clone(),
-            })?,
+            event_type: if structured {
+                KERNEL_STRUCTURED_REVISED_EVENT
+            } else {
+                KERNEL_REVISED_EVENT
+            }
+            .into(),
+            payload,
             actor: Some(actor_principal_id.into()),
         },
+        acts,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn revise_input_as(
+    db: &Db,
+    actor_principal_id: &str,
+    record_id: &str,
+    input: FieldInput<'_>,
+    expected_revision: Option<i64>,
+) -> Result<()> {
+    let mut tx = begin_write(db.write_pool()).await?;
+    let mut acts = crate::act::ActAllocation::new();
+    revise_input_in(
+        db,
+        &mut tx,
         &mut acts,
+        actor_principal_id,
+        record_id,
+        input,
+        expected_revision,
     )
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Test-only observation of the existing validator, without writes or uniqueness checks.
+#[cfg(test)]
+pub(crate) fn definition_shape_accepts(
+    bytes: &str,
+    kind: &str,
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let descriptor = kind_descriptor(bytes, kind).expect("validated definition fixture");
+    validate_record_fields(descriptor.as_ref(), kind, fields).is_ok()
 }

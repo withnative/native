@@ -160,6 +160,16 @@ pub async fn harvest_host_notification_candidates(
     after_candidate_seq: i64,
     limit: i64,
 ) -> Result<HostNotificationHarvest> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2(db).await? {
+        return crate::kernel::notifications::harvest(
+            db,
+            recipient_account_id,
+            after_candidate_seq,
+            limit,
+        )
+        .await;
+    }
     if !(1..=500).contains(&limit) {
         return Err(Error::engine("harvest limit must be 1..=500"));
     }
@@ -222,6 +232,11 @@ pub async fn revalidate_host_notification_candidate(
     recipient_account_id: &str,
     recipient_is_member: bool,
 ) -> Result<Option<HostNotificationRevalidation>> {
+    #[cfg(feature = "v2-kernel-probe")]
+    if crate::kernel::notifications::is_v2(db).await? {
+        return crate::kernel::notifications::revalidate(db, candidate_id, recipient_account_id)
+            .await;
+    }
     let candidate = sqlx::query(
         "SELECT message_id,not_before,status,priority,evaluator_kind,policy_version FROM notification_candidates WHERE candidate_id=? AND recipient_account_id=?",
     )
@@ -263,9 +278,7 @@ pub async fn revalidate_host_notification_candidate(
     }))
 }
 
-/// Resolve a candidate's Message after send revalidation. Keeping this lookup
-/// separate preserves the digest renderer's existing post-revalidation race
-/// behavior and error surface.
+/// Legacy renderer lookup: preserve v1's missing-row error and unfiltered lookup.
 #[doc(hidden)]
 pub async fn host_notification_candidate_message_id(
     db: &crate::Db,
@@ -277,6 +290,22 @@ pub async fn host_notification_candidate_message_id(
             .fetch_one(db.write_pool())
             .await?,
     )
+}
+
+/// V2 withdrawal may race rendering. Legacy databases retain their original
+/// lookup semantics, including errors for missing candidates.
+#[cfg(feature = "v2-kernel-probe")]
+#[doc(hidden)]
+pub async fn host_live_notification_candidate_message_id(
+    db: &crate::Db,
+    candidate_id: &str,
+) -> Result<Option<String>> {
+    if crate::kernel::notifications::is_v2(db).await? {
+        return Ok(sqlx::query_scalar("SELECT message_id FROM kernel_message_candidates WHERE candidate_id=? AND json_extract(state,'$.status')='effective' AND json_extract(state,'$.assurance')='native_live'").bind(candidate_id).fetch_optional(db.write_pool()).await?);
+    }
+    host_notification_candidate_message_id(db, candidate_id)
+        .await
+        .map(Some)
 }
 
 /// Timestamp shape shared by portable events and hosted notification custody.
@@ -295,6 +324,15 @@ pub enum HumanStage {
 }
 
 impl HumanStage {
+    /// Storage-free monotonic stage reducer shared with kernel messaging.
+    pub(crate) fn advanced(self, current: Self) -> Self {
+        if self.rank() > current.rank() {
+            self
+        } else {
+            current
+        }
+    }
+
     fn rank(self) -> u8 {
         match self {
             Self::Unsurfaced => 0,
@@ -999,11 +1037,7 @@ pub(crate) async fn project_awareness_event(
             .await?;
             let current_stage = HumanStage::parse(current.as_ref().map(|v| v.0.as_str()))?;
             let requested = HumanStage::parse(Some(stage))?;
-            let next = if requested.rank() > current_stage.rank() {
-                requested
-            } else {
-                current_stage
-            };
+            let next = requested.advanced(current_stage);
             let version = current.as_ref().map_or(1, |v| v.1 + 1);
             let opened_at = current
                 .as_ref()
@@ -1066,6 +1100,16 @@ pub(crate) async fn project_awareness_event(
         }
         "preference" => {
             let message = message_subject(event);
+            // Missing and JSON null are the retained pre-88 interpretation.
+            let unread_override = match payload.get("unread_override") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => {
+                    return Err(Error::engine(
+                        "invalid private read preference replay payload",
+                    ))
+                }
+            };
             let version: i64 = sqlx::query_scalar(
                 "SELECT version FROM message_preferences
                   WHERE subject_account_id=? AND message_id=?",
@@ -1076,7 +1120,7 @@ pub(crate) async fn project_awareness_event(
             .await?
             .unwrap_or(0)
                 + 1;
-            sqlx::query("INSERT INTO message_preferences(subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET attention_flag=excluded.attention_flag,muted=excluded.muted,snoozed_until=excluded.snoozed_until,archived=excluded.archived,last_event_seq=excluded.last_event_seq,version=excluded.version")
+            sqlx::query("INSERT INTO message_preferences(subject_account_id,message_id,attention_flag,muted,snoozed_until,archived,last_event_seq,version,unread_override) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(subject_account_id,message_id) DO UPDATE SET attention_flag=excluded.attention_flag,muted=excluded.muted,snoozed_until=excluded.snoozed_until,archived=excluded.archived,last_event_seq=excluded.last_event_seq,version=excluded.version,unread_override=excluded.unread_override")
                 .bind(account)
                 .bind(&message)
                 .bind(payload["attention_flag"].as_bool())
@@ -1085,6 +1129,7 @@ pub(crate) async fn project_awareness_event(
                 .bind(payload["archived"].as_bool())
                 .bind(seq)
                 .bind(version)
+                .bind(unread_override)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -1222,11 +1267,7 @@ pub async fn advance_human(
         delegation_ref: None,
         reason_code,
     };
-    let next = if stage.rank() > current_stage.rank() {
-        stage
-    } else {
-        current_stage
-    };
+    let next = stage.advanced(current_stage);
     let attained_at = now_iso();
     let payload = json!({
         "stage": next,
@@ -1426,6 +1467,8 @@ pub async fn set_agent_disposition(
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreferenceAction {
+    MarkRead,
+    MarkUnread,
     FlagAttention,
     ClearAttention,
     Mute,
@@ -1439,6 +1482,8 @@ pub enum PreferenceAction {
 impl PreferenceAction {
     fn name(&self) -> &'static str {
         match self {
+            Self::MarkRead => "read.set",
+            Self::MarkUnread => "read.cleared",
             Self::FlagAttention => "attention.flagged",
             Self::ClearAttention => "attention.cleared",
             Self::Mute => "mute.set",
@@ -1473,7 +1518,7 @@ pub async fn set_preference(
     // Build the intended post-state after reading the current row, but honor
     // an exact retry before comparing the stale expected version.
     let row = sqlx::query(
-        "SELECT attention_flag,muted,snoozed_until,archived,version FROM message_preferences
+        "SELECT attention_flag,muted,snoozed_until,archived,version,unread_override FROM message_preferences
           WHERE subject_account_id=? AND message_id=?",
     )
     .bind(account)
@@ -1494,7 +1539,12 @@ pub async fn set_preference(
     let mut archived = row
         .as_ref()
         .is_some_and(|r| r.get::<i64, _>("archived") != 0);
+    let mut unread_override = row
+        .as_ref()
+        .and_then(|r| r.get::<Option<bool>, _>("unread_override"));
     match action {
+        PreferenceAction::MarkRead => unread_override = Some(false),
+        PreferenceAction::MarkUnread => unread_override = Some(true),
         PreferenceAction::FlagAttention => attention = true,
         PreferenceAction::ClearAttention => attention = false,
         PreferenceAction::Mute => muted = true,
@@ -1521,7 +1571,7 @@ pub async fn set_preference(
         PreferenceAction::Restore => archived = false,
     }
     let command_payload = json!({"snoozed_until":snoozed_until});
-    let payload = json!({"attention_flag":attention,"muted":muted,"snoozed_until":snooze,"archived":archived});
+    let payload = json!({"attention_flag":attention,"muted":muted,"snoozed_until":snooze,"archived":archived,"unread_override":unread_override});
     if let Some(existing) = exact_retry(
         tx,
         account,
@@ -1535,7 +1585,7 @@ pub async fn set_preference(
     .await?
     {
         return Ok(
-            json!({"message_id":message_id,"version":existing.expected_version+1,"changed":false,"idempotent":true,"attention_flag":existing.payload["attention_flag"],"muted":existing.payload["muted"],"snoozed_until":existing.payload["snoozed_until"],"archived":existing.payload["archived"]}),
+            json!({"message_id":message_id,"version":existing.expected_version+1,"changed":false,"idempotent":true,"attention_flag":existing.payload["attention_flag"],"muted":existing.payload["muted"],"snoozed_until":existing.payload["snoozed_until"],"archived":existing.payload["archived"],"unread_override":existing.payload["unread_override"]}),
         );
     }
     if current_version != expected_version {
@@ -1607,7 +1657,7 @@ pub async fn set_preference(
         }
     }
     Ok(
-        json!({"message_id":message_id,"version":next_version,"changed":true,"attention_flag":attention,"muted":muted,"snoozed_until":snooze,"archived":archived}),
+        json!({"message_id":message_id,"version":next_version,"changed":true,"idempotent":false,"attention_flag":attention,"muted":muted,"snoozed_until":snooze,"archived":archived,"unread_override":unread_override}),
     )
 }
 
@@ -2054,6 +2104,21 @@ pub struct MentionInput {
     pub span_start: usize,
     pub span_end: usize,
     pub authored_label: String,
+}
+
+/// Storage-free check shared by v1 and kernel messaging. Offsets are UTF-8 bytes.
+pub(crate) fn validate_mention_span(body: &str, mention: &MentionInput) -> Result<()> {
+    if mention.span_start >= mention.span_end
+        || mention.span_end > body.len()
+        || !body.is_char_boundary(mention.span_start)
+        || !body.is_char_boundary(mention.span_end)
+        || body[mention.span_start..mention.span_end] != mention.authored_label
+    {
+        return Err(crate::Error::engine(
+            "create_record: mention span must exactly match immutable Message prose",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2824,10 +2889,19 @@ pub async fn withdraw_notification_candidates_in(
     Ok(rows.len())
 }
 
+/// Privileged host/internal consistency fence over the entire database.
+/// Never expose these global heads as a caller's private inbox cursor; ordinary
+/// KernelV2 inbox reads use recipient-scoped `notifications::head_on` instead.
 pub async fn heads_on<'e, E>(executor: E) -> Result<(i64, i64)>
 where
     E: sqlx::Executor<'e, Database = Sqlite> + Copy,
 {
+    #[cfg(feature="v2-kernel-probe")]
+    if sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='kernel_messages' AND type='table') AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE name='records' AND type='table')").fetch_one(executor).await? {
+        let awareness=sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM content_events WHERE type='kernel.message_state.v1'").fetch_one(executor).await?;
+        let candidates=sqlx::query_scalar("SELECT MAX(COALESCE((SELECT MAX(seq) FROM kernel_message_candidate_events),0),COALESCE((SELECT MAX(source_seq) FROM kernel_message_candidate_import_frontiers),0))").fetch_one(executor).await?;
+        return Ok((awareness,candidates));
+    }
     let awareness: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM awareness_events")
         .fetch_one(executor)
         .await?;
@@ -3827,6 +3901,125 @@ mod tests {
                 .unwrap(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn read_preference_legacy_replay_restart_and_retry_preserve_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-preferences.db");
+        let db = crate::create_database(path.to_str().unwrap())
+            .await
+            .unwrap();
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let context = MutationContext {
+            subject_account_id: "acct:a",
+            authenticated_actor: "acct:a",
+            executor_kind: "system",
+            executor_ref: None,
+            delegation_ref: None,
+            reason_code: "legacy preference",
+        };
+        // A retained pre-88 preference payload has no override field.
+        let (legacy, _) = append_event(
+            &mut tx,
+            &context,
+            Subject::Message("message:a"),
+            "preference",
+            "mute.set",
+            0,
+            "legacy",
+            None,
+            Some(&json!({"snoozed_until":null})),
+            &json!({"attention_flag":false,"muted":true,"snoozed_until":null,"archived":false}),
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        project_awareness_event(&mut tx, &legacy).await.unwrap();
+        let legacy_override: Option<bool> =
+            sqlx::query_scalar("SELECT unread_override FROM message_preferences")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert_eq!(legacy_override, None);
+        set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            PreferenceAction::MarkUnread,
+            None,
+            1,
+            "unread",
+            "test",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            PreferenceAction::MarkRead,
+            None,
+            2,
+            "read",
+            "test",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let before: (bool, bool, i64, i64) = sqlx::query_as(
+            "SELECT unread_override,muted,version,last_event_seq FROM message_preferences",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!((before.0, before.1, before.2), (false, true, 3));
+        db.close().await;
+        let db = crate::open_database_at(&path).await.unwrap();
+        rebuild_projections(&db).await.unwrap();
+        let after: (bool, bool, i64, i64) = sqlx::query_as(
+            "SELECT unread_override,muted,version,last_event_seq FROM message_preferences",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let mut act_alloc = crate::act::ActAllocation::new();
+        let retry = set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            PreferenceAction::MarkUnread,
+            None,
+            1,
+            "unread",
+            "test",
+            &mut act_alloc,
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry["version"], 2);
+        assert_eq!(retry["unread_override"], true);
+        assert_eq!(retry["idempotent"], true);
+        assert!(set_preference(
+            &mut tx,
+            "acct:a",
+            "message:a",
+            PreferenceAction::MarkUnread,
+            None,
+            1,
+            "different-key",
+            "test",
+            &mut act_alloc
+        )
+        .await
+        .is_err());
+        tx.rollback().await.unwrap();
+        db.close().await;
     }
 
     #[tokio::test]
