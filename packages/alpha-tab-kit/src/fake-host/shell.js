@@ -30,8 +30,9 @@
 //   are retired instead (the shell closes that holder with a notice, and
 //   Retry opens a fresh one), so the old read's timer, answer and cleanup
 //   can never reach the new document;
-// - navigation is honoured only with host user activation and a bounded,
-//   printable record id (pending.js handleNavigation);
+// - navigation is honoured only with host user activation and either a
+//   bounded, printable record id or a credential-free http(s) link (pending.js
+//   handleNavigation, lib/appNavigation.js);
 // - with `calls` configured the host offers `app.call.v2` and answers a
 //   frame's `call` with `call-result`, with no need check (the v2 contract);
 // - with `sessions` configured the host offers `app.session.v2` and answers a
@@ -344,7 +345,17 @@ async function answerIntent(intent) {
 function handleNavigation(message) {
   const hostActive = navigator.userActivation?.isActive === true;
   const id = message.recordId;
-  const valid = typeof id === "string" && id.length > 0 && id.length <= limits.shell.navigation_id_max_chars && !/[\u0000-\u001f\u007f\s]/.test(id);
+  const hasRecordId = id !== null && id !== undefined;
+  const hasHref = message.href !== null && message.href !== undefined;
+  const validId = typeof id === "string" && id.length > 0 && id.length <= limits.shell.navigation_id_max_chars && !/[\u0000-\u001f\u007f\s]/.test(id);
+  let validHref = false;
+  if (typeof message.href === "string") {
+    try {
+      const url = new URL(message.href);
+      validHref = (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password;
+    } catch { /* malformed URL */ }
+  }
+  const valid = hasRecordId !== hasHref && (hasRecordId ? validId : validHref);
   log(hostActive && valid ? "navigation" : "navigation-ignored", { recordId: id, href: message.href, newTab: message.newTab === true, hostActive, valid });
 }
 

@@ -321,3 +321,31 @@ test("fake host: an idle reload re-handshakes; the old document's handler is ign
   assert.deepEqual(shell.replies(oldChannel), ["read-1:ok/"]);
   assert.equal(oldChannel.postedAfterClose.length, 0);
 });
+
+
+test("fake host: navigation enforces the real host's activation and destination refusals", async () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const userActivation = { isActive: true };
+  Object.defineProperty(globalThis, 'navigator', { configurable: true, value: { userActivation } });
+  try {
+    const shell = await loadShell();
+    const channel = await shell.bootstrap('links');
+    shell.send(channel, { type: 'ready' });
+    const send = message => {
+      shell.send(channel, { type: 'navigation', ...message });
+      return shell.events().at(-1);
+    };
+    for (const message of [{ recordId: 'm1' }, { href: 'https://example.com' }, { href: 'https://n8v.to/46f6f3c' }]) {
+      assert.equal(send(message).type, 'navigation');
+    }
+    for (const message of [{ recordId: 'm1', href: 'https://example.com' }, { href: 'https://user:pw@example.com' },
+      { href: 'https://' }, { href: 'javascript:alert(1)' }, { recordId: 'has space' }, { recordId: '' }]) {
+      assert.equal(send(message).type, 'navigation-ignored', JSON.stringify(message));
+    }
+    userActivation.isActive = false;
+    assert.equal(send({ href: 'https://example.com' }).type, 'navigation-ignored');
+  } finally {
+    if (previous) Object.defineProperty(globalThis, 'navigator', previous);
+    else delete globalThis.navigator;
+  }
+});

@@ -152,7 +152,7 @@
     "body_save_timeout_ms": { "value": 30000, "js_literal": "export const BODY_SAVE_TIMEOUT_MS = 30_000;", "source": "experiments/demo-shell/public/views/pending.js:786" },
     "handshake_timeout_ms": { "value": 5000, "js_literal": "timer = window.setTimeout(() => fail(\"The live tab did not complete its handshake.\"), 5000);", "source": "experiments/demo-shell/public/views/pending.js:2954" },
     "snapshot_row_cap": { "value": 200, "js_literal": "export const SQL_SNAPSHOT_ROW_CAP = 200;", "source": "experiments/demo-shell/public/lib/pendingTabs.js:54" },
-    "navigation_id_max_chars": { "value": 128, "js_literal": "id.length > 128", "source": "experiments/demo-shell/public/views/pending.js:3243 handleNavigation" }
+    "navigation_id_max_chars": { "value": 128, "js_literal": "id.length <= 128", "source": "experiments/demo-shell/public/lib/appNavigation.js:24 printableId" }
   },
   "sample_input": {
     "value": {

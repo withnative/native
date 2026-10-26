@@ -4,6 +4,10 @@
 
 Work and build shared context together, in one place. Every teammate, any AI agent.
 
+> **40× fewer tokens than Markdown vaults**
+>
+> In our [context retrieval benchmark](https://www.withnative.ai/research-and-posts/markdown-context-benchmark), agents using Native consumed 40× fewer tokens per fully correct answer than agents searching a Markdown vault with wikilinks.
+
 [![Native demo: a shared document open in Native, with Codex working alongside](docs/figures/readme/demo-video.jpg)](https://www.youtube.com/watch?v=BlMRqRRk-HI)
 
 [Watch the 2-minute demo video](https://www.youtube.com/watch?v=BlMRqRRk-HI) · [Ask ChatGPT about Native](https://withnative.ai/askchatgpt)
