@@ -1,0 +1,143 @@
+{
+  "format": "native.generated-facets.v1",
+  "workspace_id": "fixture-workspace",
+  "context": {
+    "type": "WorkItem",
+    "kind": "task",
+    "logical_home_id": "H"
+  },
+  "selection": {
+    "kind": "keys",
+    "keys": [
+      "priority"
+    ]
+  },
+  "sources": [
+    {
+      "section": "schema_config",
+      "source_id": "[\"global\"]",
+      "origin": "fixture-origin",
+      "row_id": "global",
+      "event_id": "00000000-0000-4000-8000-000000000010",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": null
+    },
+    {
+      "section": "schema_config",
+      "source_id": "[\"local\"]",
+      "origin": "fixture-origin",
+      "row_id": "local",
+      "event_id": "00000000-0000-4000-8000-000000000011",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": "H"
+    },
+    {
+      "section": "vocabularies",
+      "source_id": "[\"priority\"]",
+      "origin": "fixture-origin",
+      "row_id": "priority",
+      "event_id": "00000000-0000-4000-8000-000000000012",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": null
+    },
+    {
+      "section": "vocabulary_values",
+      "source_id": "[\"high\"]",
+      "origin": "fixture-origin",
+      "row_id": "high",
+      "event_id": "00000000-0000-4000-8000-000000000013",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": null
+    }
+  ],
+  "slots": [
+    {
+      "scope": "global",
+      "layer": "pack",
+      "shape_key": "WorkItem",
+      "fragments": [
+        {
+          "source": 0,
+          "key": "priority",
+          "lineage": "G1",
+          "created_at": "2026-10-26T00:00:00Z",
+          "decl": {
+            "type": null,
+            "description": "Priority",
+            "required": null,
+            "vocab": null,
+            "vocab_ref": "rec:priority",
+            "unit": null
+          }
+        }
+      ]
+    },
+    {
+      "scope": "global",
+      "layer": "user",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "global",
+      "layer": "pack",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "global",
+      "layer": "user",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "pack",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "user",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "pack",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "user",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    }
+  ],
+  "governance_basis": [
+    {
+      "source": 1,
+      "shape_key": "WorkItem:task",
+      "lineage": "L1",
+      "created_at": "2026-10-26T00:00:00Z"
+    }
+  ],
+  "vocabularies": [
+    {
+      "field": "priority",
+      "source": 2,
+      "values": [
+        {
+          "source": 3,
+          "id": "high",
+          "token": "high",
+          "status": "active",
+          "alias_of": null,
+          "canonical_id": "high",
+          "canonical_token": "high"
+        }
+      ]
+    }
+  ]
+}

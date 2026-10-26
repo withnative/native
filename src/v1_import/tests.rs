@@ -517,6 +517,7 @@ impl Fixture {
         db.execute(r#"CREATE TABLE database_identity(singleton INTEGER,origin_db_id TEXT);
             INSERT INTO database_identity VALUES(1,'test-origin');
             CREATE TABLE records(id TEXT PRIMARY KEY,type TEXT,kind TEXT,name TEXT,body TEXT,home_id TEXT,owner_id TEXT,lifecycle TEXT,summary TEXT,created_at TEXT,updated_at TEXT,archived INTEGER,policy_anchor_id TEXT,deleted_at TEXT,persistence TEXT NOT NULL DEFAULT 'enduring',maturity TEXT,last_activity_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00Z');
+            CREATE TABLE member_contexts(account_id TEXT PRIMARY KEY,person_record_id TEXT,root_record_id TEXT UNIQUE,created_at TEXT);
             CREATE TABLE bindings(record_id TEXT,system TEXT,identifier TEXT,is_canonical INTEGER);
             INSERT INTO bindings VALUES('person-a','account','account-a',1),('person-b','account','account-b',1);
             CREATE TABLE record_policies(record_id TEXT PRIMARY KEY);
@@ -3923,6 +3924,12 @@ async fn imported_history_batches_preserve_causality_and_atomic_resume() {
         .0;
     let admin = &report.principals["account-a"];
     let before = k::dump_all_kernel_tables(&db).await.unwrap();
+    let frontier_before: i64 =
+        sqlx::query_scalar("SELECT projected_seq FROM kernel_facet_time_meta")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    k::verify_v2_ready(&db).await.unwrap();
     let mut entries: Vec<_> = (0..256)
         .map(|n| {
             let record = if n % 2 == 0 { "task" } else { "epic" };
@@ -3955,10 +3962,40 @@ async fn imported_history_batches_preserve_causality_and_atomic_resume() {
             .unwrap(),
         count_before
     );
+    assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), before);
     entries[255].0 = "epic".into();
     assert!(k::import_history_batch_as(&db, admin, &entries)
         .await
         .is_err());
+    assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), before);
+    // Fail after the retained event and its history/SQL projections have
+    // been written, at the facet-time frontier update. The common projector
+    // uses the batch's write transaction, so this must roll back receipts,
+    // retained events and every projection together, just as a crash would.
+    sqlx::query("CREATE TRIGGER synthetic_facet_time_frontier_failure BEFORE UPDATE OF projected_seq ON kernel_facet_time_meta WHEN NEW.projected_seq != OLD.projected_seq BEGIN SELECT RAISE(ABORT, 'synthetic facet-time frontier failure'); END")
+        .execute(db.write_pool()).await.unwrap();
+    let failure = k::import_history_batch_as(&db, &host, &entries)
+        .await
+        .unwrap_err();
+    sqlx::query("DROP TRIGGER synthetic_facet_time_frontier_failure")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    assert!(
+        failure
+            .to_string()
+            .contains("synthetic facet-time frontier failure"),
+        "{failure}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        count_before
+    );
+    assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), before);
+    k::verify_v2_ready(&db).await.unwrap();
     let mut heads: BTreeSet<String> = sqlx::query_scalar("SELECT e.id FROM content_events e WHERE NOT EXISTS(SELECT 1 FROM content_event_causal_frontier f WHERE f.parent_event_id=e.id)").fetch_all(db.write_pool()).await.unwrap().into_iter().collect();
     let outcome = k::import_history_batch_as(&db, &host, &entries)
         .await
@@ -3999,6 +4036,84 @@ async fn imported_history_batches_preserve_causality_and_atomic_resume() {
     }
     let actual_heads: BTreeSet<String> = sqlx::query_scalar("SELECT e.id FROM content_events e WHERE NOT EXISTS(SELECT 1 FROM content_event_causal_frontier f WHERE f.parent_event_id=e.id)").fetch_all(db.write_pool()).await.unwrap().into_iter().collect();
     assert_eq!(actual_heads, heads);
+    // Every retained envelope advances the facet-time frontier, even when
+    // no typed time value changes. Its singleton keeps one row; history and
+    // SQL headers each gain one row per entry. Keep all three in the complete
+    // dump when checking idempotent resume and FULL reconstruction.
+    let expected_frontier: i64 = sqlx::query_scalar("SELECT seq FROM content_events WHERE id=?")
+        .bind(&entries.last().unwrap().1.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let frontier: (i64, i64) =
+        sqlx::query_as("SELECT projected_seq,gap_free FROM kernel_facet_time_meta")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(frontier, (expected_frontier, 1));
+    k::verify_v2_ready(&db).await.unwrap();
+    let with_history = k::dump_all_kernel_tables(&db).await.unwrap();
+    let changed: Vec<_> = with_history
+        .projections
+        .tables
+        .iter()
+        .filter(|table| {
+            before
+                .projections
+                .tables
+                .iter()
+                .find(|prior| prior.name == table.name)
+                != Some(*table)
+        })
+        .map(|table| table.name.as_str())
+        .collect();
+    assert_eq!(
+        changed,
+        [
+            "kernel_facet_time_meta",
+            "kernel_legacy_history",
+            "kernel_legacy_sql_events"
+        ]
+    );
+    for name in &changed {
+        let prior = before
+            .projections
+            .tables
+            .iter()
+            .find(|table| table.name == *name)
+            .unwrap();
+        let after = with_history
+            .projections
+            .tables
+            .iter()
+            .find(|table| table.name == *name)
+            .unwrap();
+        assert_eq!(
+            after.rows,
+            prior.rows
+                + if *name == "kernel_facet_time_meta" {
+                    0
+                } else {
+                    entries.len() as u64
+                }
+        );
+    }
+    let headers: Vec<(String, String, Option<String>, String, String)> = sqlx::query_as(
+        "SELECT source_id,event_type,actor,created_at,source_stream FROM kernel_legacy_sql_events WHERE source_id GLOB 'batch-history-*' ORDER BY seq",
+    ).fetch_all(db.write_pool()).await.unwrap();
+    let expected_headers: Vec<_> = entries
+        .iter()
+        .map(|(_, event)| {
+            (
+                event.id.clone(),
+                event.event_type.clone(),
+                event.actor.as_ref().map(|actor| format!("v1:{actor}")),
+                event.created_at.clone(),
+                "content_events".to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(headers, expected_headers);
     let retry = k::import_history_batch_as(&db, &host, &entries)
         .await
         .unwrap();
@@ -4010,14 +4125,40 @@ async fn imported_history_batches_preserve_causality_and_atomic_resume() {
             .unwrap(),
         count_before + 512
     );
-    // Retained history now has derived SQL headers and a scanned frontier.
-    // Those may advance; every current-state projection must stay identical.
-    let mut current = k::dump_all_kernel_tables(&db).await.unwrap();
-    current.legacy_sql_events = before.legacy_sql_events.clone();
-    current.legacy_sql_progress = before.legacy_sql_progress.clone();
-    assert_eq!(current, before);
-    let with_history = k::dump_all_kernel_tables(&db).await.unwrap();
+    assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), with_history);
     k::replay_all_projections(&db).await.unwrap();
+    assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), with_history);
+    // An older writer or externally interrupted preparation cannot make a
+    // stale frontier serve silently. Reads refuse until explicit preparation
+    // catches up, rather than repairing or blessing it during a request.
+    sqlx::query("UPDATE kernel_facet_time_meta SET projected_seq=?")
+        .bind(frontier_before)
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    let refusal = k::verify_v2_ready(&db).await.unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("facet-time read projection is not ready"),
+        "{refusal}"
+    );
+    let refusal = ordinary_kernel_call(
+        &db,
+        "account-a",
+        "query_sql",
+        json!({"sql":"SELECT * FROM facet_times"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refusal
+            .to_string()
+            .contains("facet-time read projection is not ready"),
+        "{refusal}"
+    );
+    k::prepare_v2_database(&db).await.unwrap();
+    k::verify_v2_ready(&db).await.unwrap();
     assert_eq!(k::dump_all_kernel_tables(&db).await.unwrap(), with_history);
 }
 
@@ -6543,7 +6684,7 @@ async fn imported_app_authors_follow_visible_person_for_non_root_members() {
         .await
         .unwrap();
     assert_eq!(visible["rows"].as_array().unwrap().len(), 1, "{visible}");
-    assert_eq!(visible["rows"][0]["actor"], "v1:account-a");
+    assert_eq!(visible["rows"][0]["actor"], report.principals["account-a"]);
     assert_eq!(visible["rows"][0]["person_id"], "person-a");
     assert_eq!(visible["rows"][0]["display_name"], "Visible Author");
     source
@@ -6662,7 +6803,10 @@ async fn assert_private_derived_surfaces(db: &Db, id: &str, bearer: &str) {
         let get = ordinary_kernel_call(db, account, "get_record", json!({"ids":[id]}))
             .await
             .unwrap();
-        assert_eq!(get["records"][0]["status"] != "not_found", visible);
+        assert_eq!(
+            get["records"][0]["status"],
+            if visible { "found" } else { "not_found" }
+        );
         let sql = ordinary_kernel_call(
             db,
             account,
@@ -7431,6 +7575,11 @@ async fn imported_vault_root_metadata_and_logical_homes_survive_resume() {
 }
 
 #[cfg(feature = "v2-kernel-probe")]
+mod html_board;
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/facet_times.rs"]
+mod imported_facet_times;
+#[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
 async fn imported_native_delete_retains_derivation_guards_and_requires_known_evidence() {
     let f = Fixture::new().await;
@@ -7506,3 +7655,79 @@ async fn imported_native_delete_retains_derivation_guards_and_requires_known_evi
     assert_eq!(after, k::dump_all_kernel_tables(&db).await.unwrap());
     db.close().await;
 }
+
+#[cfg(feature = "v2-kernel-probe")]
+#[test]
+fn imported_cutover_build_sha_requires_matching_stamped_build_or_explicit_override() {
+    let own = "a".repeat(40);
+    let other = "b".repeat(40);
+    assert!(!cutover::admit_build_sha(Some(&own), &own, false).unwrap());
+    assert!(!cutover::admit_build_sha(Some(&own), &own, true).unwrap());
+    for importer in [
+        None,
+        Some(other.as_str()),
+        Some("dev"),
+        Some("PRIVATE malformed provenance"),
+    ] {
+        assert!(cutover::admit_build_sha(importer, &own, false)
+            .unwrap_err()
+            .to_string()
+            .contains("--allow-build-mismatch"));
+        assert!(cutover::admit_build_sha(importer, &own, true).unwrap());
+    }
+    assert!(cutover::admit_build_sha(Some("dev"), "dev", false).is_err());
+    let report = serde_json::to_value(Report::default()).unwrap();
+    assert_eq!(report["importer_build_sha"], crate::FULL_GIT_SHA);
+    let mut invalid = report;
+    invalid["importer_build_sha"] = json!("PRIVATE malformed provenance");
+    assert_eq!(
+        refusal_breakdown::sanitized_report(&invalid)["importer_build_sha"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn provider_link_import_resume_prepares_missing_read_indexes() {
+    let f = Fixture::new().await;
+    let seeds = ["task", "epic"];
+    let first = run(f.options(&seeds, false)).await.unwrap();
+    assert!(first.refusals.is_empty() && first.review.is_empty());
+    let db = f.db().await;
+    sqlx::query("DROP INDEX idx_kernel_read_type; DROP INDEX idx_kernel_read_kind")
+        .execute(db.write_pool())
+        .await
+        .unwrap();
+    assert!(k::verify_v2_ready(&db).await.is_err());
+    db.close().await;
+    let resumed = run(f.options(&seeds, true)).await.unwrap();
+    assert!(resumed.refusals.is_empty() && resumed.review.is_empty());
+    let db = f.db().await;
+    k::verify_v2_ready(&db).await.unwrap();
+    let indexes: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE type='index' AND name IN ('idx_kernel_read_type','idx_kernel_read_kind')").fetch_one(db.pool()).await.unwrap();
+    assert_eq!(indexes, 2);
+    db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+mod messaging_compat;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/record_scope_sql.rs"]
+mod record_scope_sql;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/facet_sql.rs"]
+mod facet_sql;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/lifecycle_sql.rs"]
+mod lifecycle_sql;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/record_classes_sql.rs"]
+mod record_classes_sql;
+#[cfg(feature = "v2-kernel-probe")]
+#[path = "tests/sql_fixture.rs"]
+mod sql_fixture;
+
+mod member_context;

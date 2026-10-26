@@ -177,6 +177,10 @@
         },
         {
           "kind": "file",
+          "source": "src/mcp/named_view_executor_tests.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/mcp/federated_source.rs"
         },
         {
@@ -246,6 +250,10 @@
         {
           "kind": "file",
           "source": "src/mcp/record_ref.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/mcp/record_ref"
         },
         {
           "kind": "file",
@@ -537,6 +545,18 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/named_views.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/named_views"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/projection_dump.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/historical.rs"
         },
         {
@@ -573,7 +593,23 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/v1_state/member_context.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/legacy_history.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/read_cache.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/policy_read.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/account_config.rs"
         },
         {
           "kind": "file",
@@ -581,7 +617,19 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/artifact_closures.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/imported_content.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/kernel/app_installs.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/canvas_v2.rs"
         },
         {
           "kind": "tree",
@@ -626,6 +674,14 @@
         {
           "kind": "file",
           "source": "src/kernel/provider_catalogue.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/provider_link_reads.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/kernel/facet_time_reads.rs"
         },
         {
           "kind": "file",
@@ -749,6 +805,18 @@
         },
         {
           "kind": "file",
+          "source": "src/member_copy_kernel_v2.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/member_copy_kernel_v2_tests.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/member_copy_kernel_v2"
+        },
+        {
+          "kind": "file",
           "source": "src/member_copy_lifecycle.rs"
         },
         {
@@ -802,6 +870,86 @@
         {
           "kind": "file",
           "source": "src/need_subscriptions.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/call.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/call/tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/connect.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/enrich.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/enrich/agent.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/enrich/spec.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/enrichment.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/import.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/init.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/init/review.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/native_init/mod.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/native_import.rs"
+        },
+        {
+          "kind": "file",
+          "source": "tests/native_enrich.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/login.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/node_client.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/service.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/setup.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/status.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/native_cli/status/tests.rs"
         },
         {
           "kind": "file",
@@ -1021,6 +1169,10 @@
         },
         {
           "kind": "file",
+          "source": "src/bin/native.rs"
+        },
+        {
+          "kind": "file",
           "source": "src/bin/relationship_lint.rs"
         },
         {
@@ -1041,7 +1193,23 @@
         },
         {
           "kind": "file",
+          "source": "examples/v2_html_census.rs"
+        },
+        {
+          "kind": "file",
           "source": "examples/v2_history_bench.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_snapshot_measure.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v2_read_bench.rs"
+        },
+        {
+          "kind": "file",
+          "source": "examples/v1_v2_read_bench.rs"
         },
         {
           "kind": "file",
@@ -1197,6 +1365,10 @@
         },
         {
           "kind": "file",
+          "source": "src/kernel/identity_bindings.rs"
+        },
+        {
+          "kind": "file",
           "source": "docs/v2-v1-import.md"
         },
         {
@@ -1206,7 +1378,8 @@
       ],
       "binaries": [
         "conformance",
-        "mcp-stdio"
+        "mcp-stdio",
+        "native"
       ],
       "features": [
         "experimental-agent-intents",
@@ -1223,6 +1396,12 @@
           "id": "mcp-stdio",
           "kind": "binary",
           "entrypoint": "src/bin/mcp_stdio.rs",
+          "support": "standalone"
+        },
+        {
+          "id": "native",
+          "kind": "binary",
+          "entrypoint": "src/bin/native.rs",
           "support": "standalone"
         }
       ],

@@ -114,13 +114,22 @@ async fn read_at_on(
     if read_record_on(conn, actor, id).await?.is_none() {
         return Ok(None);
     }
+    let started = std::time::Instant::now();
+    let mut verified_definitions = std::collections::BTreeMap::<String, i64>::new();
     let rows: Vec<(i64,String,String,String,Option<i64>)> = sqlx::query_as(
-        "SELECT seq,type,payload,created_at,act FROM content_events WHERE record_id=? AND seq<=? ORDER BY seq",
-    ).bind(id).bind(through).fetch_all(&mut *conn).await?;
+        "SELECT seq,type,CASE WHEN type='kernel.legacy_recorded.v1' THEN CASE WHEN ?3 THEN json_object('facet',json_extract(payload,'$.facet')) ELSE '{}' END ELSE payload END,created_at,act FROM content_events WHERE record_id=?1 AND seq<=?2 ORDER BY seq",
+    ).bind(id).bind(through).bind(include_relations).fetch_all(&mut *conn).await?;
     let mut state: Option<RecordState> = None;
     let mut metadata_seq = 0;
     for (seq, typ, raw, created, act) in rows {
-        let p: Value = serde_json::from_str(&raw)?;
+        // Retained bytes cannot establish body/field state. SQL only loads
+        // the explicitly projected facet for a full version, and no retained
+        // bytes at all for an event-local body delta.
+        let p: Value = if typ == "kernel.legacy_recorded.v1" {
+            Value::Null
+        } else {
+            serde_json::from_str(&raw)?
+        };
         match typ.as_str() {
             "kernel.record_created.v1"
             | "kernel.record_created.v2"
@@ -163,7 +172,16 @@ async fn read_at_on(
                         })?;
                         // The artifact is immutable; require its installation at
                         // this event's act, never resolve a future adoption.
-                        definition_at_on(conn, pin, act).await?;
+                        let identity = pin.value_id();
+                        if !act.is_some_and(|act| {
+                            verified_definitions
+                                .get(&identity)
+                                .is_some_and(|verified| act >= *verified)
+                        }) {
+                            definition_at_on(conn, pin, act).await?;
+                            verified_definitions
+                                .insert(identity, act.expect("definition gate requires an act"));
+                        }
                         let bytes: String = sqlx::query_scalar("SELECT artifact_bytes FROM definition_artifacts WHERE family=? AND version=? AND digest=?")
                             .bind(&pin.family).bind(i64::from(pin.version)).bind(&pin.digest).fetch_one(&mut *conn).await?;
                         let descriptor =
@@ -232,7 +250,16 @@ async fn read_at_on(
                 metadata_seq = seq;
             }
             if let Some(pin) = record.pin.as_ref() {
-                definition_at_on(conn, pin, act).await?;
+                let identity = pin.value_id();
+                if !act.is_some_and(|act| {
+                    verified_definitions
+                        .get(&identity)
+                        .is_some_and(|verified| act >= *verified)
+                }) {
+                    definition_at_on(conn, pin, act).await?;
+                    verified_definitions
+                        .insert(identity, act.expect("definition gate requires an act"));
+                }
             }
         }
     }
@@ -251,6 +278,7 @@ async fn read_at_on(
             record.created_at = original;
         }
     }
+    tracing::debug!(target:"native_ce::read_staging",phase="historical_subject",elapsed_us=started.elapsed().as_micros() as u64);
     Ok(state)
 }
 
@@ -281,7 +309,7 @@ pub(crate) async fn links_at_on(
     through: i64,
 ) -> Result<Vec<Value>> {
     let sources: Vec<String> = sqlx::query_scalar(
-        "SELECT ?1 UNION SELECT source_id FROM kernel_generic_links WHERE target_id=?1 UNION SELECT source_id FROM kernel_links WHERE target_id=?1 UNION SELECT record_id FROM content_events WHERE type IN ('kernel.link_added.v1','kernel.link_removed.v1') AND json_extract(payload,'$.target_id')=?1 UNION SELECT json_extract(payload,'$.source.record_id') FROM content_events WHERE type='kernel.link_added.v2' AND json_extract(payload,'$.target.record_id')=?1",
+        "SELECT ?1 UNION SELECT source_id FROM kernel_generic_links WHERE target_id=?1 UNION SELECT source_id FROM kernel_links WHERE target_id=?1 UNION SELECT CASE WHEN type='kernel.link_added.v2' THEN json_extract(payload,'$.source.record_id') ELSE record_id END FROM content_events WHERE type IN ('kernel.link_added.v1','kernel.link_removed.v1','kernel.link_added.v2') AND coalesce(json_extract(payload,'$.target_id'),json_extract(payload,'$.target.record_id'))=?1",
     ).bind(id).fetch_all(&mut *conn).await?;
     let mut generic: BTreeMap<String, Value> = BTreeMap::new();
     let mut legacy: BTreeMap<(String, String, String), Value> = BTreeMap::new();
@@ -406,6 +434,6 @@ pub(crate) async fn child_candidates_on(
     through: i64,
 ) -> Result<Vec<String>> {
     let home = hq::v1_import_home_id(id);
-    Ok(sqlx::query_scalar("SELECT DISTINCT record_id FROM content_events WHERE seq<=?1 AND ((type IN ('kernel.record_created.v1','kernel.import_record_created.v1') AND json_extract(payload,'$.home_id') IN (?2,?3)) OR (type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') AND json_extract(payload,'$.new_home_id') IN (?2,?3)) OR (type='kernel.import_state_delta.v1' AND json_extract(payload,'$.record.home_id') IN (?2,?3))) ORDER BY record_id")
+    Ok(sqlx::query_scalar(&format!("SELECT DISTINCT record_id FROM content_events WHERE type IN ({}) AND {} IN (?2,?3) AND seq<=?1 ORDER BY record_id",record_metadata::HISTORICAL_HOME_TYPES,record_metadata::HISTORICAL_HOME_EXPR))
         .bind(through).bind(id).bind(home).fetch_all(conn).await?)
 }

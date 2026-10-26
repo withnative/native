@@ -241,6 +241,9 @@ fn production_migrations() -> Vec<Arc<dyn EngineMigrationStep>> {
         Arc::new(Engine87To88Migration),
         Arc::new(Engine88To89Migration),
         Arc::new(Engine89To90Migration),
+        Arc::new(Engine90To91Migration),
+        Arc::new(Engine91To92Migration),
+        Arc::new(Engine92To93Migration),
     ]
 }
 
@@ -3792,6 +3795,134 @@ impl EngineMigrationStep for Engine89To90Migration {
     }
 }
 
+#[derive(Debug)]
+struct Engine90To91Migration;
+impl EngineMigrationStep for Engine90To91Migration {
+    fn from(&self) -> i64 {
+        90
+    }
+    fn to(&self) -> i64 {
+        91
+    }
+    fn name(&self) -> &str {
+        "engine-90-to-91-subject-authorization-revisions"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            if version == 90 {
+                crate::db::validate_supported_engine_migration_source(conn, 90).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(conn, 90).await?;
+            for statement in crate::schema::ddl::AUTHORIZATION_SUBJECT_DDL {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+#[derive(Debug)]
+struct Engine91To92Migration;
+impl EngineMigrationStep for Engine91To92Migration {
+    fn from(&self) -> i64 {
+        91
+    }
+    fn to(&self) -> i64 {
+        92
+    }
+    fn name(&self) -> &str {
+        "engine-91-to-92-causal-heads"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            // Pending preflights see the original preimage, including older sources.
+            if version == 91 {
+                crate::db::validate_supported_engine_migration_source(conn, 91).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            // Validate the actual intermediate source under the migration transaction.
+            crate::db::validate_supported_engine_migration_source(conn, 91).await?;
+            let ddl = crate::schema::ddl::CONTENT_EVENT_HEADS_DDL;
+            // Table and backfill first, then the triggers: the backfill is the
+            // exact definition the triggers maintain thereafter.
+            sqlx::query(ddl[0]).execute(&mut *conn).await?;
+            sqlx::query(
+                "INSERT INTO content_event_heads(event_id)
+                 SELECT event.id
+                   FROM content_events event
+                  WHERE NOT EXISTS (
+                        SELECT 1 FROM content_event_causal_frontier frontier
+                         WHERE frontier.parent_event_id = event.id)",
+            )
+            .execute(&mut *conn)
+            .await?;
+            for statement in &ddl[1..] {
+                sqlx::query(statement).execute(&mut *conn).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
+/// A partial index that makes "this viewer's Messages in Unfiled" a keyed read
+/// (`list_inbox scope:"direct"` notes to self). Derived, additive, rebuilt
+/// from existing rows by `CREATE INDEX`; no row is rewritten.
+#[derive(Debug)]
+struct Engine92To93Migration;
+impl EngineMigrationStep for Engine92To93Migration {
+    fn from(&self) -> i64 {
+        92
+    }
+    fn to(&self) -> i64 {
+        93
+    }
+    fn name(&self) -> &str {
+        "engine-92-to-93-unfiled-message-owner-index"
+    }
+    fn preflight<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+                .fetch_one(&mut *conn)
+                .await?;
+            // Pending preflights see the original preimage, including older sources.
+            if version == 92 {
+                crate::db::validate_supported_engine_migration_source(conn, 92).await?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+    fn apply<'a>(&'a self, conn: &'a mut SqliteConnection) -> BoxFuture<'a, Result<()>> {
+        async move {
+            crate::db::validate_supported_engine_migration_source(conn, 92).await?;
+            sqlx::query(crate::schema::ddl::UNFILED_MESSAGE_OWNER_INDEX_DDL)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+        .boxed()
+    }
+}
+
 /// The row copy for a `records` rebuild, shared by the SQLite and Turso paths.
 /// `rowid` is listed first on both sides: see [`Engine86To87Migration`].
 pub(crate) fn records_rebuild_copy(target: &str, source: &str, columns: &[String]) -> String {
@@ -4116,6 +4247,9 @@ const ENGINE_62_TO_63_MUTATION_TOOLS: &[&str] = &[
 /// these names remain retained pending a separate consumer/corpus audit;
 /// neither renumbering nor a current Read disposition silently widens DELETE.
 const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
+    // Named views are post-freeze. Retain every historical action, including
+    // reads and malformed calls; never widen the frozen DELETE predicate.
+    "manage_named_views",
     "get_workspace_snapshot",
     "authority_act_head",
     "authority_act_delta",
@@ -4129,6 +4263,9 @@ const ENGINE_62_TO_63_POST_FREEZE_TOOLS: &[&str] = &[
     // Hosted outbox status is a post-freeze, host-only read. Retain any
     // historical evidence; the frozen deletion predicate is unchanged.
     "outbox_status",
+    // HCP audit arrived after the freeze. Retain any historical audit calls;
+    // neither the frozen deletion sets nor their predicate may change.
+    "read_hcp_audit",
 ];
 
 /// Read actions that arrived after the 62→63 freeze on already-shipped
@@ -5794,6 +5931,261 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
+    async fn insert_head_test_event(conn: &mut SqliteConnection, id: &str, parents: &[&str]) {
+        sqlx::query(
+            "INSERT INTO content_events(id,record_id,type,causal_envelope_version,causal_status)
+             VALUES(?,'r','t',1,'complete')",
+        )
+        .bind(id)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        for parent in parents {
+            sqlx::query(
+                "INSERT INTO content_event_causal_frontier(event_id,parent_event_id) VALUES(?,?)",
+            )
+            .bind(id)
+            .bind(parent)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn scanned_heads(conn: &mut SqliteConnection) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT e.id FROM content_events e WHERE NOT EXISTS
+             (SELECT 1 FROM content_event_causal_frontier f WHERE f.parent_event_id=e.id)
+             ORDER BY e.id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+    }
+
+    async fn table_heads(conn: &mut SqliteConnection) -> Vec<String> {
+        sqlx::query_scalar("SELECT event_id FROM content_event_heads ORDER BY event_id")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn engine_91_to_92_backfills_heads_and_matches_fresh_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("causal-heads-source.db");
+        create_current_schema(&path).await;
+        let options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display())).unwrap();
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        crate::schema::step_down::step_down(&mut conn, 91)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+                .await
+                .unwrap(),
+            crate::db::ENGINE_91_SHAPE_CONTRACT_SHA256
+        );
+        // a <- b, a <- c, d <- {b,c} plus an unrelated root e and a forward
+        // reference to a parent that is not (yet) in the log.
+        insert_head_test_event(&mut conn, "a", &[]).await;
+        insert_head_test_event(&mut conn, "b", &["a"]).await;
+        insert_head_test_event(&mut conn, "c", &["a"]).await;
+        insert_head_test_event(&mut conn, "d", &["b", "c"]).await;
+        insert_head_test_event(&mut conn, "e", &[]).await;
+        insert_head_test_event(&mut conn, "f", &["ghost"]).await;
+        let expected = scanned_heads(&mut conn).await;
+        // The fresh database also carries its genesis event(s) as heads.
+        for id in ["d", "e", "f"] {
+            assert!(expected.iter().any(|head| head == id), "{expected:?}");
+        }
+        for id in ["a", "b", "c"] {
+            assert!(!expected.iter().any(|head| head == id), "{expected:?}");
+        }
+
+        let step = EngineMigrationRegistry::production()
+            .pending(91, 92)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut tx = conn.begin().await.unwrap();
+        step.preflight(&mut tx).await.unwrap();
+        step.apply(&mut tx).await.unwrap();
+        sqlx::query("PRAGMA user_version=92")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(table_heads(&mut tx).await, expected);
+        tx.commit().await.unwrap();
+
+        // The migrated triggers maintain the table from here on.
+        insert_head_test_event(&mut conn, "g", &["d", "e"]).await;
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+        let after = table_heads(&mut conn).await;
+        for id in ["f", "g"] {
+            assert!(after.iter().any(|head| head == id), "{after:?}");
+        }
+        for id in ["d", "e"] {
+            assert!(!after.iter().any(|head| head == id), "{after:?}");
+        }
+
+        let migrated = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
+        // The serving schema is now newer (engine 93 adds an index), so the
+        // migrated engine-92 file is compared with the frozen engine-92 shape
+        // and with a fresh database legitimately stepped down to 92.
+        assert_eq!(migrated, crate::db::ENGINE_92_SHAPE_CONTRACT_SHA256);
+        let fresh = crate::create_database(":memory:").await.unwrap();
+        let mut fresh_conn = fresh.write_pool().acquire().await.unwrap();
+        crate::schema::step_down::step_down(&mut fresh_conn, 92)
+            .await
+            .unwrap();
+        assert_eq!(
+            migrated,
+            crate::db::schema_shape_contract_sha256_for_test(&mut fresh_conn)
+                .await
+                .unwrap()
+        );
+        drop(fresh_conn);
+        fresh.close().await;
+    }
+
+    #[tokio::test]
+    async fn causal_heads_triggers_track_the_scan_through_forward_refs_and_cascades() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "cascade proof requires enforced FKs");
+
+        // Forward reference: a child may name a parent that arrives later.
+        let base = table_heads(&mut conn).await;
+        let with = |ids: &[&str]| {
+            let mut all = base.clone();
+            all.extend(ids.iter().map(|id| id.to_string()));
+            all.sort();
+            all
+        };
+        insert_head_test_event(&mut conn, "child", &["parent"]).await;
+        assert_eq!(table_heads(&mut conn).await, with(&["child"]));
+        insert_head_test_event(&mut conn, "parent", &[]).await;
+        assert_eq!(table_heads(&mut conn).await, with(&["child"]));
+        insert_head_test_event(&mut conn, "tip", &["child"]).await;
+        assert_eq!(table_heads(&mut conn).await, with(&["tip"]));
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+
+        // Deleting an event is normally refused; lift that guard to prove the
+        // ON DELETE CASCADE of its frontier rows keeps the heads table right.
+        sqlx::query("DROP TRIGGER content_events_no_delete")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert!(!sqlx::query_scalar::<_, i64>("PRAGMA recursive_triggers")
+            .fetch_one(&mut *conn)
+            .await
+            .map(|v| v != 0)
+            .unwrap());
+        sqlx::query("DELETE FROM content_events WHERE id='tip'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(table_heads(&mut conn).await, with(&["child"]));
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+        sqlx::query("DELETE FROM content_events WHERE id='child'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(table_heads(&mut conn).await, with(&["parent"]));
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+        drop(conn);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn causal_heads_frontier_delete_restores_a_parent_only_when_no_child_remains() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let base = table_heads(&mut conn).await;
+        let with = |ids: &[&str]| {
+            let mut all = base.clone();
+            all.extend(ids.iter().map(|id| id.to_string()));
+            all.sort();
+            all
+        };
+        insert_head_test_event(&mut conn, "parent", &[]).await;
+        insert_head_test_event(&mut conn, "left", &["parent"]).await;
+        insert_head_test_event(&mut conn, "right", &["parent"]).await;
+        assert_eq!(table_heads(&mut conn).await, with(&["left", "right"]));
+
+        // One of two children drops its edge: the parent stays covered.
+        sqlx::query(
+            "DELETE FROM content_event_causal_frontier
+              WHERE event_id='left' AND parent_event_id='parent'",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(table_heads(&mut conn).await, with(&["left", "right"]));
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+
+        // The last edge goes: the parent is a head again.
+        sqlx::query(
+            "DELETE FROM content_event_causal_frontier
+              WHERE event_id='right' AND parent_event_id='parent'",
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            table_heads(&mut conn).await,
+            with(&["left", "parent", "right"])
+        );
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+
+        // An edge naming a parent that never arrived restores nothing.
+        insert_head_test_event(&mut conn, "orphan", &["missing"]).await;
+        sqlx::query("DELETE FROM content_event_causal_frontier WHERE event_id='orphan'")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            table_heads(&mut conn).await,
+            with(&["left", "orphan", "parent", "right"])
+        );
+        assert_eq!(table_heads(&mut conn).await, scanned_heads(&mut conn).await);
+        drop(conn);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn run_basis_probe_uses_the_partial_index() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        // The very statement `undeclared_basis_feedback` executes.
+        let rows: Vec<String> = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::mcp::tools::lifecycle::RUN_BASIS_DECLARED_SQL
+        ))
+        .bind("run")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect();
+        assert!(
+            rows.iter()
+                .any(|detail| detail.contains("idx_content_events_basis_run")),
+            "{rows:?}"
+        );
+        drop(conn);
+        db.close().await;
+    }
+
     fn synthetic_zero_to_current_registry() -> EngineMigrationRegistry {
         let migrations = (0..CURRENT_ENGINE_SCHEMA_VERSION)
             .map(|from| {
@@ -6580,6 +6972,9 @@ mod tests {
             (87, 88, "engine-87-to-88-private-read-preference"),
             (88, 89, "engine-88-to-89-account-configs"),
             (89, 90, "engine-89-to-90-sql-write-receipts"),
+            (90, 91, "engine-90-to-91-subject-authorization-revisions"),
+            (91, 92, "engine-91-to-92-causal-heads"),
+            (92, 93, "engine-92-to-93-unfiled-message-owner-index"),
         ] {
             if from < start {
                 continue;
@@ -6621,6 +7016,14 @@ mod tests {
                     .unwrap()
             );
         }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap(),
+            CURRENT_ENGINE_SCHEMA_VERSION,
+            "historical fixtures must traverse every edge before ordinary reopen"
+        );
     }
 
     /// Reconstruct the released engine-57 shape: engine 58 minus exactly the
@@ -10751,6 +11154,23 @@ mod tests {
         let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
         revert_to_engine_62(&mut connection).await;
         let calls = [
+            (
+                "manage_named_views",
+                r#"{"action":"get_view_revision","run_key":"new"}"#,
+            ),
+            ("manage_named_views", r#"{"action":"list_view_revisions"}"#),
+            ("manage_named_views", r#"{"action":"record_view_revision"}"#),
+            ("manage_named_views", r#"{"action":"activate_view"}"#),
+            ("manage_named_views", r#"{"action":"unpublish_view"}"#),
+            ("manage_named_views", r#"{"action":"prepare_named_views"}"#),
+            ("manage_named_views", r#"{"action":"future_action"}"#),
+            ("manage_named_views", "{malformed"),
+            // The post-freeze read must remain evidence, never be added to
+            // the frozen historical read-deletion predicate.
+            (
+                "read_hcp_audit",
+                r#"{"after_cursor":"urn:uuid:historical"}"#,
+            ),
             ("authority_act_head", r#"{"cursor":"historical"}"#),
             ("authority_act_delta", r#"{"cursor":"historical"}"#),
             ("manage_participants", r#"{"action":"list"}"#),
@@ -11745,10 +12165,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(epoch, 0);
-        assert!(crate::authorization_grant::state_violations_on(&mut conn)
-            .await
-            .unwrap()
-            .is_empty());
+        // The frozen engine-66 shape above validates its grant objects.
+        // The current-state validator also requires engine-91 subject fences.
         // The edge under test ends at 66, but the binary is at 72: continue
         // through the archived-projection edge so the final open sees current.
         apply_remaining_production_steps(&mut conn, 66).await;
@@ -16157,5 +16575,116 @@ mod tests {
         assert!(full.ok, "{}", crate::conformance::format_report(&full));
         eprintln!("persona migration rehearsal: source remains schema81; COPY migrated81→82→83; all {} pre-existing portable sections unchanged; FULL conformance/replay passed",before["sections"].as_array().unwrap().len()-2);
         migrated.close().await;
+    }
+
+    /// Engine 92 → 93 over a database already holding Messages (some in
+    /// Unfiled, some elsewhere): the partial index appears with its exact
+    /// definition and is chosen for "this owner's Messages in Unfiled"; the
+    /// public runner then treats the migrated file as current (no-op) and
+    /// leaves the index and every row alone.
+    #[tokio::test]
+    async fn unfiled_message_owner_index_migrates_a_populated_database_and_is_a_noop_to_rerun() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("populated.db");
+        let db = crate::create_database(&path.to_string_lossy())
+            .await
+            .unwrap();
+        for (n, home) in [
+            (0, "native:unfiled"),
+            (1, "native:unfiled"),
+            (2, "native:root"),
+            (3, "native:unfiled"),
+        ] {
+            crate::store::create_record(
+                &db,
+                serde_json::json!({"type":"Message","kind":"text","body":format!("m{n}"),"home_id":home}),
+            )
+            .await
+            .unwrap();
+        }
+        db.close().await;
+        let mut connection =
+            SqliteConnection::connect_with(&single_connection_options(&path).unwrap())
+                .await
+                .unwrap();
+        crate::schema::step_down::step_down(&mut connection, 92)
+            .await
+            .unwrap();
+        let before: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE name='idx_records_unfiled_message_owner'",
+        )
+        .fetch_optional(&mut connection)
+        .await
+        .unwrap();
+        assert!(before.is_none(), "step-down to 92 drops the index");
+        let rows_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE type='Message'")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(rows_before, 4);
+        connection.close().await.unwrap();
+
+        let offbox = tempfile::tempdir().unwrap();
+        let backup = test_preimage_store(offbox.path(), dir.path());
+        let registry = EngineMigrationRegistry::production();
+        let run = |run_id: &'static str| {
+            let (path, backup, registry) = (&path, &backup, &registry);
+            async move {
+                migrate_database(
+                    path,
+                    "populated",
+                    run_id,
+                    CURRENT_ENGINE_SCHEMA_VERSION,
+                    registry,
+                    backup,
+                    Arc::new(|| async { Ok(()) }.boxed()),
+                )
+                .await
+            }
+        };
+        let first = run("first").await;
+        assert_eq!(first.outcome, "migrated", "{first:?}");
+        assert_eq!(first.from_version, Some(92));
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
+
+        let verify = |path: std::path::PathBuf| async move {
+            let db = crate::open_existing_database_at(&path).await.unwrap();
+            let sql: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_records_unfiled_message_owner'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(sql, crate::schema::ddl::UNFILED_MESSAGE_OWNER_INDEX_DDL);
+            let plan: Vec<String> = sqlx::query(
+                "EXPLAIN QUERY PLAN SELECT id FROM records
+                  WHERE type='Message' AND home_id='native:unfiled' AND deleted_at IS NULL AND owner_id=?",
+            )
+            .bind("someone")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>(3))
+            .collect();
+            assert!(
+                plan.iter()
+                    .any(|l| l.contains("idx_records_unfiled_message_owner")),
+                "{plan:?}"
+            );
+            let messages: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE type='Message'")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(messages, 4);
+            db.close().await;
+        };
+        verify(path.clone()).await;
+        let again = run("again").await;
+        assert_eq!(again.outcome, "current", "{again:?}");
+        verify(path.clone()).await;
+        assert_eq!(header_version(&path), CURRENT_ENGINE_SCHEMA_VERSION);
     }
 }

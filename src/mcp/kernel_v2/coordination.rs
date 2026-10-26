@@ -89,7 +89,29 @@ async fn bootstrap(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result
         .await?
         .map(|metadata| metadata.name)
         .unwrap_or_else(|| "Native workspace".into());
+    // The Workbench tree consumes the same View-gated logical root as
+    // get_record/get_structure; a neutral kernel root is not a fake record.
+    let root_items = if super::read_surface::root(db, actor, "native:root")
+        .await?
+        .is_some()
+    {
+        super::read_surface::get_structure(
+            db,
+            actor,
+            json!({"root_id":"native:root","max_depth":0,"max_children_per_node":0}),
+        )
+        .await?["nodes"]
+            .clone()
+    } else {
+        json!([])
+    };
+    let roots = json!({"total":root_items.as_array().expect("root nodes").len(),
+        "items":root_items,"continuation":{"tool":"get_structure","arguments":{"root_id":"native:root"}}});
     let instructions = standing_instructions(db, actor, caller).await?;
+    let source_context = {
+        let mut tx = db.pool().begin().await?;
+        kernel::v1_state::member_context::online_on(&mut tx, actor).await?
+    };
     let closed = match context.as_ref() {
         Some(context) => Some(kernel::run_witness_as(db, context).await?.closed),
         None => None,
@@ -109,10 +131,12 @@ async fn bootstrap(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result
     Ok(json!({
         "principal": {"principal_id":actor, "kind":kind, "display_name":label, "identity_basis":"authenticated kernel auth_binding"},
         "workspace": {"primary_workspace":{"id":crate::events::KERNEL_ROOT_ID,"name":workspace_name}},
+        "source_context": source_context,
         "orientation":{"template_key":crate::instructions::ENGINE_ORIENTATION_TEMPLATE_KEY,
             "template_version":crate::instructions::ENGINE_ORIENTATION_TEMPLATE_VERSION,
             "content":crate::instructions::ENGINE_ORIENTATION},
         "instructions":instructions,
+        "roots":roots,
         "pending_obligations":kernel::v1_state::onboarding_as(db,actor,caller.is_host_member()).await?,
         "run":{"run_key":key,"closed":closed,"status":status,"read_only":read_only,"durable":context.is_some()},
         "session":{"run_key":key,"reuse_required":!read_only && closed == Some(false),"guidance":guidance},

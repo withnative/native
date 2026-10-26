@@ -65,6 +65,7 @@ pub enum ToolKind {
     ArchiveRecord,
     RenderRecord,
     GetHistory,
+    ReadHcpAudit,
     WhatsChanged,
     ManageBindings,
     ManageRecordPolicy,
@@ -78,6 +79,7 @@ pub enum ToolKind {
     ManageMessages,
     ManageParticipants,
     ManageInterventions,
+    ManageNamedViews,
     InstantiateArtifact,
     ManageRendererBinding,
     ManageMdxModules,
@@ -394,7 +396,7 @@ pub enum AuthorizationDisposition {
 }
 
 impl ToolKind {
-    pub const ALL: [ToolKind; 90] = [
+    pub const ALL: [ToolKind; 92] = [
         ToolKind::Ping,
         ToolKind::EngineInfo,
         ToolKind::StandbyStatus,
@@ -423,6 +425,7 @@ impl ToolKind {
         ToolKind::ArchiveRecord,
         ToolKind::RenderRecord,
         ToolKind::GetHistory,
+        ToolKind::ReadHcpAudit,
         ToolKind::WhatsChanged,
         ToolKind::ManageBindings,
         ToolKind::ManageRecordPolicy,
@@ -436,6 +439,7 @@ impl ToolKind {
         ToolKind::ManageMessages,
         ToolKind::ManageParticipants,
         ToolKind::ManageInterventions,
+        ToolKind::ManageNamedViews,
         ToolKind::InstantiateArtifact,
         ToolKind::ManageRendererBinding,
         ToolKind::ManageMdxModules,
@@ -518,6 +522,7 @@ impl ToolKind {
             ToolKind::ArchiveRecord => "archive_record",
             ToolKind::RenderRecord => "render_record",
             ToolKind::GetHistory => "get_history",
+            ToolKind::ReadHcpAudit => "read_hcp_audit",
             ToolKind::WhatsChanged => "whats_changed",
             ToolKind::ManageBindings => "manage_bindings",
             ToolKind::ManageRecordPolicy => "manage_record_policy",
@@ -531,6 +536,7 @@ impl ToolKind {
             ToolKind::ManageMessages => "manage_messages",
             ToolKind::ManageParticipants => "manage_participants",
             ToolKind::ManageInterventions => "manage_interventions",
+            ToolKind::ManageNamedViews => "manage_named_views",
             ToolKind::InstantiateArtifact => "instantiate_artifact",
             ToolKind::ManageRendererBinding => "manage_renderer_binding",
             ToolKind::ManageMdxModules => "manage_mdx_modules",
@@ -624,6 +630,7 @@ impl ToolKind {
             | Self::ResolveMany
             | Self::RenderRecord
             | Self::GetHistory
+            | Self::ReadHcpAudit
             | Self::WhatsChanged
             | Self::GetRunActivity
             | Self::RenderRecordVersionDiff
@@ -665,6 +672,7 @@ impl ToolKind {
                 "get_attention",
             ]),
             Self::ManageInterventions => Actions(&["get", "query"]),
+            Self::ManageNamedViews => Actions(&["get_view_revision", "list_view_revisions"]),
             Self::ManageRendererBinding
             | Self::ManageArtifactInputs
             | Self::ManageArtifactModuleGrants => Actions(&["read"]),
@@ -755,6 +763,7 @@ impl ToolKind {
         use HoldingClassification as Class;
         use HoldingSensitivity::{Bounded, Refuses, Unaffected};
         match self {
+            Self::ManageNamedViews => Class::reads(Refuses),
             // Answered from the projection alone, and accept no `as_of`.
             Self::GetDashboard
             | Self::DescribeSchema
@@ -826,6 +835,7 @@ impl ToolKind {
             // Read the log directly and can honestly return a short answer,
             // provided they say the history is bounded rather than exhausted.
             Self::GetHistory
+            | Self::ReadHcpAudit
             | Self::GetEventContext
             | Self::GetRunActivity
             | Self::RenderRecordVersionDiff
@@ -933,6 +943,7 @@ impl ToolKind {
             ToolKind::DeleteRecord => ToolExposure::new(Records, true, Atomicity),
             ToolKind::ArchiveRecord => ToolExposure::new(Records, true, Atomicity),
             ToolKind::RenderRecord => ToolExposure::new(Records, false, Discoverability),
+            ToolKind::ReadHcpAudit => ToolExposure::new(History, false, CorrectnessUnderIgnorance),
             ToolKind::GetHistory => ToolExposure::new(History, true, CorrectnessUnderIgnorance),
             ToolKind::WhatsChanged => ToolExposure::new(History, true, BoundedContextOrCalls),
             ToolKind::ManageBindings => {
@@ -957,6 +968,7 @@ impl ToolKind {
             ToolKind::ManageMessages => ToolExposure::new(Messaging, true, Atomicity),
             ToolKind::ManageParticipants => ToolExposure::new(Messaging, false, Atomicity),
             ToolKind::ManageInterventions => ToolExposure::new(Messaging, false, Atomicity),
+            ToolKind::ManageNamedViews => ToolExposure::new(Records, false, Atomicity),
             ToolKind::InstantiateArtifact => ToolExposure::new(Artifacts, false, Atomicity),
             ToolKind::ManageRendererBinding => {
                 ToolExposure::new(Artifacts, false, CorrectnessUnderIgnorance)
@@ -1107,6 +1119,7 @@ impl ToolKind {
             | ToolKind::GetEventContext
             | ToolKind::UpdateRecord
             | ToolKind::GetHistory
+            | ToolKind::ReadHcpAudit
             | ToolKind::GetRunActivity
             | ToolKind::ManageBindings
             | ToolKind::ManageRecordPolicy
@@ -1118,6 +1131,7 @@ impl ToolKind {
             | ToolKind::ManageMessages
             | ToolKind::ManageParticipants
             | ToolKind::ManageInterventions
+            | ToolKind::ManageNamedViews
             | ToolKind::InstantiateArtifact
             | ToolKind::ManageRendererBinding
             | ToolKind::ManageMdxModules
@@ -1620,6 +1634,7 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
             extraction.opened(string_at(result, "id"));
             extraction.count(1);
         }
+        ToolKind::ReadHcpAudit => { /* account audit events are not record interactions */ }
         ToolKind::GetHistory => {
             if let Some(record_id) = string_at(arguments, "record_id") {
                 extraction.opened(Some(record_id));
@@ -1803,6 +1818,19 @@ fn extract(kind: ToolKind, arguments: &Value, result: &Value) -> Extraction {
                     );
                 }
                 _ => {}
+            }
+            extraction.count(1);
+        }
+        ToolKind::ManageNamedViews => {
+            if matches!(
+                string_at(arguments, "action"),
+                Some("record_view_revision" | "activate_view" | "unpublish_view")
+            ) {
+                extraction.mutated(string_at(result, "id"));
+            } else if let Some(view) =
+                string_at(arguments, "view_id").and_then(|v| v.strip_prefix("native.named-view:"))
+            {
+                extraction.opened(Some(view));
             }
             extraction.count(1);
         }
@@ -4047,6 +4075,14 @@ mod tests {
                 result_count: Some(1),
             },
             Case {
+                name: "read_hcp_audit events are account audit data, not record interactions",
+                kind: ToolKind::ReadHcpAudit,
+                arguments: json!({}),
+                result: json!({"events":[{"entryId":"urn:uuid:entry", "eventType":"preference.read"}]}),
+                touches: vec![],
+                result_count: Some(0),
+            },
+            Case {
                 name: "get_history opens explicit root and surfaces event subjects",
                 kind: ToolKind::GetHistory,
                 arguments: json!({ "record_id": "history-root" }),
@@ -5086,6 +5122,35 @@ mod tests {
                 result_count: Some(4),
             },
         ]);
+
+        for action in ["record_view_revision", "activate_view", "unpublish_view"] {
+            cases.push(Case {
+                name: "named-view writes mutate only the receipt bearer",
+                kind: ToolKind::ManageNamedViews,
+                arguments: json!({"action":action,"id":"rec-bearer"}),
+                result: json!({"id":"rec-bearer","pin":{"view_id":"native.named-view:rec-dependency"}}),
+                touches: vec![mutated("rec-bearer")],
+                result_count: Some(1),
+            });
+        }
+        for action in ["get_view_revision", "list_view_revisions"] {
+            cases.push(Case {
+                name: "named-view metadata opens its bearer, never revision or source ids",
+                kind: ToolKind::ManageNamedViews,
+                arguments: json!({"action":action,"view_id":"native.named-view:rec-bearer"}),
+                result: json!({"id":"revision-id","sources":["private-source"]}),
+                touches: vec![opened("rec-bearer")],
+                result_count: Some(1),
+            });
+        }
+        cases.push(Case {
+            name: "named-view preparation has no record touch",
+            kind: ToolKind::ManageNamedViews,
+            arguments: json!({"action":"prepare_named_views"}),
+            result: json!({"prepared":true}),
+            touches: vec![],
+            result_count: Some(1),
+        });
 
         let mut covered = HashSet::new();
         for case in cases {

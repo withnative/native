@@ -107,6 +107,8 @@ pub(crate) const KEYED_REPLAY_WRITES: &[(&str, Option<&[&str]>)] = &[
             "move",
             "mark_no_longer_relevant",
             "unmark_no_longer_relevant",
+            "delete",
+            "edit",
         ]),
     ),
     ("manage_renderer_binding", Some(&["bind", "unbind"])),

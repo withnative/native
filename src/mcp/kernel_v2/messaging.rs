@@ -7,6 +7,7 @@ use crate::{
     store::{append_in, AppendSpec},
 };
 use kernel::messaging as m;
+pub(super) use kernel::messaging::expectation_value;
 use sqlx::{Sqlite, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -82,18 +83,17 @@ async fn append(
     kind: &str,
     value: Value,
 ) -> Result<()> {
-    append_in(
-        db,
-        tx,
-        AppendSpec {
-            record_id: id.into(),
-            event_type: kind.into(),
-            payload: value,
-            actor: Some(actor.into()),
-        },
-        acts,
-    )
-    .await?;
+    let spec = AppendSpec {
+        record_id: id.into(),
+        event_type: kind.into(),
+        payload: value,
+        actor: Some(actor.into()),
+    };
+    if kind == kernel::notifications::PREFERENCE_EVENT {
+        crate::store::append_kernel_notification_preference_in(db, tx, spec, acts).await?;
+        return Ok(());
+    }
+    append_in(db, tx, spec, acts).await?;
     Ok(())
 }
 async fn head(tx: &mut Transaction<'static, Sqlite>) -> Result<i64> {
@@ -115,6 +115,24 @@ async fn person(tx: &mut Transaction<'static, Sqlite>, actor: &str, id: &str) ->
 
 pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) -> Result<Value> {
     let action = text(&args, "action")?;
+    if action == "get_notification_preference" {
+        // The transport enum's unit read variant accepts extra fields. Close
+        // this private read explicitly: no supplied selector is meaningful,
+        // even when it would otherwise be ignored in favour of the caller.
+        if args
+            .as_object()
+            .is_some_and(|args| args.keys().any(|key| key != "action"))
+        {
+            return Err(invalid("get_notification_preference accepts only action; its subject is the authenticated account"));
+        }
+        let mut tx = db.pool().begin().await?;
+        kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
+        kernel::notifications::require_account_on(&mut tx, actor).await?;
+        return Ok(
+            json!({"arrival":kernel::notifications::arrival_on(&mut tx, actor).await?,
+            "values":crate::control::NOTIFICATION_ARRIVAL_VALUES}),
+        );
+    }
     if matches!(
         action,
         "list_context"
@@ -130,13 +148,10 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         return read(db, actor, args).await;
     }
     // These operations are deliberately outside this executor slice.
-    if matches!(
-        action,
-        "share_history" | "mark_no_longer_relevant" | "unmark_no_longer_relevant"
-    ) {
+    if matches!(action, "share_history" | "delete" | "edit") {
         return Err(unsupported(
             "manage_messages",
-            "history sharing, relevance marks and live notification delivery",
+            "history sharing, message editing and deletion and live notification delivery",
         ));
     }
     let classification = matches!(action, "classify" | "unclassify" | "move");
@@ -153,9 +168,26 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
     if !classification && text(&args, "reason")?.trim().is_empty() {
         return Err(invalid("reason must not be blank"));
     }
-    let request = crate::interventions::sha256_json(&args)?;
+    // Existing member receipts retain their digest; app receipts bind the exact
+    // install identity and can never replay a member's or another app's write.
+    let app = kernel::app_installs::dispatched_identity();
+    let attributed = app.is_some();
+    let request = crate::interventions::sha256_json(&if app.is_some() {
+        json!({"app":app,"arguments":args})
+    } else {
+        args.clone()
+    })?;
     let mut tx = begin_write(db.write_pool()).await?;
     m::ensure_schema(&mut tx).await?;
+    if action == "set_notification_preference"
+        && !kernel::hosted_identity::admitted(&mut tx, actor).await?
+    {
+        return Err(invalid("database membership not found"));
+    }
+    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
+    if action == "set_notification_preference" {
+        kernel::notifications::require_account_on(&mut tx, actor).await?;
+    }
     let old:Option<(String,String)>=sqlx::query_as("SELECT request,receipt FROM kernel_message_receipts WHERE principal_id=? AND operation_key=?")
         .bind(actor).bind(key).fetch_optional(&mut *tx).await?;
     if let Some((old, receipt)) = old {
@@ -176,7 +208,7 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
             for id in strings(&receipt["message_ids"])? {
                 require(&mut tx, actor, &id).await?;
             }
-        } else {
+        } else if action != "set_notification_preference" {
             require(&mut tx, actor, text(&receipt, "message_id")?).await?;
         }
         for target in receipt["link_targets"].as_array().into_iter().flatten() {
@@ -203,7 +235,39 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         }
     }
     let mut acts = ActAllocation::new();
-    let mut receipt = if action == "send" {
+    let pending = kernel::app_installs::start_app_action_in(
+        db,
+        &mut tx,
+        actor,
+        "manage_messages",
+        request.clone(),
+        args["reason"].as_str().map(str::to_owned),
+        &mut acts,
+    )
+    .await?;
+    let mut receipt = if action == "set_notification_preference" {
+        let arrival = text(&args, "arrival")?;
+        let previous = kernel::notifications::arrival_on(&mut tx, actor).await?;
+        let changed = previous != arrival;
+        // Record accepted intent even when the value is unchanged. The
+        // command receipt below reserves the retry key in the same transaction.
+        append(
+            db,
+            &mut tx,
+            &mut acts,
+            actor,
+            actor,
+            kernel::notifications::PREFERENCE_EVENT,
+            json!({"arrival":arrival}),
+        )
+        .await?;
+        json!({"arrival":arrival,"changed":changed,"idempotent":false})
+    } else if matches!(
+        action,
+        "mark_no_longer_relevant" | "unmark_no_longer_relevant"
+    ) {
+        relevance(db, &mut tx, &mut acts, actor, &args).await?
+    } else if action == "send" {
         send(db, &mut tx, &mut acts, actor, &args).await?
     } else if action == "set_destination" {
         let collection = text(&args, "collection_id")?;
@@ -377,6 +441,15 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
                 if !reactions.iter().any(|e| e == "👍") {
                     reactions.push("👍".into());
                     reactions.sort();
+                }
+                // Like v1, acknowledging also closes the acknowledger's routing,
+                // so an obligation reopened since an earlier acknowledgement is
+                // closed again by a fresh one. The routing transition is what
+                // the projector withdraws on; it is a no-op when already closed.
+                let lanes = state.private.entry(actor.into()).or_default();
+                let old = lanes.get("routing").cloned().unwrap_or(Value::Null);
+                if old["obligation_state"] != "satisfied" || old["executor_route"] != "closed" {
+                    lanes.insert("routing".into(), json!({"obligation_state":"satisfied","executor_route":"closed","policy_version":null,"version":version(&old)+1,"reason_code":args["reason"]}));
                 }
             }
             "set_routing" => {
@@ -606,7 +679,7 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         }
         result
     };
-    if receipt["changed"] != false && action != "send" {
+    if receipt["changed"] != false && !matches!(action, "send" | "set_notification_preference") {
         let (seq, event_id, act, record_id): (i64, String, Option<i64>, String) = sqlx::query_as(
             "SELECT seq,id,act,record_id FROM main.content_events ORDER BY seq DESC LIMIT 1",
         )
@@ -615,8 +688,21 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         receipt["act"] = json!(act);
         receipt["write_receipt"] = json!({"kind":"kernel_content_event","event":{"seq":seq,"event_id":event_id,"record_id":record_id}});
     }
+    if matches!(
+        action,
+        "mark_no_longer_relevant" | "unmark_no_longer_relevant"
+    ) {
+        // v1 also anchors a no-op undo as an accepted act. The command event
+        // below is its durable witness without touching the Message clock.
+        receipt["act"] = json!(acts.get_or_allocate(&mut tx).await?);
+    }
+    if let Some(attribution) =
+        kernel::app_installs::finish_app_action_in(db, &mut tx, actor, pending, &mut acts).await?
+    {
+        receipt["app_attribution"] = attribution;
+    }
     let unchanged_awareness = action == "mutate_human_awareness" && receipt["changed"] == false;
-    if !key.is_empty() && !unchanged_awareness {
+    if !key.is_empty() && (!unchanged_awareness || attributed) {
         let nonce = if action == "mutate_human_awareness" {
             caller.verified_human_interaction().map(|p| p.nonce.clone())
         } else {
@@ -638,7 +724,7 @@ pub(super) async fn execute(db: &Db, actor: &str, caller: &Caller, args: Value) 
         )
         .await?;
     }
-    tx.commit().await?;
+    db.commit_kernel_content(tx).await?;
     if let Some(hub) = db.realtime_hub() {
         hub.wake();
     }
@@ -750,12 +836,32 @@ async fn send(
         kernel::kernel_require(tx, actor, &mention.target_id, Capability::View).await?;
         let binding = match mention.target_kind.as_str() {
             "principal" => {
+                let principal = person(tx, actor, &mention.target_id).await?;
                 if !addressed.contains(&mention.target_id) {
-                    return Err(invalid(
-                        "principal mention target must already be addressed",
-                    ));
+                    // A mention alerts a person without addressing them or
+                    // changing who can read the Message. That only holds where
+                    // the Message inherits its audience, a Collection origin,
+                    // and only for someone who already sees that Collection.
+                    // A direct context's readers are its exact participants.
+                    if state.origin["type"] != "collection" {
+                        return Err(invalid(
+                            "principal mention target must already be addressed",
+                        ));
+                    }
+                    let collection = match text(&state.origin, "collection_id")? {
+                        "native:root" => crate::events::KERNEL_ROOT_ID,
+                        id => id,
+                    };
+                    if !kernel::kernel_effective_capability_on(tx, &principal, collection)
+                        .await?
+                        .allows(Capability::View)
+                    {
+                        return Err(invalid(
+                            "a mentioned person who is not addressed must be able to see the Collection the Message is posted in; the mention is refused and access is unchanged",
+                        ));
+                    }
                 }
-                format!("native/{}", person(tx, actor, &mention.target_id).await?)
+                format!("native/{principal}")
             }
             "record" => {
                 let origin = if let Some(origin) = &state.mention_origin {
@@ -902,197 +1008,13 @@ fn lane(state: &kernel::MessageState, actor: &str, lane: &str) -> Value {
         .cloned()
         .unwrap_or(Value::Null)
 }
-async fn governed_work_evidence(
-    conn: &mut sqlx::SqliteConnection,
+/// Caller-only flags shared by exact state and SQL. This pure part must not
+/// evaluate expectations or visit other viewers' private lanes.
+pub(super) fn private_fields(
     actor: &str,
-    id: &str,
-    expectation: &str,
-    rules: &kernel::MessageRules,
-) -> Result<Option<Value>> {
-    let account: Option<String> =
-        sqlx::query_scalar("SELECT auth_binding FROM kernel_principals WHERE principal_id=?")
-            .bind(actor)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let legacy_actor = account.as_ref().map(|a| format!("v1:{a}"));
-    let candidates:Vec<(String,Option<String>)>=sqlx::query_as("SELECT l.source_id,l.actor FROM kernel_generic_links l JOIN kernel_records r ON r.id=l.source_id WHERE l.target_id=? AND l.relationship='derived_from' AND l.active=1 ORDER BY COALESCE((SELECT json_extract(e.payload,'$.legacy.payload.created_at') FROM main.content_events e WHERE e.record_id=r.id AND e.type='kernel.legacy_recorded.v1' AND json_extract(e.payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY e.seq DESC LIMIT 1),r.created_at),r.id").bind(id).fetch_all(&mut *conn).await?;
-    for (candidate, link_actor) in candidates {
-        if link_actor.as_deref() != Some(actor) && link_actor.as_ref() != legacy_actor.as_ref() {
-            continue;
-        }
-        let Some(view) = kernel::read_record_on(conn, actor, &candidate).await? else {
-            continue;
-        };
-        let (typ, kind) = super::v1_type_and_kind(
-            view.family.as_deref(),
-            view.pin.as_ref().map(|p| p.version),
-            None,
-            view.kind.as_deref(),
-            &view.fields,
-        );
-        if (expectation == "action" && typ != Some("WorkItem"))
-            || (expectation == "decision" && typ != Some("Resolution"))
-        {
-            continue;
-        }
-        let provenance:Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.legacy.payload') FROM main.content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1").bind(&candidate).fetch_optional(&mut *conn).await?;
-        let provenance: Option<Value> = provenance
-            .map(|raw| serde_json::from_str(&raw))
-            .transpose()?;
-        let authored = if let Some(provenance) = &provenance {
-            account.as_ref().is_some_and(|account| {
-                provenance["creator"] == account.as_str()
-                    || provenance["verified_owner_accounts"]
-                        .as_array()
-                        .is_some_and(|owners| owners.iter().any(|owner| owner == account))
-            })
-        } else {
-            view.owner_id.as_deref()==Some(actor) || sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE record_id=? AND type='kernel.record_created.v1' AND actor=?)").bind(&candidate).bind(actor).fetch_one(&mut *conn).await?
-        };
-        if !authored {
-            continue;
-        }
-        if expectation == "decision" {
-            if kind.is_some_and(|k| rules.decision_kinds.contains(k)) {
-                return Ok(Some(json!({"kind":"decision","record_id":candidate})));
-            }
-            continue;
-        }
-        let Some(lifecycle) = view.fields.get("lifecycle").and_then(Value::as_str) else {
-            continue;
-        };
-        let home = if let Some(provenance) = &provenance {
-            provenance["original_home"].as_str().map(str::to_owned)
-        } else if view.home_id == crate::events::KERNEL_ROOT_ID {
-            Some("native:root".into())
-        } else {
-            sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM main.content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1").bind(&view.home_id).fetch_optional(&mut *conn).await?.or(Some(view.home_id.clone()))
-        };
-        let rows: Vec<crate::query::cascade::SchemaConfigRow> = rules
-            .schemas
-            .iter()
-            .map(|row| crate::query::cascade::SchemaConfigRow {
-                id: row["id"].as_str().unwrap_or("").into(),
-                layer: row["layer"].as_str().unwrap_or("").into(),
-                name: None,
-                data: row["data"].clone(),
-                applies_to_collection_id: row["applies_to_collection_id"]
-                    .as_str()
-                    .map(str::to_owned),
-                version_lineage: None,
-                created_at: row["created_at"].as_str().unwrap_or("").into(),
-            })
-            .collect();
-        let facets = crate::query::cascade::facets_for_record_context(
-            &rows,
-            "WorkItem",
-            kind,
-            home.as_deref(),
-        );
-        let governing = facets
-            .get("lifecycle")
-            .and_then(|shape| shape.get("vocab").or_else(|| shape.get("vocab_ref")))
-            .and_then(Value::as_str)
-            .map(crate::meta::resolve_vocab_ref);
-        if governing.is_some_and(|g| {
-            rules
-                .positive
-                .get(g)
-                .is_some_and(|values| values.contains(lifecycle))
-        }) {
-            return Ok(Some(
-                json!({"kind":"completed_work_item","record_id":candidate}),
-            ));
-        }
-    }
-    Ok(None)
-}
-
-pub(super) async fn expectation_value(
-    tx: &mut sqlx::SqliteConnection,
-    actor: &str,
-    id: &str,
+    recipient: Option<&str>,
     state: &kernel::MessageState,
-) -> Result<Value> {
-    let declared = state
-        .expectation
-        .as_deref()
-        .filter(|e| crate::message_expectation::EXPECTATION_VALUES.contains(e));
-    let mut result = json!({"format":crate::message_expectation::EXPECTATION_DERIVATION_VERSION,"message_id":id,"recipient_id":actor,"expectation":declared,"state":match declared {None=>"unknown",Some("none")=>"not_required",_=>"open"}});
-    if matches!(declared, None | Some("none")) {
-        return Ok(result);
-    }
-    if let Some(imported) = state.expectations.get(actor) {
-        result = imported.clone();
-        result["recipient_id"] = json!(actor);
-        if let Some(evidence) = result["evidence"]["record_id"].as_str() {
-            if kernel::read_record_on(tx, actor, evidence).await?.is_none() {
-                // Retain the source evaluator's satisfaction fact without
-                // disclosing an evidence identity hidden on the kernel.
-                result.as_object_mut().unwrap().remove("evidence");
-            }
-        }
-    }
-    if let (Some(expectation @ ("action" | "decision")), Some(rules)) =
-        (declared, state.rules.as_ref())
-    {
-        // Reconcile current kernel evidence on each read. Reopening a task or
-        // deleting evidence cannot leave a stale imported satisfaction flag.
-        result["state"] = json!("open");
-        result.as_object_mut().unwrap().remove("evidence");
-        if let Some(evidence) = governed_work_evidence(tx, actor, id, expectation, rules).await? {
-            result["state"] = json!("satisfied");
-            result["evidence"] = evidence;
-        }
-    }
-    if declared == Some("ack") && state.acknowledgements.contains_key(actor) {
-        result["state"] = json!("satisfied");
-        result["evidence"] = json!({"kind":"acknowledgement","record_id":id});
-        return Ok(result);
-    }
-    if matches!(declared, Some("ack" | "reply")) {
-        let replies:Vec<(String,String)>=sqlx::query_as("SELECT message_id,state FROM kernel_messages WHERE json_extract(state,'$.reply_to')=? AND json_extract(state,'$.author')=? ORDER BY event_seq,message_id").bind(id).bind(actor).fetch_all(&mut *tx).await?;
-        for (reply, raw) in replies {
-            let reply_state: kernel::MessageState = serde_json::from_str(&raw)?;
-            let sender_person: Option<String> = sqlx::query_scalar(
-                "SELECT person_id FROM kernel_message_people WHERE principal_id=?",
-            )
-            .bind(state.author.as_deref().unwrap_or(""))
-            .fetch_optional(&mut *tx)
-            .await?;
-            let account: String = sqlx::query_scalar(
-                "SELECT auth_binding FROM kernel_principals WHERE principal_id=?",
-            )
-            .bind(actor)
-            .fetch_one(&mut *tx)
-            .await?;
-            let authored:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_generic_links WHERE source_id=? AND target_id=? AND relationship='reply_to' AND active=1 AND actor IN (?,?))").bind(&reply).bind(id).bind(actor).bind(format!("v1:{account}")).fetch_one(&mut *tx).await?;
-            // v1 also delivers replies to persona/agent utterances through
-            // an explicit reply_to in the same declared Collection.
-            let delivered = sender_person.is_some_and(|p| reply_state.addressed_to.contains(&p))
-                || (state.speaker.is_some()
-                    && state.origin["type"] == "collection"
-                    && reply_state.origin == state.origin);
-            if authored
-                && reply_state.speaker.is_none()
-                && delivered
-                && kernel::read_record_on(tx, actor, &reply).await?.is_some()
-            {
-                result["state"] = json!("satisfied");
-                result["evidence"] = json!({"kind":"reply","record_id":reply});
-                break;
-            }
-        }
-    }
-    Ok(result)
-}
-
-pub(super) async fn state_value(
-    tx: &mut sqlx::SqliteConnection,
-    actor: &str,
-    id: &str,
-    state: &kernel::MessageState,
-) -> Result<Value> {
+) -> Value {
     let human = lane(state, actor, "human");
     let preference = lane(state, actor, "preference");
     let stage = human["stage"].as_str().unwrap_or("unsurfaced");
@@ -1103,6 +1025,23 @@ pub(super) async fn state_value(
     let unread = !own
         && !flag(&preference, "archived")
         && unread_override.unwrap_or(!matches!(stage, "opened" | "acknowledged"));
+    let mentioned = recipient.is_some_and(|p| {
+        state.mentions.iter().any(|m| {
+            flag(m, "effective")
+                && m["target_kind"] == "principal"
+                && (m["target_id"] == p || m["target_record_id"] == p)
+        })
+    });
+    json!({"human":{"stage":stage,"version":version(&human)},"mention":{"principal":mentioned},
+        "attention":{"unread":unread,"unread_override":unread_override,"version":version(&preference),"archived":flag(&preference,"archived")}})
+}
+
+pub(super) async fn state_value(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+    id: &str,
+    state: &kernel::MessageState,
+) -> Result<Value> {
     let mut grouped = BTreeMap::<&str, Vec<Value>>::new();
     for (principal, reactions) in &state.reactions {
         // Render participant identity only through caller-visible Person records.
@@ -1137,18 +1076,13 @@ pub(super) async fn state_value(
         && recipient
             .as_ref()
             .is_some_and(|p| state.addressed_to.contains(p));
-    let mentioned = recipient.as_ref().is_some_and(|p| {
-        state.mentions.iter().any(|m| {
-            flag(m, "effective")
-                && m["target_kind"] == "principal"
-                && (m["target_id"] == *p || m["target_record_id"] == *p)
-        })
-    });
-    Ok(
-        json!({"message_id":id,"human":{"stage":stage,"version":version(&human)},"mention":{"principal":mentioned},
-        "attention":{"unread":unread,"unread_override":unread_override,"version":version(&preference),"archived":flag(&preference,"archived")},"reactions":reactions,
-        "message_expectation_state":expectation,"can_satisfy_acknowledgement":can_ack}),
-    )
+
+    let mut value = private_fields(actor, recipient.as_deref(), state);
+    value["message_id"] = json!(id);
+    value["reactions"] = json!(reactions);
+    value["message_expectation_state"] = expectation;
+    value["can_satisfy_acknowledgement"] = json!(can_ack);
+    Ok(value)
 }
 async fn message_row(
     tx: &mut Transaction<'static, Sqlite>,
@@ -1172,7 +1106,9 @@ async fn message_row(
     row["body"] = json!(view.body);
     row["created_at"] = json!(state.created_at.as_ref().unwrap_or(&created));
     row["home_id"] = json!(home);
-    row["owner_id"] = json!(view.owner_id);
+    // The workbench's v1 record shape resolves local owners as Person IDs,
+    // while kernel ownership continues to use authenticated principals.
+    row["owner_id"] = json!(visible_person(tx, actor, view.owner_id.as_deref()).await?);
     row["origin"] = state.origin.clone();
     row["communication_origin"] = m::communication_origin(tx, state).await?;
     row["created_at_ms"] = json!(chrono::DateTime::parse_from_rfc3339(
@@ -1240,6 +1176,234 @@ async fn inbox_row(
     Ok(row)
 }
 
+/// Per-page memo for the v3 identity pass, so each distinct Person, reply
+/// target or Collection id is resolved once per page however many items
+/// mention it.
+#[derive(Default)]
+struct InboxIdentityMemo {
+    /// Person id -> slot when readable (full record read, the only place a
+    /// name is fetched), `None` when not readable.
+    slots: BTreeMap<String, Option<Value>>,
+    /// Person id -> may View, from a capability check only (no record load).
+    can_view: BTreeMap<String, bool>,
+    /// Non-Person record id (reply target, Collection) -> readable.
+    readable: BTreeMap<String, bool>,
+}
+
+impl InboxIdentityMemo {
+    /// The slot for a Person the viewer may see. The viewer's own slot is
+    /// always returned, with `name: null` when their own Person is unreadable
+    /// to them (hosted applies the same rule).
+    async fn slot(
+        &mut self,
+        tx: &mut Transaction<'static, Sqlite>,
+        actor: &str,
+        person_id: &str,
+        viewer_person: Option<&str>,
+    ) -> Result<Option<Value>> {
+        // A Person already capability-checked as not viewable needs no record
+        // read. (A cached "viewable" still needs the read for the name; the
+        // kernel memoizes that check per caller and event heads.)
+        if !self.slots.contains_key(person_id)
+            && viewer_person != Some(person_id)
+            && self.can_view.get(person_id) == Some(&false)
+        {
+            self.slots.insert(person_id.to_owned(), None);
+        }
+        if !self.slots.contains_key(person_id) {
+            let viewer = viewer_person == Some(person_id);
+            let slot = match kernel::read_record_on(tx, actor, person_id).await? {
+                Some(record) => Some(json!({
+                    "person_id": record.id,
+                    "name": record.fields.get("title").and_then(Value::as_str),
+                    "viewer": viewer,
+                    "state": "person",
+                })),
+                None if viewer => Some(
+                    json!({"person_id": person_id, "name": null, "viewer": true, "state": "person"}),
+                ),
+                None => None,
+            };
+            self.can_view.insert(person_id.to_owned(), slot.is_some());
+            self.slots.insert(person_id.to_owned(), slot);
+        }
+        Ok(self.slots[person_id].clone())
+    }
+
+    /// Whether the viewer may see this Person, without loading the record.
+    async fn person_visible(
+        &mut self,
+        tx: &mut Transaction<'static, Sqlite>,
+        actor: &str,
+        person_id: &str,
+        viewer_person: Option<&str>,
+    ) -> Result<bool> {
+        if viewer_person == Some(person_id) {
+            return Ok(true);
+        }
+        if let Some(known) = self.can_view.get(person_id) {
+            return Ok(*known);
+        }
+        let allowed = kernel::kernel_effective_capability_on(tx, actor, person_id)
+            .await?
+            .allows(Capability::View);
+        self.can_view.insert(person_id.to_owned(), allowed);
+        Ok(allowed)
+    }
+
+    async fn record_readable(
+        &mut self,
+        tx: &mut Transaction<'static, Sqlite>,
+        actor: &str,
+        id: &str,
+    ) -> Result<bool> {
+        if let Some(known) = self.readable.get(id) {
+            return Ok(*known);
+        }
+        // The workspace root is `native:root` on the wire but a separate root
+        // anchor in the kernel (`collection_origin` maps it the same way).
+        let readable = if id == "native:root" {
+            kernel::kernel_effective_capability_on(tx, actor, crate::events::KERNEL_ROOT_ID)
+                .await?
+                .allows(Capability::View)
+        } else {
+            kernel::read_record_on(tx, actor, id).await?.is_some()
+        };
+        self.readable.insert(id.to_owned(), readable);
+        Ok(readable)
+    }
+}
+
+/// `native.message-inbox.v3` identity fields for one page of inbox states,
+/// with the hosted semantics (`messaging_inbox_identity.rs`): the sender; the
+/// viewer's visible participants only (viewer first, then by Person id, at
+/// most the shared cap, `participant_count` = visible total, hidden members
+/// omitted); `reply_to_id` only when visible; and a `conversation` that has a
+/// key only for a Collection the viewer can see.
+///
+/// Cost: one capability pass over the union of participant ids across the
+/// page (each distinct id once), and a full record read only for ids that are
+/// actually listed (at most the cap per item, shared across items).
+async fn inbox_identity_page(
+    tx: &mut Transaction<'static, Sqlite>,
+    actor: &str,
+    viewer_person: Option<&str>,
+    states: &[kernel::MessageState],
+) -> Result<Vec<serde_json::Map<String, Value>>> {
+    let mut memo = InboxIdentityMemo::default();
+    let mut senders: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut out = Vec::with_capacity(states.len());
+    for state in states {
+        let mut fields = serde_json::Map::new();
+        let sender_person = match state.author.as_deref() {
+            Some(author) => {
+                if !senders.contains_key(author) {
+                    let person: Option<String> = sqlx::query_scalar(
+                        "SELECT person_id FROM kernel_message_people WHERE principal_id=?",
+                    )
+                    .bind(author)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    senders.insert(author.to_owned(), person);
+                }
+                senders[author].clone()
+            }
+            None => None,
+        };
+        let sender = match sender_person.as_deref() {
+            Some(id) => memo.slot(tx, actor, id, viewer_person).await?,
+            None => None,
+        };
+        let mut sender = sender.unwrap_or_else(crate::awareness::inbox_hidden_person);
+        if let (Some(speaker), true) = (&state.speaker, sender["state"] == "person") {
+            sender["speaker"] = json!({"kind": speaker["kind"], "assurance": speaker["assurance"]});
+        }
+        fields.insert("sender".into(), sender);
+
+        let in_unfiled = state
+            .home_id
+            .as_deref()
+            .is_none_or(|home| home == "native:unfiled");
+        // Authored by the viewer's own principal (not merely a principal that
+        // now resolves to the viewer's Person), in the Unfiled origin.
+        let is_self = state.origin["type"] == "collection"
+            && state.origin["collection_id"] == "native:unfiled"
+            && state.author.as_deref() == Some(actor)
+            && in_unfiled
+            && state.addressed_to.is_empty()
+            && viewer_person.is_some()
+            && sender_person.as_deref() == viewer_person;
+        let legacy = !matches!(state.origin["type"].as_str(), Some("direct" | "collection"));
+        let mut direct_ids: Vec<&str> = if state.origin["type"] == "direct" {
+            state.origin["participant_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        } else if legacy {
+            // A legacy Message stores no origin members: its audience is the
+            // sender plus its addressees.
+            state
+                .addressed_to
+                .iter()
+                .map(String::as_str)
+                .chain(sender_person.as_deref())
+                .collect()
+        } else if is_self {
+            sender_person.as_deref().into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        direct_ids.sort_unstable();
+        direct_ids.dedup();
+        // Viewer first, then Person-id order: the shared participant order.
+        direct_ids.sort_by_key(|id| viewer_person != Some(*id));
+        let mut listed = Vec::new();
+        let mut visible_count = 0usize;
+        for id in &direct_ids {
+            if listed.len() < crate::awareness::INBOX_PARTICIPANT_CAP {
+                if let Some(slot) = memo.slot(tx, actor, id, viewer_person).await? {
+                    visible_count += 1;
+                    listed.push(slot);
+                }
+            } else if memo.person_visible(tx, actor, id, viewer_person).await? {
+                visible_count += 1;
+            }
+        }
+        fields.insert("participant_count".into(), json!(visible_count));
+        fields.insert(
+            "participants".into(),
+            Value::Array(crate::awareness::inbox_participants(listed)),
+        );
+
+        let reply = match &state.reply_to {
+            Some(target) if memo.record_readable(tx, actor, target).await? => json!(target),
+            _ => Value::Null,
+        };
+        fields.insert("reply_to_id".into(), reply);
+
+        // A direct context has no key in this version; a Collection is keyed
+        // by its id only for a viewer who can see that Collection.
+        let conversation = match state.origin["type"].as_str() {
+            _ if is_self => json!({"type": "self"}),
+            Some("direct") => json!({"type": "direct"}),
+            Some("collection") => {
+                let collection = state.origin["collection_id"].as_str().unwrap_or_default();
+                if memo.record_readable(tx, actor, collection).await? {
+                    json!({"type": "collection", "key": format!("collection:{collection}")})
+                } else {
+                    json!({"type": "collection"})
+                }
+            }
+            _ => json!({"type": "legacy"}),
+        };
+        fields.insert("conversation".into(), conversation);
+        out.push(fields);
+    }
+    Ok(out)
+}
+
 async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     if args["action"] == "list_notification_candidates" {
         let number = |key: &str, default: i64| -> Result<i64> {
@@ -1257,6 +1421,7 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
             ));
         }
         let mut tx = db.write_pool().begin().await?;
+        kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
         let (candidates, scanned) =
             kernel::notifications::rows_on(&mut tx, actor, after, limit).await?;
         let head = kernel::notifications::head_on(&mut tx, actor).await?;
@@ -1266,6 +1431,7 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     }
     let action = text(&args, "action")?;
     let mut tx = db.write_pool().begin().await?;
+    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     if action == "list_destinations" {
         let raw:Vec<(String,String)>=sqlx::query_as("SELECT collection_id,state FROM kernel_message_destinations WHERE principal_id=? ORDER BY json_extract(state,'$.joined_at') DESC,collection_id").bind(actor).fetch_all(&mut *tx).await?;
         let mut destinations = Vec::new();
@@ -1318,6 +1484,10 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     } else {
         None
     };
+    // V1 resolves the request's Person IDs to canonical principals for the
+    // response (tools/messaging.rs::resolve_context_selector). Keep the
+    // stored selector unchanged for filtering and cursor admission.
+    let mut response_origin = origin.clone();
     if let Some(origin) = &origin {
         match text(origin, "type")? {
             "collection" => {
@@ -1326,12 +1496,24 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
             "direct" => {
                 let participants = strings(&origin["participant_ids"])?;
                 let mut caller_in = false;
-                for id in participants {
-                    caller_in |= person(&mut tx, actor, &id).await? == actor;
+                let mut principals = Vec::with_capacity(participants.len());
+                for id in &participants {
+                    let principal = person(&mut tx, actor, id).await?;
+                    caller_in |= principal == actor;
+                    principals.push(principal);
                 }
                 if !caller_in {
                     return Err(invalid("caller must belong to direct context"));
                 }
+                let principals = crate::events::normalize_direct_origin_principals(principals);
+                if principals.len() != participants.len() {
+                    return Err(invalid(
+                        "direct participants must resolve to distinct canonical principals",
+                    ));
+                }
+                response_origin = Some(serde_json::to_value(
+                    crate::events::MessageOriginDeclaredPayload::Direct { principals },
+                )?);
             }
             _ => return Err(invalid("invalid origin")),
         }
@@ -1348,6 +1530,30 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
         10_000
     };
     let view = args["view"].as_str().unwrap_or("needs_me");
+    // `scope:"direct"` (list_inbox only): the viewer's own direct contexts.
+    let direct_scope = match args["scope"].as_str() {
+        None if args["scope"].is_null() => false,
+        Some("direct") if action == "list_inbox" => true,
+        _ => return Err(invalid("inbox scope must be \"direct\"")),
+    };
+    if direct_scope && conversation.is_some() {
+        return Err(invalid(
+            "inbox scope and conversation_id are mutually exclusive",
+        ));
+    }
+    let preview_chars = match args.get("preview_chars").filter(|v| !v.is_null()) {
+        Some(v) => match v.as_u64() {
+            Some(n)
+                if (1..=crate::mcp::tools::messaging::MAX_PREVIEW_CHARS as u64).contains(&n) =>
+            {
+                Some(n as usize)
+            }
+            _ => return Err(invalid("inbox preview_chars must be 1..=1000")),
+        },
+        None => {
+            direct_scope.then_some(crate::mcp::tools::messaging::DIRECT_SCOPE_DEFAULT_PREVIEW_CHARS)
+        }
+    };
     if ![
         "needs_me",
         "agent_queue",
@@ -1361,6 +1567,7 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     }
     // Snapshot tokens bind the caller and selection, and every continuation
     // reauthorizes in this snapshot. No retained body is returned after revocation.
+    let mut truncated = false;
     let token = args["snapshot"].as_str().or(args["cursor"].as_str());
     let mut after = args["after"].as_u64().unwrap_or(0) as usize;
     let (ids, snapshot_head) = if let Some(token) = token {
@@ -1370,18 +1577,80 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
             || snapshot["origin"] != args["origin"]
             || snapshot["conversation_id"] != args["conversation_id"]
             || snapshot["view"] != args["view"]
+            || snapshot["scope"] != args["scope"]
         {
             return Err(invalid("snapshot selection mismatch"));
         }
         if action == "list_context" {
             after = snapshot["after"].as_u64().unwrap_or(0) as usize;
         }
+        truncated = snapshot["truncated"].as_bool().unwrap_or(false);
         (
             strings(&snapshot["ids"])?,
             snapshot["head"].as_i64().unwrap_or(0),
         )
     } else {
-        let candidates:Vec<String>=sqlx::query_scalar("SELECT m.message_id FROM kernel_messages m JOIN kernel_records r ON r.id=m.message_id ORDER BY COALESCE(json_extract(m.state,'$.created_at'),r.created_at) DESC,r.id DESC").fetch_all(&mut *tx).await?;
+        let candidates: Vec<String> = if direct_scope {
+            let viewer: Option<String> = sqlx::query_scalar(
+                "SELECT person_id FROM kernel_message_people WHERE principal_id=?",
+            )
+            .bind(actor)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let viewer = viewer.ok_or_else(|| {
+                invalid("manage_messages.list_inbox: scope direct needs a current member identity")
+            })?;
+            // One state-JSON scan selects the viewer's contexts (no kernel
+            // index covers participants yet, so it is O(messages) but cheap
+            // per row; adding one needs a kernel schema migration, tracked as
+            // a follow-up). Deleted messages are excluded as on hosted. The
+            // per-message work then runs only for these, and visibility is
+            // applied BEFORE the cap, newest first, so unreadable messages
+            // never use up the cap or set `truncated`: it means more visible
+            // direct messages exist. A note to self (the viewer's own collection-origin message in Unfiled with no
+            // addressee) is the third arm. (Kernel principals map 1:1 to a Person,
+            // and direct origins are Person ids, so there are no aliases.)
+            let matched: Vec<String> = sqlx::query_scalar(
+                "SELECT m.message_id FROM kernel_messages m JOIN kernel_records r ON r.id=m.message_id
+                  WHERE NOT EXISTS (SELECT 1 FROM kernel_import_tombstones t WHERE t.record_id=m.message_id)
+                    AND ((json_extract(m.state,'$.origin.type')='direct'
+                          AND EXISTS (SELECT 1 FROM json_each(m.state,'$.origin.participant_ids') j WHERE j.value=?1))
+                     OR (COALESCE(json_extract(m.state,'$.origin.type'),'') NOT IN ('direct','collection')
+                         AND (json_extract(m.state,'$.author')=?2
+                              OR EXISTS (SELECT 1 FROM json_each(m.state,'$.addressed_to') a WHERE a.value=?1))
+                         AND (json_extract(m.state,'$.home_id') IS NULL
+                              OR json_extract(m.state,'$.home_id')='native:unfiled'))
+                     OR (json_extract(m.state,'$.origin.type')='collection'
+                         AND json_extract(m.state,'$.origin.collection_id')='native:unfiled'
+                         AND json_extract(m.state,'$.author')=?2
+                         AND json_array_length(COALESCE(json_extract(m.state,'$.addressed_to'),'[]'))=0
+                         AND (json_extract(m.state,'$.home_id') IS NULL
+                              OR json_extract(m.state,'$.home_id')='native:unfiled')))
+                  ORDER BY COALESCE(json_extract(m.state,'$.created_at'),r.created_at) DESC,r.id DESC",
+            )
+            .bind(&viewer)
+            .bind(actor)
+            .fetch_all(&mut *tx)
+            .await?;
+            let cap = crate::mcp::tools::messaging::direct_scope_cap();
+            let mut ids = Vec::new();
+            for id in matched {
+                if kernel::kernel_effective_capability_on(&mut tx, actor, &id)
+                    .await?
+                    .allows(Capability::View)
+                {
+                    ids.push(id);
+                    if ids.len() > cap {
+                        break;
+                    }
+                }
+            }
+            truncated = ids.len() > cap;
+            ids.truncate(cap);
+            ids
+        } else {
+            sqlx::query_scalar("SELECT m.message_id FROM kernel_messages m JOIN kernel_records r ON r.id=m.message_id ORDER BY COALESCE(json_extract(m.state,'$.created_at'),r.created_at) DESC,r.id DESC").fetch_all(&mut *tx).await?
+        };
         let mut ids = Vec::new();
         for id in candidates {
             if !kernel::kernel_effective_capability_on(&mut tx, actor, &id)
@@ -1424,7 +1693,8 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
                 }
                 continue;
             }
-            if action == "list_inbox" {
+            // A direct-scope browse pins only ids; items are built for the page.
+            if action == "list_inbox" && !(direct_scope && view == "browse") {
                 let row = inbox_row(&mut tx, actor, &id, &state).await?;
                 if !crate::mcp::tools::messaging::item_in_view(&row, view) {
                     continue;
@@ -1437,7 +1707,16 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     if after > ids.len() {
         return Err(invalid("after exceeds snapshot"));
     }
+    let viewer_person: Option<String> = if action == "list_inbox" {
+        sqlx::query_scalar("SELECT person_id FROM kernel_message_people WHERE principal_id=?")
+            .bind(actor)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     let mut rows = Vec::new();
+    let mut page_states: Vec<kernel::MessageState> = Vec::new();
     let mut conversations = BTreeMap::<String, usize>::new();
     let mut offset = after;
     while offset < ids.len() && rows.len() < limit {
@@ -1461,19 +1740,42 @@ async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
         if action == "list_inbox" {
             row = inbox_row(&mut tx, actor, id, &state).await?;
             row.as_object_mut().unwrap().remove("_predicates");
+            // Raw origin fields list every participant principal/Person id,
+            // hidden ones included; the v3 identity fields replace them.
+            let object = row.as_object_mut().unwrap();
+            object.remove("origin");
+            object.remove("communication_origin");
+            page_states.push(state);
         }
         rows.push(row);
     }
+    if action == "list_inbox" {
+        let identity =
+            inbox_identity_page(&mut tx, actor, viewer_person.as_deref(), &page_states).await?;
+        for (row, fields) in rows.iter_mut().zip(identity) {
+            row.as_object_mut().unwrap().extend(fields);
+        }
+    }
     let candidate_head = kernel::notifications::head_on(&mut tx, actor).await?;
     tx.rollback().await?;
-    let snapshot=db.put_inbox_snapshot(json!({"actor":actor,"action":action,"origin":args["origin"],"conversation_id":args["conversation_id"],"view":args["view"],"ids":ids,"head":snapshot_head,"after":offset}))?;
+    let snapshot=db.put_inbox_snapshot(json!({"actor":actor,"action":action,"origin":args["origin"],"conversation_id":args["conversation_id"],"view":args["view"],"scope":args["scope"],"truncated":truncated,"ids":ids,"head":snapshot_head,"after":offset}))?;
     let has_more = offset < ids.len();
     match action {
         "list_context" => Ok(
-            json!({"origin":origin,"messages":rows,"viewer_relative":true,"has_more":has_more,"next_cursor":if has_more {Some(snapshot)} else {None}}),
+            json!({"origin":response_origin,"messages":rows,"viewer_relative":true,"has_more":has_more,"next_cursor":if has_more {Some(snapshot)} else {None}}),
         ),
         "list_inbox" => {
-            let response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":rows,"snapshot":snapshot,"next_after":if has_more {Some(offset)} else {None},"newer_available":content!=snapshot_head,"heads":{"content":content,"awareness":content,"candidates":candidate_head,"control":0,"authorization":content},"counts_are_distinct_message_ids":true});
+            if let Some(limit_chars) = preview_chars {
+                for row in &mut rows {
+                    crate::mcp::tools::messaging::apply_preview(row, limit_chars);
+                }
+            }
+            let mut response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":rows,"snapshot":snapshot,"next_after":if has_more {Some(offset)} else {None},"newer_available":content!=snapshot_head,"heads":{"content":content,"awareness":content,"candidates":candidate_head,"control":0,"authorization":content},"counts_are_distinct_message_ids":true});
+            if direct_scope {
+                response["scope"] = json!("direct");
+                response["candidate_cap"] = json!(crate::mcp::tools::messaging::direct_scope_cap());
+                response["truncated"] = json!(truncated);
+            }
             crate::awareness::validate_messaging_surface_response(&response)?;
             Ok(response)
         }
@@ -1535,6 +1837,28 @@ pub(super) async fn mentions_as(
         }
     }
     Ok(json!(rows))
+}
+
+/// Map the kernel principal to the caller-visible v1 Person identity.
+pub(super) async fn visible_person(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+    principal: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(principal) = principal else {
+        return Ok(None);
+    };
+    let person: Option<String> =
+        sqlx::query_scalar("SELECT person_id FROM kernel_message_people WHERE principal_id=?")
+            .bind(principal)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match person {
+        Some(id) => Ok(kernel::read_record_on(tx, actor, &id)
+            .await?
+            .map(|record| record.id)),
+        None => Ok(None),
+    }
 }
 
 pub(super) async fn participants(db: &Db, actor: &str, args: Value) -> Result<Value> {
@@ -1723,4 +2047,109 @@ pub(super) async fn participants(db: &Db, actor: &str, args: Value) -> Result<Va
         hub.wake();
     }
     Ok(receipt)
+}
+
+/// v1: tools/messaging.rs:2331 (mark), :2544 (unmark), :1648 (own live marks).
+/// View of a local Message is sufficient; neither home Edit nor sender identity
+/// is required. Caller-owned evidence derives live authority from the Message.
+async fn relevance(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+) -> Result<Value> {
+    let message = text(args, "message_id")?;
+    require(tx, actor, message).await?;
+    let bound: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM kernel_message_people WHERE principal_id=?)",
+    )
+    .bind(actor)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !bound {
+        return Err(invalid("marking requires a portable account binding"));
+    }
+    let existing = m::own_relevance_marks_on(tx, actor, message).await?;
+    if args["action"] == "unmark_no_longer_relevant" {
+        for (id, link) in &existing {
+            append(
+                db,
+                tx,
+                acts,
+                actor,
+                id,
+                "kernel.generic_link_removed.v1",
+                json!({"link_id":link}),
+            )
+            .await?;
+        }
+        return Ok(
+            json!({"status":"unmarked","message_id":message,"changed":!existing.is_empty()}),
+        );
+    }
+    if let Some((id, link)) = existing.first() {
+        // v1 re-appends the live link under a new key even when changed=false.
+        // This also makes the owner the latest asserting actor of a link that
+        // somebody else with Edit may originally have put on their evidence.
+        append(
+            db,
+            tx,
+            acts,
+            actor,
+            id,
+            "kernel.generic_link_added.v1",
+            json!({"link_id":link,"source_id":id,"target_id":message,"relationship":"resolves","note":"no_longer_relevant"}),
+        )
+        .await?;
+        return Ok(
+            json!({"status":"marked","message_id":message,"evidence_record_id":id,"changed":false}),
+        );
+    }
+    let source = kernel::read_record_on(tx, actor, message)
+        .await?
+        .ok_or_else(|| Error::engine(kernel::HIDDEN_OR_MISSING))?;
+    let fields = crate::v2_standard::v1_compat::compat_fields(
+        "Annotation",
+        "no_longer_relevant",
+        Some("No longer relevant"),
+        None,
+        None,
+    );
+    let raw = serde_json::to_string(&fields)?;
+    let id = kernel::create_input_admitted_in(
+        db,
+        tx,
+        acts,
+        actor,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        kernel::FieldInput::Raw(&raw),
+        &source.home_id,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    append(
+        db,
+        tx,
+        acts,
+        actor,
+        &id,
+        "kernel.body_set.v1",
+        json!({"body":args["note"].as_str().unwrap_or("")}),
+    )
+    .await?;
+    // All Annotations derive authority from their unique part_of bearer on
+    // both engines (v1 authorization.rs:1292). Complete that bearer last, so
+    // body and relevance writes share the owned creation fence. The sealed
+    // owner-only relevance route admits later reaffirm/undo with Message View.
+    append(db, tx, acts, actor, &id, "kernel.generic_link_added.v1",
+        json!({"link_id":uuid::Uuid::new_v4().to_string(),"source_id":id,"target_id":message,"relationship":"resolves","note":"no_longer_relevant"})).await?;
+    kernel::generic_links::add_generic_link_in(db, tx, acts, actor, &id, message, "part_of", None)
+        .await?;
+    Ok(json!({"status":"marked","message_id":message,"evidence_record_id":id,"changed":true}))
 }

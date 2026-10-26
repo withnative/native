@@ -1,0 +1,111 @@
+{
+  "provenance": {
+    "source": "experiments/alpha-tab-proof-packages/notion-pages-descriptor.json",
+    "source_sha256": "fa7b5a755f157d1c4311972950c7b11675809029da15c63951fea258d4b1f263",
+    "purpose": "Public declaration-only SQL parity fixture; contains no workspace data or bundle source."
+  },
+  "declaration": {
+    "needs": [
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.tree",
+        "label": "Your folders and saved collections: names, where each sits, and how many pages each holds (no bodies)",
+        "sql": "SELECT f.id, f.name, f.kind, f.home_id, COALESCE(c.n, 0) AS pages, f.last_activity_at FROM records f LEFT JOIN (SELECT home_id, COUNT(*) AS n FROM records WHERE deleted_at IS NULL AND type NOT IN ('Collection', 'Annotation') AND COALESCE(kind, '') <> 'attachment' GROUP BY home_id) c ON c.home_id = f.id WHERE f.type = 'Collection' AND f.deleted_at IS NULL ORDER BY CASE WHEN f.kind = 'folder' THEN 0 ELSE 1 END, f.last_activity_at DESC, f.id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.recent",
+        "label": "Your 200 most recently edited pages: name, type, folder, status and dates (no bodies)",
+        "sql": "SELECT id, name, type, kind, home_id, lifecycle, created_at, last_activity_at FROM records WHERE deleted_at IS NULL AND type IN ('Document', 'WorkItem', 'Resolution', 'Outcome', 'Program') AND COALESCE(kind, '') <> 'attachment' ORDER BY last_activity_at DESC, id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.claims",
+        "label": "Which pages agent runs currently claim, with each run's declared intent",
+        "sql": "SELECT c.record_id, a.run_key, a.appears_active, substr(a.declared_intent, 1, 160) AS intent, a.principal_display_name, a.last_observed_activity_at FROM agent_activity_claims c JOIN agent_activity a ON a.activity_id = c.activity_id WHERE c.is_current = 1 ORDER BY a.last_observed_activity_at DESC, c.claim_id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.children",
+        "label": "The pages inside one folder, with status, area, priority and who filed them, read when you open it",
+        "sql": "SELECT r.id, r.name, r.type, r.kind, r.home_id, r.lifecycle, substr(r.summary, 1, 200) AS summary, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = 'area') AS area, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = 'priority') AS priority, (SELECT f.value FROM facet_values f WHERE f.record_id = r.id AND f.key = 'filed_by') AS filed_by, r.created_at, r.last_activity_at FROM records r WHERE r.home_id = ?1 AND r.deleted_at IS NULL AND r.type NOT IN ('Collection', 'Annotation') AND COALESCE(r.kind, '') <> 'attachment' ORDER BY r.last_activity_at DESC, r.id LIMIT 200",
+        "params": [
+          {
+            "name": "id",
+            "type": "text",
+            "max_len": 64
+          }
+        ]
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.page",
+        "label": "Complete selected record source and identity; NULL originals remain read-only",
+        "sql": "SELECT id, name, type, kind, home_id, lifecycle, summary, body, length(body) AS body_length, 'full' AS body_source, EXISTS(SELECT 1 FROM facet_values f WHERE f.record_id = records.id AND f.key = 'runtime') AS runtime_present, created_at, updated_at, last_activity_at FROM records WHERE id = ?1 AND deleted_at IS NULL ORDER BY id LIMIT 1",
+        "params": [
+          {
+            "name": "record_id",
+            "type": "text",
+            "max_len": 128,
+            "required": true
+          }
+        ]
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.properties",
+        "label": "The properties (facets) of one page, read when you open it",
+        "sql": "SELECT f.key, f.value FROM facet_values f JOIN records r ON r.id = f.record_id WHERE f.record_id = ?1 AND r.deleted_at IS NULL ORDER BY f.key LIMIT 80",
+        "params": [
+          {
+            "name": "id",
+            "type": "text",
+            "max_len": 64
+          }
+        ]
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.links",
+        "label": "What one page links to and what links to it, including its comments and attached files",
+        "sql": "SELECT 'in' AS dir, l.relationship, s.id, s.name, s.type, s.kind, l.created_at AS linked_at, CASE WHEN s.kind = 'comment' THEN substr(s.body, 1, 800) END AS excerpt, CASE WHEN s.kind = 'attachment' THEN (SELECT b.mime FROM facet_values f JOIN blobs b ON b.id = f.value WHERE f.record_id = s.id AND f.key = 'blob_ref' ORDER BY b.id LIMIT 1) END AS mime FROM links l JOIN records s ON s.id = l.source_id WHERE l.target_id = ?1 AND s.deleted_at IS NULL UNION ALL SELECT 'out', l.relationship, t.id, t.name, t.type, t.kind, l.created_at, NULL, NULL FROM links l JOIN records t ON t.id = l.target_id WHERE l.source_id = ?1 AND t.deleted_at IS NULL ORDER BY 1 DESC, 7 DESC, 3 LIMIT 200",
+        "params": [
+          {
+            "name": "id",
+            "type": "text",
+            "max_len": 64
+          }
+        ]
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "notion.history",
+        "label": "The change history of one page, with the agent run and declared intent behind each change",
+        "sql": "SELECT e.local_seq, e.type, e.run_key, e.created_at, (SELECT substr(a.declared_intent, 1, 160) FROM agent_activity a WHERE a.run_key = e.run_key ORDER BY a.activity_id LIMIT 1) AS intent, (SELECT a.principal_display_name FROM agent_activity a WHERE a.run_key = e.run_key ORDER BY a.activity_id LIMIT 1) AS principal FROM content_events e JOIN records r ON r.id = e.record_id WHERE e.record_id = ?1 AND r.deleted_at IS NULL ORDER BY e.local_seq DESC LIMIT 60",
+        "params": [
+          {
+            "name": "id",
+            "type": "text",
+            "max_len": 64
+          }
+        ]
+      },
+      "records.search.v1"
+    ],
+    "effects": [
+      {
+        "effect": "records.body-set.v1",
+        "max_body_bytes": 32768,
+        "target": {
+          "need": "notion.page"
+        }
+      },
+      {
+        "effect": "records.title-set.v1",
+        "target": {
+          "need": "notion.recent"
+        }
+      }
+    ]
+  }
+}

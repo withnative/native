@@ -156,16 +156,9 @@ pub(crate) async fn project_policy(
 ) -> Result<()> {
     validate_event(event)?;
     project_policy_rows(conn, event).await?;
-    // Every applied policy operation advances the epoch at least once, even
-    // when it wrote no projection row. Hosted clients use the SSE
-    // authorization frame as their acknowledgement that a policy write landed,
-    // so an operation that is a no-op in the projections must still be
-    // acknowledged or the caller waits forever. Re-asserting an identical
-    // empty explicit policy is exactly that case: `INSERT OR IGNORE` suppresses
-    // the record_policies trigger, the entry DELETE and re-INSERT touch no
-    // rows, and the anchor refresh writes nothing. The trigger fences remain
-    // the authority for what changed; this is an explicit "an operation was
-    // applied" statement, not a substitute for them.
+    // Preserve the broad cache fence for every applied operation. Realtime
+    // prompts describe possible access changes, not policy acknowledgements;
+    // identical replacement events need not move their subject fences.
     sqlx::query("UPDATE authorization_revision SET epoch = epoch + 1 WHERE id = 1")
         .execute(&mut *conn)
         .await?;
@@ -187,23 +180,26 @@ async fn project_policy_rows(conn: &mut SqliteConnection, event: &PolicyEventRow
             .bind(&event.created_at)
             .execute(&mut *conn)
             .await?;
-            sqlx::query("DELETE FROM policy_entries WHERE policy_anchor_id = ?")
-                .bind(&event.record_id)
-                .execute(&mut *conn)
-                .await?;
-            for entry in payload.entries {
-                sqlx::query(
-                    "INSERT INTO policy_entries
-                        (policy_anchor_id, subject_kind, subject_id, effect, capability)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(&event.record_id)
-                .bind(entry.subject_kind)
-                .bind(entry.subject_id)
-                .bind(entry.effect)
-                .bind(entry.capability)
-                .execute(&mut *conn)
-                .await?;
+            let existing = sqlx::query(
+                "SELECT subject_kind, subject_id, effect, capability FROM policy_entries WHERE policy_anchor_id = ?",
+            ).bind(&event.record_id).fetch_all(&mut *conn).await?
+                .into_iter().map(|row| NormalizedPolicyEntry {
+                    subject_kind: row.get("subject_kind"), subject_id: row.get("subject_id"),
+                    effect: row.get("effect"), capability: row.get("capability"),
+                }).collect::<std::collections::BTreeSet<_>>();
+            let wanted = payload
+                .entries
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            for entry in existing.difference(&wanted) {
+                sqlx::query("DELETE FROM policy_entries WHERE policy_anchor_id = ? AND subject_kind = ? AND subject_id = ? AND effect = ? AND capability = ?")
+                    .bind(&event.record_id).bind(&entry.subject_kind).bind(&entry.subject_id)
+                    .bind(&entry.effect).bind(&entry.capability).execute(&mut *conn).await?;
+            }
+            for entry in wanted.difference(&existing) {
+                sqlx::query("INSERT INTO policy_entries (policy_anchor_id, subject_kind, subject_id, effect, capability) VALUES (?, ?, ?, ?, ?)")
+                    .bind(&event.record_id).bind(&entry.subject_kind).bind(&entry.subject_id)
+                    .bind(&entry.effect).bind(&entry.capability).execute(&mut *conn).await?;
             }
             Ok(())
         }

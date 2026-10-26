@@ -120,6 +120,7 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     // Excluded: every immutable companion (section 3.2 "Excluded: every
     // immutable companion" row).
     ("content_event_causal_frontier", Excluded),
+    ("content_event_heads", Excluded),
     ("content_event_sources", Excluded),
     ("replicated_message_provenance", Excluded),
     ("destination_message_ingest", Excluded),
@@ -149,6 +150,9 @@ pub(crate) const MEMBER_TABLE_DISPOSITIONS: &[(&str, MemberTableKind)] = &[
     ("policy_entries", Excluded),
     ("authorization_revision", Excluded),
     ("authorization_grant_revision", Excluded),
+    ("authorization_subject_revision", Excluded),
+    ("authorization_subject_births", Excluded),
+    ("authorization_subject_birth_fence", Excluded),
     ("database_identity", Excluded),
     // Excluded: message structure (section 3.2 "Excluded (v1): message
     // structure" row). Message records ship as records; audience/mention
@@ -949,6 +953,7 @@ mod tests {
         "awareness_command_intents",
         "external_observations",
         "content_event_causal_frontier",
+        "content_event_heads",
         "content_event_sources",
         "replicated_message_provenance",
         "destination_message_ingest",
@@ -973,6 +978,9 @@ mod tests {
         "policy_entries",
         "authorization_revision",
         "authorization_grant_revision",
+        "authorization_subject_revision",
+        "authorization_subject_births",
+        "authorization_subject_birth_fence",
         "database_identity",
         "message_audiences",
         "message_mentions",

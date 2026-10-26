@@ -170,6 +170,8 @@ pub async fn insert(
         Some(bearer),
         true,
         Some(&metadata.idempotency_key),
+        None,
+        None,
     )
     .await?;
     kernel::blobs::bind(db, &mut tx, &mut acts, &actor, &id, &meta).await?;

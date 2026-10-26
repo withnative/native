@@ -440,7 +440,7 @@ fn render_operation_census(stats: &ContractStats) -> String {
 - **{} operations carry a non-disclosure obligation**.\n\
 - All **{} mutating operations** carry an explicit no-write-on-deny obligation\n  and named negative evidence.\n\
 - **{} read operations** have justified `negative_evidence: not_applicable`:\n  `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and\n  `manage_vocabularies.list_values`. They have no authorization threshold;\n  each still has positive executable evidence.\n\
-- Complete-coverage claim: **SQLite local**, exercised by\n  `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit\n  this claim.",
+- Complete-coverage claim: **SQLite local**, exercised by\n  `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit\n  this claim. Named-view rows separately qualify hosted-v2 success and\n  ordinary-SQLite refusal; they do not claim local success.",
         stats.tools,
         stats.operations,
         stats.ordinary,
@@ -474,6 +474,36 @@ fn validate_report_census(report: &str, stats: &ContractStats) -> Result<(), Str
 
 fn parsed_manifest() -> ContractManifest {
     serde_json::from_str(MANIFEST).unwrap()
+}
+
+#[tokio::test]
+async fn named_view_operations_refuse_the_ordinary_sqlite_profile_without_events() {
+    let db = create_database(":memory:").await.unwrap();
+    let registry = production_registry();
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    for args in [
+        json!({"action":"get_view_revision","view_id":"native.named-view:bearer","revision_id":"revision"}),
+        json!({"action":"list_view_revisions","view_id":"native.named-view:bearer"}),
+        json!({"action":"record_view_revision","id":MATRIX_OWNER,"definition":{},"idempotency_key":"draft"}),
+        json!({"action":"activate_view","id":MATRIX_OWNER,"pin":{},"name":"view_test","expected_binding_event_id":null,"idempotency_key":"publish"}),
+        json!({"action":"unpublish_view","id":MATRIX_OWNER,"expected_binding_event_id":null,"idempotency_key":"unpublish"}),
+        json!({"action":"prepare_named_views"}),
+    ] {
+        let error = call_as(&registry, &db, Caller::local(), "manage_named_views", args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("view_profile_unsupported"), "{error}");
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+    }
+    db.close().await;
 }
 
 #[test]

@@ -239,7 +239,7 @@ fn lean_catalogue_advertises_the_direct_set_and_keeps_every_callable_index() {
     );
     assert_eq!(lean.operations_by_executor, full.operations_by_executor);
     let direct = lean.direct_operations.as_ref().unwrap();
-    assert_eq!(direct["records_read"], ["search"]);
+    assert_eq!(direct["records_read"], ["get_record", "search"]);
     assert_eq!(
         direct["records_write"],
         full.operations_by_executor["records_write"]
@@ -247,15 +247,34 @@ fn lean_catalogue_advertises_the_direct_set_and_keeps_every_callable_index() {
     assert!(!direct.contains_key("records_delete"));
 
     // records_read is narrowed everywhere a discriminator appears, with
-    // search-only prose and field listing.
+    // search-and-get_record prose and field listing.
     let records_read = descriptor(&lean.descriptors, "records_read");
     assert_eq!(
         records_read["inputSchema"]["properties"]["operation"]["enum"],
-        json!(["search"])
+        json!(["get_record", "search"])
     );
     let schema = records_read["inputSchema"].to_string();
-    for hidden in ["\"get_record\"", "\"query_record\"", "get_dashboard:"] {
+    for hidden in ["\"query_record\"", "get_dashboard:"] {
         assert!(!schema.contains(hidden), "{hidden} leaked into {schema}");
+    }
+    assert!(schema.contains("\"get_record\""), "{schema}");
+    // The per-operation field listing names get_record's real fields and no
+    // field that only another operation uses.
+    let arguments = records_read["inputSchema"]["properties"]["arguments"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(arguments.contains("get_record:"), "{arguments}");
+    for field in ["ids", "as_of"] {
+        assert!(
+            arguments.contains(field),
+            "{field} missing from {arguments}"
+        );
+    }
+    for other in ["query_record:", "steps"] {
+        assert!(
+            !arguments.contains(other),
+            "{other} leaked into {arguments}"
+        );
     }
     assert!(records_read["description"]
         .as_str()
@@ -309,13 +328,13 @@ fn lean_catalogue_advertises_the_direct_set_and_keeps_every_callable_index() {
     );
     let description = call["description"].as_str().unwrap();
     assert!(description.contains(lean::LEAN_CATALOG_QUERY));
-    assert!(description.contains("operation:'get_record'"));
+    assert!(description.contains("operation:'get_history'"));
     for executor in full.operations_by_executor.keys() {
         if !direct.contains_key(executor) {
             assert!(description.contains(executor.as_str()), "{executor}");
         }
     }
-    assert!(description.contains("records_read (all but search)"));
+    assert!(description.contains("records_read (all but get_record, search)"));
 
     // Bytes and digest are recomputed over the served projection.
     assert_eq!(
@@ -679,7 +698,16 @@ async fn lean_refuses_direct_calls_to_operations_it_does_not_advertise() {
     let id = create_note(&full, 1, "Hidden read target").await;
 
     let read = json!({"operation":"get_record","format":"json","run_key":RUN_KEY,"arguments":{"ids":[id]}});
-    let refused = send(&lean, 2, "records_read", read.clone()).await;
+    // get_record is advertised directly: the lean read matches the full one.
+    let direct_read = send(&lean, 2, "records_read", read.clone()).await;
+    assert_eq!(direct_read["result"]["isError"], false, "{direct_read}");
+    let full_read = send(&full, 2, "records_read", read.clone()).await;
+    assert_eq!(observed(&direct_read), observed(&full_read));
+
+    // Another records_read operation stays routed: get_history is refused
+    // with the call_executor repair.
+    let history = json!({"operation":"get_history","format":"json","run_key":RUN_KEY,"arguments":{"record_id":id}});
+    let refused = send(&lean, 2, "records_read", history.clone()).await;
     assert_eq!(refused["result"]["isError"], true, "{refused}");
     let repair = &refused["result"]["structuredContent"]["repair"];
     assert_eq!(repair["code"], "call_executor_required");
@@ -691,7 +719,7 @@ async fn lean_refuses_direct_calls_to_operations_it_does_not_advertise() {
     assert_eq!(repair["next_call"]["tool"], "call_executor");
     assert_eq!(
         repair["next_call"]["arguments"],
-        routed("records_read", read.clone())
+        routed("records_read", history.clone())
     );
     let text = refused["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("not advertised directly"), "{text}");
@@ -704,7 +732,7 @@ async fn lean_refuses_direct_calls_to_operations_it_does_not_advertise() {
         repair["next_call"]["arguments"].clone(),
     )
     .await;
-    let direct = send(&full, 3, "records_read", read).await;
+    let direct = send(&full, 3, "records_read", history).await;
     assert_eq!(observed(&repaired), observed(&direct));
 
     // A hidden mutation is refused before admission, preparation or dispatch.
@@ -730,7 +758,7 @@ async fn lean_refuses_direct_calls_to_operations_it_does_not_advertise() {
     )
     .await;
     let text = unknown["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("select one of: search"), "{text}");
+    assert!(text.contains("select one of: get_record, search"), "{text}");
     assert!(text.contains("call_executor"), "{text}");
     // A direct call to a hidden executor's unknown operation says the same.
     let hidden = send(
@@ -867,7 +895,8 @@ async fn lean_discovery_keeps_every_contract_and_marks_direct_advertisement() {
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(hidden_pairs, expected_hidden);
-    assert!(hidden_pairs.contains(&("records_read".into(), "get_record".into())));
+    assert!(!hidden_pairs.contains(&("records_read".into(), "get_record".into())));
+    assert!(hidden_pairs.contains(&("records_read".into(), "get_history".into())));
 
     // A full server marks every row as advertised directly.
     let full_rows = send(
@@ -916,11 +945,11 @@ async fn lean_bootstrap_reports_the_projection_in_json_and_text() {
         .contains(&json!("records_delete")));
     assert_eq!(
         call["narrowed_executors"]["records_read"],
-        json!(["search"])
+        json!(["get_record", "search"])
     );
     assert_eq!(
         call["examples"][0],
-        json!({"executor":"records_read","operation":"get_record","arguments":{"ids":["<id or short reference>"]}})
+        json!({"executor":"records_read","operation":"get_history","arguments":{"record_id":"<id or short reference>"}})
     );
     let examples = call["examples"].as_array().unwrap();
     assert!(examples
@@ -976,7 +1005,7 @@ async fn lean_bootstrap_reports_the_projection_in_json_and_text() {
     );
     assert!(text.contains("records_delete"), "{text}");
     assert!(
-        text.contains("`records_read` is advertised for search only"),
+        text.contains("`records_read` is advertised for get_record and search only"),
         "{text}"
     );
     assert!(text.contains("Example `call_executor`:"), "{text}");
@@ -1116,7 +1145,7 @@ async fn early_lean_refusal_renders_the_dispatch_refusal_without_run_context() {
     let registry = registry();
     let catalogue = lean_catalogue(&registry, false);
     let full_catalogue = full_catalogue(&registry, false);
-    let envelope = json!({"operation":"records_read.get_record","arguments":{"ids":["x"]}});
+    let envelope = json!({"operation":"get_history","arguments":{"record_id":"x"}});
     let dispatched = send(&lean, 1, "records_read", envelope.clone()).await;
     let early = catalogue
         .lean_direct_refusal(json!(1), false, "records_read", Some(&envelope))
@@ -1129,7 +1158,7 @@ async fn early_lean_refusal_renders_the_dispatch_refusal_without_run_context() {
     );
     assert_eq!(
         early["result"]["structuredContent"]["repair"]["next_call"]["arguments"]["operation"],
-        "get_record"
+        "get_history"
     );
     assert_eq!(early["result"]["_meta"], dispatched["result"]["_meta"]);
     let early_text = early["result"]["content"][0]["text"].as_str().unwrap();
@@ -1151,6 +1180,10 @@ async fn early_lean_refusal_renders_the_dispatch_refusal_without_run_context() {
         (
             "records_read",
             json!({"operation":"search","arguments":{"query":"x"}}),
+        ),
+        (
+            "records_read",
+            json!({"operation":"get_record","arguments":{"ids":["x"]}}),
         ),
         ("records_read", json!({"operation":"no_such_operation"})),
         (

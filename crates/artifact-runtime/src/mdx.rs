@@ -1785,22 +1785,91 @@ fn validate_governed_sql_execution_receipt(
     receipt: &Value,
     relation: &Value,
 ) -> Result<(), Failure> {
-    let receipt = exact_input_object(
-        receipt,
-        &[
-            "version",
-            "observed_at",
-            "row_count",
-            "truncated",
-            "completeness",
-            "replayable",
-            "observation_window_hours",
-            "catalog_revision",
-            "relations",
-            "degraded_sources",
-        ],
-        "governed SQL execution receipt",
-    )?;
+    let pinned = receipt.get("version").and_then(Value::as_str)
+        == Some("native.governed-sql-port-receipt.v2");
+    let mut fields = vec![
+        "version",
+        "observed_at",
+        "row_count",
+        "truncated",
+        "completeness",
+        "replayable",
+        "observation_window_hours",
+        "catalog_revision",
+        "relations",
+        "degraded_sources",
+    ];
+    if pinned {
+        fields.extend(["view_provenance", "query_sha256"]);
+    }
+    let receipt = exact_input_object(receipt, &fields, "governed SQL execution receipt")?;
+    if pinned {
+        let digest = |v: &Value| {
+            v.as_str().is_some_and(|s| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        };
+        if !digest(&receipt["query_sha256"]) {
+            return Err(input_failure("pinned query digest is invalid"));
+        }
+        let provenance = exact_input_object(
+            &receipt["view_provenance"],
+            &["roots", "closure_digest"],
+            "view provenance",
+        )?;
+        if !digest(&provenance["closure_digest"]) {
+            return Err(input_failure("view closure digest is invalid"));
+        }
+        let roots = provenance["roots"]
+            .as_object()
+            .filter(|r| !r.is_empty() && r.len() <= 8)
+            .ok_or_else(|| input_failure("view root pins are invalid"))?;
+        for (name, pin) in roots {
+            if !(6..=128).contains(&name.len())
+                || !name.starts_with("view_")
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(input_failure("view root name is invalid"));
+            }
+            let pin = exact_input_object(
+                pin,
+                &[
+                    "view_id",
+                    "revision_id",
+                    "definition_sha256",
+                    "schema_sha256",
+                ],
+                "view root pin",
+            )?;
+            let view = pin["view_id"].as_str().filter(|id| {
+                id.starts_with("native.named-view:")
+                    && id.len() > 18
+                    && id.len() <= 160
+                    && !id.chars().any(char::is_control)
+            });
+            let revision = pin["revision_id"].as_str().filter(|id| {
+                id.len() == 36
+                    && id.bytes().enumerate().all(|(i, b)| {
+                        if [8, 13, 18, 23].contains(&i) {
+                            b == b'-'
+                        } else {
+                            b.is_ascii_digit() || (b'a'..=b'f').contains(&b)
+                        }
+                    })
+            });
+            if view.is_none()
+                || revision.is_none()
+                || !digest(&pin["definition_sha256"])
+                || !digest(&pin["schema_sha256"])
+            {
+                return Err(input_failure("view exact pin is invalid"));
+            }
+        }
+    }
     let observation_window_is_valid = match receipt.get("observation_window_hours") {
         Some(Value::Null) => true,
         Some(value) => value
@@ -1808,7 +1877,9 @@ fn validate_governed_sql_execution_receipt(
             .is_some_and(|value| value <= MAX_JSON_SAFE_INTEGER),
         None => false,
     };
-    if receipt.get("version").and_then(Value::as_str) != Some("native.governed-sql-port-receipt.v1")
+    if (!pinned
+        && receipt.get("version").and_then(Value::as_str)
+            != Some("native.governed-sql-port-receipt.v1"))
         || receipt
             .get("observed_at")
             .and_then(Value::as_str)
@@ -4296,6 +4367,19 @@ const Child=()=>globalThis.__nativeBridge.jsx("RecordTable",{records:child.input
             .expect("complete governed relations are accepted");
         validate_relation_envelope(&governed_relation_envelope(true, "truncated"))
             .expect("truncated governed relations are accepted");
+        let mut pinned = governed_relation_envelope(false, "best_effort");
+        pinned["source"]["execution_receipt"]["version"] =
+            json!("native.governed-sql-port-receipt.v2");
+        pinned["source"]["execution_receipt"]["query_sha256"] = json!("a".repeat(64));
+        pinned["source"]["execution_receipt"]["view_provenance"] = json!({"roots":{"view_notes":{"view_id":"native.named-view:bearer","revision_id":"11111111-1111-4111-8111-111111111111","definition_sha256":"b".repeat(64),"schema_sha256":"c".repeat(64)}},"closure_digest":"d".repeat(64)});
+        validate_relation_envelope(&pinned).expect("pinned v2 receipts retain exact provenance");
+        let mut wrong_version = pinned.clone();
+        wrong_version["source"]["execution_receipt"]["version"] =
+            json!("native.governed-sql-port-receipt.v1");
+        assert!(validate_relation_envelope(&wrong_version).is_err());
+        pinned["source"]["execution_receipt"]["view_provenance"]["roots"]["view_notes"]
+            ["revision_id"] = json!("latest");
+        assert!(validate_relation_envelope(&pinned).is_err());
         let mut leaked_boundary = governed_relation_envelope(false, "best_effort");
         leaked_boundary["source"]["execution_receipt"]["boundary"] =
             json!({ "content_event_seq": 42 });

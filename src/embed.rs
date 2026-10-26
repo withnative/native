@@ -111,7 +111,7 @@ pub fn text_change_for<'a>(event: &'a EventRow, payload: &Value) -> Option<TextC
         // Every record has a `name` column (the projector defaults a missing
         // one to ''), so creation always seeds the index.
         "record.created" => TextChangeKind::Created,
-        "record.updated" | "receipt.committed.v1" => {
+        "record.updated" | "receipt.committed.v1" | "message.revision.recorded.v1" => {
             let fields = payload.as_object()?;
             if !INDEXED_COLUMNS.iter().any(|col| fields.contains_key(*col)) {
                 return None;

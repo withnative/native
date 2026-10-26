@@ -16,6 +16,9 @@
 //! SQLite syntax), and bare GROUP BY columns are rejected with aggregate,
 //! FILTER, window and grouped-expression exemptions.
 
+mod named_view_rebind;
+pub(crate) use named_view_rebind::rebind_definition;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -108,6 +111,247 @@ pub fn top_level_unordered_limit(sql: &str) -> bool {
     }
 }
 
+/// A SELECT level whose LIMIT needs an explicit ordering. Ranges refer to the
+/// original text; lexer tokens keep literals, comments and quoted names opaque.
+pub(super) struct UnorderedLimitLevel {
+    pub range: std::ops::Range<usize>,
+    pub location: String,
+    pub column_count: Option<usize>,
+    pub describe_sql: Option<String>,
+}
+
+const MAX_REPAIR_RANGES: usize = 256;
+const MAX_REPAIR_LEVELS: usize = 32;
+
+pub(super) fn unordered_limit_levels(sql: &str) -> Option<Vec<UnorderedLimitLevel>> {
+    use turso_parser::{lexer::Lexer, token::TokenType};
+
+    if sql.len() > sql_contract::MAX_SQL_BYTES {
+        return None;
+    }
+    let mut range_count = 1;
+    let mut ranges: Vec<_> = std::iter::once(0..sql.len()).collect();
+    let mut stack = Vec::new();
+    let mut tails = HashMap::new();
+    let mut offset = 0;
+    for token in Lexer::new(sql.as_bytes()) {
+        let token = token.ok()?;
+        let end = offset + token.value.len();
+        match token.token_type {
+            TokenType::TK_LP => {
+                range_count += 1;
+                if range_count > MAX_REPAIR_RANGES {
+                    // Keep E2's root-only hint without discovering nested
+                    // repairs: parse once and use the enforcement walk.
+                    let root = parse_select_inner(sql).ok()?;
+                    return (root.limit.is_some()
+                        && root.order_by.is_empty()
+                        && checked_unordered_limit_count(&root).ok()? == 1)
+                        .then(|| vec![top_level_limit_repair(sql, &root)]);
+                }
+                stack.push(end);
+            }
+            TokenType::TK_RP => ranges.push(stack.pop()?..offset),
+            TokenType::TK_ORDER | TokenType::TK_LIMIT => {
+                tails
+                    .entry(stack.last().copied().unwrap_or(0))
+                    .or_insert(offset);
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|range| (range.start, std::cmp::Reverse(range.end)));
+    let levels = ranges
+        .into_iter()
+        .filter_map(|range| {
+            parse_select_inner(&sql[range.clone()])
+                .ok()
+                .map(|ast| (range, ast))
+        })
+        .collect::<Vec<_>>();
+    // Require the complete statement to parse, rather than suggesting repairs
+    // for SELECT-shaped fragments of an unsupported statement.
+    if levels.first()?.0 != (0..sql.len()) {
+        return None;
+    }
+    let root = &levels[0].1;
+    let checked_count = checked_unordered_limit_count(root).ok()?;
+    if checked_count > MAX_REPAIR_LEVELS {
+        return None;
+    }
+    if checked_count == 0 {
+        return Some(Vec::new());
+    }
+    // Preserve E2 even when ignored syntax contains SELECTs outside the
+    // expression walker (e.g. window frame bounds). No source matching is
+    // necessary when the enforcement walk proves only the root is flagged.
+    if checked_count == 1 && root.limit.is_some() && root.order_by.is_empty() {
+        return Some(vec![top_level_limit_repair(sql, root)]);
+    }
+    // Sorted ranges form a forest. Each index is pushed and popped once;
+    // direct child ordinals are counted once, including ordered CTE bodies.
+    let mut parents = Vec::with_capacity(levels.len());
+    let mut child_ordinals = Vec::with_capacity(levels.len());
+    let mut child_counts = vec![0; levels.len()];
+    let mut source_children = vec![Vec::new(); levels.len()];
+    let mut ancestors: Vec<usize> = Vec::new();
+    for (index, (range, _)) in levels.iter().enumerate() {
+        while ancestors
+            .last()
+            .is_some_and(|parent| levels[*parent].0.end <= range.start)
+        {
+            ancestors.pop();
+        }
+        let parent = ancestors.last().copied();
+        let ordinal = parent.map_or(0, |parent| {
+            let ordinal = child_counts[parent];
+            child_counts[parent] += 1;
+            source_children[parent].push(index);
+            ordinal
+        });
+        parents.push(parent);
+        child_ordinals.push(ordinal);
+        ancestors.push(index);
+    }
+    // Match direct AST children within their source parent. Include unchecked
+    // edges so identical SELECTs in projection and ON positions stay distinct.
+    // Structural matching also handles LIMIT offset,count's reversed AST fields.
+    let mut visits: Vec<Option<LimitLevelVisit<'_>>> =
+        std::iter::repeat_with(|| None).take(levels.len()).collect();
+    visits[0] = Some(LimitLevelVisit {
+        select: &levels[0].1,
+        checked: true,
+        alias: None,
+    });
+    for index in 0..levels.len() {
+        let parent = visits[index].as_ref()?;
+        let children = std::cell::RefCell::new(Vec::new());
+        visit_limit_children(parent.select, true, &|select, alias, checked| {
+            children.borrow_mut().push(Some(LimitLevelVisit {
+                select,
+                checked: parent.checked && checked,
+                alias,
+            }));
+            Ok(())
+        })
+        .ok()?;
+        let mut children = children.into_inner();
+        if children.len() != source_children[index].len() {
+            return None;
+        }
+        for &child_index in &source_children[index] {
+            let matched = children.iter().position(|child| {
+                child
+                    .as_ref()
+                    .is_some_and(|child| child.select == &levels[child_index].1)
+            })?;
+            visits[child_index] = children[matched].take();
+        }
+    }
+    let visits = visits.into_iter().collect::<Option<Vec<_>>>()?;
+    let mut repairs = Vec::new();
+    for (index, (range, select)) in levels.iter().enumerate() {
+        if !visits[index].checked || select.limit.is_none() || !select.order_by.is_empty() {
+            continue;
+        }
+        let location = match parents[index] {
+            None => "top level".to_owned(),
+            Some(parent_index) => {
+                let parent = &levels[parent_index].1;
+                // CTE bodies are the first direct SELECT children, in source
+                // order. Identical bodies still need separate named repairs.
+                let child_index = child_ordinals[index];
+                if let Some(cte) = parent
+                    .with
+                    .as_ref()
+                    .and_then(|with| with.ctes.get(child_index))
+                {
+                    format!("CTE {}", cte.tbl_name)
+                } else if !parent.body.compounds.is_empty()
+                    && range.start
+                        < *tails
+                            .get(&levels[parent_index].0.start)
+                            .unwrap_or(&levels[parent_index].0.end)
+                {
+                    "compound arm subquery".to_owned()
+                } else {
+                    "subquery".to_owned()
+                }
+            }
+        };
+        let location = if let Some(alias) = &visits[index].alias {
+            format!("{location} {alias}")
+        } else {
+            location
+        };
+        let column_count = limit_projection_width(select);
+        // Describe stars in their original CTE scope, including shadowing.
+        // Wrappers are prepare-only and never become executable SQL.
+        let describe_sql = if column_count.is_none() {
+            let mut text = sql[range.clone()].to_owned();
+            let mut ancestor = parents[index];
+            while let Some(parent) = ancestor {
+                if let Some(with) = &levels[parent].1.with {
+                    text = format!("{with} SELECT * FROM ({text})");
+                    if text.len() > sql_contract::MAX_SQL_BYTES {
+                        return None;
+                    }
+                }
+                ancestor = parents[parent];
+            }
+            Some(text)
+        } else {
+            None
+        };
+        repairs.push(UnorderedLimitLevel {
+            range: range.clone(),
+            location,
+            column_count,
+            describe_sql,
+        });
+    }
+    Some(repairs)
+}
+
+fn top_level_limit_repair(sql: &str, root: &Select) -> UnorderedLimitLevel {
+    let column_count = limit_projection_width(root);
+    UnorderedLimitLevel {
+        range: 0..sql.len(),
+        location: "top level".to_owned(),
+        column_count,
+        describe_sql: column_count.is_none().then(|| sql.to_owned()),
+    }
+}
+
+fn limit_projection_width(select: &Select) -> Option<usize> {
+    match &select.body.select {
+        OneSelect::Select { columns, .. }
+            if columns
+                .iter()
+                .all(|column| matches!(column, ResultColumn::Expr(..))) =>
+        {
+            Some(columns.len())
+        }
+        OneSelect::Values(rows) => rows.first().map(Vec::len),
+        _ => None,
+    }
+}
+
+fn checked_unordered_limit_count(select: &Select) -> crate::Result<usize> {
+    let count = std::cell::Cell::new(usize::from(
+        select.limit.is_some() && select.order_by.is_empty(),
+    ));
+    visit_limit_children(select, false, &|child, _, _| {
+        count.set(count.get() + checked_unordered_limit_count(child)?);
+        Ok(())
+    })?;
+    Ok(count.get())
+}
+
 /// Run every shared rule on one caller statement. A statement the parser
 /// cannot handle is admitted for the engine to decide (fail-open); the
 /// deferral is counted and warned (bounded kind + length only, never the
@@ -137,28 +381,43 @@ pub fn check_limit_order(select: &Select) -> crate::Result<()> {
             "LIMIT without ORDER BY: add ORDER BY over a unique key",
         ));
     }
+    visit_limit_children(select, false, &|child, _, _| check_limit_order(child))
+}
+
+/// The enforcement walk and repair discovery share these edges. Discovery also
+/// visits unchecked edges to match source ranges unambiguously, but marks their
+/// entire subtrees unchecked. Enforcement never traverses those edges.
+fn visit_limit_children<'a>(
+    select: &'a Select,
+    include_unchecked: bool,
+    visit: &dyn Fn(&'a Select, Option<String>, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
     if let Some(with) = &select.with {
         for cte in &with.ctes {
-            check_limit_order(&cte.select)?;
+            visit(&cte.select, None, true)?;
         }
     }
-    check_one_limit(&select.body.select)?;
+    visit_one_limit(&select.body.select, include_unchecked, visit)?;
     for compound in &select.body.compounds {
-        check_one_limit(&compound.select)?;
+        visit_one_limit(&compound.select, include_unchecked, visit)?;
     }
     for sorted in &select.order_by {
-        check_expr_selects(&sorted.expr, &check_limit_order)?;
+        check_expr_selects(&sorted.expr, &|child| visit(child, None, true))?;
     }
     if let Some(limit) = &select.limit {
-        check_expr_selects(&limit.expr, &check_limit_order)?;
+        check_expr_selects(&limit.expr, &|child| visit(child, None, true))?;
         if let Some(offset) = &limit.offset {
-            check_expr_selects(offset, &check_limit_order)?;
+            check_expr_selects(offset, &|child| visit(child, None, true))?;
         }
     }
     Ok(())
 }
 
-fn check_one_limit(one: &OneSelect) -> crate::Result<()> {
+fn visit_one_limit<'a>(
+    one: &'a OneSelect,
+    include_unchecked: bool,
+    visit: &dyn Fn(&'a Select, Option<String>, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
     if let OneSelect::Select {
         columns,
         from,
@@ -170,46 +429,84 @@ fn check_one_limit(one: &OneSelect) -> crate::Result<()> {
     {
         for column in columns {
             if let ResultColumn::Expr(expr, _) = column {
-                check_expr_selects(expr, &check_limit_order)?;
+                check_expr_selects(expr, &|child| visit(child, None, true))?;
             }
         }
         if let Some(from) = from {
-            check_from_limit(&from.select)?;
-            for join in &from.joins {
-                check_from_limit(&join.table)?;
+            visit_from_clause_limit(from, include_unchecked, visit)?;
+        }
+        if let Some(expr) = where_clause {
+            check_expr_selects(expr, &|child| visit(child, None, true))?;
+        }
+        if let Some(group) = group_by {
+            if include_unchecked {
+                for expr in &group.exprs {
+                    check_expr_selects(expr, &|child| visit(child, None, false))?;
+                }
+            }
+            if let Some(expr) = &group.having {
+                check_expr_selects(expr, &|child| visit(child, None, true))?;
             }
         }
-        if let Some(where_clause) = where_clause {
-            check_expr_selects(where_clause, &check_limit_order)?;
-        }
-        if let Some(having) = group_by.as_ref().and_then(|group| group.having.as_ref()) {
-            check_expr_selects(having, &check_limit_order)?;
-        }
         for definition in window_clause {
-            check_window_selects(&definition.window, &check_limit_order)?;
+            check_window_selects(&definition.window, &|child| visit(child, None, true))?;
         }
     } else if let OneSelect::Values(rows) = one {
         for row in rows {
             for expr in row {
-                check_expr_selects(expr, &check_limit_order)?;
+                check_expr_selects(expr, &|child| visit(child, None, true))?;
             }
         }
     }
     Ok(())
 }
 
-fn check_from_limit(table: &SelectTable) -> crate::Result<()> {
+fn visit_from_clause_limit<'a>(
+    from: &'a FromClause,
+    include_unchecked: bool,
+    visit: &dyn Fn(&'a Select, Option<String>, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
+    visit_from_limit(&from.select, include_unchecked, visit)?;
+    for join in &from.joins {
+        visit_from_limit(&join.table, include_unchecked, visit)?;
+        if include_unchecked {
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                check_expr_selects(expr, &|child| visit(child, None, false))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn visit_from_limit<'a>(
+    table: &'a SelectTable,
+    include_unchecked: bool,
+    visit: &dyn Fn(&'a Select, Option<String>, bool) -> crate::Result<()>,
+) -> crate::Result<()> {
     match table {
-        SelectTable::Select(select, _) => check_limit_order(select),
-        SelectTable::Sub(from, _) => {
-            check_from_limit(&from.select)?;
-            for join in &from.joins {
-                check_from_limit(&join.table)?;
+        SelectTable::Select(select, alias) => {
+            let alias = if include_unchecked {
+                alias.as_ref().map(|alias| alias.name().to_string())
+            } else {
+                None
+            };
+            visit(select, alias, true)
+        }
+        SelectTable::Sub(from, _) => visit_from_clause_limit(from, include_unchecked, visit),
+        SelectTable::TableCall(_, args, _) if include_unchecked => {
+            for expr in args {
+                check_expr_selects(expr, &|child| visit(child, None, false))?;
             }
             Ok(())
         }
         SelectTable::Table(..) | SelectTable::TableCall(..) => Ok(()),
     }
+}
+
+struct LimitLevelVisit<'a> {
+    select: &'a Select,
+    checked: bool,
+    alias: Option<String>,
 }
 
 /// Rule-input shape gate (task 81c1d95, pure slice): the conservative subset
@@ -355,9 +652,9 @@ fn check_rule_table(table: &SelectTable) -> crate::Result<()> {
 /// Run `check` on every SELECT nested in an expression. The match is
 /// exhaustive over expression shapes holding children, so no nesting level
 /// escapes the caller (LIMIT and GROUP BY both build on this).
-pub fn check_expr_selects(
-    expr: &Expr,
-    check: &dyn Fn(&Select) -> crate::Result<()>,
+pub fn check_expr_selects<'a>(
+    expr: &'a Expr,
+    check: &dyn Fn(&'a Select) -> crate::Result<()>,
 ) -> crate::Result<()> {
     match expr {
         Expr::Exists(select) | Expr::Subquery(select) => check(select),
@@ -473,9 +770,9 @@ pub fn check_expr_selects(
     }
 }
 
-fn check_tail_selects(
-    tail: &FunctionTail,
-    check: &dyn Fn(&Select) -> crate::Result<()>,
+fn check_tail_selects<'a>(
+    tail: &'a FunctionTail,
+    check: &dyn Fn(&'a Select) -> crate::Result<()>,
 ) -> crate::Result<()> {
     if let Some(filter) = &tail.filter_clause {
         check_expr_selects(filter, check)?;
@@ -486,9 +783,9 @@ fn check_tail_selects(
     Ok(())
 }
 
-fn check_window_selects(
-    window: &Window,
-    check: &dyn Fn(&Select) -> crate::Result<()>,
+fn check_window_selects<'a>(
+    window: &'a Window,
+    check: &dyn Fn(&'a Select) -> crate::Result<()>,
 ) -> crate::Result<()> {
     for partition in &window.partition_by {
         check_expr_selects(partition, check)?;
@@ -1734,6 +2031,113 @@ fn check_outer_refs(
     }
 }
 
+/// Inspect unresolved hosted-v2 table references, preserving lexical CTE scope.
+/// Routing only: SQLite's two authorizers remain authoritative.
+pub(crate) fn named_view_references(
+    sql: &str,
+) -> crate::Result<std::collections::BTreeSet<String>> {
+    let select =
+        parse_select_inner(sql).map_err(|_| reject("named view SQL must parse as one SELECT"))?;
+    let names = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    visit_named_view_tables(
+        &select,
+        &|name| {
+            names
+                .borrow_mut()
+                .insert(name.name.as_str().to_ascii_lowercase());
+            Ok(())
+        },
+        false,
+        &std::collections::BTreeSet::new(),
+    )?;
+    Ok(names.into_inner())
+}
+
+/// Definitions cannot qualify schemas or shadow the logical/named namespace.
+pub(crate) fn validate_named_view_shape(sql: &str) -> crate::Result<()> {
+    let select =
+        parse_select_inner(sql).map_err(|_| reject("named view SQL must parse as one SELECT"))?;
+    visit_named_view_tables(
+        &select,
+        &|name| {
+            if name.db_name.is_some() {
+                return Err(reject(
+                    "named view definitions cannot qualify relation schemas",
+                ));
+            }
+            Ok(())
+        },
+        true,
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+fn visit_named_view_tables(
+    select: &Select,
+    visit: &dyn Fn(&turso_parser::ast::QualifiedName) -> crate::Result<()>,
+    definition: bool,
+    inherited: &std::collections::BTreeSet<String>,
+) -> crate::Result<()> {
+    fn table(
+        table: &SelectTable,
+        visit: &dyn Fn(&turso_parser::ast::QualifiedName) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        match table {
+            SelectTable::Table(name, ..) | SelectTable::TableCall(name, ..) => visit(name),
+            SelectTable::Sub(from, _) => from_clause(from, visit),
+            SelectTable::Select(..) => Ok(()), // visited by visit_limit_children
+        }
+    }
+    fn from_clause(
+        from: &FromClause,
+        visit: &dyn Fn(&turso_parser::ast::QualifiedName) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        table(&from.select, visit)?;
+        for join in &from.joins {
+            table(&join.table, visit)?;
+        }
+        Ok(())
+    }
+    let mut scope = inherited.clone();
+    if let Some(with) = &select.with {
+        for cte in &with.ctes {
+            let name = cte.tbl_name.as_str().to_ascii_lowercase();
+            if name.starts_with("_native_view_")
+                || (definition
+                    && (sql_contract::is_logical_relation(&name) || name.starts_with("view_")))
+            {
+                return Err(reject(
+                    "named view definitions cannot shadow logical or named relations",
+                ));
+            }
+            scope.insert(name);
+        }
+    }
+    let visible_reference = |name: &turso_parser::ast::QualifiedName| {
+        if definition
+            || name.db_name.is_some()
+            || !scope.contains(&name.name.as_str().to_ascii_lowercase())
+        {
+            visit(name)
+        } else {
+            Ok(())
+        }
+    };
+    for one in
+        std::iter::once(&select.body.select).chain(select.body.compounds.iter().map(|c| &c.select))
+    {
+        if let OneSelect::Select {
+            from: Some(from), ..
+        } = one
+        {
+            from_clause(from, &visible_reference)?;
+        }
+    }
+    visit_limit_children(select, true, &|child, _, _| {
+        visit_named_view_tables(child, visit, definition, &scope)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1748,6 +2152,60 @@ mod tests {
 
     fn rule_rejected(sql: &str) -> bool {
         check_rule_statement(sql).is_err()
+    }
+
+    #[test]
+    fn unordered_limit_repair_matches_enforcement_edges_including_identical_selects() {
+        for sql in [
+            "SELECT r.id FROM records r JOIN links l ON l.id = (SELECT id FROM links LIMIT 1) LIMIT 5",
+            "SELECT count(*) FROM records GROUP BY (SELECT id FROM links LIMIT 1) LIMIT 5",
+            "SELECT value FROM json_each((SELECT id FROM links LIMIT 1)) LIMIT 5",
+            "SELECT sum(1) OVER (ROWS (SELECT 1 LIMIT 1) PRECEDING) FROM records LIMIT 5",
+        ] {
+            let levels = unordered_limit_levels(sql).unwrap();
+            assert_eq!(levels.len(), 1, "{sql}");
+            assert_eq!(levels[0].location, "top level", "{sql}");
+        }
+        let sql = "SELECT (SELECT id FROM links LIMIT 1) FROM records r JOIN links l ON l.id = (SELECT id FROM links LIMIT 1) LIMIT 5";
+        let levels = unordered_limit_levels(sql).unwrap();
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[1].range.start, sql.find("SELECT id").unwrap());
+        for sql in [
+            "SELECT (SELECT 1 LIMIT 1) FROM records GROUP BY (SELECT 2 LIMIT 1) LIMIT 5",
+            "SELECT (SELECT 1 LIMIT 1) FROM json_each((SELECT 2 LIMIT 1)) LIMIT 5",
+        ] {
+            let levels = unordered_limit_levels(sql).unwrap();
+            assert_eq!(levels.len(), 2, "{sql}");
+            assert_eq!(levels[1].range.start, sql.find("SELECT 1").unwrap());
+        }
+        // An unchecked edge also excludes descendants which would be checked
+        // if the rule ever entered that SELECT.
+        let sql = "SELECT (SELECT 2 LIMIT 1), r.id FROM records r JOIN links l ON l.id = (SELECT (SELECT id FROM links LIMIT 1) LIMIT 1) LIMIT 5";
+        assert_eq!(unordered_limit_levels(sql).unwrap().len(), 2);
+        let sql = "SELECT id FROM records LIMIT (SELECT 1 LIMIT 1), (SELECT 2 LIMIT 1)";
+        assert_eq!(unordered_limit_levels(sql).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn unordered_limit_repair_describes_only_star_levels() {
+        let sql = format!(
+            "SELECT {}",
+            vec!["(SELECT 1 LIMIT 1)"; MAX_REPAIR_LEVELS].join(",")
+        );
+        assert_eq!(
+            unordered_limit_levels(&sql).unwrap().len(),
+            MAX_REPAIR_LEVELS
+        );
+        let explicit = unordered_limit_levels(
+            "WITH c AS (SELECT id FROM records) SELECT * FROM (SELECT id FROM c LIMIT 1) s",
+        )
+        .unwrap();
+        assert!(explicit.iter().all(|level| level.describe_sql.is_none()));
+        let stars = unordered_limit_levels(
+            "WITH c AS (SELECT id FROM records) SELECT * FROM (SELECT * FROM c LIMIT 1) s",
+        )
+        .unwrap();
+        assert!(stars[0].describe_sql.as_ref().unwrap().starts_with("WITH"));
     }
 
     #[test]

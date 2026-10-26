@@ -36,7 +36,7 @@ pub(crate) use alpha_tab_provenance::complete_update_in as complete_alpha_tab_up
 
 pub const CONTROL_EVENT_SCHEMA_VERSION: i64 = 1;
 
-pub const CONTROL_EVENT_TYPES: [&str; 35] = [
+pub const CONTROL_EVENT_TYPES: [&str; 41] = [
     "agent_run.started.v1",
     "agent_run.started.v2",
     "agent_run.closed.v1",
@@ -72,6 +72,12 @@ pub const CONTROL_EVENT_TYPES: [&str; 35] = [
     "alpha_tab.removed",
     "alpha_tab.order_set",
     "alpha_tab.adopted.v2",
+    "notification_preference.set",
+    "hcp.entry.versioned.v1",
+    "hcp.entry.status_set.v1",
+    "hcp.entry.suggestion.v1",
+    "hcp.entry.confirmed.v1",
+    "hcp.read.v1",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -632,6 +638,162 @@ pub const ALPHA_TAB_ORDER_MAX_ENTRIES: usize = 64;
 /// headroom for future built-in ids.
 pub const ALPHA_TAB_ORDER_MAX_ENTRY_CHARS: usize = 160;
 
+/// Per-person notification preference: which message arrivals may notify the
+/// account. The event carries the complete setting, so the latest event for an
+/// account stands and no projection table is needed; readers take the newest
+/// event of the account's aggregate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationPreferencePayload {
+    pub account_id: String,
+    pub arrival: String,
+}
+
+/// The closed vocabulary of [`NotificationPreferencePayload::arrival`].
+pub const NOTIFICATION_ARRIVAL_VALUES: [&str; 3] = ["all", "dms_and_mentions", "off"];
+
+/// Canonical identity of one account's notification preference.
+pub fn notification_preference_aggregate_id(account_id: &str) -> String {
+    encode_aggregate_parts(&[account_id])
+}
+
+/// The HCP v2 client behind an event (HCP v2 §3.2.3): its OAuth client id and
+/// the operator Native knows for it, as they stood when the event was recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpClientPayload {
+    pub id: String,
+    pub name: String,
+    pub operator_id: String,
+    pub operator_name: String,
+}
+
+/// One version of an HCP v2 entry, in full. The trusted state of a person's
+/// entries is the ordered fold of their `hcp_state` events, never the private
+/// record that views them. Appended only by the HCP v2 handler (see
+/// [`NewControlEvent::hcp_state`]); `entry` is bounded by
+/// [`HCP_ENTRY_MAX_ENCODED_BYTES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpEntryVersionedPayload {
+    pub account_id: String,
+    /// `urn:uuid:<id>`, the entry's identifier across its versions.
+    pub entry_id: String,
+    pub version: u64,
+    /// One of [`HCP_VERSION_CAUSES`].
+    pub cause: String,
+    /// The category before this version, when the version moved the entry.
+    #[serde(default)]
+    pub prior_category: Option<String>,
+    pub client: HcpClientPayload,
+    /// The reason the client gave, for an update.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The whole grouped-form entry at this version.
+    pub entry: Value,
+    /// SHA-256 (hex) of the view record body projected for this event.
+    pub view_digest: String,
+}
+
+/// A change of an entry's status within one version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpEntryStatusSetPayload {
+    pub account_id: String,
+    pub entry_id: String,
+    /// The version whose status changes: always the entry's current one.
+    pub version: u64,
+    pub from: String,
+    pub to: String,
+    /// One of [`HCP_STATUS_CAUSES`].
+    pub cause: String,
+    #[serde(default)]
+    pub related_entry_id: Option<String>,
+    pub client: HcpClientPayload,
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// SHA-256 (hex) of the view record body projected for this event.
+    #[serde(default)]
+    pub view_digest: Option<String>,
+}
+
+/// Immutable mapping from a provider-created ordinary suggestion to one version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpEntrySuggestionPayload {
+    pub account_id: String,
+    pub entry_id: String,
+    pub version: u64,
+    pub client: HcpClientPayload,
+    pub suggestion_id: String,
+    pub created_event_id: String,
+    pub body_digest: String,
+}
+
+/// A locally verified management action; status consequences share its act/transaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpEntryConfirmedPayload {
+    pub account_id: String,
+    pub entry_id: String,
+    pub version: u64,
+    pub client: HcpClientPayload,
+    pub disposition: String,
+    pub suggestion_id: String,
+    pub resolution_event_id: String,
+    pub attestation_id: String,
+    pub interaction_receipt_id: String,
+    pub confirmed_at: String,
+}
+
+/// An authorized retrieval and its disclosure ledger, committed before returning
+/// content. This is reserved by the same seal as entry events, on a separate
+/// account-derived aggregate. No record or facet can establish disclosure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HcpReadPayload {
+    pub account_id: String,
+    pub kind: String,
+    pub client: HcpClientPayload,
+    pub purpose: String,
+    pub retrieval_id: String,
+    pub categories: Vec<String>,
+    pub entry_ids: Vec<String>,
+}
+
+pub const HCP_AUDIT_AGGREGATE_KIND: &str = "hcp_audit";
+pub fn hcp_audit_aggregate_id(account_id: &str) -> String {
+    encode_aggregate_parts(&[account_id])
+}
+
+/// Aggregate kind of a person's HCP v2 trusted state.
+pub const HCP_STATE_AGGREGATE_KIND: &str = "hcp_state";
+/// Most bytes one entry may take in an event payload, measured as the entry's
+/// JSON text encoded again as a JSON string.
+pub const HCP_ENTRY_MAX_ENCODED_BYTES: usize = 64 * 1024;
+pub const HCP_VERSION_CAUSES: [&str; 3] = ["add", "update", "native-edit"];
+pub const HCP_STATUS_CAUSES: [&str; 6] = [
+    "conflict",
+    "release",
+    "rejected",
+    "confirmed",
+    "client_delete",
+    "deprecated",
+];
+pub const HCP_STATUSES: [&str; 4] = ["active", "deprecated", "conflicted", "deleted"];
+
+/// Canonical identity of one person's HCP v2 state, derived from their account
+/// alone: nothing a record, a share or a transfer says can name it.
+pub fn hcp_state_aggregate_id(account_id: &str) -> String {
+    encode_aggregate_parts(&[account_id])
+}
+
+/// Whether a serialized entry is within [`HCP_ENTRY_MAX_ENCODED_BYTES`].
+pub fn hcp_entry_fits(entry_json: &str) -> bool {
+    serde_json::to_string(entry_json)
+        .is_ok_and(|encoded| encoded.len() <= HCP_ENTRY_MAX_ENCODED_BYTES)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlEventPayload {
     AgentRunStarted(AgentRunStartedPayload),
@@ -669,9 +831,28 @@ pub enum ControlEventPayload {
     AlphaTabAdopted(AlphaTabAdoptPayload),
     AlphaTabAdoptedV2(AlphaTabAdoptV2Payload),
     AlphaTabOrderSet(AlphaTabOrderPayload),
+    NotificationPreferenceSet(NotificationPreferencePayload),
+    HcpEntryVersioned(HcpEntryVersionedPayload),
+    HcpEntryStatusSet(HcpEntryStatusSetPayload),
+    HcpRead(HcpReadPayload),
+    HcpEntrySuggestion(HcpEntrySuggestionPayload),
+    HcpEntryConfirmed(HcpEntryConfirmedPayload),
 }
 
 impl ControlEventPayload {
+    /// Reserved for the HCP v2 handler: only [`NewControlEvent::hcp_state`]
+    /// may carry one.
+    fn is_hcp_reserved(&self) -> bool {
+        matches!(
+            self,
+            Self::HcpEntryVersioned(_)
+                | Self::HcpEntryStatusSet(_)
+                | Self::HcpRead(_)
+                | Self::HcpEntrySuggestion(_)
+                | Self::HcpEntryConfirmed(_)
+        )
+    }
+
     pub fn event_type(&self) -> &'static str {
         match self {
             Self::AgentRunStarted(_) => "agent_run.started.v2",
@@ -709,6 +890,12 @@ impl ControlEventPayload {
             Self::AlphaTabAdopted(_) => "alpha_tab.adopted",
             Self::AlphaTabAdoptedV2(_) => "alpha_tab.adopted.v2",
             Self::AlphaTabOrderSet(_) => "alpha_tab.order_set",
+            Self::NotificationPreferenceSet(_) => "notification_preference.set",
+            Self::HcpEntryVersioned(_) => "hcp.entry.versioned.v1",
+            Self::HcpEntryStatusSet(_) => "hcp.entry.status_set.v1",
+            Self::HcpRead(_) => "hcp.read.v1",
+            Self::HcpEntrySuggestion(_) => "hcp.entry.suggestion.v1",
+            Self::HcpEntryConfirmed(_) => "hcp.entry.confirmed.v1",
         }
     }
 
@@ -748,10 +935,16 @@ impl ControlEventPayload {
             | Self::AlphaTabAdopted(_)
             | Self::AlphaTabAdoptedV2(_)
             | Self::AlphaTabOrderSet(_) => "alpha_tab",
+            Self::NotificationPreferenceSet(_) => "notification_preference",
+            Self::HcpEntryVersioned(_)
+            | Self::HcpEntryStatusSet(_)
+            | Self::HcpEntrySuggestion(_)
+            | Self::HcpEntryConfirmed(_) => HCP_STATE_AGGREGATE_KIND,
+            Self::HcpRead(_) => HCP_AUDIT_AGGREGATE_KIND,
         }
     }
 
-    fn to_json(&self) -> Result<String> {
+    pub(crate) fn to_json(&self) -> Result<String> {
         Ok(match self {
             Self::AgentRunStarted(value) => serde_json::to_string(value)?,
             Self::AgentRunClosed(value) => serde_json::to_string(value)?,
@@ -798,6 +991,12 @@ impl ControlEventPayload {
             Self::AlphaTabAdopted(value) => serde_json::to_string(value)?,
             Self::AlphaTabAdoptedV2(value) => serde_json::to_string(value)?,
             Self::AlphaTabOrderSet(value) => serde_json::to_string(value)?,
+            Self::NotificationPreferenceSet(value) => serde_json::to_string(value)?,
+            Self::HcpEntryVersioned(value) => serde_json::to_string(value)?,
+            Self::HcpEntryStatusSet(value) => serde_json::to_string(value)?,
+            Self::HcpRead(value) => serde_json::to_string(value)?,
+            Self::HcpEntrySuggestion(value) => serde_json::to_string(value)?,
+            Self::HcpEntryConfirmed(value) => serde_json::to_string(value)?,
         })
     }
 }
@@ -852,6 +1051,9 @@ pub(crate) struct NewControlEvent {
     pub(crate) run_key: Option<String>,
     pub(crate) reason: String,
     pub(crate) payload: ControlEventPayload,
+    /// Set only by [`NewControlEvent::hcp_state`]. The field is private to this
+    /// module, so no other code can build a `NewControlEvent` by literal.
+    hcp_sealed: bool,
 }
 
 impl NewControlEvent {
@@ -869,6 +1071,9 @@ impl NewControlEvent {
                 "authored control events cannot claim an engine actor",
             ));
         }
+        if payload.is_hcp_reserved() {
+            return Err(Error::engine(HCP_RESERVED));
+        }
         if matches!(
             &payload,
             ControlEventPayload::OnboardingProgrammeCreated(value)
@@ -885,6 +1090,40 @@ impl NewControlEvent {
             run_key,
             reason: reason.into(),
             payload,
+            hcp_sealed: false,
+        })
+    }
+
+    /// An HCP v2 state or read-audit event. `hcp.*` events are reserved: this is the
+    /// only constructor that accepts one, and it needs the seal that only the
+    /// HCP v2 module can mint, so no generic tool or other module can write
+    /// into a person's trusted state. The actor is the authenticated account.
+    pub(crate) fn hcp_state(
+        _seal: &crate::mcp::tools::hcp_v2::HcpWriteSeal,
+        idempotency_key: impl Into<String>,
+        run_key: Option<String>,
+        reason: impl Into<String>,
+        payload: ControlEventPayload,
+    ) -> Result<Self> {
+        let account = match &payload {
+            ControlEventPayload::HcpEntryVersioned(value) => value.account_id.clone(),
+            ControlEventPayload::HcpEntryStatusSet(value) => value.account_id.clone(),
+            ControlEventPayload::HcpRead(value) => value.account_id.clone(),
+            ControlEventPayload::HcpEntrySuggestion(value) => value.account_id.clone(),
+            ControlEventPayload::HcpEntryConfirmed(value) => value.account_id.clone(),
+            _ => return Err(Error::engine("only hcp.* events use the HCP constructor")),
+        };
+        Ok(Self {
+            idempotency_key: idempotency_key.into(),
+            aggregate_id: match &payload {
+                ControlEventPayload::HcpRead(_) => hcp_audit_aggregate_id(&account),
+                _ => hcp_state_aggregate_id(&account),
+            },
+            actor: account,
+            run_key,
+            reason: reason.into(),
+            payload,
+            hcp_sealed: true,
         })
     }
 
@@ -905,6 +1144,9 @@ impl NewControlEvent {
                 "engine provisioning cannot introduce a legacy rollout cutoff",
             ));
         }
+        if payload.is_hcp_reserved() {
+            return Err(Error::engine(HCP_RESERVED));
+        }
         Ok(Self {
             idempotency_key: idempotency_key.into(),
             aggregate_id: aggregate_id.into(),
@@ -912,9 +1154,12 @@ impl NewControlEvent {
             run_key: None,
             reason: reason.into(),
             payload,
+            hcp_sealed: false,
         })
     }
 }
+
+const HCP_RESERVED: &str = "hcp.* control events are reserved for the HCP v2 handler";
 
 fn nonblank(label: &str, value: &str) -> Result<()> {
     if value.trim().is_empty() {
@@ -1127,6 +1372,12 @@ fn expected_aggregate_kind(event_type: &str) -> Option<&'static str> {
         value if value.starts_with("onboarding_programme.") => Some("onboarding_programme"),
         value if value.starts_with("member_obligation.") => Some("member_obligation"),
         "seeded_instruction_source.applied" => Some("seeded_instruction_source"),
+        "notification_preference.set" => Some("notification_preference"),
+        "hcp.entry.versioned.v1"
+        | "hcp.entry.status_set.v1"
+        | "hcp.entry.suggestion.v1"
+        | "hcp.entry.confirmed.v1" => Some(HCP_STATE_AGGREGATE_KIND),
+        "hcp.read.v1" => Some(HCP_AUDIT_AGGREGATE_KIND),
         _ => None,
     }
 }
@@ -1153,6 +1404,73 @@ fn validate_obligation_aggregate(
     if event.aggregate_id != member_obligation_aggregate_id(account_id, programme_id, generation) {
         return Err(Error::engine(
             "member obligation aggregate id does not match its canonical payload identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Checks common to entry HCP v2 events: the event is the person's own (the
+/// aggregate and the actor are the payload's account) and names a client and an
+/// entry.
+fn validate_hcp_event(
+    event: &ControlEventRow,
+    account_id: &str,
+    entry_id: &str,
+    version: u64,
+    client: &HcpClientPayload,
+) -> Result<()> {
+    validate_hcp_identity(event, account_id, client)?;
+    if !entry_id.starts_with("urn:uuid:") || uuid::Uuid::parse_str(&entry_id[9..]).is_err() {
+        return Err(Error::engine("hcp entry_id must be a urn:uuid: identifier"));
+    }
+    if version < 1 {
+        return Err(Error::engine("hcp entry version must be positive"));
+    }
+    Ok(())
+}
+
+fn validate_hcp_identity(
+    event: &ControlEventRow,
+    account_id: &str,
+    client: &HcpClientPayload,
+) -> Result<()> {
+    nonblank("hcp account_id", account_id)?;
+    for (label, value) in [
+        ("hcp client id", client.id.as_str()),
+        ("hcp client name", client.name.as_str()),
+        ("hcp client operator id", client.operator_id.as_str()),
+        ("hcp client operator name", client.operator_name.as_str()),
+    ] {
+        nonblank(label, value)?;
+    }
+    let aggregate = if event.event_type == "hcp.read.v1" {
+        hcp_audit_aggregate_id(account_id)
+    } else {
+        hcp_state_aggregate_id(account_id)
+    };
+    if event.aggregate_id != aggregate {
+        return Err(Error::engine(
+            "hcp aggregate id does not match its canonical payload identity",
+        ));
+    }
+    if event.actor != account_id {
+        return Err(Error::engine("hcp event actor must be its account"));
+    }
+    Ok(())
+}
+
+fn validate_hcp_entry(entry: &Value, entry_id: &str, version: u64) -> Result<()> {
+    if !entry.is_object()
+        || entry["id"].as_str() != Some(entry_id)
+        || entry["record"]["version"].as_u64() != Some(version)
+    {
+        return Err(Error::engine(
+            "hcp entry must be an object naming the event's entry and version",
+        ));
+    }
+    if !hcp_entry_fits(&entry.to_string()) {
+        return Err(Error::engine(
+            "hcp entry is larger than its encoded size bound",
         ));
     }
     Ok(())
@@ -1566,6 +1884,9 @@ fn validate_account_config(
 }
 
 pub fn validate_control_event(event: &ControlEventRow) -> Result<()> {
+    if event.event_type.starts_with("hcp.") {
+        return Err(Error::engine(HCP_RESERVED));
+    }
     if event.event_type == "alpha_tab.import_reset" {
         return Err(Error::engine(
             "alpha tab import reset is reserved for canonical import",
@@ -1954,6 +2275,112 @@ pub(crate) fn validate_stored_control_event(event: &ControlEventRow) -> Result<(
         "alpha_tab.order_set" => {
             let value: AlphaTabOrderPayload = decode(event)?;
             validate_alpha_tab_order(event, &value)?;
+        }
+        "notification_preference.set" => {
+            let value: NotificationPreferencePayload = decode(event)?;
+            nonblank("notification preference account_id", &value.account_id)?;
+            if !NOTIFICATION_ARRIVAL_VALUES.contains(&value.arrival.as_str()) {
+                return Err(Error::engine(
+                    "notification preference arrival must be all, dms_and_mentions, or off",
+                ));
+            }
+            if event.aggregate_id != notification_preference_aggregate_id(&value.account_id) {
+                return Err(Error::engine(
+                    "notification preference aggregate id does not match its canonical payload identity",
+                ));
+            }
+        }
+        "hcp.entry.suggestion.v1" => {
+            let p: HcpEntrySuggestionPayload = decode(event)?;
+            validate_hcp_event(event, &p.account_id, &p.entry_id, p.version, &p.client)?;
+            for id in [&p.suggestion_id, &p.created_event_id] {
+                uuid::Uuid::parse_str(id)
+                    .map_err(|_| Error::engine("invalid HCP suggestion identity"))?;
+            }
+            valid_sha256_hex("hcp suggestion body_digest", &p.body_digest)?;
+        }
+        "hcp.entry.confirmed.v1" => {
+            let p: HcpEntryConfirmedPayload = decode(event)?;
+            validate_hcp_event(event, &p.account_id, &p.entry_id, p.version, &p.client)?;
+            if !matches!(p.disposition.as_str(), "confirmed" | "rejected") {
+                return Err(Error::engine("invalid HCP confirmation disposition"));
+            }
+            for id in [
+                &p.suggestion_id,
+                &p.resolution_event_id,
+                &p.attestation_id,
+                &p.interaction_receipt_id,
+            ] {
+                uuid::Uuid::parse_str(id)
+                    .map_err(|_| Error::engine("invalid HCP confirmation identity"))?;
+            }
+            chrono::DateTime::parse_from_rfc3339(&p.confirmed_at)
+                .map_err(|_| Error::engine("invalid HCP confirmation time"))?;
+        }
+        "hcp.read.v1" => {
+            let value: HcpReadPayload = decode(event)?;
+            validate_hcp_identity(event, &value.account_id, &value.client)?;
+            if !matches!(value.kind.as_str(), "search" | "get")
+                || value.purpose.trim().is_empty()
+                || value.purpose.len() > 4096
+                || value.categories.is_empty()
+                || value.categories.len() > 64
+                || value
+                    .categories
+                    .iter()
+                    .any(|c| c.trim().is_empty() || c.len() > 4096)
+                || value.entry_ids.len() > 20
+                || (value.kind == "get" && value.entry_ids.len() != 1)
+            {
+                return Err(Error::engine("invalid hcp retrieval payload"));
+            }
+            for id in std::iter::once(&value.retrieval_id).chain(value.entry_ids.iter()) {
+                if !id.starts_with("urn:uuid:") || uuid::Uuid::parse_str(&id[9..]).is_err() {
+                    return Err(Error::engine("hcp retrieval identifiers must be urn:uuid"));
+                }
+            }
+        }
+        "hcp.entry.versioned.v1" => {
+            let value: HcpEntryVersionedPayload = decode(event)?;
+            validate_hcp_event(
+                event,
+                &value.account_id,
+                &value.entry_id,
+                value.version,
+                &value.client,
+            )?;
+            if !HCP_VERSION_CAUSES.contains(&value.cause.as_str()) {
+                return Err(Error::engine("hcp entry version cause is unknown"));
+            }
+            valid_sha256_hex("hcp view_digest", &value.view_digest)?;
+            validate_hcp_entry(&value.entry, &value.entry_id, value.version)?;
+        }
+        "hcp.entry.status_set.v1" => {
+            let value: HcpEntryStatusSetPayload = decode(event)?;
+            validate_hcp_event(
+                event,
+                &value.account_id,
+                &value.entry_id,
+                value.version,
+                &value.client,
+            )?;
+            if !HCP_STATUSES.contains(&value.from.as_str())
+                || !HCP_STATUSES.contains(&value.to.as_str())
+                || value.from == value.to
+            {
+                return Err(Error::engine(
+                    "hcp status change must move between two known statuses",
+                ));
+            }
+            if !HCP_STATUS_CAUSES.contains(&value.cause.as_str()) {
+                return Err(Error::engine("hcp status change cause is unknown"));
+            }
+            if let Some(related) = &value.related_entry_id {
+                nonblank("hcp related_entry_id", related)?;
+            }
+            if let Some(digest) = &value.view_digest {
+                valid_sha256_hex("hcp view_digest", digest)?;
+            }
         }
         "seeded_instruction_source.applied" => {
             let value: SeededInstructionSourceAppliedPayload = decode(event)?;
@@ -2931,6 +3358,30 @@ pub(crate) async fn project_control(
             .await?;
             require_one(result, event).await?;
         }
+        // The newest event of the account's aggregate is the setting; readers
+        // consult `control_events` directly, so there is nothing to project.
+        "notification_preference.set" => {
+            let _: NotificationPreferencePayload = decode(event)?;
+        }
+        // HCP v2 trusted state is the ordered fold of a person's `hcp_state`
+        // events, read from `control_events` by the HCP v2 module (which
+        // judges the chain deterministically on every replay); there is no
+        // projection table to keep.
+        "hcp.entry.versioned.v1" => {
+            let _: HcpEntryVersionedPayload = decode(event)?;
+        }
+        "hcp.entry.status_set.v1" => {
+            let _: HcpEntryStatusSetPayload = decode(event)?;
+        }
+        "hcp.entry.suggestion.v1" => {
+            let _: HcpEntrySuggestionPayload = decode(event)?;
+        }
+        "hcp.entry.confirmed.v1" => {
+            let _: HcpEntryConfirmedPayload = decode(event)?;
+        }
+        "hcp.read.v1" => {
+            let _: HcpReadPayload = decode(event)?;
+        }
         _ => unreachable!("validated event type"),
     }
 
@@ -2994,6 +3445,9 @@ async fn append_control_event_on(
             "alpha tab import reset is reserved for canonical import",
         ));
     }
+    if input.payload.is_hcp_reserved() && !input.hcp_sealed {
+        return Err(Error::engine(HCP_RESERVED));
+    }
     append_control_event_on_internal(conn, input, act_alloc).await
 }
 
@@ -3041,7 +3495,7 @@ async fn append_control_event_on_internal(
         created_at: now_iso(),
         act: None,
     };
-    if event.event_type == "alpha_tab.import_reset" {
+    if event.event_type == "alpha_tab.import_reset" || input.payload.is_hcp_reserved() {
         validate_stored_control_event(&event)?;
     } else {
         validate_control_event(&event)?;

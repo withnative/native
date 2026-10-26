@@ -508,6 +508,53 @@ async fn catalogue_ids_bind_imported_tokens_once_without_email_rebinding() {
         .await
         .unwrap();
     let record = create_record_as(&db, &admin, &private).await.unwrap();
+    #[cfg(feature = "v2-kernel-probe")]
+    let person = {
+        let package = crate::v2_standard::v1_compat::package();
+        let identity = package.identity().unwrap();
+        install_package_as(&db, &admin, &package).await.unwrap();
+        adopt_package_at(
+            &db,
+            &admin,
+            KERNEL_ROOT_ID,
+            &package,
+            Some(&identity),
+            &package.declared_reads,
+        )
+        .await
+        .unwrap();
+        let person = "person:mapped-member";
+        hq::import_record_as(
+            &db,
+            &host,
+            person,
+            KERNEL_ROOT_ID,
+            Some(&admin),
+            &hq::ImportRecordState {
+                message_principal: Some(imported.clone()),
+                definition: Some(hq::ImportDefinition {
+                    pin: RevisionIdentity {
+                        family: package.definitions[0].family.clone(),
+                        version: package.definitions[0].version,
+                        digest: package.definitions[0].digest.clone(),
+                    },
+                    primary_type: "V1".into(),
+                    kind: crate::v2_standard::v1_compat::KIND.into(),
+                    fields: crate::v2_standard::v1_compat::compat_fields(
+                        "Entity",
+                        "person",
+                        Some("Member"),
+                        None,
+                        None,
+                    ),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        person
+    };
     async fn load(db: &Db, actor: &str, ids: &[(&str, &str)]) -> Result<crate::mcp::Caller> {
         reconcile_hosted_caller(db, |_| async {
             // SAFETY: this complete host fixture owns catalogue IDs and emails.
@@ -540,6 +587,28 @@ async fn catalogue_ids_bind_imported_tokens_once_without_email_rebinding() {
     .await
     .unwrap();
     assert_eq!(caller.credential(), "acct_imported");
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        assert_eq!(
+            visible_member_identity_as(&db, &imported, "catalog-member")
+                .await
+                .unwrap(),
+            Some((imported.clone(), person.into()))
+        );
+        let hidden = create_home(&db, KERNEL_ROOT_ID, Some(&[(&admin, "manage")]), &admin)
+            .await
+            .unwrap();
+        rehome_record_as(&db, &admin, person, &hidden)
+            .await
+            .unwrap();
+        assert!(visible_member_identity_as(&db, &imported, "catalog-member")
+            .await
+            .unwrap()
+            .is_none());
+        rehome_record_as(&db, &admin, person, KERNEL_ROOT_ID)
+            .await
+            .unwrap();
+    }
     assert_eq!(
         resolve_principal_by_binding(&db, caller.credential())
             .await
@@ -558,6 +627,23 @@ async fn catalogue_ids_bind_imported_tokens_once_without_email_rebinding() {
     )
     .await
     .unwrap();
+    #[cfg(feature = "v2-kernel-probe")]
+    {
+        assert!(
+            visible_member_identity_as(&db, &admin, "catalog-member")
+                .await
+                .unwrap()
+                .is_none(),
+            "a roster drop cannot retain identity disclosure"
+        );
+        assert!(
+            visible_member_identity_as(&db, &admin, "catalog-new")
+                .await
+                .unwrap()
+                .is_none(),
+            "email reuse cannot inherit the source Person"
+        );
+    }
     assert_eq!(
         reused.credential(),
         "catalog-new",
@@ -591,6 +677,13 @@ async fn catalogue_ids_bind_imported_tokens_once_without_email_rebinding() {
     .await
     .unwrap();
     assert_eq!(rejoined.credential(), "acct_imported");
+    #[cfg(feature = "v2-kernel-probe")]
+    assert_eq!(
+        visible_member_identity_as(&db, &imported, "catalog-member")
+            .await
+            .unwrap(),
+        Some((imported.clone(), person.into()))
+    );
     assert_eq!(
         kernel_effective_capability(&db, &imported, &record)
             .await
@@ -629,5 +722,167 @@ async fn catalogue_ids_bind_imported_tokens_once_without_email_rebinding() {
             .unwrap(),
         Capability::Edit
     );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn bulk_home_policy_matches_single_gate_across_roster_and_policy_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, admin) = create_v2_database(
+        dir.path().join("bulk.db").to_str().unwrap(),
+        "account",
+        "Owner",
+        "owner",
+    )
+    .await
+    .unwrap();
+    let member = create_principal(&db, "account", "Member", "member", &admin)
+        .await
+        .unwrap();
+    let host = resolve_principal_by_binding(&db, hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    hq::import_home_policy_as(
+        &db,
+        &host,
+        KERNEL_ROOT_ID,
+        &[(&admin, "manage"), (&member, "view")],
+    )
+    .await
+    .unwrap();
+    import_policy(
+        &db,
+        &host,
+        KERNEL_ROOT_ID,
+        BTreeMap::from([(admin.clone(), "manage".into())]),
+        Some("view".into()),
+    )
+    .await
+    .unwrap();
+    let private = create_home(&db, KERNEL_ROOT_ID, Some(&[(&admin, "manage")]), &admin)
+        .await
+        .unwrap();
+    create_home(&db, &private, None, &admin).await.unwrap();
+    create_home(&db, KERNEL_ROOT_ID, None, &admin)
+        .await
+        .unwrap();
+    async fn compare(db: &Db, principals: &[&str]) {
+        let mut tx = db.pool().begin().await.unwrap();
+        for principal in principals {
+            let bulk = visible_home_anchors_as(&mut tx, principal).await.unwrap();
+            let admitted = admitted(&mut tx, principal).await.unwrap();
+            if !admitted {
+                assert!(bulk.homes.is_empty());
+                continue;
+            }
+            for home in bulk.homes {
+                match kernel_policy_capability_on(&mut tx, principal, &home.home_id).await {
+                    Ok(cap) => {
+                        assert!(home.policy_valid);
+                        assert_eq!(home.policy_view, cap.allows(Capability::View));
+                    }
+                    Err(Error::Engine(message)) if message == HIDDEN_OR_MISSING => {
+                        assert!(!home.policy_valid);
+                        assert!(!home.policy_view);
+                    }
+                    Err(e) => panic!("single gate failed: {e}"),
+                }
+            }
+        }
+        tx.rollback().await.unwrap();
+    }
+    compare(&db, &[&admin, &member]).await;
+    admit(&db, "owner", &["owner", "member"]).await.unwrap();
+    compare(&db, &[&admin, &member]).await;
+    admit(&db, "owner", &["owner"]).await.unwrap();
+    compare(&db, &[&admin, &member]).await;
+    admit(&db, "owner", &["owner", "member"]).await.unwrap();
+    replace_home_policy(&db, &admin, KERNEL_ROOT_ID, &[(&admin, "manage")])
+        .await
+        .unwrap();
+    compare(&db, &[&admin, &member]).await;
+    sqlx::query("INSERT INTO kernel_policy_entries(root_id,subject_kind,subject_id,effect,capability) VALUES(?,'bogus','bad','bogus','view')").bind(private).execute(db.write_pool()).await.unwrap();
+    compare(&db, &[&admin, &member]).await;
+    db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn write_request_read_caches_follow_roster_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, admin) = create_v2_database(
+        dir.path().join("roster-cache.db").to_str().unwrap(),
+        "account",
+        "Owner",
+        "owner",
+    )
+    .await
+    .unwrap();
+    let viewer = create_principal(&db, "account", "Member", "member", &admin)
+        .await
+        .unwrap();
+    let host = resolve_principal_by_binding(&db, hq::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    hq::import_home_policy_as(
+        &db,
+        &host,
+        KERNEL_ROOT_ID,
+        &[(&admin, "manage"), (&viewer, "view")],
+    )
+    .await
+    .unwrap();
+    import_policy(
+        &db,
+        &host,
+        KERNEL_ROOT_ID,
+        BTreeMap::from([(admin.clone(), "manage".into())]),
+        Some("view".into()),
+    )
+    .await
+    .unwrap();
+    admit(&db, "owner", &["owner", "member"]).await.unwrap();
+    let record = create_record_as(&db, &admin, KERNEL_ROOT_ID).await.unwrap();
+    read_cache::scope_request(async {
+        let namespaces = [
+            "home_visibility",
+            "lifecycle",
+            "ancestor_descriptors",
+            "disclosed_accounts",
+        ];
+        let mut snapshot = db.write_pool().begin().await.unwrap();
+        let mut before = Vec::new();
+        for namespace in namespaces {
+            let key = read_cache::key_on(&mut snapshot, &viewer, namespace)
+                .await
+                .unwrap();
+            read_cache::put(key.clone(), std::sync::Arc::new(17usize));
+            before.push(key);
+        }
+        assert!(read_record_on(&mut snapshot, &viewer, &record)
+            .await
+            .unwrap()
+            .is_some());
+        snapshot.rollback().await.unwrap();
+        admit(&db, "owner", &["owner"]).await.unwrap();
+        let mut snapshot = db.write_pool().begin().await.unwrap();
+        for (namespace, old) in namespaces.into_iter().zip(before) {
+            let key = read_cache::key_on(&mut snapshot, &viewer, namespace)
+                .await
+                .unwrap();
+            assert!(key != old, "{namespace}");
+            assert!(read_cache::get::<usize>(&key).is_none());
+        }
+        assert!(read_record_on(&mut snapshot, &viewer, &record)
+            .await
+            .unwrap()
+            .is_none());
+        snapshot.rollback().await.unwrap();
+    })
+    .await;
     db.close().await;
 }

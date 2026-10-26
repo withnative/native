@@ -1374,12 +1374,14 @@ pub fn call_message(id: u64, executor: &str, operation: &str, arguments: Value) 
     })
 }
 
-/// Step-create arguments: exactly the frozen [`FrozenStepRequest::wire_request`]
-/// plus the position key. Sent verbatim on every attempt.
+/// Frozen step content plus transport controls. Position-defined imports can
+/// share titles; explicit confirmation keeps them independent of the soft gate.
+/// Confirmation is excluded from canonical action identity, including retries.
 pub fn step_create_arguments(request: &FrozenStepRequest) -> Value {
     let mut args = request.wire_request();
     if let Some(object) = args.as_object_mut() {
         object.insert("idempotency_key".into(), Value::String(request.key.clone()));
+        object.insert("confirm".into(), Value::Bool(true));
     }
     args
 }
@@ -1392,6 +1394,7 @@ pub fn create_root_arguments(account_id: &str, root_name: &str) -> Result<Value>
         return Err(Error::engine("saver root creation needs account and name"));
     }
     Ok(json!({
+        "confirm": true,
         "type": "Collection",
         "kind": "folder",
         "name": root_name,
@@ -1414,6 +1417,7 @@ pub fn create_session_folder_arguments(
         return Err(Error::engine("saver folder creation needs root and title"));
     }
     Ok(json!({
+        "confirm": true,
         "type": "Collection",
         "kind": "folder",
         "home_id": root_id,
@@ -1449,6 +1453,7 @@ pub fn create_session_record_arguments(
         ));
     }
     Ok(json!({
+        "confirm": true,
         "type": "Document",
         "kind": "agent-session",
         "lifecycle": "open",
@@ -4256,6 +4261,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .insert("idempotency_key".into(), Value::String(req.key.clone()));
+        expected["confirm"] = Value::Bool(true);
         assert_eq!(step_create_arguments(&req), expected);
     }
 

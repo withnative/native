@@ -1441,6 +1441,9 @@ impl ExecutorPrototypeStdioServer {
         match &engine {
             EngineHandle::Sqlite(db)
                 if db.open_mode() == crate::db::DatabaseOpenMode::StandbyReadOnly => {}
+            #[cfg(feature = "v2-kernel-probe")]
+            EngineHandle::KernelV2(db)
+                if db.open_mode() == crate::db::DatabaseOpenMode::StandbyReadOnly => {}
             #[allow(unreachable_patterns)]
             _ => {
                 return Err(Error::engine(
@@ -3953,7 +3956,17 @@ fn build_contracts_for_hosting(
             // in this environment and therefore must not be advertised.
             continue;
         }
+        #[cfg(feature = "v2-kernel-probe")]
+        let retained_view_plan = engine_kind == super::registry::EngineKind::KernelV2
+            && row.legacy_tool == "manage_named_views"
+            && matches!(
+                row.candidate_operation.as_str(),
+                "activate_view" | "unpublish_view"
+            );
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let retained_view_plan = false;
         if engine_kind != super::registry::EngineKind::Sqlite
+            && !retained_view_plan
             && write_operations::requires_plan(&row.candidate_executor, &row.candidate_operation)
         {
             // The signed plan store is currently SQLite-qualified. A source
@@ -4400,8 +4413,9 @@ fn add_ordinary_executor_format_contracts(
 /// request time.
 fn add_sql_read_catalog_card(descriptors: &mut [Value]) {
     // E2 I-4: the served `sql_read` descriptor carries the catalog card so
-    // first contact already names every relation, the value model, the
-    // placeholder rule and worked statements. Budget enforced below.
+    // first contact already names the core relations (the rest via
+    // `catalog_relations`), the value model, the placeholder rule and worked
+    // statements. Budget enforced below.
     let card = crate::query::sql_contract::sql_read_catalog_card();
     debug_assert!(
         card.len() <= crate::query::sql_contract::SQL_READ_CARD_MAX_BYTES,
@@ -4416,6 +4430,29 @@ fn add_sql_read_catalog_card(descriptors: &mut [Value]) {
             .and_then(Value::as_str)
             .unwrap_or_default();
         descriptor["description"] = json!(format!("{description} {card}"));
+    }
+}
+
+/// Executors whose descriptor lists fields for a chosen set of operations
+/// rather than all of them, to keep a first-contact descriptor small.
+/// `records_write` carries 25 operations but nearly every first call is one of
+/// these; models without their field lists guessed `create_record` fields
+/// (`record_type`, `title`) and omitted `reason`, so these stay complete.
+/// Every other operation keeps its `operation` enum entry and its contract;
+/// only its field list is left to `describe_operation`. This shapes descriptor
+/// text on every surface that serves the executor, lean and executor alike.
+fn field_listing_operations(executor: &str) -> Option<&'static [&'static str]> {
+    match executor {
+        "records_write" => Some(&[
+            "create_record",
+            "update_record",
+            "manage_links.add",
+            "manage_links.remove",
+            "attach_text",
+            "batch_write",
+            "create_many",
+        ]),
+        _ => None,
     }
 }
 
@@ -4455,6 +4492,20 @@ fn add_operation_field_listings(
         if routed.is_empty() {
             continue;
         }
+        // Some executors list fields for their common operations only; the
+        // rest stay in the `operation` enum and are covered by one sentence.
+        let (routed, unlisted_operations) = match field_listing_operations(&name) {
+            Some(listed) => {
+                let total = routed.len();
+                let routed = routed
+                    .into_iter()
+                    .filter(|contract| listed.contains(&contract.operation.as_str()))
+                    .collect::<Vec<_>>();
+                let omitted = routed.len() < total;
+                (routed, omitted)
+            }
+            None => (routed, false),
+        };
         // Body writes need their semantics at first contact: a caller that
         // mistakes replacement for append can lose content despite a valid
         // concurrency token. Disclose this bounded exception only when the
@@ -4535,6 +4586,12 @@ fn add_operation_field_listings(
                  sibling actions, so its own fields are only available from \
                  describe_operation.",
             );
+        }
+        if unlisted_operations {
+            if !clause.is_empty() {
+                clause.push(' ');
+            }
+            clause.push_str("Fields for the other operations come from describe_operation.");
         }
         if clause.is_empty() {
             continue;
@@ -6973,6 +7030,31 @@ mod tests {
         for profile in crate::mcp::ExposureProfile::ALL {
             let ordinary = registry.descriptor_projection(profile);
             let lens = crate::mcp::lens_descriptor_projection(&registry, profile).unwrap();
+            // Measure the exact boot projections, retaining every supported
+            // named-view action even while its producer gate is closed.
+            if profile == crate::mcp::ExposureProfile::Complete {
+                for projection in [&ordinary, &lens] {
+                    let view = projection
+                        .iter()
+                        .find(|t| t.name == "manage_named_views")
+                        .expect("named views stay discoverable with the gate off");
+                    assert!(view.descriptor["description"]
+                        .as_str()
+                        .unwrap()
+                        .contains("gated off by default"));
+                    assert_eq!(
+                        view.descriptor["inputSchema"]["oneOf"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        6
+                    );
+                    assert!(
+                        crate::mcp::descriptor_projection_bytes(projection)
+                            <= crate::mcp::COMPLETE_PROFILE_MAX_BYTES
+                    );
+                }
+            }
             println!(
                 "sql_write opt-in hosted {}: ordinary={} lens={} limit={}",
                 profile.as_str(),
@@ -8276,7 +8358,7 @@ mod tests {
         );
         assert_eq!(
             audit.candidate_surfaces.stable.ordinary.descriptor_bytes,
-            43_840
+            44_228
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.ordinary.descriptors)
@@ -8293,7 +8375,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             audit.candidate_surfaces.stable.lens.descriptor_bytes,
-            50_087
+            50_458
         );
         assert_eq!(
             serde_json::to_vec(&audit.candidate_surfaces.stable.lens.descriptors)
@@ -8453,6 +8535,8 @@ mod tests {
         assert!(
             description.contains("An operation not listed here")
                 || description.contains("An operation shown next")
+                || description
+                    .contains("Fields for the other operations come from describe_operation.")
                 || descriptor["inputSchema"]["properties"]["operation"]["enum"]
                     .as_array()
                     .expect("operation enum")
@@ -8460,6 +8544,46 @@ mod tests {
                     .all(|operation| description
                         .contains(&format!("{}: ", operation.as_str().unwrap()))),
             "unlisted operations must be explained: {description}"
+        );
+
+        // records_write lists fields for its common operations only; every
+        // other operation stays in the enum and is deferred in one sentence.
+        for listed in [
+            "create_record",
+            "update_record",
+            "manage_links.add",
+            "manage_links.remove",
+            "attach_text",
+            "batch_write",
+            "create_many",
+        ] {
+            assert!(
+                description.contains(&format!("{listed}: ")),
+                "common operation {listed} lost its field list: {description}"
+            );
+        }
+        let operations = descriptor["inputSchema"]["properties"]["operation"]["enum"]
+            .as_array()
+            .expect("operation enum");
+        for unlisted in [
+            "claim_unowned_record",
+            "create_attribution",
+            "manage_relationships.assert",
+            "resolve_suggestions.accept",
+            "save_account",
+        ] {
+            assert!(
+                operations.iter().any(|operation| operation == unlisted),
+                "{unlisted} must stay selectable"
+            );
+            assert!(
+                !description.contains(&format!("{unlisted}: ")),
+                "{unlisted} should defer to describe_operation: {description}"
+            );
+        }
+        assert!(
+            description.contains("Fields for the other operations come from describe_operation."),
+            "{description}"
         );
 
         // Routing executors carry no operation vocabulary of their own.
@@ -12635,6 +12759,25 @@ mod tests {
                     let contract = contracts
                         .get(&(name.to_string(), operation.to_string()))
                         .expect("contract");
+                    // An executor that lists common operations only defers the
+                    // rest in one sentence, whatever their projection.
+                    if field_listing_operations(name)
+                        .is_some_and(|listed| !listed.contains(&operation))
+                    {
+                        assert!(
+                            !description.contains(&format!("{operation}: ")),
+                            "{surface} {name}.{operation} is outside the common listing \
+                             and must not be named"
+                        );
+                        assert!(
+                            description.contains(
+                                "Fields for the other operations come from describe_operation."
+                            ),
+                            "{surface} {name}.{operation} is not covered by the deferral \
+                             sentence: {description}"
+                        );
+                        continue;
+                    }
                     if contract.action_specific_projection {
                         named += 1;
                         assert!(
@@ -13576,7 +13719,7 @@ mod tests {
                 .iter()
                 .filter(|row| row.candidate_plan_policy == "plan_required")
                 .count(),
-            37
+            39
         );
     }
 
@@ -14447,7 +14590,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             execute["properties"]["operation"]["enum"],
-            json!(["correct_record_type"])
+            json!(["activate_view", "correct_record_type", "unpublish_view"])
         );
         for property in ["plan_id", "target", "effect_summary"] {
             assert!(execute["properties"].get(property).is_some());
@@ -20336,3 +20479,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+#[path = "named_view_executor_tests.rs"]
+pub(crate) mod named_views;

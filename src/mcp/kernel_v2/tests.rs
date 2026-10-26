@@ -1089,10 +1089,6 @@ async fn kernel_v2_unknown_callers_and_unsupported_options_refuse() {
         ),
         (
             "query_record",
-            json!({"steps": [{"step": "filter", "facets": [{"key": "title", "eq": "Alpha"}]}]}),
-        ),
-        (
-            "query_record",
             json!({"steps": [{"step": "filter"}], "count_by": "type"}),
         ),
         (
@@ -1111,6 +1107,16 @@ async fn kernel_v2_unknown_callers_and_unsupported_options_refuse() {
         let error = call(&world, name, args).await.unwrap_err();
         assert!(error.to_string().contains("unsupported"), "{error}");
     }
+    // Frozen app queries now use v1 facet predicates; an absent value yields
+    // an empty result rather than an unsupported-option refusal.
+    let filtered = call(
+        &world,
+        "query_record",
+        json!({"steps": [{"step": "filter", "facets": [{"key": "title", "eq": "Alpha"}]}]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered["records"], json!([]));
     let error = call(
         &world,
         "create_record",
@@ -1809,6 +1815,25 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
     // Complete the deliberately raw, pre-metadata bulk fixture as startup does.
     kernel::ensure_record_metadata(&w.db).await.unwrap();
     let started = std::time::Instant::now();
+    let (pulse, pulse_stats) = super::sql::measured(call(
+        &w,
+        "query_sql",
+        json!({"sql":"SELECT id, updated_at FROM records WHERE id IN (?1,?2)",
+            "parameters":[{"type":"text","value":w.first},{"type":"text","value":w.hidden}]}),
+    ))
+    .await;
+    assert_eq!(pulse.unwrap()["row_count"], 1);
+    assert_eq!(pulse_stats.staged_records, 1);
+    assert_eq!(pulse_stats.staged_relations, 1);
+    assert!(pulse_stats.staging_vm_ops < 250_000, "{pulse_stats:?}");
+    let (wide, wide_stats) = super::sql::measured(call(
+        &w, "query_sql", json!({"sql":"SELECT id, type, kind, name, summary, home_id, lifecycle, maturity, updated_at, last_activity_at FROM records WHERE deleted_at IS NULL AND id IN (?1,?2)",
+            "parameters":[{"type":"text","value":w.first},{"type":"text","value":w.hidden}]}),
+    )).await;
+    assert_eq!(wide.unwrap()["row_count"], 1);
+    assert!(wide_stats.staged_records <= 2, "{wide_stats:?}");
+    assert_eq!(wide_stats.staged_relations, 1);
+    assert!(wide_stats.staging_vm_ops < 250_000, "{wide_stats:?}");
     let (out, stats) = super::sql::measured(call(
         &w,
         "query_sql",
@@ -1817,7 +1842,10 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
     .await;
     let elapsed = started.elapsed();
     assert_eq!(out.unwrap()["row_count"], 5);
-    assert_eq!(stats.staged_records, 10002);
+    assert_eq!(
+        stats.staged_records, 5,
+        "closed ID prefixes stage only the returned visible window"
+    );
     assert_eq!(stats.staged_metadata_records, 0);
     assert_eq!(stats.staged_relations, 1);
     assert_eq!(stats.home_checks, 3);
@@ -1835,14 +1863,43 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
     ))
     .await;
     let out = out.unwrap();
-    assert_eq!(out["row_count"], 16);
-    for relation in ["my_message_state", "messages_awaiting_reply"] {
-        assert!(out["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["relation_name"] == relation));
-    }
+    // Includes attachment-scoped blobs and the caller-visible typed-time relation.
+    assert_eq!(out["row_count"], 24);
+    let names = out["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["relation_name"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from([
+            "records",
+            "blobs",
+            "links",
+            "runs",
+            "run_intents",
+            "actors",
+            "comment_anchors",
+            "vocabularies",
+            "vocabulary_values",
+            "record_lifecycle_interpretations",
+            "agent_activity",
+            "agent_activity_claims",
+            "facet_values",
+            "facet_observations",
+            "facet_times",
+            "bindings",
+            "content_events",
+            "message_reactions",
+            "my_mentions",
+            "my_message_state",
+            "messages_awaiting_reply",
+            "catalog_relations",
+            "catalog_columns",
+            "catalog_view_definitions",
+        ])
+    );
     assert_eq!(stats.staged_records, 0);
     assert_eq!(stats.staged_relations, 0);
     assert_eq!(stats.home_checks, 0);
@@ -1854,6 +1911,58 @@ async fn kernel_v2_sql_hq_scale_stages_only_needed_values() {
         started.elapsed()
     );
     w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_sql_saved_inputs_keep_separate_bounded_staging_and_vm_deadlines() {
+    use std::time::Duration;
+    let w = world().await;
+    let request = json!({"sql":"SELECT id FROM records ORDER BY id LIMIT 2"});
+    // Deterministic elapsed offsets exercise admission without sleeps or a
+    // shared-host timing assertion. Native preparation exceeds the caller VM
+    // budget, but remains within the separately bounded saved-input allowance.
+    let result = super::sql::with_elapsed(
+        Duration::from_secs(3),
+        Duration::ZERO,
+        super::sql::query_stored_saved_sql(&w.db, &w.viewer, request.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["row_count"], 2);
+    let denied = super::sql::with_elapsed(
+        Duration::from_secs(3),
+        Duration::ZERO,
+        super::sql::query_sql(&w.db, &w.viewer, request.clone()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        denied.to_string().contains("query_sql [timeout]"),
+        "{denied}"
+    );
+    let denied = super::sql::with_elapsed(
+        Duration::from_secs(9),
+        Duration::ZERO,
+        super::sql::query_stored_saved_sql(&w.db, &w.viewer, request),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        denied.to_string().contains("query_sql [timeout]"),
+        "{denied}"
+    );
+
+    sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20) INSERT INTO kernel_records(id,home_id,owner_id,created_seq,created_at) SELECT printf('vm-bound:%05d',x),r.home_id,r.owner_id,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?")
+        .bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+    // A saved query cannot spend the preparation allowance executing caller
+    // SQL. The ordinary VM deadline still interrupts its first progress tick.
+    let denied = super::sql::with_elapsed(Duration::ZERO, Duration::from_secs(3),
+        super::sql::query_stored_saved_sql(&w.db, &w.viewer,
+            json!({"sql":"SELECT count(*) AS n FROM records a CROSS JOIN records b CROSS JOIN records c"}))).await.unwrap_err();
+    assert!(
+        denied.to_string().contains("query_sql [timeout]"),
+        "{denied}"
+    );
 }
 
 #[tokio::test]
@@ -2376,16 +2485,33 @@ async fn kernel_v2_sql_relations_visibility_and_guards() {
             assert_eq!(out["rows"][0]["n"], 0, "{relation}");
         }
     }
-    for sql in [
-        "SELECT count(*) AS n FROM bindings",
-        "SELECT count(*) AS n FROM facet_times",
+    // Supported messaging projections remain empty without verified Person
+    // bindings or governed Message state; physical records alone grant neither.
+    // Untyped native facets likewise create no typed-time rows.
+    for relation in [
+        "bindings",
+        "message_reactions",
+        "my_mentions",
+        "facet_times",
     ] {
-        let error = call(&w, "query_sql", query(sql))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("not yet supported on v2"), "{sql}: {error}");
+        let out = call(
+            &w,
+            "query_sql",
+            query(&format!("SELECT count(*) AS n FROM {relation}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["rows"][0]["n"], 0, "{relation}");
     }
+    let error = call(
+        &w,
+        "query_sql",
+        query("SELECT count(*) AS n FROM facet_keys"),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("not yet supported on v2"), "{error}");
     for sql in [
         "DELETE FROM records",
         "SELECT id FROM records; SELECT id FROM records",
@@ -2866,7 +2992,7 @@ async fn kernel_v2_legacy_sql_headers_follow_disclosure_and_rebuild_without_sour
     assert_eq!(out["rows"][0]["created_at"], "2026-01-01T00:00:00.000Z");
     let admin=call_as(&world,"acct:admin","query_sql",json!({"sql":"SELECT id,actor,run_key FROM content_events WHERE id LIKE 'legacy-%' ORDER BY id"})).await.unwrap();
     assert_eq!(admin["rows"].as_array().unwrap().len(), 2);
-    assert_eq!(admin["rows"][1]["actor"], "v1:acct:admin");
+    assert_eq!(admin["rows"][1]["actor"], world.admin);
     let before = kernel::dump_all_kernel_tables(&world.db).await.unwrap();
     // Simulate an older writer: W5 disclosure is present, but the new
     // header projection and progress did not include its latest envelopes.
@@ -2895,7 +3021,14 @@ async fn kernel_v2_legacy_sql_headers_follow_disclosure_and_rebuild_without_sour
     .unwrap_err();
     assert!(stale.to_string().contains("needs catchup"), "{stale}");
     world.db.close().await;
-    world.db = kernel::open_v2_database(world._dir.path().join("v2.db").to_str().unwrap())
+    let path = world._dir.path().join("v2.db");
+    let refused = kernel::open_v2_database(path.to_str().unwrap())
+        .await
+        .err()
+        .unwrap();
+    assert!(refused.to_string().contains("needs catchup"));
+    // Preparation uses a controlled raw opener; serving never repairs a gap.
+    world.db = crate::db::open_existing_v2_file(path.to_str().unwrap())
         .await
         .unwrap();
     let still_stale = call(
@@ -4328,7 +4461,10 @@ async fn kernel_v2_browser_hq_scale_batch_get_and_global_history_share_staging()
             .iter()
             .all(|r| r["status"] == "found"));
         assert_eq!(stats.installations, 1, "{stats:?}");
-        assert_eq!(stats.staged_records, 10002);
+        assert_eq!(
+            stats.staged_records, 100,
+            "Get stages its requested notes, not unrelated workspace metadata"
+        );
         eprintln!("BROWSER_READ_BENCH get_record ids=100 children_limit={children_limit} visible=10002 elapsed_ms={:.3} installations={}",elapsed.as_secs_f64()*1000.0,stats.installations);
     }
     let started = std::time::Instant::now();
@@ -4880,6 +5016,305 @@ fn kernel_v2_run_activity_has_exactly_one_handler() {
         |_, _, _| async { Ok::<Value, Error>(Value::Null) },
     );
     assert!(duplicate.unwrap_err().to_string().contains("already has a"));
+}
+
+#[test]
+fn kernel_v2_bindings_has_exactly_one_handler() {
+    let mut registry = registry();
+    assert!(registry.has_engine_handler("manage_bindings", EngineKind::KernelV2));
+    let duplicate = registry.register_engine_handler(
+        "manage_bindings",
+        EngineKind::KernelV2,
+        |_, _, _| async { Ok::<Value, Error>(Value::Null) },
+    );
+    assert!(duplicate.unwrap_err().to_string().contains("already has a"));
+}
+
+async fn binding_fixture() -> (World, Db, String) {
+    let w = world().await;
+    let v1 = crate::create_database(":memory:").await.unwrap();
+    crate::authorization::replace_explicit_policy(
+        &v1,
+        "local",
+        crate::schema::ROOT_RECORD_ID,
+        vec![crate::authorization::AllowEntry::account(
+            "local",
+            crate::authorization::Capability::Manage,
+        )],
+    )
+    .await
+    .unwrap();
+    let definition = json!({"family":"fixture.bindings","version":1,"interpreter":"native.defn/2","primary_type":"Entity","kinds":[{"token":"person","description":"Binding parity","maturity":"current","identity":{"field":"title"},"fields":[{"name":"title","type":"text","required":true}],"links":[]}]});
+    let pin = kernel::install_definition_as(
+        &w.db,
+        &w.admin,
+        "fixture.bindings",
+        1,
+        &serde_json::to_vec(&definition).unwrap(),
+    )
+    .await
+    .unwrap();
+    kernel::adopt_definition_as(&w.db, &w.admin, &pin.family, Some(&pin))
+        .await
+        .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let person = kernel::create_as(
+        &w.db,
+        &w.admin,
+        &pin.family,
+        "person",
+        json!({"title":"Binding Person"}).as_object().unwrap(),
+        &home,
+    )
+    .await
+    .unwrap();
+    for (id, typ, kind) in [
+        (&w.first, "Document", "note"),
+        (&w.second, "Document", "note"),
+        (&w.hidden, "Document", "note"),
+        (&person, "Entity", "person"),
+    ] {
+        registry().call(v1.clone(),Caller::local(),"create_record",json!({"id":id,"type":typ,"kind":kind,"name":id,"reason":"Synthetic binding parity fixture"})).await.unwrap();
+    }
+    (w, v1, person)
+}
+
+fn binding_claim(record: &str) -> Value {
+    json!({"system":"native-record","identifier":crate::identity::encode_native_record("ndb_00000000000000000000000000000000",record).unwrap()})
+}
+
+#[tokio::test]
+async fn kernel_v2_bindings_v1_add_list_canonical_noop_and_replay() {
+    let (w, v1, person) = binding_fixture().await;
+    let alpha = binding_claim("alpha");
+    let beta = binding_claim("beta");
+    for (record, binding, canonical) in [
+        (&w.first, alpha.clone(), false),
+        (&w.first, alpha.clone(), true),
+        (&w.first, alpha.clone(), false),
+        (&w.first, beta.clone(), true),
+        (&w.first, beta.clone(), true),
+        (
+            &person,
+            json!({"system":"native-principal","identifier":"native/A"}),
+            true,
+        ),
+    ] {
+        let args = json!({"action":"add","record_id":record,"binding":binding,"canonical":canonical,"reason":"Binding parity"});
+        let expected = registry()
+            .call(v1.clone(), Caller::local(), "manage_bindings", args.clone())
+            .await
+            .unwrap();
+        let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+        let actual = call_as(&w, "acct:admin", "manage_bindings", args)
+            .await
+            .unwrap();
+        for key in ["status", "record_id", "changed"] {
+            assert_eq!(actual[key], expected[key], "{key}");
+        }
+        if expected["changed"] == false {
+            assert!(actual.get("act").is_none());
+            assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+        }
+        let args = json!({"action":"list","record_id":record});
+        let expected = registry()
+            .call(v1.clone(), Caller::local(), "manage_bindings", args.clone())
+            .await
+            .unwrap();
+        assert_eq!(call(&w, "manage_bindings", args).await.unwrap(), expected);
+    }
+    let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    let events:Vec<(String,String,Option<i64>)>=sqlx::query_as("SELECT actor,payload,act FROM content_events WHERE type='kernel.identity_binding_added.v1' ORDER BY seq").fetch_all(w.db.pool()).await.unwrap();
+    assert_eq!(events.len(), 4);
+    assert!(events.iter().all(|(actor, payload, act)| actor == &w.admin
+        && act.is_some()
+        && serde_json::from_str::<Value>(payload).unwrap()["reason"] == "Binding parity"));
+    v1.close().await;
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_bindings_v1_reserved_shape_and_argument_refusals() {
+    let (w, v1, person) = binding_fixture().await;
+    for args in [
+        json!({"action":"add","record_id":person,"binding":{"system":"email","identifier":"a@example.test"},"reason":"Reserved"}),
+        json!({"action":"add","record_id":person,"binding":{"system":"account","identifier":"account"},"reason":"Reserved"}),
+        json!({"action":"add","record_id":person,"binding":{"system":"unknown","identifier":"x"},"reason":"Unknown"}),
+        json!({"action":"add","record_id":w.first,"binding":{"system":"native-principal","identifier":"native/A"},"reason":"Wrong shape"}),
+        json!({"action":"add","record_id":person,"binding":{"system":"native-principal","identifier":w.admin},"reason":"Kernel IDs are not wire addresses"}),
+        json!({"action":"add","record_id":w.first,"binding":binding_claim("key"),"reason":"   "}),
+        json!({"action":"add","record_id":w.first,"binding":binding_claim("key"),"reason":"Invalid key","idempotency_key":"not accepted by v1"}),
+        json!({"action":"list","record_id":w.first,"reason":"Not accepted on list"}),
+    ] {
+        let expected = registry()
+            .call(v1.clone(), Caller::local(), "manage_bindings", args.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        let actual = call_as(&w, "acct:admin", "manage_bindings", args)
+            .await
+            .unwrap_err()
+            .to_string();
+        if !expected.contains("invalid arguments") {
+            assert_eq!(actual, expected);
+        } else {
+            assert!(actual.contains("invalid arguments"), "{actual}");
+        }
+    }
+    v1.close().await;
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_bindings_authority_hidden_collisions_and_cas_are_atomic() {
+    let (w, v1, _person) = binding_fixture().await;
+    let args = |record: &str, claim: Value| json!({"action":"add","record_id":record,"binding":claim,"canonical":true,"reason":"Authority parity"});
+    for id in [w.hidden.as_str(), "missing"] {
+        assert!(call(
+            &w,
+            "manage_bindings",
+            json!({"action":"list","record_id":id})
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains(kernel::HIDDEN_OR_MISSING));
+    }
+    let claim = binding_claim("occupied");
+    call_as(
+        &w,
+        "acct:admin",
+        "manage_bindings",
+        args(&w.hidden, claim.clone()),
+    )
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for cap in ["view", "edit"] {
+        kernel::replace_home_policy(
+            &w.db,
+            &w.admin,
+            &home,
+            &[(&w.admin, "manage"), (&w.viewer, cap)],
+        )
+        .await
+        .unwrap();
+        let capability = if cap == "view" {
+            crate::authorization::Capability::View
+        } else {
+            crate::authorization::Capability::Edit
+        };
+        crate::authorization::replace_explicit_policy(
+            &v1,
+            "local",
+            &w.first,
+            vec![crate::authorization::AllowEntry::members(capability)],
+        )
+        .await
+        .unwrap();
+        assert!(registry()
+            .call(
+                v1.clone(),
+                Caller::local(),
+                "manage_bindings",
+                args(&w.first, binding_claim("new"))
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("requires Manage"));
+        let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+        assert!(
+            call(&w, "manage_bindings", args(&w.first, binding_claim("new")))
+                .await
+                .is_err()
+        );
+        assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    }
+    kernel::replace_home_policy(
+        &w.db,
+        &w.admin,
+        &home,
+        &[(&w.admin, "manage"), (&w.viewer, "manage")],
+    )
+    .await
+    .unwrap();
+    let error = call(&w, "manage_bindings", args(&w.first, claim.clone()))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("binding_not_visible"), "{error}");
+    assert!(!error.contains(&w.hidden));
+    let visible = call_as(&w, "acct:admin", "manage_bindings", args(&w.first, claim))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(visible.contains("binding collision"));
+    let mut snapshot = w.db.pool().begin().await.unwrap();
+    let revision = kernel::identity_bindings::revision_on(&mut snapshot, &w.first)
+        .await
+        .unwrap();
+    snapshot.rollback().await.unwrap();
+    let mut guarded = args(&w.first, binding_claim("guarded"));
+    guarded["if_binding_state_revision"] = json!(revision);
+    call(&w, "manage_bindings", guarded.clone()).await.unwrap();
+    let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    assert!(call(&w, "manage_bindings", guarded)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("binding state revision conflict"));
+    assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    sqlx::query("CREATE TRIGGER fail_binding_projection BEFORE INSERT ON kernel_identity_bindings BEGIN SELECT RAISE(ABORT,'synthetic binding failure'); END").execute(w.db.write_pool()).await.unwrap();
+    assert!(call(
+        &w,
+        "manage_bindings",
+        args(&w.first, binding_claim("rollback"))
+    )
+    .await
+    .is_err());
+    assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    v1.close().await;
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_bindings_audit_keeps_body_guard_and_history_unchanged() {
+    let w = world().await;
+    let before = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap();
+    call_as(&w,"acct:admin","manage_bindings",json!({"action":"add","record_id":w.first,"binding":binding_claim("separate-audit"),"reason":"Binding audit is not body history"})).await.unwrap();
+    let after = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.revision, after.revision);
+    assert_eq!(before.metadata, after.metadata);
+    assert_eq!(before.body, after.body);
+    for actor in [&w.admin, &w.viewer] {
+        let history =
+            kernel::history_page_as(&w.db, actor, &w.first, None, false, 1000, true, false)
+                .await
+                .unwrap();
+        assert!(history
+            .iter()
+            .all(|event| event.event_type != "kernel.identity_binding_added.v1"));
+    }
+    let sql=call_as(&w,"acct:admin","query_sql",json!({"sql":"SELECT count(*) AS n FROM content_events WHERE type='kernel.identity_binding_added.v1'"})).await.unwrap();
+    assert_eq!(sql["rows"][0]["n"], 0);
+    w.db.close().await;
 }
 
 #[tokio::test]
@@ -6990,6 +7425,8 @@ async fn kernel_v2_record_image_rolls_back_blobs_links_receipt_and_body_on_failu
     w.db.close().await;
 }
 
+#[path = "private_create_tests.rs"]
+mod private_create_tests;
 async fn reference_fixture() -> (World, Db, Vec<String>) {
     let w = world().await;
     let v1 = crate::create_database(":memory:").await.unwrap();
@@ -7589,4 +8026,3265 @@ async fn kernel_v2_delete_replays_after_deleting_member_leaves_roster() {
     kernel::replay_all_projections(&w.db).await.unwrap();
     assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
     w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_bindings_native_fields_cannot_impersonate_v1_person_shape() {
+    let (w, v1, _) = binding_fixture().await;
+    let definition = json!({"family":"fixture.binding-shape","version":1,"interpreter":"native.defn/2","primary_type":"Document","kinds":[{"token":"note","description":"Native fields are not v1 spine","maturity":"current","identity":{"field":"title"},"fields":[{"name":"title","type":"text","required":true},{"name":"v1_type","type":"text","required":false},{"name":"v1_kind","type":"text","required":false}],"links":[]}]});
+    let pin = kernel::install_definition_as(
+        &w.db,
+        &w.admin,
+        "fixture.binding-shape",
+        1,
+        &serde_json::to_vec(&definition).unwrap(),
+    )
+    .await
+    .unwrap();
+    kernel::adopt_definition_as(&w.db, &w.admin, &pin.family, Some(&pin))
+        .await
+        .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let id = kernel::create_as(
+        &w.db,
+        &w.admin,
+        &pin.family,
+        "note",
+        json!({"title":"Document with misleading fields","v1_type":"Entity","v1_kind":"person"})
+            .as_object()
+            .unwrap(),
+        &home,
+    )
+    .await
+    .unwrap();
+    registry().call(v1.clone(),Caller::local(),"create_record",json!({"id":id,"type":"Document","kind":"note","name":"Actual document","reason":"Shape parity"})).await.unwrap();
+    let args = json!({"action":"add","record_id":id,"binding":{"system":"native-principal","identifier":"native/A"},"reason":"No type impersonation"});
+    let expected = registry()
+        .call(v1.clone(), Caller::local(), "manage_bindings", args.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    let before = kernel::dump_all_kernel_tables(&w.db).await.unwrap();
+    let actual = call_as(&w, "acct:admin", "manage_bindings", args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(actual, expected);
+    assert!(actual.contains("incompatible record kind"));
+    assert_eq!(before, kernel::dump_all_kernel_tables(&w.db).await.unwrap());
+    v1.close().await;
+    w.db.close().await;
+}
+
+#[path = "interventions_tests.rs"]
+mod interventions_tests;
+#[path = "member_configuration_tests.rs"]
+mod member_configuration_tests;
+#[path = "surface_bindings_tests.rs"]
+mod surface_bindings_tests;
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_home_staging_uses_subject_index_and_preserves_visibility() {
+    use sqlx::Row;
+    let w = world().await;
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    connection.close_on_drop();
+    sqlx::query("BEGIN")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let reads = [("records".into(), "home_id".into())].into_iter().collect();
+    super::sql::install(&mut connection, &w.viewer, &reads)
+        .await
+        .unwrap();
+    let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {}", super::sql::HOME_MAP_SQL))
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>(3))
+        .collect::<Vec<_>>();
+    assert!(
+        plan.iter().any(|detail| detail.contains("SEARCH e")
+            && detail.contains("record_id=?")
+            && detail.contains("type=?")),
+        "home lookup must seek both subject and type: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.starts_with("SCAN e")),
+        "unrelated history must never be scanned: {plan:?}"
+    );
+    let provenance_plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        crate::v1_import::SNAPSHOT_PROVENANCE_SQL
+    ))
+    .bind(&w.first)
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.get::<String, _>(3))
+    .collect::<Vec<_>>();
+    assert!(
+        provenance_plan
+            .iter()
+            .any(|detail| detail.contains("SEARCH h")
+                && detail.contains("record_id=?")
+                && detail.contains("source_stream=?")),
+        "snapshot lookup must seek the prepared header: {provenance_plan:?}"
+    );
+    // Main materializes trusted placement before caller SQL. Check the
+    // preparation query, since the public view now only seeks that table.
+    let placement_plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::sql::logical_home_rows_sql()
+    ))
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.get::<String, _>(3))
+    .collect::<Vec<_>>();
+    assert!(
+        placement_plan
+            .iter()
+            .any(|detail| detail.contains("idx_kernel_hosted_event_lookup")
+                && detail.contains("record_id=?")
+                && detail.contains("type=?")),
+        "rehome lookup must seek by subject and exact type: {placement_plan:?}"
+    );
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    kernel::create_principal(&w.db, "account", "No grants", "acct:outsider", &w.admin)
+        .await
+        .unwrap();
+    for (credential, visible_status, hidden_status) in [
+        ("acct:viewer", "found", "not_found"),
+        ("acct:admin", "found", "found"),
+        ("acct:outsider", "not_found", "not_found"),
+    ] {
+        let answer = call_as(
+            &w,
+            credential,
+            "get_record",
+            json!({"ids":[w.first,w.hidden],"children_limit":0,"links_limit":0}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["records"][0]["status"], visible_status);
+        assert_eq!(answer["records"][1]["status"], hidden_status);
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_get_stages_only_part_of_and_keeps_provider_links() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let fields = crate::v2_standard::v1_compat::compat_fields(
+        "WorkItem",
+        "task",
+        Some("Provider source"),
+        None,
+        None,
+    );
+    let source = kernel::create_json_as(
+        &w.db,
+        &w.admin,
+        crate::v2_standard::v1_compat::FAMILY,
+        crate::v2_standard::v1_compat::KIND,
+        &serde_json::to_string(&fields).unwrap(),
+        &home,
+    )
+    .await
+    .unwrap();
+    let package = crate::v2_standard::relates_to::package();
+    let installed = kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&installed),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    for (key, target) in [("visible", &w.second), ("hidden", &w.hidden)] {
+        let request = kernel::prepare_provider_as(
+            &w.db,
+            &w.admin,
+            &source,
+            target,
+            key,
+            crate::v2_standard::relates_to::Command::Assert { sources: vec![] },
+        )
+        .await
+        .unwrap();
+        kernel::commit_provider_as(&w.db, &w.admin, &request)
+            .await
+            .unwrap();
+    }
+    let (result, stats) =
+        super::sql::measured(call(&w, "get_record", json!({"ids":[source]}))).await;
+    let result = result.unwrap();
+    assert_eq!(stats.provider_states_decoded, 0, "{stats:?}");
+    let links = result["records"][0]["links_out"].as_array().unwrap();
+    assert!(links.iter().any(|link| link["target_id"] == w.second));
+    assert!(links.iter().all(|link| link["target_id"] != w.hidden));
+    let (sql, stats) = super::sql::measured(call(&w,"query_sql",json!({"sql":"SELECT DISTINCT target_id FROM links WHERE source_id=?1 AND relationship='relates_to' ORDER BY target_id","parameters":[{"type":"text","value":source}]}))).await;
+    assert_eq!(sql.unwrap()["rows"], json!([{"target_id":w.second}]));
+    assert_eq!(stats.provider_states_decoded, 0, "{stats:?}");
+    sqlx::query("DELETE FROM kernel_provider_link_heads")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(call(&w, "get_record", json!({"ids":[source]}))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("provider-link read projection is not ready"));
+    assert!(call(
+        &w,
+        "query_sql",
+        json!({"sql":"SELECT source_id,target_id FROM links LIMIT 100"})
+    )
+    .await
+    .unwrap_err()
+    .to_string()
+    .contains("provider-link read projection is not ready"));
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    assert!(call(&w, "get_record", json!({"ids":[source]}))
+        .await
+        .is_ok());
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_request_cache_binds_actor_database_heads_and_lifetime() {
+    let w = world().await;
+    kernel::read_cache::scope_request(async {
+        let viewer = call_as(
+            &w,
+            "acct:viewer",
+            "get_record",
+            json!({"ids":[w.first,w.hidden]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(viewer["records"][1]["status"], "not_found");
+        let owner = call_as(&w, "acct:admin", "get_record", json!({"ids":[w.hidden]}))
+            .await
+            .unwrap();
+        assert_eq!(owner["records"][0]["status"], "found");
+        let mut old_snapshot = w.db.write_pool().begin().await.unwrap();
+        let old_key = kernel::read_cache::key_on(&mut old_snapshot, &w.viewer, "home_visibility")
+            .await
+            .unwrap();
+        assert!(kernel::read_cache::get::<kernel::VisibleHomeAnchors>(&old_key).is_some());
+        let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+            .bind(&w.first)
+            .fetch_one(&mut *old_snapshot)
+            .await
+            .unwrap();
+        kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+            .await
+            .unwrap();
+        // An old transaction keeps its own snapshot; a new transaction must
+        // never reuse its authority, even inside this one request scope.
+        assert!(
+            kernel::read_cache::key_on(&mut old_snapshot, &w.viewer, "home_visibility")
+                .await
+                .unwrap()
+                == old_key
+        );
+        old_snapshot.rollback().await.unwrap();
+        let refused = call_as(&w, "acct:viewer", "get_record", json!({"ids":[w.first]}))
+            .await
+            .unwrap();
+        assert_eq!(refused["records"][0]["status"], "not_found");
+        let mut current = w.db.write_pool().begin().await.unwrap();
+        let new_key = kernel::read_cache::key_on(&mut current, &w.viewer, "home_visibility")
+            .await
+            .unwrap();
+        assert!(new_key != old_key);
+        assert!(kernel::read_cache::get::<kernel::VisibleHomeAnchors>(&new_key).is_some());
+        current.rollback().await.unwrap();
+        let copy_dir = tempfile::tempdir().unwrap();
+        let copy_path = copy_dir.path().join("copy.db");
+        sqlx::query("VACUUM INTO ?")
+            .bind(copy_path.to_str().unwrap())
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        let copy = kernel::open_marked_v2_database(copy_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let mut snapshot = copy.write_pool().begin().await.unwrap();
+        let copy_key = kernel::read_cache::key_on(&mut snapshot, &w.viewer, "home_visibility")
+            .await
+            .unwrap();
+        assert!(
+            copy_key != new_key,
+            "identical heads in another physical database must not alias"
+        );
+        assert!(kernel::read_cache::get::<kernel::VisibleHomeAnchors>(&copy_key).is_none());
+        snapshot.rollback().await.unwrap();
+        copy.close().await;
+    })
+    .await;
+    let mut snapshot = w.db.write_pool().begin().await.unwrap();
+    assert!(
+        kernel::read_cache::key_on(&mut snapshot, &w.viewer, "home_visibility")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    snapshot.rollback().await.unwrap();
+    kernel::read_cache::scope_request(async {
+        let mut snapshot = w.db.write_pool().begin().await.unwrap();
+        let key = kernel::read_cache::key_on(&mut snapshot, &w.viewer, "home_visibility")
+            .await
+            .unwrap();
+        assert!(
+            kernel::read_cache::get::<kernel::VisibleHomeAnchors>(&key).is_none(),
+            "a new request starts empty"
+        );
+        snapshot.rollback().await.unwrap();
+    })
+    .await;
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_bounded_get_matches_full_staging_for_filing_and_windows() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    call_as(&w,"acct:admin","create_record",json!({"type":"Annotation","kind":"comment","body":"Unrelated annotation","links":[{"target_id":w.second,"relationship":"part_of"}]})).await.unwrap();
+    let package = crate::v2_standard::document_package();
+    let identity = package.identity().unwrap();
+    kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&identity),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let folder = call_as(
+        &w,
+        "acct:admin",
+        "create_record",
+        json!({"type":"Collection","kind":"folder","name":"Scoped folder","home_id":home}),
+    )
+    .await
+    .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child=call_as(&w,"acct:admin","create_record",json!({"type":"Document","kind":"note","name":"Scoped child","body":"child","home_id":folder})).await.unwrap()["id"].as_str().unwrap().to_owned();
+    call_as(
+        &w,
+        "acct:admin",
+        "update_record",
+        json!({"id":w.first,"home_id":folder}),
+    )
+    .await
+    .unwrap();
+    let citation=call_as(&w,"acct:admin","create_record",json!({"type":"Annotation","kind":"citation","body":"Cited passage","links":[{"target_id":child,"relationship":"part_of"}]})).await.unwrap()["id"].as_str().unwrap().to_owned();
+    let revision = kernel::read_record_as(&w.db, &w.admin, &child)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    kernel::set_archived_as(&w.db, &w.admin, &child, true, revision)
+        .await
+        .unwrap();
+    let reads = [
+        ("records", "id"),
+        ("records", "type"),
+        ("records", "kind"),
+        ("records", "name"),
+        ("records", "archived"),
+        ("records", "created_at"),
+        ("records", "home_id"),
+        ("links", "source_id"),
+        ("links", "target_id"),
+        ("links", "relationship"),
+    ];
+    // Compare batch child windows with the original individual section
+    // reader, including empty/offset pages and duplicate requested ids.
+    for (limit, offset) in [(0, 0), (1, 0), (1, 1), (50, 0)] {
+        let ids = vec![
+            folder.clone(),
+            child.clone(),
+            folder.clone(),
+            w.hidden.clone(),
+        ];
+        let opts = crate::query::read::EnrichOptions {
+            children_limit: limit,
+            children_offset: offset,
+            ..Default::default()
+        };
+        kernel::read_cache::scope_request(super::sql::with_read_session(&w.db, &w.viewer, &reads, async {
+            let batched = super::read_surface::child_sections(&w.db, &w.viewer, &ids, &opts).await.unwrap();
+            for id in &ids {
+                let expected = super::read_surface::section(&w.db,&w.viewer,"r.home_id=?1 AND NOT (r.type='Annotation' AND coalesce(r.kind,'') IN ('comment','suggestion','citation','attribution','acknowledgement')) AND NOT (r.type='Entity' AND r.kind IS 'semantic-unit')",vec![json!({"type":"text","value":id})],"r.name,r.id",limit,offset).await.unwrap();
+                assert_eq!(batched.get(id).unwrap(), &expected);
+            }
+            Ok(())
+        })).await.unwrap();
+    }
+    for (credential, actor) in [("acct:viewer", &w.viewer), ("acct:admin", &w.admin)] {
+        for ids in [
+            json!([w.first]),
+            json!([folder]),
+            json!([child, citation, w.hidden]),
+            json!([KERNEL_ROOT_ID, "native:root"]),
+            json!(["missing", w.hidden]),
+        ] {
+            let args = json!({"ids":ids,"children_limit":50,"include_citations":true,"include_suggestions":true});
+            let expected = kernel::read_cache::scope_request(super::sql::with_read_session(
+                &w.db,
+                actor,
+                &reads,
+                super::get_record_in_session(&w.db, actor, args.clone()),
+            ))
+            .await
+            .unwrap();
+            let actual = call_as(&w, credential, "get_record", args).await.unwrap();
+            assert_eq!(actual["records"], expected["records"], "{credential}");
+        }
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_readiness_requires_indexes_and_current_headers() {
+    let w = world().await;
+    for index in [
+        "idx_kernel_record_event_clock",
+        "idx_kernel_record_moves",
+        "idx_kernel_record_filing_types",
+        "idx_kernel_record_message_types",
+        "idx_kernel_v1_state_record",
+        "idx_kernel_historical_home",
+        "idx_kernel_historical_target",
+    ] {
+        sqlx::query(&format!("DROP INDEX {index}"))
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        let error = kernel::verify_v2_ready(&w.db).await.unwrap_err();
+        assert!(error.to_string().contains(index));
+        assert!(
+            kernel::open_marked_v2_database(w.db.path().to_str().unwrap())
+                .await
+                .is_err()
+        );
+        kernel::prepare_v2_database(&w.db).await.unwrap();
+        kernel::verify_v2_ready(&w.db).await.unwrap();
+    }
+    let plan: Vec<(i64,i64,i64,String)> = sqlx::query_as("EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM kernel_record_fields WHERE name='v1_type' AND value_json='\"Message\"')")
+        .fetch_all(w.db.pool()).await.unwrap();
+    assert!(plan
+        .iter()
+        .any(|row| row.3.contains("idx_kernel_record_message_types")));
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    kernel::import_event_as(
+        &w.db,
+        &host,
+        &w.first,
+        &kernel::LegacyEvent {
+            source: None,
+            id: "readiness-frontier".into(),
+            event_type: "v1.snapshot_provenance".into(),
+            payload: json!({"record_id":w.first}),
+            created_at: "2026-10-21T00:00:00Z".into(),
+            actor: None,
+            run_key: None,
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE kernel_legacy_sql_progress SET scanned_seq=0 WHERE singleton=1")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(kernel::verify_v2_ready(&w.db)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("catchup"));
+    assert!(
+        kernel::open_marked_v2_database(w.db.path().to_str().unwrap())
+            .await
+            .is_err()
+    );
+    // Existing handles also fail closed; both direct reads bypass SQL staging.
+    assert!(crate::v1_import::placement_as(&w.db, &w.viewer, &w.first)
+        .await
+        .is_err());
+    for (tool, args) in [
+        (
+            "query_record",
+            json!({"steps":[{"step":"filter","ids":[w.first]}]}),
+        ),
+        ("search", json!({"query":"revised"})),
+    ] {
+        assert!(call(&w, tool, args).await.is_err(), "{tool}");
+    }
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    kernel::verify_v2_ready(&w.db).await.unwrap();
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_write_request_caches_follow_authority_events() {
+    let w = world().await;
+    kernel::read_cache::scope_request(async {
+        let namespaces = [
+            "home_visibility",
+            "lifecycle",
+            "ancestor_descriptors",
+            "disclosed_accounts",
+        ];
+        let mut snapshot = w.db.write_pool().begin().await.unwrap();
+        let mut before = Vec::new();
+        for namespace in namespaces {
+            let key = kernel::read_cache::key_on(&mut snapshot, &w.viewer, namespace)
+                .await
+                .unwrap();
+            kernel::read_cache::put(key.clone(), std::sync::Arc::new(17usize));
+            before.push(key);
+        }
+        let home = kernel::read_record_on(&mut snapshot, &w.viewer, &w.first)
+            .await
+            .unwrap()
+            .unwrap()
+            .home_id;
+        assert!(
+            kernel::read_cache::with_capabilities(kernel::kernel_effective_capability_on(
+                &mut snapshot,
+                &w.viewer,
+                &w.first
+            ))
+            .await
+            .unwrap()
+            .allows(crate::authorization::Capability::View)
+        );
+        snapshot.rollback().await.unwrap();
+        // A writer inside this very request changes projected authority. The
+        // policy API must also append an event before another read can reuse
+        // any of the caches (not only the capability cache, disabled on writes).
+        kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+            .await
+            .unwrap();
+        let mut snapshot = w.db.write_pool().begin().await.unwrap();
+        for (namespace, old) in namespaces.into_iter().zip(before) {
+            let current = kernel::read_cache::key_on(&mut snapshot, &w.viewer, namespace)
+                .await
+                .unwrap();
+            assert!(
+                current != old,
+                "{namespace}: authority writes must advance event heads"
+            );
+            assert!(kernel::read_cache::get::<usize>(&current).is_none());
+        }
+        assert!(
+            !kernel::read_cache::with_capabilities(kernel::kernel_effective_capability_on(
+                &mut snapshot,
+                &w.viewer,
+                &w.first
+            ))
+            .await
+            .unwrap()
+            .allows(crate::authorization::Capability::View)
+        );
+        assert!(kernel::read_record_on(&mut snapshot, &w.viewer, &w.first)
+            .await
+            .unwrap()
+            .is_none());
+        snapshot.rollback().await.unwrap();
+    })
+    .await;
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_batch_hydration_keeps_the_staged_snapshot() {
+    let w = world().await;
+    let first = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap();
+    let reads = [
+        ("records", "id"),
+        ("records", "type"),
+        ("records", "kind"),
+        ("records", "name"),
+        ("records", "archived"),
+        ("records", "created_at"),
+        ("records", "home_id"),
+        ("links", "source_id"),
+        ("links", "target_id"),
+        ("links", "relationship"),
+    ];
+    let ids = vec![w.first.clone(), w.second.clone()];
+    let value = kernel::read_cache::scope_request(super::sql::with_part_of_read_session(
+        &w.db,
+        &w.admin,
+        &reads,
+        &ids,
+        async {
+            // Simulate a concurrent writer after staging pinned its read snapshot.
+            kernel::set_body_as(&w.db, &w.admin, &w.first, "newer body", first.revision).await?;
+            kernel::observe_facet_as(
+                &w.db,
+                &w.admin,
+                &w.first,
+                &kernel::FacetObservation {
+                    key: "snapshot-proof".into(),
+                    value: Some("newer facet".into()),
+                    value_num: None,
+                    vocab_ref: None,
+                    as_of: crate::store::now_iso(),
+                },
+                None,
+            )
+            .await?;
+            super::get_record_in_session(&w.db, &w.admin, json!({"ids":ids})).await
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        value["records"][0]["version"],
+        format!("rec:{}", first.revision)
+    );
+    assert_ne!(value["records"][0]["body"], "newer body");
+    assert!(!value["records"][0]["facets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["key"] == "snapshot-proof"));
+    assert_eq!(
+        kernel::read_record_as(&w.db, &w.admin, &w.first)
+            .await
+            .unwrap()
+            .unwrap()
+            .body
+            .as_deref(),
+        Some("newer body")
+    );
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_batch_large_body_does_not_inherit_sql_cell_limit() {
+    let w = world().await;
+    let body = "x".repeat(crate::query::sql::MAX_SQLITE_VALUE_BYTES as usize + 4096);
+    let record = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap();
+    kernel::set_body_as(&w.db, &w.admin, &w.first, &body, record.revision)
+        .await
+        .unwrap();
+    // Counts/enrichment execute governed SQL before the next record is hydrated.
+    let result = call(&w, "get_record", json!({"ids":[w.first,w.second,w.first]}))
+        .await
+        .unwrap();
+    assert_eq!(result["records"][0]["body"], body);
+    assert_eq!(result["records"][2]["body"], body);
+    assert_eq!(result["records"][1]["status"], "found");
+    // The SQL ceiling itself is unchanged.
+    assert!(call(&w, "query_sql", json!({"sql":"SELECT body FROM records WHERE id=?1","parameters":[{"type":"text","value":w.first}]})).await.is_err());
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_global_history_windows_match_full_staging() {
+    let w = world().await;
+    // A whole candidate window is invisible to the member. Scanning it must
+    // neither end the page early nor disclose a hidden position as its cursor.
+    for n in 0..300 {
+        let revision = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
+        kernel::set_body_as(
+            &w.db,
+            &w.admin,
+            &w.hidden,
+            &format!("private revision {n}"),
+            revision,
+        )
+        .await
+        .unwrap();
+    }
+    let reads = &[
+        ("content_events", "local_seq"),
+        ("content_events", "record_id"),
+        ("content_events", "run_key"),
+        ("content_events", "parent_key"),
+    ];
+    for actor in [&w.viewer, &w.admin] {
+        for order in ["oldest_first", "newest_first"] {
+            for detail in ["metadata", "full"] {
+                let mut cursor = None;
+                for _ in 0..3 {
+                    let mut args = json!({"limit":2,"order":order,"detail":detail});
+                    if let Some(seq) = cursor {
+                        args["after_local_seq"] = json!(seq);
+                    }
+                    let expected = kernel::read_cache::scope_request(sql::with_read_session(
+                        &w.db,
+                        actor,
+                        reads,
+                        read_surface::history_in_session(&w.db, actor, args.clone()),
+                    ))
+                    .await
+                    .unwrap();
+                    let actual = kernel::read_cache::scope_request(read_surface::history(
+                        &w.db, actor, args,
+                    ))
+                    .await
+                    .unwrap();
+                    assert_eq!(actual, expected, "{order} {detail}");
+                    cursor = actual["next_after_local_seq"].as_i64();
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_search_windows_preserve_tiers_archive_visibility_and_body_snippets() {
+    let w = world().await;
+    let public = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let private = kernel::read_record_as(&w.db, &w.admin, &w.hidden)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    let mut expected = Vec::new();
+    for n in 0..230 {
+        let hidden = n % 9 == 0;
+        let archived = n % 17 == 0;
+        let title_match = n % 7 == 0;
+        let title = if title_match {
+            format!("windowneedle title {n}")
+        } else {
+            format!("Entry {n}")
+        };
+        let id = kernel::create_as(
+            &w.db,
+            &w.admin,
+            "fixture.mcp",
+            "note",
+            json!({"title":title,"body":format!("windowneedle body {n}")})
+                .as_object()
+                .unwrap(),
+            if hidden { &private } else { &public },
+        )
+        .await
+        .unwrap();
+        if archived {
+            let revision = kernel::read_record_as(&w.db, &w.admin, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .revision;
+            kernel::hq::set_archived_as(&w.db, &w.admin, &id, true, revision)
+                .await
+                .unwrap();
+        }
+        expected.push((if title_match { 0 } else { 2 }, id, hidden, archived));
+    }
+    // More than two windows, with hidden/archived ids interspersed. Later
+    // title hits must displace earlier body hits, without changing id ties.
+    for actor in [&w.viewer, &w.admin] {
+        for include_archived in [false, true] {
+            let mut wanted: Vec<_> = expected
+                .iter()
+                .filter(|(_, _, hidden, archived)| {
+                    (!hidden || actor == &w.admin) && (!archived || include_archived)
+                })
+                .collect();
+            wanted.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+            wanted.truncate(200);
+            let (hits, truncated) =
+                kernel::search_v2::search_as(&w.db, actor, "windowneedle", 200, include_archived)
+                    .await
+                    .unwrap();
+            assert!(!truncated);
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (&hit.id, hit.score as i64))
+                    .collect::<Vec<_>>(),
+                wanted.iter().map(|row| (&row.1, row.0)).collect::<Vec<_>>()
+            );
+            assert!(hits
+                .iter()
+                .filter(|hit| hit.score == 2.0)
+                .all(|hit| hit.snippet.contains("windowneedle body")));
+        }
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_browser_materialized_record_cache_is_read_only_and_head_bound() {
+    let w = world().await;
+    kernel::read_cache::scope_request(async {
+        let before = kernel::read_cache::with_capabilities(kernel::read_record_as(&w.db, &w.viewer, &w.first)).await.unwrap().unwrap();
+        assert_eq!(before.fields["body"], "revised");
+        kernel::revise_as(&w.db,&w.admin,&w.first,json!({"body":"New event"}).as_object().unwrap()).await.unwrap();
+        let after = kernel::read_cache::with_capabilities(kernel::read_record_as(&w.db,&w.viewer,&w.first)).await.unwrap().unwrap();
+        assert_eq!(after.fields["body"], "New event");
+        assert!(after.revision > before.revision);
+        assert!(kernel::read_cache::with_capabilities(kernel::read_record_as(&w.db,&w.viewer,&w.hidden)).await.unwrap().is_none());
+        assert!(kernel::read_cache::with_capabilities(kernel::read_record_as(&w.db,&w.admin,&w.hidden)).await.unwrap().is_some());
+        // An intermediate projection edit in a write transaction must never
+        // consume a view memoized by an earlier closed read of the same head.
+        let mut tx = w.db.write_pool().begin().await.unwrap();
+        kernel::read_cache::with_capabilities(kernel::read_record_on(&mut tx,&w.viewer,&w.first)).await.unwrap();
+        sqlx::query("UPDATE kernel_record_fields SET value_json='\"Intermediate projection\"' WHERE record_id=? AND name='body'").bind(&w.first).execute(&mut *tx).await.unwrap();
+        let fresh = kernel::read_record_on(&mut tx,&w.viewer,&w.first).await.unwrap().unwrap();
+        assert_eq!(fresh.fields["body"], "Intermediate projection");
+        tx.rollback().await.unwrap();
+        let home = after.home_id;
+        kernel::replace_home_policy(&w.db,&w.admin,&home,&[]).await.unwrap();
+        assert!(kernel::read_cache::with_capabilities(kernel::read_record_as(&w.db,&w.viewer,&w.first)).await.unwrap().is_none());
+    }).await;
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_browser_sql_id_prefix_matches_full_barrier() {
+    let w = world().await;
+    for (credential, actor) in [("acct:viewer", &w.viewer), ("acct:admin", &w.admin)] {
+        for statement in [
+            "SELECT id,name FROM records ORDER BY id LIMIT 1",
+            "SELECT name FROM records ORDER BY id ASC LIMIT 2",
+            "SELECT id,name FROM records WHERE name IS NOT NULL ORDER BY id LIMIT 1",
+            "SELECT name AS id FROM records ORDER BY id LIMIT 1",
+        ] {
+            let expected = kernel::read_cache::scope_request(super::sql::with_read_session(
+                &w.db,
+                actor,
+                &[("records", "id"), ("records", "name")],
+                super::sql::query_sql(&w.db, actor, json!({"sql":statement})),
+            ))
+            .await
+            .unwrap();
+            let (actual, stats) = super::sql::measured(call_as(
+                &w,
+                credential,
+                "query_sql",
+                json!({"sql":statement}),
+            ))
+            .await;
+            let mut actual = actual.unwrap();
+            actual.as_object_mut().unwrap().remove("run_context");
+            assert_eq!(actual, expected, "{credential}/{statement}");
+            if statement == "SELECT id,name FROM records ORDER BY id LIMIT 1" {
+                assert_eq!(stats.staged_records, 1);
+            }
+            if credential == "acct:viewer" {
+                assert!(!actual.to_string().contains("Secret"));
+            }
+        }
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_browser_counted_query_never_decodes_a_hidden_carrier() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let hidden = call_as(&w,"acct:admin","create_record",json!({"type":"Annotation","kind":"comment","body":"Hidden malformed carrier","links":[{"target_id":w.hidden,"relationship":"part_of"}]})).await.unwrap()["id"].as_str().unwrap().to_owned();
+    sqlx::query(
+        "UPDATE kernel_record_fields SET value_json='{' WHERE record_id=? AND name='v1_kind'",
+    )
+    .bind(&hidden)
+    .execute(w.db.write_pool())
+    .await
+    .unwrap();
+    let args = json!({"steps":[{"step":"filter","types":["Document","Annotation"],"kinds":["note"]}],"limit":100});
+    let actual = call(&w, "query_record", args.clone()).await.unwrap();
+    let expected = kernel::search_v2::FORCE_GROUP_SCAN
+        .scope(true, call(&w, "query_record", args.clone()))
+        .await
+        .unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(actual["total"], 2);
+    assert!(
+        call_as(&w, "acct:admin", "query_record", args)
+            .await
+            .is_err(),
+        "a visible malformed carrier still reports its decoding failure"
+    );
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_history_admission_seeks_only_selected_positions() {
+    use sqlx::Row;
+    let w = world().await;
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    connection.close_on_drop();
+    sqlx::query("BEGIN")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let reads = [("content_events".into(), "id".into())]
+        .into_iter()
+        .collect();
+    super::sql::install(&mut connection, &w.viewer, &reads)
+        .await
+        .unwrap();
+    let plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::sql::LEGACY_ADMISSION_SQL
+    ))
+    .bind(false)
+    .bind("acct:viewer")
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.get::<String, _>(3))
+    .collect::<Vec<_>>();
+    assert!(plan.iter().any(|p| p.starts_with("SCAN a")), "{plan:?}");
+    for alias in ["m", "h"] {
+        assert!(
+            !plan.iter().any(|p| p.starts_with(&format!("SCAN {alias}"))),
+            "selected positions must precede retained headers: {plan:?}"
+        );
+    }
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_clean_connection_reuse_drops_all_caller_state() {
+    let w = world().await;
+    // Force all successive requests onto one physical slot. An ordinary pool
+    // page cache may survive; TEMP rows and authority must never survive.
+    let mut held = Vec::new();
+    for _ in 1..w.db.governed_pool().options().get_max_connections() {
+        held.push(w.db.governed_pool().acquire().await.unwrap());
+    }
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    let baseline: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let visible = call_as(
+        &w,
+        "acct:viewer",
+        "get_record",
+        json!({"ids":[w.first,w.hidden]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(visible["records"][0]["status"], "found");
+    assert_eq!(visible["records"][1]["status"], "not_found");
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert!(after > baseline, "successful reads reuse the physical slot");
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM temp.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "all materialized caller relations were rolled back"
+    );
+    let query_only: i64 = sqlx::query_scalar("PRAGMA query_only")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(query_only, 0);
+    drop(connection);
+    let owner = call_as(&w, "acct:admin", "get_record", json!({"ids":[w.hidden]}))
+        .await
+        .unwrap();
+    assert_eq!(owner["records"][0]["status"], "found");
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+        .await
+        .unwrap();
+    let revoked = call_as(
+        &w,
+        "acct:viewer",
+        "get_record",
+        json!({"ids":[w.first,w.hidden]}),
+    )
+    .await
+    .unwrap();
+    assert!(revoked["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["status"] == "not_found"));
+    let failure = super::sql::with_read_session(&w.db, &w.admin, &[("records", "id")], async {
+        Err::<(), _>(Error::engine("fixture read failure"))
+    })
+    .await
+    .unwrap_err();
+    assert!(failure.to_string().contains("fixture read failure"));
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM temp.sqlite_schema WHERE name NOT GLOB 'sqlite_*'"
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        0
+    );
+    drop(connection);
+    let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let db = w.db.clone();
+        let actor = w.admin.clone();
+        let ready = ready.clone();
+        tokio::spawn(async move {
+            super::sql::with_read_session(&db, &actor, &[("records", "id")], async {
+                ready.notify_one();
+                std::future::pending::<Result<()>>().await
+            })
+            .await
+        })
+    };
+    ready.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let mut connection = w.db.governed_pool().acquire().await.unwrap();
+    let changes: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(changes, 0, "cancellation closes the physical connection");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM temp.sqlite_schema WHERE name NOT GLOB 'sqlite_*'"
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        0
+    );
+    drop(connection);
+    let revoked = call_as(&w, "acct:viewer", "get_record", json!({"ids":[w.hidden]}))
+        .await
+        .unwrap();
+    assert_eq!(revoked["records"][0]["status"], "not_found");
+    drop(held);
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_batch_wall_deadline_refuses_without_partial_results() {
+    let w = world().await;
+    // Expire while waiting for a governed slot, so the outer cap demonstrably
+    // includes pool acquisition, before any per-statement/subject guard exists.
+    let pool = w.db.governed_pool();
+    let mut held = Vec::new();
+    for _ in 0..pool.options().get_max_connections() {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let result = GET_BATCH_DEADLINE_OVERRIDE
+        .scope(
+            std::time::Duration::from_millis(20),
+            call(&w, "get_record", json!({"ids":[w.first,w.second]})),
+        )
+        .await;
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("batch deadline exceeded; no partial results returned"));
+    drop(held);
+    assert!(call(&w, "get_record", json!({"ids":[w.first]}))
+        .await
+        .is_ok());
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_browser_write_request_caches_follow_tombstone_events() {
+    let w = world().await;
+    kernel::read_cache::scope_request(async {
+        let mut snapshot = w.db.write_pool().begin().await.unwrap();
+        let namespaces = [
+            "home_visibility",
+            "lifecycle",
+            "ancestor_descriptors",
+            "disclosed_accounts",
+        ];
+        let mut before = Vec::new();
+        for namespace in namespaces {
+            let key = kernel::read_cache::key_on(&mut snapshot, &w.viewer, namespace)
+                .await
+                .unwrap();
+            kernel::read_cache::put(key.clone(), std::sync::Arc::new(17usize));
+            before.push(key);
+        }
+        assert!(kernel::read_record_on(&mut snapshot, &w.viewer, &w.first)
+            .await
+            .unwrap()
+            .is_some());
+        snapshot.rollback().await.unwrap();
+        call_as(
+            &w,
+            "acct:admin",
+            "delete_record",
+            json!({"id":w.first,"reason":"cache tombstone proof"}),
+        )
+        .await
+        .unwrap();
+        let mut snapshot = w.db.write_pool().begin().await.unwrap();
+        for (namespace, old) in namespaces.into_iter().zip(before) {
+            let current = kernel::read_cache::key_on(&mut snapshot, &w.viewer, namespace)
+                .await
+                .unwrap();
+            assert!(current != old, "{namespace}");
+            assert!(kernel::read_cache::get::<usize>(&current).is_none());
+        }
+        assert!(kernel::read_record_on(&mut snapshot, &w.viewer, &w.first)
+            .await
+            .unwrap()
+            .is_none());
+        snapshot.rollback().await.unwrap();
+    })
+    .await;
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_provider_link_lazy_columns_preserve_clocks_notes_and_disclosure_barrier() {
+    let w = world().await;
+    let large = "x".repeat(crate::query::sql::MAX_SQLITE_VALUE_BYTES as usize + 1);
+    let link = kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        &w.second,
+        "lazy-clock-proof",
+        Some(large.clone()),
+    )
+    .await
+    .unwrap()
+    .link;
+    let count = call(
+        &w,
+        "query_sql",
+        json!({"sql":"SELECT count(*) AS n FROM links WHERE relationship='lazy-clock-proof'"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        count["rows"][0]["n"], 1,
+        "unused oversized note must not poison a count"
+    );
+    let note=call(&w,"query_sql",json!({"sql":"SELECT note FROM links WHERE id=?1","parameters":[{"type":"text","value":link.link_id}]})).await;
+    assert!(
+        note.is_err(),
+        "requested oversized values retain the ordinary SQL value bound"
+    );
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        &w.second,
+        "lazy-clock-proof",
+        Some("{\"x\":1}".into()),
+    )
+    .await
+    .unwrap();
+    let row=call(&w,"query_sql",json!({"sql":"SELECT * FROM links WHERE id=?1","parameters":[{"type":"text","value":link.link_id}]})).await.unwrap();
+    assert_eq!(row["rows"][0]["note"], "{\"x\":1}");
+    assert_eq!(row["rows"][0]["source_id"], w.first);
+    assert_eq!(row["rows"][0]["target_id"], w.second);
+    assert!(row["rows"][0]["created_at"].is_string());
+    assert!(row["rows"][0]["created_at_ms"].is_i64());
+    kernel::add_generic_link_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        &w.hidden,
+        "lazy-clock-proof",
+        Some("malformed private JSON".into()),
+    )
+    .await
+    .unwrap();
+    for target in [w.hidden.as_str(), "missing"] {
+        let out=call(&w,"query_sql",json!({"sql":"SELECT count(*) AS n FROM links WHERE CASE WHEN target_id=?1 THEN json_extract(note,'$.x') ELSE 0 END","parameters":[{"type":"text","value":target}]})).await.unwrap();
+        assert_eq!(
+            out["rows"][0]["n"], 0,
+            "caller expressions may not reach hidden rows"
+        );
+    }
+    w.db.close().await;
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn kernel_v2_provider_link_joined_metadata_matches_lazy_values_and_endpoint_gate() {
+    let w = world().await;
+    for target in [&w.second, &w.hidden] {
+        kernel::add_generic_link_as(
+            &w.db,
+            &w.admin,
+            &w.first,
+            target,
+            "joined-metadata-proof",
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    for credential in ["acct:viewer", "acct:admin"] {
+        let query = "SELECT r.id,r.type,r.kind,r.name,l.relationship FROM links l JOIN records r ON r.id=l.target_id WHERE l.relationship='joined-metadata-proof' ORDER BY r.id";
+        let fast = call_as(&w, credential, "query_sql", json!({"sql":query}))
+            .await
+            .unwrap();
+        // Adding body selects the original lazy path. Compare every metadata
+        // value against it, with the same live endpoint fence for both callers.
+        let lazy_query = query.replacen("l.relationship FROM", "l.relationship,r.body FROM", 1);
+        let mut lazy = call_as(&w, credential, "query_sql", json!({"sql":lazy_query}))
+            .await
+            .unwrap();
+        for row in lazy["rows"].as_array_mut().unwrap() {
+            row.as_object_mut().unwrap().remove("body");
+        }
+        assert_eq!(fast["rows"], lazy["rows"]);
+        let cte = call_as(&w, credential, "query_sql", json!({"sql":"SELECT target_id AS id FROM links WHERE relationship='joined-metadata-proof' ORDER BY target_id"})).await.unwrap();
+        assert_eq!(
+            fast["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect::<Vec<_>>(),
+            cte["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect::<Vec<_>>()
+        );
+        // Neither count reads a link column. The joined path must preserve
+        // row multiplicity through its private _row column, including hidden
+        // endpoints being absent for the member.
+        let count = call_as(
+            &w,
+            credential,
+            "query_sql",
+            json!({"sql":"SELECT count(*) AS n FROM links"}),
+        )
+        .await
+        .unwrap();
+        let joined_count = call_as(&w, credential, "query_sql", json!({"sql":"SELECT count(*) AS n FROM records r CROSS JOIN links l WHERE r.id=?1", "parameters":[{"type":"text","value":w.first}]})).await.unwrap();
+        assert_eq!(count["rows"], joined_count["rows"]);
+        assert_eq!(
+            fast["rows"].as_array().unwrap().len(),
+            if credential == "acct:admin" { 2 } else { 1 }
+        );
+    }
+    w.db.close().await;
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_pages_are_private_caller_and_database_bound() {
+    let w = world().await;
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let token = opened["snapshot_token"]
+        .as_str()
+        .expect("real snapshot pin");
+    let mut ids = Vec::new();
+    let mut after = Value::Null;
+    loop {
+        let page=call(&w,"get_workspace_snapshot",json!({"action":"page","snapshot_token":token,"section":"records","limit":1,"after_id":after})).await.unwrap();
+        assert!(page["rows"].as_array().unwrap().len() <= 1);
+        ids.extend(
+            page["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap().to_owned()),
+        );
+        if page["has_more"] == false {
+            break;
+        }
+        after = page["after_id"].clone();
+    }
+    assert!(ids.contains(&w.first) && ids.contains(&w.second));
+    assert!(!ids.contains(&w.hidden));
+    for section in ["facets", "links", "content_events"] {
+        let page = call(
+            &w,
+            "get_workspace_snapshot",
+            json!({"action":"page","snapshot_token":token,"section":section,"limit":1000}),
+        )
+        .await
+        .unwrap();
+        assert!(page["rows"].is_array(), "{page}");
+        assert!(!page.to_string().contains(&w.hidden));
+    }
+    let other = call_as(
+        &w,
+        "acct:admin",
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":token,"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other["reason"], "token_expired_or_unknown");
+    let second = world().await;
+    let other = call(
+        &second,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":token,"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other["reason"], "token_expired_or_unknown");
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_catch_up_resume_and_fence_move() {
+    let w = world().await;
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let token = opened["snapshot_token"].clone();
+    kernel::revise_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        json!({"body":"Changed body"}).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    let pinned = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":token,"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        pinned["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == w.first && r["name"] == "Alpha"),
+        "content edits do not drift pinned pages"
+    );
+    let delta = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"catch_up","snapshot_token":token}),
+    )
+    .await
+    .unwrap();
+    assert!(delta["upsert_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == w.first));
+    let events = delta["content_events"].as_array().unwrap();
+    assert!(events
+        .windows(2)
+        .all(|w| w[0]["seq"].as_i64() < w[1]["seq"].as_i64()));
+    let changed = call(
+        &w,
+        "whats_changed",
+        json!({"after_local_seq":0,"through_local_seq":delta["content_seq"],"limit":1000}),
+    )
+    .await
+    .unwrap();
+    let changed: Vec<_> = changed["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["last_local_seq"].clone())
+        .collect();
+    // Snapshot's content lane excludes home/control events that the general
+    // change feed also discloses. Every included event still has precisely the
+    // canonical sequence and order; the latest actual edit must be present.
+    assert!(events.iter().all(|e| changed.contains(&e["seq"])));
+    assert_eq!(
+        events.last().unwrap()["seq"],
+        changed.last().unwrap().clone()
+    );
+    let resumed=call(&w,"get_workspace_snapshot",json!({"action":"resume","manifest":{"version":1,"profile":crate::workspace_snapshot::RESUME_MANIFEST_PROFILE,"records":[],"facets":[],"links":[]}})).await.unwrap();
+    assert!(resumed["upsert_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == w.first));
+    assert!(!resumed.to_string().contains(&w.hidden));
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+        .await
+        .unwrap();
+    let page = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":resumed["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page["reason"], "authorization_epoch_moved");
+    let restart = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"catch_up","snapshot_token":resumed["snapshot_token"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restart["reason"], "authorization_epoch_moved");
+    let moved=call(&w,"get_workspace_snapshot",json!({"action":"catch_up","snapshot_token":resumed["snapshot_token"],"accept_fence_moved":true})).await.unwrap();
+    assert_eq!(moved["fence_moved"], true);
+    assert!(moved["delete_record_ids"]
+        .as_array()
+        .unwrap()
+        .contains(&json!(w.first)));
+    assert!(!moved["upsert_records"].to_string().contains(&w.first));
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_unrepresentable_native_records_are_unavailable_not_empty() {
+    let w = world().await;
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    let bare = kernel::create_record_as(&w.db, &w.admin, &home)
+        .await
+        .unwrap();
+    assert!(kernel::read_record_as(&w.db, &w.viewer, &bare)
+        .await
+        .unwrap()
+        .is_some());
+    // The low-level neutral constructor genuinely has no primary type. Carry
+    // NULL exactly like get_record / SQL, not a made-up Document classification.
+    let get = call(&w, "get_record", json!({"ids":[bare],"children_limit":0}))
+        .await
+        .unwrap();
+    assert!(get["records"][0]["type"].is_null());
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    assert!(opened["snapshot_token"].is_string(), "{opened}");
+    let page = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    let row = page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == bare)
+        .unwrap();
+    assert!(row["type"].is_null());
+    let resumed=call(&w,"get_workspace_snapshot",json!({"action":"resume","manifest":{"version":1,"profile":crate::workspace_snapshot::RESUME_MANIFEST_PROFILE,"records":[],"facets":[],"links":[]}})).await.unwrap();
+    assert!(resumed["snapshot_token"].is_string());
+    assert!(resumed["upsert_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == bare && r["type"].is_null()));
+    let package = crate::v2_standard::document_package();
+    let identity = package.identity().unwrap();
+    kernel::install_package_as(&w.db, &w.admin, &package)
+        .await
+        .unwrap();
+    kernel::adopt_package_at(
+        &w.db,
+        &w.admin,
+        KERNEL_ROOT_ID,
+        &package,
+        Some(&identity),
+        &package.declared_reads,
+    )
+    .await
+    .unwrap();
+    let typed=call_as(&w,"acct:admin","create_record",json!({"type":"Document","kind":"note","name":"Native member create","home_id":home,"reason":"native snapshot parity"})).await.unwrap();
+    let old_page = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        old_page["reason"], "authorization_epoch_moved",
+        "native creation has v1's INSERT fence"
+    );
+    let new_open = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let page = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":new_open["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert!(page["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["id"] == typed["id"] && r["type"] == "Document" && r["kind"] == "note"));
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_agent_control_chatter_keeps_pages_and_content_window() {
+    let w = world().await;
+    let context = kernel::run_ledger::open_run_as(&w.db, &w.admin, "scout-chair-a748b2")
+        .await
+        .unwrap();
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    let first=call(&w,"get_workspace_snapshot",json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records","limit":1})).await.unwrap();
+    assert_eq!(first["has_more"], true);
+    for index in 0..520 {
+        kernel::run_ledger::set_run_intent_as(&w.db, &context, &format!("Agent activity {index}"))
+            .await
+            .unwrap();
+    }
+    kernel::hq::observe_facet_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        &kernel::hq::FacetObservation {
+            key: "phase".into(),
+            value: Some("active".into()),
+            value_num: None,
+            vocab_ref: None,
+            as_of: "2026-01-01T00:00:00Z".into(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT max(seq) FROM content_events WHERE record_id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::hq::set_archived_as(&w.db, &w.admin, &w.first, true, revision)
+        .await
+        .unwrap();
+    let next=call(&w,"get_workspace_snapshot",json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records","limit":1,"after_id":first["after_id"]})).await.unwrap();
+    assert!(next["rows"].is_array(), "{next}");
+    assert!(!next["restart_required"].as_bool().unwrap_or(false));
+    let delta = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"catch_up","snapshot_token":opened["snapshot_token"]}),
+    )
+    .await
+    .unwrap();
+    assert!(delta["snapshot_token"].is_string(), "{delta}");
+    assert!(delta["content_events"]
+        .as_array()
+        .unwrap()
+        .windows(2)
+        .all(|r| r[0]["seq"].as_i64() < r[1]["seq"].as_i64()));
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+        .await
+        .unwrap();
+    let revoked = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":delta["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(revoked["reason"], "authorization_epoch_moved");
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_real_content_exhausts_gap_without_moving_fences() {
+    let w = world().await;
+    let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+        .await
+        .unwrap();
+    for index in 0..513 {
+        kernel::hq::observe_facet_as(
+            &w.db,
+            &w.admin,
+            &w.first,
+            &kernel::hq::FacetObservation {
+                key: "churn".into(),
+                value: Some(index.to_string()),
+                value_num: None,
+                vocab_ref: None,
+                as_of: "2026-01-01T00:00:00Z".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let page = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        page["rows"].is_array(),
+        "facet writes leave pinned pages unchanged"
+    );
+    let delta = call(
+        &w,
+        "get_workspace_snapshot",
+        json!({"action":"catch_up","snapshot_token":opened["snapshot_token"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(delta["reason"], "content_gap_outside_window");
+}
+
+#[tokio::test]
+async fn kernel_v2_workspace_snapshot_relationship_and_unit_fences_are_distinct() {
+    let w = world().await;
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    for (stream, event_type, expected) in [
+        (
+            "relationship_events",
+            "relationship.asserted.v1",
+            "relationship_seq_moved",
+        ),
+        ("content_events", "unit.created.v1", "unit_seq_moved"),
+    ] {
+        let opened = call(&w, "get_workspace_snapshot", json!({"action":"open"}))
+            .await
+            .unwrap();
+        kernel::import_event_as(&w.db, &host, &w.first, &kernel::LegacyEvent {
+            source: Some(json!({"origin":"synthetic-snapshot-fences","stream":stream,"metadata":{"record_id":w.first},"subjects":[w.first]})),
+            id: uuid::Uuid::new_v4().to_string(), event_type: event_type.into(), payload: json!({}),
+            created_at: "2026-01-01T00:00:00Z".into(), actor: None, run_key: None,
+        }).await.unwrap();
+        let page = call(
+            &w,
+            "get_workspace_snapshot",
+            json!({"action":"page","snapshot_token":opened["snapshot_token"],"section":"records"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["reason"], expected);
+    }
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn provider_link_write_predicates_do_not_require_prepared_read_indexes() {
+    let w = world().await;
+    install_comment_carrier(&w).await;
+    let comment = call(&w, "create_record", json!({"type":"Annotation","kind":"comment","body":"Unprepared write proof","links":[{"target_id":w.first,"relationship":"part_of"}]})).await.unwrap()["id"].as_str().unwrap().to_owned();
+    let destination = kernel::create_home(
+        &w.db,
+        KERNEL_ROOT_ID,
+        Some(&[(&w.admin, "manage")]),
+        &w.admin,
+    )
+    .await
+    .unwrap();
+    sqlx::query("DROP INDEX idx_kernel_read_type; DROP INDEX idx_kernel_read_kind")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(kernel::verify_v2_ready(&w.db).await.is_err());
+    // Low-level kernel writers deliberately do not imply serving readiness.
+    kernel::rehome_record_as(&w.db, &w.admin, &w.second, &destination)
+        .await
+        .unwrap();
+    let err = kernel::rehome_record_as(&w.db, &w.admin, &w.first, &destination)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("requires the atomic member move"),
+        "{err}"
+    );
+    let mut tx = crate::db::begin_write(w.db.write_pool()).await.unwrap();
+    let mut acts = crate::act::ActAllocation::new();
+    kernel::move_record_with_comments_in(
+        &w.db,
+        &mut tx,
+        &mut acts,
+        &w.admin,
+        &w.first,
+        &destination,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    for id in [&w.first, &comment] {
+        assert_eq!(
+            kernel::read_record_as(&w.db, &w.admin, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .home_id,
+            destination
+        );
+    }
+    // The shared Message predicate must also compile without optional indexes.
+    let homes = "SELECT root_id AS id,1 AS view FROM kernel_roots";
+    let unhinted = kernel::messaging::sql_guard("r", "?1", homes, false);
+    let query = format!("SELECT id FROM kernel_records r WHERE {unhinted} ORDER BY id");
+    let expected: Vec<String> = sqlx::query_scalar(&query)
+        .bind(&w.admin)
+        .fetch_all(w.db.pool())
+        .await
+        .unwrap();
+    call_as(
+        &w,
+        "acct:admin",
+        "delete_record",
+        json!({"id":w.first,"reason":"Unprepared delete proof"}),
+    )
+    .await
+    .unwrap();
+    assert!(kernel::read_record_as(&w.db, &w.admin, &comment)
+        .await
+        .unwrap()
+        .is_none());
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    kernel::verify_v2_ready(&w.db).await.unwrap();
+    let hinted = kernel::messaging::sql_guard("r", "?1", homes, true);
+    let actual: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT id FROM kernel_records r WHERE {hinted} ORDER BY id"
+    ))
+    .bind(&w.admin)
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    // Message audience predicate is independent of the deletion lifecycle gate.
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn kernel_v2_sql_metadata_pulse_matches_full_gate_and_rechecks_revocation() {
+    let w = world().await;
+    let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
+        .bind(&w.first)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    // A real imported home names a separate logical filing record. Its
+    // visibility is a dependency even outside the caller's ID list.
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let imported_home = kernel::v1_import_home_id(&w.second);
+    kernel::import_home_as(
+        &w.db,
+        &host,
+        &imported_home,
+        &w.second,
+        &home,
+        &w.admin,
+        None,
+    )
+    .await
+    .unwrap();
+    kernel::rehome_record_as(&w.db, &w.admin, &w.first, &imported_home)
+        .await
+        .unwrap();
+    let args = json!({"sql":"SELECT id, updated_at FROM records WHERE id IN (?1,?2,?3,?4,?5,?6)",
+        "parameters":[{"type":"text","value":w.first},{"type":"text","value":w.second},
+            {"type":"text","value":w.hidden},{"type":"text","value":w.first},
+            {"type":"text","value":null},{"type":"text","value":"missing'); SELECT 1;--"}]});
+    // Same statement through the unrestricted staging oracle. Qualification
+    // deliberately excludes it from the closed optimization.
+    let mut full = args.clone();
+    full["sql"] =
+        json!("SELECT r.id, r.updated_at FROM records r WHERE r.id IN (?1,?2,?3,?4,?5,?6)");
+    for phase in 0..3 {
+        for who in ["acct:viewer", "acct:admin"] {
+            let (narrow, stats) =
+                super::sql::measured(call_as(&w, who, "query_sql", args.clone())).await;
+            let narrow = narrow.unwrap();
+            let oracle = call_as(&w, who, "query_sql", full.clone()).await.unwrap();
+            assert_eq!(narrow["rows"], oracle["rows"]);
+            assert_eq!(narrow["truncated"], oracle["truncated"]);
+            assert!(stats.staged_records <= 3);
+            let wide_sql = "SELECT id, type, kind, name, summary, home_id, lifecycle, maturity, updated_at, last_activity_at FROM records WHERE deleted_at IS NULL AND id IN (?1,?2,?3,?4,?5,?6)";
+            let mut wide = args.clone();
+            wide["sql"] = json!(wide_sql);
+            let (wide_out, wide_stats) =
+                super::sql::measured(call_as(&w, who, "query_sql", wide.clone())).await;
+            let wide_out = wide_out.unwrap();
+            wide["sql"] = json!(wide_sql.replace("FROM records WHERE", "FROM records AS r WHERE"));
+            let wide_oracle = call_as(&w, who, "query_sql", wide).await.unwrap();
+            assert_eq!(wide_out["rows"], wide_oracle["rows"]);
+            assert!(wide_stats.staged_records <= 6, "{wide_stats:?}");
+            let mut one = json!({"sql":wide_sql.replace("?1,?2,?3,?4,?5,?6", "?1"),
+                "parameters":[{"type":"text","value":w.first}]});
+            let one_out = call_as(&w, who, "query_sql", one.clone()).await.unwrap();
+            one["sql"] = json!(one["sql"]
+                .as_str()
+                .unwrap()
+                .replace("FROM records WHERE", "FROM records AS r WHERE"));
+            let one_oracle = call_as(&w, who, "query_sql", one).await.unwrap();
+            assert_eq!(one_out["rows"], one_oracle["rows"]);
+            if phase == 0 && who == "acct:viewer" {
+                assert_eq!(one_out["rows"][0]["home_id"], w.second);
+            }
+            if who == "acct:viewer" {
+                assert!(!narrow["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["id"] == w.hidden));
+                if phase == 0 {
+                    assert_eq!(narrow["row_count"], 2);
+                }
+                if phase == 2 {
+                    assert_eq!(narrow["row_count"], 0);
+                }
+            }
+        }
+        if phase == 0 {
+            // An unsealed Message remains hidden even when its home is visible.
+            sqlx::query("UPDATE kernel_records SET primary_type='Message' WHERE id=?")
+                .bind(&w.second)
+                .execute(w.db.write_pool())
+                .await
+                .unwrap();
+        } else if phase == 1 {
+            // The imported home inherits this original policy anchor.
+            kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+                .await
+                .unwrap();
+        }
+    }
+    // Even record ownership cannot admit a caller removed from the roster.
+    assert!(
+        call_as(&w, "acct:admin", "query_sql", args.clone())
+            .await
+            .unwrap()["row_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    for members in [vec!["acct:admin", "acct:viewer"], vec!["acct:viewer"]] {
+        let actor = members[0].to_owned();
+        kernel::hosted_identity::reconcile_hosted_caller(&w.db, |_| async move {
+            // SAFETY: complete synthetic host-owned roster, no tool input.
+            Ok(unsafe {
+                kernel::hosted_identity::VerifiedHostedMembership::from_accounts_unchecked(
+                    actor,
+                    members.into_iter().map(str::to_owned).collect(),
+                )
+            })
+        })
+        .await
+        .unwrap();
+    }
+    let offboarded_narrow = call_as(&w, "acct:admin", "query_sql", args)
+        .await
+        .unwrap_err();
+    let offboarded_full = call_as(&w, "acct:admin", "query_sql", full)
+        .await
+        .unwrap_err();
+    assert_eq!(offboarded_narrow.to_string(), offboarded_full.to_string());
+    assert_eq!(
+        offboarded_narrow.to_string(),
+        "database membership not found"
+    );
+    w.db.close().await;
+}
+
+fn named_view_fixture_definition(sql: &str, labels: &[&str], dependencies: &[&str]) -> Value {
+    use sha2::{Digest, Sha256};
+    let columns: Vec<_> = labels.iter().map(|name| json!({"name":name,"type":if *name == "id" {"identifier"} else {"text"},"nullable":*name != "id"})).collect();
+    let schema = format!(
+        "{:x}",
+        Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+            &json!(columns)
+        ))
+    );
+    let relations: serde_json::Map<_, _> = dependencies
+        .iter()
+        .map(|name| {
+            let r = crate::query::sql_contract::LOGICAL_RELATIONS
+                .iter()
+                .find(|r| r.name == *name)
+                .unwrap();
+            (
+                (*name).into(),
+                json!({"identity":r.identity,"semantic_version":r.semantic_version}),
+            )
+        })
+        .collect();
+    let profile = crate::query::sql_contract::QuerySqlProfile::SqliteLocal.contract();
+    json!({"v":"1.1","kind":"governed_sql","profile":{"id":profile.id,"revision":profile.revision},
+        "catalog_revision":crate::query::sql_contract::LOGICAL_CATALOG_REVISION,"relations":relations,"sql":sql,"parameters":[],
+        "output":{"columns":columns,"schema_sha256":schema,"row_identity":["id"],"order":[{"column":"id","direction":"asc"}]},"bounds":{"rows":1000}})
+}
+
+async fn named_view_save(w: &World, bearer: &str, definition: &Value) {
+    kernel::observe_facet_as(
+        &w.db,
+        &w.admin,
+        bearer,
+        &kernel::FacetObservation {
+            key: "query".into(),
+            value: Some(definition.to_string()),
+            value_num: None,
+            vocab_ref: None,
+            as_of: chrono::Utc::now().to_rfc3339(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_select_join_visibility_and_cleanup() {
+    let w = world().await;
+    let body = "SELECT id,name FROM records WHERE type='Document'";
+    let definition = named_view_fixture_definition(body, &["id", "name"], &["records"]);
+    named_view_save(&w, &w.first, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_notes")
+        .await
+        .unwrap();
+    named_view_save(&w, &w.second, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.second, "view_other")
+        .await
+        .unwrap();
+    for actor in [&w.viewer, &w.admin, &w.viewer] {
+        for sql in [
+            "SELECT id,name FROM view_notes ORDER BY id",
+            "SELECT count(*) AS n FROM view_notes",
+            "SELECT id,name FROM view_notes WHERE 0",
+            "SELECT id,name FROM view_notes LIMIT 1",
+            "SELECT v.id,v.name FROM view_notes v JOIN records r ON r.id=v.id ORDER BY v.id",
+            "SELECT v.id,v.name FROM view_notes v JOIN view_other o ON o.id=v.id ORDER BY v.id",
+        ] {
+            let inline = sql
+                .replace("view_notes", &format!("({body})"))
+                .replace("view_other", &format!("({body})"));
+            let (actual, stats) =
+                super::sql::measured(super::sql::query_sql(&w.db, actor, json!({"sql":sql}))).await;
+            let actual = actual.unwrap();
+            assert_eq!(stats.uncached_caller_statements, 1);
+            let expected = super::sql::query_sql(&w.db, actor, json!({"sql":inline}))
+                .await
+                .unwrap();
+            assert_eq!(actual["rows"], expected["rows"], "{sql}");
+            assert_eq!(actual["columns"], expected["columns"]);
+            if actor == &w.viewer {
+                assert!(!actual["rows"].to_string().contains(&w.hidden));
+            }
+        }
+    }
+    for sql in [
+        "CREATE VIEW leaked AS SELECT * FROM view_notes",
+        "SELECT * FROM main.kernel_records",
+        "SELECT load_extension('x') FROM view_notes",
+        "SELECT bad FROM view_notes",
+    ] {
+        assert!(
+            super::sql::query_sql(&w.db, &w.viewer, json!({"sql":sql}))
+                .await
+                .is_err(),
+            "{sql}"
+        );
+    }
+    let slot = w.db.governed_pool().acquire().await.unwrap();
+    let mut slot = slot;
+    let leftovers: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM temp.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+    )
+    .fetch_one(&mut *slot)
+    .await
+    .unwrap();
+    assert_eq!(leftovers, 0);
+    drop(slot);
+    // A stale definition never replaces the admitted one implicitly.
+    let changed = named_view_fixture_definition(
+        "SELECT id,name FROM records WHERE name='Secret'",
+        &["id", "name"],
+        &["records"],
+    );
+    named_view_save(&w, &w.first, &changed).await;
+    let error = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_notes"}))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("digest changed"), "{error}");
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_private_bearer_and_admission_boundary() {
+    let w = world().await;
+    let definition = named_view_fixture_definition(
+        "SELECT id,utc_date_label(created_at_ms) AS day FROM records",
+        &["id", "day"],
+        &["records"],
+    );
+    named_view_save(&w, &w.hidden, &definition).await;
+    assert!(
+        kernel::named_views::publish(&w.db, &w.viewer, &w.hidden, "view_private")
+            .await
+            .is_err()
+    );
+    kernel::named_views::publish(&w.db, &w.admin, &w.hidden, "view_private")
+        .await
+        .unwrap();
+    let error = super::sql::query_sql(
+        &w.db,
+        &w.viewer,
+        json!({"sql":"SELECT * FROM view_private"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("Secret"));
+    assert!(
+        super::sql::query_sql(&w.db, &w.admin, json!({"sql":"SELECT * FROM view_private"}))
+            .await
+            .is_ok()
+    );
+    let view = super::sql::query_sql(
+        &w.db,
+        &w.admin,
+        json!({"sql":"SELECT id,day FROM view_private ORDER BY id"}),
+    )
+    .await
+    .unwrap();
+    let inline = super::sql::query_sql(
+        &w.db,
+        &w.admin,
+        json!({"sql":"SELECT id,utc_date_label(created_at_ms) AS day FROM records ORDER BY id"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(view["rows"], inline["rows"]);
+    let spec = crate::store::AppendSpec {
+        record_id: w.first.clone(),
+        event_type: kernel::named_views::EVENT.into(),
+        payload: json!({}),
+        actor: Some(w.admin.clone()),
+    };
+    let error = crate::store::append(&w.db, spec).await.unwrap_err();
+    assert!(error.to_string().contains("engine-owned"), "{error}");
+    assert!(kernel::observe_facet_as(
+        &w.db,
+        &w.admin,
+        &w.first,
+        &kernel::FacetObservation {
+            key: "named_view".into(),
+            value: Some("{}".into()),
+            value_num: None,
+            vocab_ref: None,
+            as_of: chrono::Utc::now().to_rfc3339(),
+        },
+        None
+    )
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_catalog_is_visible_verified_and_hosted_only() {
+    let w = world().await;
+    let definition =
+        named_view_fixture_definition("SELECT id,name FROM records", &["id", "name"], &["records"]);
+    named_view_save(&w, &w.first, &definition).await;
+    named_view_save(&w, &w.hidden, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_visible")
+        .await
+        .unwrap();
+    kernel::named_views::publish(&w.db, &w.admin, &w.hidden, "view_hidden")
+        .await
+        .unwrap();
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name,identity,caller_relative,profiles,comment FROM catalog_relations WHERE relation_name LIKE 'view_%' ORDER BY relation_name"})).await.unwrap();
+    // Slice 1 carriers fold for compatibility, but retained discovery does
+    // not reconstruct immutable revisions from present-day facets.
+    assert_eq!(out["row_count"], 0);
+    assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT column_name,column_position FROM catalog_columns WHERE relation_name='view_visible' ORDER BY column_position"})).await.unwrap();
+    assert_eq!(out["rows"], json!([]));
+    assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
+    let static_rows = super::sql::query_sql(
+        &w.db,
+        &w.viewer,
+        json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name='records'"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(static_rows["row_count"], 1);
+    // A v2 standby shares this handler but must never load copied bindings.
+    let offline =
+        crate::db::open_kernel_v2_standby_read_only(w._dir.path().join("v2.db").to_str().unwrap())
+            .await
+            .unwrap();
+    let (catalog, stats) = super::sql::measured(super::sql::query_sql(&offline, &w.viewer,
+        json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"}))).await;
+    assert_eq!(catalog.unwrap()["row_count"], 0);
+    assert_eq!(stats.named_registry_loads, 0);
+    assert!(super::sql::query_sql(
+        &offline,
+        &w.viewer,
+        json!({"sql":"SELECT * FROM view_visible"})
+    )
+    .await
+    .is_err());
+    offline.close().await;
+    // Shared portable/v1/member schemas never gain the hosted registry.
+    assert!(crate::query::sql::validate("SELECT * FROM view_visible").is_err());
+    assert!(!crate::query::sql_contract::LOGICAL_RELATIONS
+        .iter()
+        .any(|r| r.name.starts_with("view_")));
+    assert!(!crate::mcp::member_scope::QUERY_SQL_SERVED_RELATIONS
+        .iter()
+        .any(|r| r.starts_with("view_")));
+    let changed = named_view_fixture_definition(
+        "SELECT id,name FROM records WHERE 0",
+        &["id", "name"],
+        &["records"],
+    );
+    named_view_save(&w, &w.first, &changed).await;
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"})).await.unwrap();
+    assert_eq!(out["row_count"], 0);
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_ship_dark_and_skip_registry_for_static_reads() {
+    let w = world().await;
+    let args = json!({"sql":"SELECT id FROM records ORDER BY id LIMIT 1"});
+    let (baseline, before) =
+        super::sql::measured(super::sql::query_sql(&w.db, &w.viewer, args.clone())).await;
+    let baseline = baseline.unwrap();
+    assert_eq!(before.named_registry_loads, 0);
+    let catalogs = json!({"sql":"SELECT relation_name,column_name,column_position FROM catalog_columns ORDER BY relation_name,column_position"});
+    let catalog_before = super::sql::query_sql(&w.db, &w.viewer, catalogs.clone())
+        .await
+        .unwrap();
+    let definition =
+        named_view_fixture_definition("SELECT id,name FROM records", &["id", "name"], &["records"]);
+    named_view_save(&w, &w.first, &definition).await;
+    // Saving SQL alone has no discovery or execution effect.
+    let catalog_after = super::sql::query_sql(&w.db, &w.viewer, catalogs)
+        .await
+        .unwrap();
+    assert_eq!(catalog_before["rows"], catalog_after["rows"]);
+    assert!(
+        super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_notes"}))
+            .await
+            .is_err()
+    );
+    for published in [false, true] {
+        if published {
+            kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_notes")
+                .await
+                .unwrap();
+        }
+        let (result, after) =
+            super::sql::measured(super::sql::query_sql(&w.db, &w.viewer, args.clone())).await;
+        let result = result.unwrap();
+        assert_eq!(result["rows"], baseline["rows"]);
+        assert_eq!(result["columns"], baseline["columns"]);
+        assert_eq!(after.named_registry_loads, 0);
+        assert_eq!(after.uncached_caller_statements, 0);
+        assert_eq!(after.staged_records, before.staged_records);
+        assert_eq!(after.installations, before.installations);
+        assert_eq!(after.staged_relations, before.staged_relations);
+        assert!(
+            after.staged_records <= 1,
+            "id-prefix narrowing retained: {after:?}"
+        );
+    }
+    assert!(registry().get("admit_named_view").is_none());
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_admission_negatives_collisions_and_cap() {
+    let w = world().await;
+    for (sql, labels, deps) in [
+        (
+            "SELECT id,name FROM main.records",
+            vec!["id", "name"],
+            vec!["records"],
+        ),
+        (
+            "SELECT r.id,b.url AS name FROM records r JOIN bindings b ON b.record_id=r.id",
+            vec!["id", "name"],
+            vec!["records", "bindings"],
+        ),
+        (
+            "SELECT id,name FROM view_other",
+            vec!["id", "name"],
+            vec!["records"],
+        ),
+        (
+            "SELECT id,load_extension('x') AS name FROM records",
+            vec!["id", "name"],
+            vec!["records"],
+        ),
+        (
+            "SELECT id,now_ms() AS name FROM records",
+            vec!["id", "name"],
+            vec!["records"],
+        ),
+        (
+            "SELECT id,name FROM records; SELECT 1",
+            vec!["id", "name"],
+            vec!["records"],
+        ),
+        (
+            "SELECT relation_name AS id,comment AS name FROM catalog_relations",
+            vec!["id", "name"],
+            vec!["catalog_relations"],
+        ),
+    ] {
+        let definition: crate::mcp::tools::querying::SavedSqlDefinition =
+            serde_json::from_value(named_view_fixture_definition(sql, &labels, &deps)).unwrap();
+        assert!(
+            kernel::named_views::validate_definition(&definition).is_err(),
+            "{sql}"
+        );
+    }
+    let definition =
+        named_view_fixture_definition("SELECT id,name FROM records", &["id", "name"], &["records"]);
+    for changed in [
+        {
+            let mut d = definition.clone();
+            d["sql"] = json!("SELECT id,name FROM records WHERE id=?1");
+            d["parameters"] = json!([{"type":"text","value":"x"}]);
+            d
+        },
+        {
+            let mut d = definition.clone();
+            d["output"]["schema_sha256"] = json!("bad digest");
+            d
+        },
+        {
+            let mut d = definition.clone();
+            d["sql"] = json!("x".repeat(crate::query::sql_contract::MAX_SQL_BYTES + 1));
+            d
+        },
+    ] {
+        let changed = serde_json::from_value(changed).unwrap();
+        assert!(kernel::named_views::validate_definition(&changed).is_err());
+    }
+    named_view_save(&w, &w.first, &definition).await;
+    assert!(
+        kernel::named_views::publish(&w.db, &w.viewer, &w.first, "view_notes")
+            .await
+            .is_err()
+    );
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_notes")
+        .await
+        .unwrap();
+    named_view_save(&w, &w.second, &definition).await;
+    for name in [
+        "view_notes",
+        "VIEW_NOTES",
+        "records",
+        "view_other;DROP TABLE records",
+    ] {
+        assert!(
+            kernel::named_views::publish(&w.db, &w.admin, &w.second, name)
+                .await
+                .is_err(),
+            "{name}"
+        );
+    }
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    for i in 1..=8 {
+        let bearer = kernel::create_as(
+            &w.db,
+            &w.admin,
+            "fixture.mcp",
+            "note",
+            json!({"title":format!("View bearer {i}")})
+                .as_object()
+                .unwrap(),
+            &home,
+        )
+        .await
+        .unwrap();
+        named_view_save(&w, &bearer, &definition).await;
+        let result =
+            kernel::named_views::publish(&w.db, &w.admin, &bearer, &format!("view_fixture_{i}"))
+                .await;
+        assert_eq!(result.is_ok(), i < 8, "binding {i}: {result:?}");
+    }
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM kernel_facets WHERE key='named_view'")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 8);
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_snapshot_revocation_timeout_and_cancellation() {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+    let w = world().await;
+    let definition = named_view_fixture_definition(
+        "SELECT id,name,archived FROM records WHERE type='Document'",
+        &["id", "name", "archived"],
+        &["records"],
+    );
+    named_view_save(&w, &w.first, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_notes")
+        .await
+        .unwrap();
+    let arrived = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let db = w.db.clone();
+    let actor = w.viewer.clone();
+    let task = tokio::spawn(super::sql::with_named_read_pause(
+        arrived.clone(),
+        resume.clone(),
+        async move {
+            super::sql::query_sql(
+                &db,
+                &actor,
+                json!({"sql":"SELECT id,name,archived FROM view_notes ORDER BY id"}),
+            )
+            .await
+        },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
+        .await
+        .expect("named read reached pre-staging registry pause");
+    let changed = named_view_fixture_definition(
+        "SELECT id,name,archived FROM records WHERE 0",
+        &["id", "name", "archived"],
+        &["records"],
+    );
+    named_view_save(&w, &w.first, &changed).await;
+    let source = kernel::read_record_as(&w.db, &w.admin, &w.second)
+        .await
+        .unwrap()
+        .unwrap();
+    kernel::set_archived_as(&w.db, &w.admin, &w.second, true, source.revision)
+        .await
+        .unwrap();
+
+    resume.wait().await;
+    let old = task.await.unwrap().unwrap();
+    assert_eq!(
+        old["row_count"], 2,
+        "read must retain its old definition and source snapshot"
+    );
+    let old_source = old["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == w.second)
+        .unwrap();
+    assert_eq!(old_source["name"], "Beta");
+    assert_eq!(
+        old_source["archived"], 0,
+        "staging must use the pinned source snapshot"
+    );
+    let current = super::sql::query_sql(&w.db, &w.viewer,
+        json!({"sql":"SELECT archived FROM records WHERE id=?1", "parameters":[{"type":"text","value":w.second}]})).await.unwrap();
+    assert_eq!(current["rows"][0]["archived"], 1);
+    assert!(
+        super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_notes"}))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("digest changed")
+    );
+    named_view_save(&w, &w.first, &definition).await;
+    let error = super::sql::with_elapsed(
+        std::time::Duration::ZERO,
+        std::time::Duration::from_secs(3),
+        super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT count(*) AS n FROM view_notes a CROSS JOIN records b CROSS JOIN records c CROSS JOIN records d CROSS JOIN records e CROSS JOIN records f CROSS JOIN records g CROSS JOIN records h CROSS JOIN records i CROSS JOIN records j"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("timeout"), "{error}");
+    let arrived = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let db = w.db.clone();
+    let actor = w.admin.clone();
+    let task = tokio::spawn(super::sql::with_named_read_pause(
+        arrived.clone(),
+        resume,
+        async move {
+            super::sql::query_sql(&db, &actor, json!({"sql":"SELECT * FROM view_notes"})).await
+        },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
+        .await
+        .expect("named read reached pre-staging registry pause");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // Inspect every possible pooled physical connection, including reuse after
+    // the error and cancelled admin read, before another caller borrows it.
+    let mut slots = Vec::new();
+    for _ in 0..w.db.governed_pool().options().get_max_connections() {
+        let mut slot = w.db.governed_pool().acquire().await.unwrap();
+        let leftovers: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM temp.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+        )
+        .fetch_one(&mut *slot)
+        .await
+        .unwrap();
+        assert_eq!(leftovers, 0);
+        let query_only: bool = sqlx::query_scalar("PRAGMA query_only")
+            .fetch_one(&mut *slot)
+            .await
+            .unwrap();
+        assert!(!query_only);
+        slots.push(slot);
+    }
+    drop(slots);
+    // A new read after cancellation must rebuild its own staging/definition.
+    let out = super::sql::query_sql(
+        &w.db,
+        &w.viewer,
+        json!({"sql":"SELECT count(*) AS n FROM view_notes"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["rows"][0]["n"], 2);
+    let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+        .await
+        .unwrap()
+        .unwrap()
+        .home_id;
+    kernel::replace_home_policy(&w.db, &w.admin, &home, &[])
+        .await
+        .unwrap();
+    assert!(
+        super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_notes"}))
+            .await
+            .is_err()
+    );
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name='view_notes'"})).await.unwrap();
+    assert_eq!(out["row_count"], 0);
+}
+
+/// Synthetic HQ-sized staging evidence. Direct bulk fixture inserts avoid
+/// measuring the canonical write API rather than the read path under study.
+#[tokio::test]
+#[ignore = "Manual HQ-sized staging and catalog cost measurement; see named-views-slice1-design.md"]
+async fn kernel_v2_named_views_measure_hq_sized_staging() {
+    let work = async {
+        if std::env::var_os("NATIVE_MEASURE_SQL").is_some() {
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .try_init();
+        }
+        let w = world().await;
+        // Deliberately model an older, unprepared file despite normal creation.
+        sqlx::query("DROP INDEX idx_kernel_named_view_lifecycle")
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<3000) INSERT INTO kernel_records(id,home_id,owner_id,primary_type,kind,accession,pin_family,pin_version,pin_digest,interpreter,created_seq,created_at) SELECT printf('measure:%05d',x),r.home_id,r.owner_id,'WorkItem','task',printf('measure-accession:%05d',x),r.pin_family,r.pin_version,r.pin_digest,r.interpreter,r.created_seq,r.created_at FROM n CROSS JOIN kernel_records r WHERE r.id=?")
+        .bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+        sqlx::query("INSERT INTO kernel_record_fields(record_id,name,value_json,created_seq) SELECT r.id,'title',json_quote(r.id),r.created_seq FROM kernel_records r WHERE r.id LIKE 'measure:%'")
+        .execute(w.db.write_pool()).await.unwrap();
+        sqlx::query("WITH RECURSIVE k(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM k WHERE x<7) INSERT INTO kernel_facets(record_id,key,value,as_of,event_seq) SELECT r.id,printf('measure_key_%03d',(CAST(substr(r.id,9) AS INTEGER)*8+x)%701),'value','2026-10-24T00:00:00Z',r.created_seq FROM kernel_records r CROSS JOIN k WHERE r.id LIKE 'measure:%'")
+        .execute(w.db.write_pool()).await.unwrap();
+        sqlx::query("INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,created_at,active,event_seq,imported) SELECT 'edge:'||r.id,r.id,?,'related','2026-10-24T00:00:00Z',1,r.created_seq,0 FROM kernel_records r WHERE r.id LIKE 'measure:%'")
+        .bind(&w.second).execute(w.db.write_pool()).await.unwrap();
+        let key_count: i64 = sqlx::query_scalar("SELECT count(DISTINCT key) FROM kernel_facets")
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+        assert!(key_count >= 701);
+        // Deliberately synthetic uninterpreted headers measure fallback cost;
+        // no replay or producer qualification is inferred from this bulk fixture.
+        sqlx::query("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<65000) INSERT INTO content_events(id,record_id,type,payload,created_at,causal_envelope_version,causal_status) SELECT printf('measure-log:%05d',x),?,'fixture','{}','2026-10-25',1,'legacy_unknown' FROM n").bind(&w.first).execute(w.db.write_pool()).await.unwrap();
+        eprintln!("NAMED_VIEW_HISTORY index=absent unrelated_headers=65000");
+        named_view_measure_catalog(&w, 0).await;
+        let prep_registry = registry();
+        prep_registry
+            .call_engine(
+                EngineHandle::KernelV2(w.db.clone()),
+                Caller::authenticated("acct:admin"),
+                "manage_named_views",
+                json!({"action":"prepare_named_views"}),
+            )
+            .await
+            .unwrap();
+        eprintln!("NAMED_VIEW_HISTORY index=present unrelated_headers=65000 bindings=0");
+        named_view_measure_catalog(&w, 0).await;
+        let body = "SELECT r.id,r.name,f.value AS facet_value,l.target_id AS linked_id FROM records r JOIN facet_values f ON f.record_id=r.id AND f.key='measure_key_000' JOIN links l ON l.source_id=r.id WHERE r.type='WorkItem'";
+        let definition = named_view_fixture_definition(
+            body,
+            &["id", "name", "facet_value", "linked_id"],
+            &["records", "facet_values", "links"],
+        );
+        let mut query = serde_json::to_value(&definition).unwrap();
+        query["v"] = json!("1.2");
+        let meanings:serde_json::Map<String,Value>=definition["output"]["columns"].as_array().unwrap().iter().map(|c|(c["name"].as_str().unwrap().to_owned(),json!({"meaning":format!("Synthetic measurement field {}",c["name"].as_str().unwrap()),"source_mapping":"fixture SELECT expression","vocabulary":null,"unit":null,"encoding":null}))).collect();
+        let retained = json!({"query":query,"origin":{"kind":"authored"},"description":"HQ-sized synthetic records, facets and links","scope":{"description":"Caller-visible task rows with fixture facet and link","cardinality":"one row per fixture facet and related link","default_inclusion":"matching caller-visible tasks"},"columns":meanings,"source_pins":[]});
+        let home = kernel::read_record_as(&w.db, &w.admin, &w.first)
+            .await
+            .unwrap()
+            .unwrap()
+            .home_id;
+        for i in 0..8 {
+            let bearer = if i == 0 {
+                w.first.clone()
+            } else {
+                kernel::create_as(
+                    &w.db,
+                    &w.admin,
+                    "fixture.mcp",
+                    "note",
+                    json!({"title":format!("Measure view {i}")})
+                        .as_object()
+                        .unwrap(),
+                    &home,
+                )
+                .await
+                .unwrap()
+            };
+            // Bulk setup measures reads, not mutation admission over this
+            // deliberately uninterpreted history. Producer paths are covered
+            // separately by the operation/executor fixtures.
+            use crate::named_views::{Action, Pin, Revision, Transition, REVISION, TRANSITION};
+            let definition: crate::named_views::contract::Definition =
+                serde_json::from_value(retained.clone()).unwrap();
+            let mut revision = Revision {
+                v: 1,
+                view_id: format!("native.named-view:{bearer}"),
+                definition_sha256: String::new(),
+                definition: serde_json::to_value(&definition).unwrap(),
+            };
+            revision.definition_sha256 = revision.digest();
+            let revision_id = uuid::Uuid::new_v4().to_string();
+            let binding = Transition {
+                v: 1,
+                view_id: revision.view_id.clone(),
+                expected: None,
+                action: Action::Activate {
+                    name: if i == 0 {
+                        "view_measure".into()
+                    } else {
+                        format!("view_measure_{i}")
+                    },
+                    pin: Pin {
+                        view_id: revision.view_id.clone(),
+                        revision_id: revision_id.clone(),
+                        definition_sha256: revision.definition_sha256.clone(),
+                        schema_sha256: definition.query.output.schema_sha256.clone(),
+                    },
+                },
+            };
+            for (event_id, kind, payload) in [
+                (
+                    revision_id,
+                    REVISION,
+                    serde_json::to_value(revision).unwrap(),
+                ),
+                (
+                    uuid::Uuid::new_v4().to_string(),
+                    TRANSITION,
+                    serde_json::to_value(binding).unwrap(),
+                ),
+            ] {
+                sqlx::query("INSERT INTO content_events(id,record_id,type,payload,created_at,causal_envelope_version,causal_status) VALUES(?,?,?,?,?,1,'legacy_unknown')")
+                    .bind(event_id).bind(&bearer).bind(kind).bind(payload.to_string()).bind("2026-10-25")
+                    .execute(w.db.write_pool()).await.unwrap();
+            }
+        }
+        // Drop only for the read-fallback measurement under study.
+        sqlx::query("DROP INDEX idx_kernel_named_view_lifecycle")
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        crate::query::sql::view_validation::clear_cache();
+        eprintln!("NAMED_VIEW_HISTORY index=absent unrelated_headers=65000 bindings=8 cache=cold_then_warm");
+        // Continuity omits dynamic rows until the accelerator is available.
+        named_view_measure_catalog(&w, 0).await;
+        prep_registry
+            .call_engine(
+                EngineHandle::KernelV2(w.db.clone()),
+                Caller::authenticated("acct:admin"),
+                "manage_named_views",
+                json!({"action":"prepare_named_views"}),
+            )
+            .await
+            .unwrap();
+        eprintln!("NAMED_VIEW_HISTORY index=present unrelated_headers=65000 bindings=8 cache=cold_then_warm");
+        named_view_measure_catalog(&w, 8).await;
+        for iteration in 0..4 {
+            let mut results = Vec::new();
+            for (label, sql) in [
+                ("inline", format!("SELECT * FROM ({body}) ORDER BY id")),
+                ("view", "SELECT * FROM view_measure ORDER BY id".into()),
+            ] {
+                let started = std::time::Instant::now();
+                let (result, stats) = super::sql::measured(super::sql::query_sql(
+                    &w.db,
+                    &w.viewer,
+                    json!({"sql":sql}),
+                ))
+                .await;
+                let total_us = started.elapsed().as_micros();
+                eprintln!("NAMED_VIEW_SCALE iteration={iteration} path={label} records=3000 facets=24000 keys=701 links=3000 staging_us={} total_us={total_us} staged_records={} result={}", stats.staging_us, stats.staged_records, if result.is_ok() {"ok"} else {"error"});
+                let result = result.expect(
+                "HQ-sized named view must fit the unchanged two-second budget; STOP if this fails",
+            );
+                results.push(result["rows"].clone());
+            }
+            assert_eq!(results[0], results[1]);
+        }
+        // Replace an existing binding at the eight-view cap, then cycle the
+        // same bearer through draft, activation and removal using real writes.
+        named_view_measure_writes(&w, retained).await;
+    };
+    crate::named_views::gate::testing(true, work).await;
+}
+
+async fn named_view_measure_writes(w: &World, definition: Value) {
+    let registry = registry();
+    let mut conn = w.db.pool().acquire().await.unwrap();
+    assert!(crate::named_views::storage::verify_index_on(&mut conn)
+        .await
+        .unwrap());
+    let head: i64 = sqlx::query_scalar("SELECT max(seq) FROM content_events")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert!(head > 65_000);
+    let state = crate::named_views::load_prefix(&mut conn, head, None)
+        .await
+        .unwrap();
+    let (view, binding) = state
+        .bindings
+        .iter()
+        .find(|(_, b)| {
+            b.active
+                .as_ref()
+                .is_some_and(|(name, _)| name == "view_measure_7")
+        })
+        .unwrap();
+    let id = view.strip_prefix("native.named-view:").unwrap().to_owned();
+    let mut previous = binding.event_id.clone();
+    drop(conn);
+    let plan_caller = |action: &str| {
+        Caller::authenticated("acct:admin")
+            .with_hosting_context("admin", "workspace")
+            .with_hosting_owner(true)
+            .with_write_plan_execution(crate::mcp::registry::WritePlanExecution {
+                plan_id: "measurement".into(),
+                effect_digest: "measurement".into(),
+                executor: "records_write".into(),
+                operation: action.into(),
+            })
+    };
+    // All calls below use registered source handlers and their unchanged
+    // absolute deadline. A trusted fixture plan marker isolates source latency
+    // from the separate prepare/confirm protocol already covered elsewhere.
+    for iteration in 0..4 {
+        let started = std::time::Instant::now();
+        let draft = registry
+            .call_engine(
+                EngineHandle::KernelV2(w.db.clone()),
+                Caller::authenticated("acct:admin"),
+                "manage_named_views",
+                json!({"action":"record_view_revision","id":id,"definition":definition,
+                "idempotency_key":format!("measure-draft-{iteration}")}),
+            )
+            .await;
+        eprintln!("NAMED_VIEW_WRITE iteration={iteration} operation=record_view_revision total_us={} result={}",
+            started.elapsed().as_micros(), if draft.is_ok() { "ok" } else { "error" });
+        let draft = draft.expect("indexed HQ revision admission must fit the unchanged two-second budget; STOP on failure");
+        let started = std::time::Instant::now();
+        let active = registry.call_engine(EngineHandle::KernelV2(w.db.clone()),
+            plan_caller("activate_view"), "manage_named_views",
+            json!({"action":"activate_view","id":id,"pin":draft["pin"],"name":"view_measure_7",
+                "expected_binding_event_id":previous,"idempotency_key":format!("measure-activate-{iteration}")})).await;
+        eprintln!(
+            "NAMED_VIEW_WRITE iteration={iteration} operation=activate_view total_us={} result={}",
+            started.elapsed().as_micros(),
+            if active.is_ok() { "ok" } else { "error" }
+        );
+        let active = active.expect(
+            "indexed HQ activation must fit the unchanged two-second budget; STOP on failure",
+        );
+        let started = std::time::Instant::now();
+        let inactive = registry.call_engine(EngineHandle::KernelV2(w.db.clone()),
+            plan_caller("unpublish_view"), "manage_named_views",
+            json!({"action":"unpublish_view","id":id,"expected_binding_event_id":active["event_id"],
+                "idempotency_key":format!("measure-unpublish-{iteration}")})).await;
+        eprintln!(
+            "NAMED_VIEW_WRITE iteration={iteration} operation=unpublish_view total_us={} result={}",
+            started.elapsed().as_micros(),
+            if inactive.is_ok() { "ok" } else { "error" }
+        );
+        let inactive = inactive.expect(
+            "indexed HQ unpublish must fit the unchanged two-second budget; STOP on failure",
+        );
+        previous = inactive["event_id"].as_str().unwrap().into();
+    }
+}
+
+async fn named_view_measure_catalog(w: &World, bindings: usize) {
+    for iteration in 0..4 {
+        for relation in ["catalog_relations", "catalog_columns"] {
+            let started = std::time::Instant::now();
+            let ((out, stats), scanned) = crate::named_views::storage::measured_fallback(
+                super::sql::measured(super::sql::query_sql(
+                    &w.db,
+                    &w.viewer,
+                    json!({"sql":format!("SELECT * FROM {relation} ORDER BY relation_name")}),
+                )),
+            )
+            .await;
+            assert_eq!(scanned, 0, "catalog reads never scan event history");
+            let total_us = started.elapsed().as_micros();
+            let out = out.expect("HQ-sized catalog must fit the unchanged two-second budget");
+            let dynamic = out["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["relation_name"].as_str().unwrap().starts_with("view_"))
+                .count();
+            assert_eq!(
+                dynamic,
+                bindings * if relation == "catalog_columns" { 4 } else { 1 }
+            );
+            assert_eq!(stats.named_registry_loads, 1);
+            eprintln!("NAMED_VIEW_CATALOG iteration={iteration} visible_bindings={bindings} relation={relation} staging_us={} total_us={total_us}", stats.staging_us);
+        }
+    }
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_discovery_index_preparation_and_rebuild() {
+    async fn plan(db: &Db) -> Vec<(i64, i64, i64, String)> {
+        use sqlx::Connection;
+        // EXPLAIN may retain a pooled connection's pre-DDL schema cache even
+        // without a cached statement. Inspect each schema on a fresh handle.
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(db.path())
+            .read_only(true)
+            .create_if_missing(false);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .unwrap();
+        let plan = sqlx::query_as(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            kernel::named_views::DISCOVER_SQL
+        ))
+        .persistent(false)
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+        plan
+    }
+    let w = world().await;
+    let definition =
+        named_view_fixture_definition("SELECT id,name FROM records", &["id", "name"], &["records"]);
+    named_view_save(&w, &w.first, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_rebuilt")
+        .await
+        .unwrap();
+    let indexed = plan(&w.db).await;
+    assert!(
+        indexed
+            .iter()
+            .any(|p| p.3.contains("idx_kernel_named_view_admissions")),
+        "{indexed:?}"
+    );
+    let queries = [
+        "SELECT id,name FROM view_rebuilt ORDER BY id",
+        "SELECT relation_name FROM catalog_relations WHERE relation_name='view_rebuilt'",
+        "SELECT column_name,column_position FROM catalog_columns WHERE relation_name='view_rebuilt' ORDER BY column_position",
+    ];
+    let mut expected = Vec::new();
+    for sql in queries {
+        expected.push(
+            super::sql::query_sql(&w.db, &w.viewer, json!({"sql":sql}))
+                .await
+                .unwrap()["rows"]
+                .clone(),
+        );
+    }
+    sqlx::query("DROP INDEX idx_kernel_named_view_admissions")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    let unindexed = plan(&w.db).await;
+    assert!(
+        !unindexed
+            .iter()
+            .any(|p| p.3.contains("idx_kernel_named_view_admissions")),
+        "{unindexed:?}"
+    );
+    assert!(
+        unindexed
+            .iter()
+            .any(|p| p.3.contains("SCAN main.content_events")),
+        "{unindexed:?}"
+    );
+    let schema: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::verify_v2_ready(&w.db).await.unwrap();
+    let path = w._dir.path().join("v2.db");
+    // Both hosted/local writable openers must admit older files without repair.
+    for reopened in [
+        kernel::open_v2_database(path.to_str().unwrap())
+            .await
+            .unwrap(),
+        kernel::open_marked_v2_database(path.to_str().unwrap())
+            .await
+            .unwrap(),
+    ] {
+        for (sql, rows) in queries.iter().zip(&expected) {
+            let out = super::sql::query_sql(&reopened, &w.viewer, json!({"sql":sql}))
+                .await
+                .unwrap();
+            assert_eq!(&out["rows"], rows, "{sql}");
+        }
+        reopened.close().await;
+    }
+    // Read-only node/member admission also stays compatible. Its static SQL
+    // contract continues to omit/refuse named views, even with a copied binding.
+    let readonly = crate::db::open_marked_v2_database_read_only_at(&path)
+        .await
+        .unwrap();
+    let out = super::sql::query_sql(
+        &readonly,
+        &w.viewer,
+        json!({"sql":"SELECT id,name FROM records ORDER BY id"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["rows"], expected[0]);
+    for relation in ["catalog_relations", "catalog_columns"] {
+        let out = super::sql::query_sql(&readonly, &w.viewer,
+            json!({"sql":format!("SELECT relation_name FROM {relation} WHERE relation_name='view_rebuilt'")})).await.unwrap();
+        assert_eq!(out["row_count"], 0);
+    }
+    assert!(
+        super::sql::query_sql(&readonly, &w.viewer, json!({"sql":queries[0]}))
+            .await
+            .is_err()
+    );
+    readonly.close().await;
+    let after: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        schema, after,
+        "opens and reads must not create the optional index"
+    );
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    assert!(plan(&w.db)
+        .await
+        .iter()
+        .any(|p| p.3.contains("idx_kernel_named_view_admissions")));
+    let prepared: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    kernel::prepare_v2_database(&w.db).await.unwrap();
+    let repeated: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(prepared, repeated);
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":queries[1]}))
+        .await
+        .unwrap();
+    assert_eq!(out["rows"], expected[1]);
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_historic_facet_rebuild_is_not_publication() {
+    let w = world().await;
+    let observation = kernel::FacetObservation {
+        key: "named_view".into(),
+        value: Some(
+            json!({"v":1,"name":"view_impostor","definition_sha256":"unused","origin":"authored"})
+                .to_string(),
+        ),
+        value_num: None,
+        vocab_ref: None,
+        as_of: chrono::Utc::now().to_rfc3339(),
+    };
+    let host = kernel::resolve_principal_by_binding(&w.db, kernel::HOST_IMPORT_BINDING)
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    kernel::hq::import_event_with_facet_as(
+        &w.db,
+        &host,
+        &w.first,
+        &kernel::LegacyEvent {
+            id: "historic-user-named-view".into(),
+            event_type: "facet.set".into(),
+            payload: json!({"key":"named_view","value":observation.value}),
+            created_at: observation.as_of.clone(),
+            actor: None,
+            run_key: None,
+            source: None,
+        },
+        Some(&observation),
+    )
+    .await
+    .unwrap();
+    kernel::replay_all_projections(&w.db).await.unwrap();
+    let stored: String = sqlx::query_scalar(
+        "SELECT value FROM kernel_facets WHERE record_id=? AND key='named_view'",
+    )
+    .bind(&w.first)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert!(stored.contains("view_impostor"));
+    let out = super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name='view_impostor'"})).await.unwrap();
+    assert_eq!(out["row_count"], 0);
+    assert!(super::sql::query_sql(
+        &w.db,
+        &w.viewer,
+        json!({"sql":"SELECT * FROM view_impostor"})
+    )
+    .await
+    .is_err());
+    let mut new_observation = observation;
+    new_observation.key = "named_view".into();
+    assert!(
+        kernel::observe_facet_as(&w.db, &w.admin, &w.second, &new_observation, None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_outer_predicates_preserve_other_records() {
+    let w = world().await;
+    kernel::observe_facet_as(
+        &w.db,
+        &w.admin,
+        &w.second,
+        &kernel::FacetObservation {
+            key: "other_record_marker".into(),
+            value: Some("present".into()),
+            value_num: None,
+            vocab_ref: None,
+            as_of: chrono::Utc::now().to_rfc3339(),
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    kernel::link_as(&w.db, &w.admin, &w.second, "relates_to", &w.first)
+        .await
+        .unwrap();
+    let body = "SELECT r.id,r.type,(SELECT count(*) FROM facet_values f WHERE f.record_id<>r.id) AS other_facets,(SELECT count(*) FROM links l WHERE l.source_id<>r.id) AS other_links FROM records r";
+    let definition = named_view_fixture_definition(
+        body,
+        &["id", "type", "other_facets", "other_links"],
+        &["records", "facet_values", "links"],
+    );
+    named_view_save(&w, &w.first, &definition).await;
+    kernel::named_views::publish(&w.db, &w.admin, &w.first, "view_counts")
+        .await
+        .unwrap();
+    for (suffix, parameters) in [
+        (
+            "WHERE id=?1 ORDER BY id",
+            json!([{"type":"text","value":w.first}]),
+        ),
+        ("WHERE type='Document' ORDER BY id", json!([])),
+        ("ORDER BY id LIMIT 1", json!([])),
+    ] {
+        let (actual, stats) = super::sql::measured(super::sql::query_sql(
+            &w.db,
+            &w.viewer,
+            json!({"sql":format!("SELECT * FROM view_counts {suffix}"),"parameters":parameters}),
+        ))
+        .await;
+        let actual = actual.unwrap();
+        let expected = super::sql::with_full_record_scope_staging(super::sql::with_full_facet_staging(super::sql::with_full_record_class_staging(super::sql::query_sql(&w.db, &w.viewer,
+            json!({"sql":format!("SELECT * FROM ({body}) {suffix}"),"parameters":parameters}))))).await.unwrap();
+        assert_eq!(actual["rows"], expected["rows"], "{suffix}");
+        assert_eq!(stats.staged_records, 2, "{suffix}");
+        if suffix.starts_with("WHERE id") {
+            assert!(actual["rows"][0]["other_facets"].as_i64().unwrap() > 0);
+            assert!(actual["rows"][0]["other_links"].as_i64().unwrap() > 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn kernel_v2_named_views_bad_binding_isolated_from_catalog_and_good_view() {
+    let w = world().await;
+    let definition =
+        named_view_fixture_definition("SELECT id,name FROM records", &["id", "name"], &["records"]);
+    for (record, name) in [(&w.first, "view_broken"), (&w.second, "view_healthy")] {
+        named_view_save(&w, record, &definition).await;
+        kernel::named_views::publish(&w.db, &w.admin, record, name)
+            .await
+            .unwrap();
+    }
+    let original: String = sqlx::query_scalar(
+        "SELECT value FROM kernel_facets WHERE record_id=? AND key='named_view'",
+    )
+    .bind(&w.first)
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    let mut bad_shape: Value = serde_json::from_str(&original).unwrap();
+    bad_shape["v"] = json!("bad version");
+    let mut bad_name: Value = serde_json::from_str(&original).unwrap();
+    bad_name["name"] = json!("view_bad-name");
+    for raw in [
+        "{".to_owned(),
+        bad_shape.to_string(),
+        bad_name.to_string(),
+        "x".repeat(256 * 1024 + 1),
+    ] {
+        sqlx::query("UPDATE kernel_facets SET value=? WHERE record_id=? AND key='named_view'")
+            .bind(raw)
+            .bind(&w.first)
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        for relation in ["catalog_relations", "catalog_columns"] {
+            let out = super::sql::query_sql(&w.db, &w.viewer,
+                json!({"sql":format!("SELECT relation_name FROM {relation} WHERE relation_name LIKE 'view_%' ORDER BY relation_name")})).await.unwrap();
+            assert_eq!(out["row_count"], 0);
+            assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
+        }
+        let error =
+            super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_broken"}))
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("view_broken' unavailable"),
+            "{error}"
+        );
+        assert!(super::sql::query_sql(
+            &w.db,
+            &w.viewer,
+            json!({"sql":"SELECT * FROM view_healthy ORDER BY id"})
+        )
+        .await
+        .is_ok());
+    }
+    sqlx::query("UPDATE kernel_facets SET value=? WHERE record_id=? AND key='named_view'")
+        .bind(&original)
+        .bind(&w.first)
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    for bad_sql in [
+        "SELECT id,name FROM records WHERE",
+        "SELECT id,name FROM main.kernel_records",
+    ] {
+        let mut bad_definition = definition.clone();
+        bad_definition["sql"] = json!(bad_sql);
+        named_view_save(&w, &w.first, &bad_definition).await;
+        let out = super::sql::query_sql(&w.db, &w.viewer,
+            json!({"sql":"SELECT relation_name FROM catalog_relations WHERE relation_name LIKE 'view_%'"})).await.unwrap();
+        assert_eq!(out["row_count"], 0);
+        assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
+        let error =
+            super::sql::query_sql(&w.db, &w.viewer, json!({"sql":"SELECT * FROM view_broken"}))
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("view_broken' unavailable"),
+            "{error}"
+        );
+    }
+    let outsider =
+        kernel::create_principal(&w.db, "account", "Outsider", "acct:outsider", &w.admin)
+            .await
+            .unwrap();
+    let missing = super::sql::query_sql(
+        &w.db,
+        &outsider,
+        json!({"sql":"SELECT * FROM view_healthy"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(missing.contains("no such table: view_healthy"), "{missing}");
+    // The retained registry rejects corrupt legacy history before reaching its
+    // test-only Slice 1 adapter. No production legacy producer is supported.
+    for _ in 0..7 {
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,causal_envelope_version,causal_status) VALUES(?,?,'kernel.named_view_admitted.v1',?,1,'legacy_unknown')")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(&w.first).bind(&original)
+            .execute(w.db.write_pool()).await.unwrap();
+    }
+    for relation in ["catalog_relations", "catalog_columns"] {
+        let out = super::sql::query_sql(
+            &w.db,
+            &w.viewer,
+            json!({"sql":format!("SELECT relation_name FROM {relation}")}),
+        )
+        .await
+        .unwrap();
+        assert!(out["row_count"].as_u64().unwrap() > 0);
+        assert_eq!(out["notices"][0]["code"], "view_catalog_incomplete");
+        assert!(out["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| !r["relation_name"].as_str().unwrap().starts_with("view_")));
+    }
+    for (actor, sql) in [
+        (&w.viewer, "SELECT * FROM view_healthy"),
+        (&outsider, "SELECT * FROM view_healthy"),
+    ] {
+        let error = super::sql::query_sql(&w.db, actor, json!({"sql":sql}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("legacy admission history limit"), "{error}");
+        assert!(!error.contains(&w.first));
+        assert!(!error.contains(&w.second));
+    }
+}
+
+#[tokio::test]
+async fn named_view_detail_catalog_refuses_stored_unpinned_and_pinned_reads() {
+    let (db, actor) =
+        crate::kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+    for pins in [None, Some(serde_json::json!({}))] {
+        let mut args = serde_json::json!({"sql":"SELECT relation_name FROM catalog_view_definitions ORDER BY relation_name"});
+        if let Some(pins) = pins {
+            args["_named_view_pins"] = pins;
+        }
+        let error = sql::query_stored_saved_sql(&db, &actor, args)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("saved governed SQL cannot read 'catalog_view_definitions'"),
+            "{error}"
+        );
+    }
+    sql::query_sql(
+        &db,
+        &actor,
+        serde_json::json!({"sql":"SELECT relation_name FROM catalog_view_definitions"}),
+    )
+    .await
+    .unwrap();
 }

@@ -17,11 +17,12 @@ use crate::error::Result;
 use super::registry::Caller;
 use crate::standby::delta_transport::{AuthorityActDeltaResponseV1, AuthorityActHeadResponseV1};
 
-/// One exact-cut request. The client supplies `F1` only: `F2` is whatever head
+/// One exact-cut request. The client supplies `F1` and, for v2, its verified base blob keys. `F2` is the head
 /// the authority observes in the same read transaction.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AuthorityActDeltaRequest {
     pub from_exclusive_act: i64,
+    pub blob_inventory: Option<Vec<String>>,
 }
 
 pub trait AuthorityActSource: Send + Sync {

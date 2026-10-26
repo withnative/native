@@ -3,7 +3,8 @@ use super::*;
 
 const HOSTED_WORKSPACE_WRITER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-const HOSTED_GUARDED_SQL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(super) const HOSTED_GUARDED_SQL_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 const GUARDED_REPLAY_TIMEOUT: &str =
     "guarded durable receipt replay exceeded 5 seconds; retry the same plan";
@@ -157,7 +158,7 @@ impl ExecutorPrototypeStdioServer {
             .await
     }
 
-    fn try_acquire_sql_commit_single_flight(
+    pub(super) fn try_acquire_sql_commit_single_flight(
         &self,
     ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, (&'static str, String, bool)>
     {
@@ -610,7 +611,7 @@ impl ExecutorPrototypeStdioServer {
         }
     }
 
-    async fn acquire_sql_commit_authority(
+    pub(super) async fn acquire_sql_commit_authority(
         &self,
         caller: &Caller,
     ) -> std::result::Result<

@@ -52,7 +52,7 @@ pub use transfer_progress::{
 };
 
 const STATE_CONTRACT: &str = "native.standby-refresh-state.v1";
-const CONFIG_CONTRACT: &str = "native.standby-refresh-config.v1";
+pub(crate) const CONFIG_CONTRACT: &str = "native.standby-refresh-config.v1";
 const PROTOCOL_VERSION: &str = "2026-07-28";
 const MAX_PAGE_BYTES: usize = crate::mcp::SNAPSHOT_MAX_PAGE_BYTES;
 // A complete MCP result carries the page in both text and structured content.
@@ -544,7 +544,7 @@ enum DeltaAttempt {
     FallBackToSnapshot(DeltaFallbackDiagnostic),
     /// Hosted authors an unreadable interchange revision: pause following
     /// instead of falling back to a whole snapshot that could never admit.
-    Paused(InstalledGeneration),
+    Paused(InstalledGeneration, &'static str),
 }
 
 /// The serving process has not opened the current generation with a build
@@ -576,6 +576,8 @@ pub enum DeltaFallbackClass {
     /// `delta_too_large`, or the legacy MCP oversize refusal), so only a whole
     /// snapshot can express it.
     DeltaTooLarge,
+    BlobInventoryLimit,
+    ProjectionDivergence,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -669,9 +671,21 @@ pub fn sanitize_deferral(raw: &str) -> Option<&'static str> {
         DEFERRED_FULL_REFRESH_INTERVAL,
         DEFERRED_DATABASE_BUSY,
         DEFERRED_REVISION_UNSUPPORTED,
+        "engine v2 requires v2-kernel-probe build",
+        "kernel_v2_replay_cooldown",
+        "insufficient_disk",
+        "refresh_in_progress",
     ]
     .into_iter()
     .find(|token| *token == raw)
+}
+
+fn refresh_pause_message(reason: &'static str) -> &'static str {
+    if reason == DEFERRED_REVISION_UNSUPPORTED {
+        "hosted uses a newer interchange revision; upgrade the node to resume following"
+    } else {
+        reason
+    }
 }
 
 /// Legacy states without correlation IDs cannot attribute a retained detail.
@@ -1138,6 +1152,8 @@ fn start_background_refresh_inner(
 }
 
 pub struct StandbyRefreshController {
+    #[cfg(test)]
+    kernel_available_space: Option<u64>,
     runtime: StandbyRuntimeConfig,
     config: StandbyRefreshConfig,
     store: GenerationStore,
@@ -1186,6 +1202,34 @@ impl Drop for StandbySnapshotDownload {
     }
 }
 
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+struct KernelReplayCooldown<'a> {
+    controller: &'a StandbyRefreshController,
+    started: std::time::Instant,
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+impl<'a> KernelReplayCooldown<'a> {
+    fn start(controller: &'a StandbyRefreshController) -> Result<Self> {
+        controller.defer_kernel_replay(Duration::ZERO)?;
+        Ok(Self {
+            controller,
+            started: std::time::Instant::now(),
+        })
+    }
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+impl Drop for KernelReplayCooldown<'_> {
+    fn drop(&mut self) {
+        if self
+            .controller
+            .defer_kernel_replay(self.started.elapsed())
+            .is_err()
+        {
+            tracing::warn!("kernel replay cooldown persistence failed");
+        }
+    }
+}
+
 impl StandbyRefreshController {
     /// Deliberately acquire ONE full snapshot without delta fallback, admission
     /// or pruning. Network acquisition retains its existing bounded transport,
@@ -1211,6 +1255,11 @@ impl StandbyRefreshController {
         };
         let bearer =
             read_credential(&self.config.credential_file).map_err(|error| *error.source)?;
+        if self.delta_enabled {
+            if let Ok(Some(reason)) = self.revision_pause_needed(&bearer).await {
+                return Err(Error::engine(refresh_pause_message(reason)));
+            }
+        }
         let manifest = tokio::time::timeout(
             ATTEMPT_TIMEOUT,
             self.download_binary_only(
@@ -1237,20 +1286,46 @@ impl StandbyRefreshController {
         let _verification_retry = self.store.retry_verification_after_refresh(&self.observed);
         // Never overlap the built-in refresh daemon or another attempt.
         let controller_lock = open_private_lock(&self.refresh_dir.join("controller.lock"))?;
-        controller_lock.try_lock_exclusive()?;
+        if let Err(error) = controller_lock.try_lock_exclusive() {
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && self
+                    .store
+                    .current_for_head_probe()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|g| g.manifest.kernel_v2.is_some())
+            {
+                return Ok(StandbyDeltaOutcome::Deferred {
+                    reason: "refresh_in_progress",
+                });
+            }
+            return Err(error.into());
+        }
         let attempt_lock = open_private_lock(&self.refresh_dir.join("attempt.lock"))?;
-        attempt_lock.try_lock_exclusive()?;
+        if let Err(error) = attempt_lock.try_lock_exclusive() {
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                && self
+                    .store
+                    .current_for_head_probe()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|g| g.manifest.kernel_v2.is_some())
+            {
+                return Ok(StandbyDeltaOutcome::Deferred {
+                    reason: "refresh_in_progress",
+                });
+            }
+            return Err(error.into());
+        }
         let bearer =
             read_credential(&self.config.credential_file).map_err(|error| *error.source)?;
         let Some(current) = self.store.current_for_head_probe().ok().flatten() else {
-            if self
+            if let Some(reason) = self
                 .revision_pause_needed(&bearer)
                 .await
                 .map_err(|error| *error.source)?
             {
-                return Ok(StandbyDeltaOutcome::Deferred {
-                    reason: DEFERRED_REVISION_UNSUPPORTED,
-                });
+                return Ok(StandbyDeltaOutcome::Deferred { reason });
             }
             return Ok(StandbyDeltaOutcome::FullRefreshRequired {
                 reason: DeltaFallbackClass::UntrustedLocalBase,
@@ -1285,9 +1360,7 @@ impl StandbyRefreshController {
             }
             // A revision pause is not a snapshot request: the external
             // scheduler must wait, not capture.
-            DeltaAttempt::Paused(_) => StandbyDeltaOutcome::Deferred {
-                reason: DEFERRED_REVISION_UNSUPPORTED,
-            },
+            DeltaAttempt::Paused(_, reason) => StandbyDeltaOutcome::Deferred { reason },
         })
     }
 
@@ -1313,6 +1386,8 @@ impl StandbyRefreshController {
             delta_enabled: true,
             #[cfg(test)]
             transfer_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            kernel_available_space: None,
         })
     }
 
@@ -1807,10 +1882,10 @@ impl StandbyRefreshController {
                     DeltaAttempt::FallBackToSnapshot(diagnostic) => {
                         delta_fallback = Some(diagnostic)
                     }
-                    DeltaAttempt::Paused(generation) => {
+                    DeltaAttempt::Paused(generation, reason) => {
                         return Ok(AttemptSuccess::Deferred {
                             generation,
-                            reason: DEFERRED_REVISION_UNSUPPORTED,
+                            reason,
                             delta_fallback: None,
                         })
                     }
@@ -1827,21 +1902,41 @@ impl StandbyRefreshController {
         // on every cause, including Manual — so a bump pauses here instead
         // of burning a capture the node could never admit. Production FULL
         // acquisition requires a validated compatible head observation.
-        if !(self.delta_enabled && probe_base.is_some())
-            && self.revision_pause_needed(&bearer).await?
-        {
+        let pause = if self.delta_enabled && probe_base.is_some() {
+            None
+        } else {
+            self.revision_pause_needed(&bearer).await?
+        };
+        if let Some(reason) = pause {
             return match probe_base {
                 Some(generation) => Ok(AttemptSuccess::Deferred {
                     generation,
-                    reason: DEFERRED_REVISION_UNSUPPORTED,
+                    reason,
                     delta_fallback,
                 }),
                 None => Err(AttemptError::new(
                     RefreshFailureClass::RevisionUnsupported,
-                    "hosted uses a newer interchange revision; upgrade the node to resume following",
-                    Error::engine("hosted interchange revision is not readable by this build"),
+                    refresh_pause_message(reason),
+                    Error::engine(if reason == DEFERRED_REVISION_UNSUPPORTED {
+                        "hosted interchange revision is not readable by this build"
+                    } else {
+                        reason
+                    }),
                 )),
             };
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        if let Some(current) = probe_base
+            .as_ref()
+            .filter(|g| g.manifest.kernel_v2.is_some())
+        {
+            if !self.kernel_has_disk_space(current, 3).map_err(local_io)? {
+                return Ok(AttemptSuccess::Deferred {
+                    generation: current.clone(),
+                    reason: super::generation_store::INSUFFICIENT_DISK,
+                    delta_fallback,
+                });
+            }
         }
         // A retained export spends no new hosted capture: one authorized
         // poll decides. A live handle bypasses the FULL cooldown below
@@ -1977,7 +2072,10 @@ impl StandbyRefreshController {
     /// when hosted authors an interchange revision this build cannot read.
     /// Production refuses acquisition on all other head errors. Tests that
     /// disable following may use an isolated snapshot client without a head server.
-    async fn revision_pause_needed(&self, bearer: &str) -> std::result::Result<bool, AttemptError> {
+    async fn revision_pause_needed(
+        &self,
+        bearer: &str,
+    ) -> std::result::Result<Option<&'static str>, AttemptError> {
         let transport = AuthorityActTransport::new(
             &self.config.hosted_origin,
             &self.runtime.hosted_route_database_id,
@@ -1986,10 +2084,12 @@ impl StandbyRefreshController {
         )
         .map_err(classify_delta_transport_error)?;
         match transport.head().await {
-            Ok(_) => Ok(false),
-            Err(error) if crate::standby::is_revision_unsupported(&error) => Ok(true),
+            Ok(head) => Ok(head.refresh_pause_reason()),
+            Err(error) if crate::standby::is_revision_unsupported(&error) => {
+                Ok(Some(DEFERRED_REVISION_UNSUPPORTED))
+            }
             Err(error) if self.delta_enabled => Err(classify_delta_transport_error(error)),
-            Err(_) => Ok(false),
+            Err(_) => Ok(None),
         }
     }
 
@@ -2013,10 +2113,19 @@ impl StandbyRefreshController {
             // An unreadable interchange revision pauses following here: it
             // must never become a HeadCompatibility whole-snapshot fallback.
             Err(error) if crate::standby::is_revision_unsupported(&error) => {
-                return Ok(DeltaAttempt::Paused(current))
+                return Ok(DeltaAttempt::Paused(current, DEFERRED_REVISION_UNSUPPORTED))
             }
             Err(error) => return Err(classify_delta_transport_error(error)),
         };
+        if let Some(reason) = remote_head.refresh_pause_reason() {
+            return Ok(DeltaAttempt::Paused(current, reason));
+        }
+        if remote_head.head().is_kernel_v2() != current.manifest.kernel_v2.is_some() {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::HeadCompatibility,
+                message: "upstream engine changed; a fresh generation is required",
+            }));
+        }
         // A same-format replacement can re-verify and bind the existing copy
         // locally. Any format/evidence failure keeps the consumer_changed FULL.
         if let Err(error) = self
@@ -2077,6 +2186,12 @@ impl StandbyRefreshController {
                     }))
                 }
             }
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        if let super::delta_transport::AuthorityHead::KernelV2(remote) = remote_head.head() {
+            return self
+                .try_kernel_delta(&transport, current, remote, &synced_at)
+                .await;
         }
         let local_head = match read_authority_act_head_from_path(&current.snapshot_path).await {
             Ok(head) => head,
@@ -2229,6 +2344,179 @@ impl StandbyRefreshController {
                 message: "hosted delta was refused during apply; a whole snapshot is required",
             })),
         }
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    async fn try_kernel_delta(
+        &self,
+        transport: &AuthorityActTransport,
+        current: InstalledGeneration,
+        remote: &super::delta_transport::KernelHead,
+        synced_at: &str,
+    ) -> std::result::Result<DeltaAttempt, AttemptError> {
+        let fallback = |message| {
+            DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::IntegrityOrApplyRefusal,
+                message,
+            })
+        };
+        let before = match super::kernel_v2::verify_path(&current.snapshot_path).await {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(fallback(
+                    "kernel-v2 local base is invalid; a whole snapshot is required",
+                ))
+            }
+        };
+        let verified = self
+            .store
+            .verified_refresh_base(&current.id, &self.observed);
+        if before == remote.generation {
+            self.store
+                .record_synced(&current, before.head_act, synced_at)
+                .map_err(local_io)?;
+            self.store.complete_validated_refresh(
+                &current.id,
+                &self.observed,
+                verified,
+                before.head_act,
+                false,
+            );
+            return Ok(DeltaAttempt::Unchanged(current));
+        }
+        if before.genesis_event_id != remote.generation.genesis_event_id
+            || before.head_act > remote.generation.head_act
+        {
+            return Ok(fallback("kernel-v2 hosted history changed or regressed"));
+        }
+        if self.kernel_replay_cooling_down().map_err(local_io)? {
+            return Ok(DeltaAttempt::Deferred {
+                generation: current,
+                reason: "kernel_v2_replay_cooldown",
+            });
+        }
+        if !self.kernel_has_disk_space(&current, 2).map_err(local_io)? {
+            return Ok(DeltaAttempt::Deferred {
+                generation: current,
+                reason: super::generation_store::INSUFFICIENT_DISK,
+            });
+        }
+        if before.blob_count > super::kernel_v2_delta::MAX_BLOB_INVENTORY as i64 {
+            return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                class: DeltaFallbackClass::BlobInventoryLimit,
+                message: "kernel_v2_blob_inventory_limit; a whole snapshot is required",
+            }));
+        }
+        let inventory = super::kernel_v2::blob_inventory_path(&current.snapshot_path)
+            .await
+            .map_err(local_io)?;
+        let delta = match transport.kernel_delta(before.head_act, &inventory).await {
+            Ok(delta) => delta,
+            Err(error) => {
+                let classified = classify_delta_transport_error(error);
+                if matches!(
+                    classified.class,
+                    RefreshFailureClass::Authentication | RefreshFailureClass::Network
+                ) {
+                    return Err(classified);
+                }
+                return Ok(fallback(
+                    "kernel-v2 delta unavailable or invalid; a whole snapshot is required",
+                ));
+            }
+        };
+        let _cooldown = KernelReplayCooldown::start(self).map_err(local_io)?;
+        let prepared = match self
+            .store
+            .prepare_kernel_delta(&current, &delta, synced_at)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) if super::generation_store::is_kernel_disk_refusal(&error) => {
+                return Ok(DeltaAttempt::Deferred {
+                    generation: current,
+                    reason: super::generation_store::INSUFFICIENT_DISK,
+                });
+            }
+            Err(Error::Engine(message)) if message == "kernel_v2_projection_divergence" => {
+                return Ok(DeltaAttempt::FallBackToSnapshot(DeltaFallbackDiagnostic {
+                    class: DeltaFallbackClass::ProjectionDivergence,
+                    message: "kernel_v2_projection_divergence; a whole snapshot is required",
+                }));
+            }
+            Err(_) => {
+                return Ok(fallback(
+                    "kernel-v2 scratch delta apply refused; serving generation unchanged",
+                ))
+            }
+        };
+        let generation =
+            match self
+                .store
+                .publish_kernel_delta(prepared, &self.observed)
+                .await
+            {
+                Ok(generation) => generation,
+                Err(error) if super::generation_store::is_kernel_disk_refusal(&error) => {
+                    return Ok(DeltaAttempt::Deferred {
+                        generation: current,
+                        reason: super::generation_store::INSUFFICIENT_DISK,
+                    });
+                }
+                Err(_) => return Ok(fallback(
+                    "kernel-v2 scratch generation admission refused; serving generation unchanged",
+                )),
+            };
+        let head_act = delta.delta().head.head_act;
+        self.store
+            .record_synced(&generation, head_act, synced_at)
+            .map_err(local_io)?;
+        self.store.schedule_maintenance(&self.observed);
+        Ok(DeltaAttempt::Advanced {
+            generation,
+            head_act,
+        })
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn kernel_has_disk_space(&self, current: &InstalledGeneration, copies: u64) -> Result<bool> {
+        let available = fs2::available_space(self.store.staging_dir())?;
+        #[cfg(test)]
+        let available = self.kernel_available_space.unwrap_or(available);
+        Ok(available
+            >= super::generation_store::kernel_disk_budget(&current.snapshot_path, copies)?)
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn kernel_replay_cooling_down(&self) -> Result<bool> {
+        let path = self.refresh_dir.join("kernel-replay.json");
+        if !path.try_exists()? {
+            return Ok(false);
+        }
+        require_regular_file(&path)?;
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        let until = value["not_before"]
+            .as_str()
+            .ok_or_else(|| Error::engine("invalid kernel replay schedule"))?;
+        let until = chrono::DateTime::parse_from_rfc3339(until)
+            .map_err(|_| Error::engine("invalid kernel replay timestamp"))?;
+        Ok(until > chrono::Utc::now())
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn defer_kernel_replay(&self, elapsed: Duration) -> Result<()> {
+        // Rest at least as long as replay took (and at least one minute).
+        // The attempt lock covers copy, replay, verification and publication.
+        let seconds = elapsed.as_secs().max(60);
+        let until =
+            chrono::Utc::now() + chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64);
+        let mut temp = tempfile::NamedTempFile::new_in(&self.refresh_dir)?;
+        temp.write_all(&serde_jcs::to_vec(&serde_json::json!({"not_before": until.to_rfc3339(), "last_wall_millis": elapsed.as_millis()}))?)?;
+        temp.as_file().sync_all()?;
+        temp.persist(self.refresh_dir.join("kernel-replay.json"))
+            .map_err(|e| e.error)?;
+        File::open(&self.refresh_dir)?.sync_all()?;
+        Ok(())
     }
 
     async fn download_and_install(
@@ -2637,6 +2925,22 @@ impl StandbyRefreshController {
             let Some(name) = name.to_str() else {
                 continue;
             };
+            let kernel_replay = name
+                .strip_prefix("kernel-replay-")
+                .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_alphanumeric()));
+            let kernel_file = ["kernel-delta-", "kernel-manifest-"].iter().any(|prefix| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|s| s.len() == 6 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+            });
+            if kernel_replay || kernel_file {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if kernel_replay && metadata.is_dir() {
+                    fs::remove_dir_all(entry.path())?;
+                } else if metadata.is_file() || metadata.file_type().is_symlink() {
+                    fs::remove_file(entry.path())?;
+                }
+                continue;
+            }
             let Some(rest) = name.strip_prefix("refresh-") else {
                 continue;
             };
@@ -3251,6 +3555,8 @@ mod tests {
     mod gzip;
     mod gzip_http;
     mod gzip_recovery;
+    #[cfg(feature = "v2-kernel-probe")]
+    mod kernel_v2_refresh;
     mod progress;
 
     /// Reader locks stand in for serving processes that outlive the test.
@@ -3476,6 +3782,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum BinaryWireFault {
         None,
+        HeadProbeUnavailable,
         ContentRange,
         Etag,
         Length,
@@ -3793,6 +4100,13 @@ mod tests {
         assert_eq!(database, "route-1");
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         fixture.mcp_calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(fixture.fault, BinaryWireFault::HeadProbeUnavailable) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"head unavailable"})),
+            )
+                .into_response();
+        }
         let authority = fixture.authority.expect("delta authority fixture");
         let operation = body["params"]["arguments"]["operation"].as_str().unwrap();
         let result = match operation {
@@ -4572,7 +4886,24 @@ mod tests {
             .staging_dir()
             .join(format!("refresh-{}.snapshot.db", uuid::Uuid::new_v4()));
         fs::write(&orphan, b"orphan").unwrap();
+        let replay = controller.store.staging_dir().join("kernel-replay-AbCd12");
+        fs::create_dir(&replay).unwrap();
+        fs::write(replay.join("snapshot.db"), b"private scratch").unwrap();
+        let delta = controller.store.staging_dir().join("kernel-delta-AbCd12");
+        let manifest = controller
+            .store
+            .staging_dir()
+            .join("kernel-manifest-AbCd12");
+        fs::write(&delta, b"scratch checkpoint").unwrap();
+        fs::write(&manifest, b"scratch manifest").unwrap();
+        let unrelated = controller
+            .store
+            .staging_dir()
+            .join("kernel-replay-operator-notes");
+        fs::write(&unrelated, b"keep").unwrap();
         controller.cleanup_interrupted_staging().unwrap();
+        assert!(!replay.exists() && !delta.exists() && !manifest.exists());
+        assert!(unrelated.exists());
         assert!(!orphan.exists());
         assert!(controller.refresh_dir.join("binary-resume.json").exists());
         assert!(controller
@@ -4684,6 +5015,57 @@ mod tests {
         authority.close().await;
     }
 
+    // Generation maintenance and detached binary workers have independent
+    // lifetimes. A cancellation counter is also not a worker-completion signal.
+    // Wait for both leases before a test asks the next tick to exercise policy,
+    // rather than the production busy/coalescing path. Never retry the tick.
+    async fn refresh_workers_idle(controller: &StandbyRefreshController) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                controller.store.maintenance_idle().await;
+                let locks = ["attempt.lock", "binary-work.lock"]
+                    .map(|name| open_private_lock(&controller.refresh_dir.join(name)).unwrap());
+                let idle = locks.iter().all(|lock| match lock.try_lock_exclusive() {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(error) => panic!("refresh worker quiescence failed: {error}"),
+                });
+                drop(locks);
+                if idle {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("refresh maintenance and transfer workers must become idle");
+    }
+
+    #[tokio::test]
+    async fn refresh_workers_idle_waits_for_attempt_and_transfer_leases() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = controller_for_origin(
+            &directory,
+            "ndb_0123456789abcdef0123456789abcdef".into(),
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        for name in ["attempt.lock", "binary-work.lock"] {
+            let lease = open_private_lock(&controller.refresh_dir.join(name)).unwrap();
+            lease.try_lock_exclusive().unwrap();
+            // Maintenance is already idle: either independent lease must still
+            // prevent the helper from completing. This uses no timing race.
+            controller.store.maintenance_idle().await;
+            let idle = refresh_workers_idle(&controller);
+            tokio::pin!(idle);
+            assert!(futures::poll!(idle.as_mut()).is_pending(), "{name}");
+            drop(lease);
+            idle.await;
+        }
+    }
+
     #[tokio::test]
     async fn resume_probe_refusal_obeys_terminal_custody_and_later_capture_budget() {
         let authority = crate::create_database(":memory:").await.unwrap();
@@ -4719,13 +5101,13 @@ mod tests {
                 })
                 .await
                 .unwrap();
-                controller.store.maintenance_idle().await;
+                refresh_workers_idle(&controller).await;
                 enable_deltas(&mut controller);
                 *fake.bytes.lock().unwrap() = bytes_b.clone();
                 *fake.manifest.lock().unwrap() = manifest_b.clone();
                 fake.succeed_reads
                     .store(fake.reads.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
-                controller.store.maintenance_idle().await;
+                refresh_workers_idle(&controller).await;
                 assert!(controller.refresh_once(RefreshCause::Manual).await.is_err());
                 let ledger_path = controller.refresh_dir.join("binary-resume.json");
                 let partial_path = controller.refresh_dir.join("binary-resume.partial.db");
@@ -4751,7 +5133,7 @@ mod tests {
                 *fake.poll_mode.lock().unwrap() = ResumePollMode::Refused(class);
                 // This is the real controller path: head, delta fallback,
                 // retained-handle probe, then (only on success) the FULL gate.
-                controller.store.maintenance_idle().await;
+                refresh_workers_idle(&controller).await;
                 assert!(controller
                     .refresh_once(RefreshCause::Scheduled)
                     .await
@@ -4784,15 +5166,17 @@ mod tests {
                 *fake.poll_mode.lock().unwrap() = ResumePollMode::Ready;
                 fake.succeed_reads.store(usize::MAX, Ordering::SeqCst);
                 if !eligible_before_refusal {
-                    // Verification retries also take attempt.lock; let them
-                    // settle so this tick exercises the production FULL gate.
-                    controller.store.maintenance_idle().await;
-                    let StandbyRefreshOutcome::Deferred { reason, .. } = controller
+                    // Wait for verification and transfer custody so this tick
+                    // exercises the production FULL gate, not busy coalescing.
+                    refresh_workers_idle(&controller).await;
+                    let outcome = controller
                         .refresh_once(RefreshCause::Scheduled)
                         .await
-                        .unwrap()
-                    else {
-                        panic!("the next tick must respect the original capture cooldown");
+                        .unwrap();
+                    let StandbyRefreshOutcome::Deferred { reason, .. } = outcome else {
+                        panic!(
+                            "the next tick must respect the original capture cooldown: {outcome:?}"
+                        );
                     };
                     assert_eq!(reason, DEFERRED_FULL_REFRESH_INTERVAL);
                     assert!(controller
@@ -4806,7 +5190,7 @@ mod tests {
                     state.last_full_refresh_at = Some("2020-01-01T00:00:00Z".into());
                     controller.write_state(&state).unwrap();
                 }
-                controller.store.maintenance_idle().await;
+                refresh_workers_idle(&controller).await;
                 let StandbyRefreshOutcome::Installed { generation, .. } = controller
                     .refresh_once(RefreshCause::Scheduled)
                     .await
@@ -5122,6 +5506,62 @@ mod tests {
             mcp_calls: Arc::default(),
             cancels: Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn acquisition_only_ignores_head_probe_errors_for_v1() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let (bytes, manifest) = snapshot_fixture(&db).await;
+        let mut fixture = acquisition_fixture(bytes, manifest);
+        fixture.fault = BinaryWireFault::HeadProbeUnavailable;
+        let (port, server) = serve_binary_fixture(fixture.clone()).await;
+        let mut controller = controller_for_origin(
+            &directory,
+            origin,
+            Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Protocol,
+                calls: AtomicUsize::new(0),
+            }),
+        );
+        controller.delta_enabled = true;
+        controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+        // No head authority: the endpoint refuses the preliminary probe, but
+        // standalone snapshot acquisition retains its independent v1 transport.
+        let download = controller.acquire_snapshot_only().await.unwrap();
+        assert!(download.snapshot_path().is_file());
+        assert_eq!(fixture.mcp_calls.load(Ordering::SeqCst), 1);
+        server.abort();
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn v1_delta_only_lock_contention_remains_an_error() {
+        let client = Arc::new(AlwaysFailClient {
+            class: RefreshFailureClass::Network,
+            calls: AtomicUsize::new(0),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let db = crate::create_database(":memory:").await.unwrap();
+        let origin = crate::identity::database_id(&db).await.unwrap();
+        let mut controller = controller_for_origin(&directory, origin, client.clone());
+        controller.observed = super::super::generation_store::tests::observed();
+        let (snapshot, manifest) =
+            super::super::generation_store::tests::stage(&controller.store, &db, "v1-lock").await;
+        let installed = controller
+            .store
+            .install_staged(&snapshot, &manifest, &controller.observed)
+            .await
+            .unwrap();
+        assert!(installed.manifest.kernel_v2.is_none());
+        for name in ["controller.lock", "attempt.lock"] {
+            let lock = open_private_lock(&controller.refresh_dir.join(name)).unwrap();
+            lock.try_lock_exclusive().unwrap();
+            assert!(controller.refresh_delta_only().await.is_err(), "{name}");
+        }
+        assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+        db.close().await;
     }
 
     #[tokio::test]
@@ -5802,8 +6242,15 @@ mod tests {
                             AuthorityFault::Gap => from + 1,
                             _ => from,
                         };
-                        super::super::delta_transport::observe_authority_act_delta(
-                            &db, "route-1", from,
+                        let inventory: Option<Vec<String>> = serde_json::from_value(
+                            body["params"]["arguments"]["arguments"]["blob_inventory"].clone(),
+                        )
+                        .unwrap();
+                        super::super::delta_transport::observe_authority_act_delta_with_inventory(
+                            &db,
+                            "route-1",
+                            from,
+                            inventory.as_deref(),
                         )
                         .await
                         .map(|value| serde_json::to_value(value).unwrap())
@@ -9609,5 +10056,80 @@ mod tests {
         assert!(!serialized.contains("live-credential-9f8e7d6c"));
         assert!(!serialized.contains("private record body"));
         assert!(serialized.contains("install-fence:verify"));
+    }
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    #[tokio::test]
+    async fn default_build_pauses_v2_before_any_full_download_cold_and_warm() {
+        for warm in [false, true] {
+            let client = Arc::new(AlwaysFailClient {
+                class: RefreshFailureClass::Network,
+                calls: AtomicUsize::new(0),
+            });
+            let (_directory, mut controller) = controller_with_client(client.clone());
+            let v1 = crate::create_database(":memory:").await.unwrap();
+            let origin = crate::identity::database_id(&v1).await.unwrap();
+            controller.runtime.origin_database_id = origin.clone();
+            controller.store = GenerationStore::open(
+                &controller.runtime.replica_root,
+                "route-1",
+                Some(origin.clone()),
+            )
+            .unwrap();
+            controller.observed = crate::standby::generation_store::tests::observed();
+            controller.delta_enabled = true;
+            if warm {
+                let (snapshot, manifest) = crate::standby::generation_store::tests::stage(
+                    &controller.store,
+                    &v1,
+                    "default-pause",
+                )
+                .await;
+                controller
+                    .store
+                    .install_staged(&snapshot, &manifest, &controller.observed)
+                    .await
+                    .unwrap();
+            }
+            let (v2, _) = Box::pin(crate::kernel::create_v2_database(
+                ":memory:",
+                "account",
+                "Owner",
+                "acct:pause",
+            ))
+            .await
+            .unwrap();
+            let mut head = serde_json::to_value(
+                super::super::delta_transport::observe_authority_act_head(&v2, "route-1")
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            // A legitimate imported workspace retains its v1 source origin.
+            head["head"]["origin_database_id"] = json!(origin);
+            let (port, server) = serve_one_head_refusal("200 OK", json!({"jsonrpc":"2.0","id":1,"result":{"isError":false,"content":[],"structuredContent":head}})).await;
+            controller.config.hosted_origin = format!("http://127.0.0.1:{port}");
+            let reason = "engine v2 requires v2-kernel-probe build";
+            let outcome = controller.refresh_once(RefreshCause::Scheduled).await;
+            if warm {
+                assert!(
+                    matches!(outcome.unwrap(), StandbyRefreshOutcome::Deferred { reason: actual, .. } if actual == reason)
+                );
+                assert_eq!(
+                    controller.state().unwrap().last_deferral.as_deref(),
+                    Some(reason)
+                );
+            } else {
+                assert!(outcome.unwrap_err().to_string().contains(reason));
+                assert_eq!(
+                    controller.state().unwrap().last_failure.as_deref(),
+                    Some(reason)
+                );
+            }
+            assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+            assert!(controller.state().unwrap().last_full_refresh_at.is_none());
+            server.await.unwrap();
+            v1.close().await;
+            v2.close().await;
+        }
     }
 }

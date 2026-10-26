@@ -250,6 +250,10 @@ pub struct IndexedLinkCandidates {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // M3 will consume the fields when its transport is added.
 pub(crate) struct FilteredWorkspaceIndex {
+    /// None is the unchanged v1 projection. V2 retains genuine SQL NULL
+    /// type information without inventing a v1 spine type for neutral records.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub native_untyped_records: Option<HashSet<String>>,
     pub content_seq: i64,
     pub authorization_epoch: i64,
     pub relationship_seq: i64,
@@ -322,6 +326,8 @@ impl FilteredWorkspaceIndex {
             })
             .collect();
         Self {
+            #[cfg(feature = "v2-kernel-probe")]
+            native_untyped_records: None,
             content_seq: index.cursor_seq,
             authorization_epoch,
             relationship_seq,

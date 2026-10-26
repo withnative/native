@@ -105,7 +105,7 @@ pub struct DescriptorSubject {
     pub value: Option<String>,
 }
 
-fn parse_surface(surface: &str) -> Result<Surface> {
+pub(crate) fn parse_surface(surface: &str) -> Result<Surface> {
     match surface {
         SURFACE_HOME => Ok(Surface::Home),
         other => Err(Error::engine(format!(
@@ -121,7 +121,7 @@ fn surface_name(surface: Surface) -> &'static str {
 }
 
 /// Parse the subject argument. Only `environment` is accepted in this slice.
-fn parse_subject(subject: Option<&str>) -> Result<SubjectPattern> {
+pub(crate) fn parse_subject(subject: Option<&str>) -> Result<SubjectPattern> {
     match subject.unwrap_or(SUBJECT_ENVIRONMENT) {
         SUBJECT_ENVIRONMENT => Ok(SubjectPattern::Environment),
         other => Err(Error::engine(format!(
@@ -179,7 +179,7 @@ fn descriptor(surface: Surface, subject: &SubjectPattern, mode: Mode) -> Binding
 /// surface-binding descriptor. A note that does not parse is ignored rather
 /// than treated as a binding: `manage_links` remains open, so `read` reports
 /// invalid graph states explicitly instead of trusting them.
-fn decode_descriptor(note: Option<&str>) -> Option<BindingDescriptor> {
+pub(crate) fn decode_descriptor(note: Option<&str>) -> Option<BindingDescriptor> {
     let descriptor: BindingDescriptor = serde_json::from_str(note?).ok()?;
     if descriptor.v != SURFACE_BINDING_NOTE_VERSION {
         return None;
@@ -203,7 +203,7 @@ fn decode_descriptor(note: Option<&str>) -> Option<BindingDescriptor> {
     Some(descriptor)
 }
 
-fn descriptor_subject(descriptor: &BindingDescriptor) -> Option<SubjectPattern> {
+pub(crate) fn descriptor_subject(descriptor: &BindingDescriptor) -> Option<SubjectPattern> {
     let value = descriptor.subject.value.clone();
     match descriptor.subject.kind.as_str() {
         SUBJECT_ENVIRONMENT => Some(SubjectPattern::Environment),
@@ -543,7 +543,7 @@ fn binding_json(binding: &SurfaceBinding) -> Value {
     })
 }
 
-fn resolution_json(
+pub(crate) fn resolution_json(
     surface: Surface,
     request: &SurfaceRequest,
     resolution: &crate::surface_binding::Resolution,

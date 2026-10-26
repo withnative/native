@@ -15,12 +15,17 @@ pub struct WorkspaceMetadata {
 }
 
 pub async fn read(db: &Db) -> Result<Option<WorkspaceMetadata>> {
+    let mut conn = db.pool().acquire().await?;
+    read_on(&mut conn).await
+}
+
+pub(crate) async fn read_on(conn: &mut SqliteConnection) -> Result<Option<WorkspaceMetadata>> {
     let raw: Option<String> = sqlx::query_scalar(
-        "SELECT payload FROM content_events WHERE record_id=? AND type=? ORDER BY seq DESC LIMIT 1",
+        "SELECT payload FROM main.content_events WHERE record_id=? AND type=? ORDER BY seq DESC LIMIT 1",
     )
     .bind(RECORD_ID)
     .bind(EVENT_TYPE)
-    .fetch_optional(db.pool())
+    .fetch_optional(conn)
     .await?;
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()
@@ -31,7 +36,7 @@ pub(crate) async fn import_as(db: &Db, principal: &str, metadata: WorkspaceMetad
     hq::require_import(&mut tx, principal).await?;
     hq::require_source_import_open(&mut tx).await?;
     let previous: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT payload,actor FROM content_events WHERE record_id=? AND type=? ORDER BY seq DESC LIMIT 1",
+        "SELECT payload,actor FROM main.content_events WHERE record_id=? AND type=? ORDER BY seq DESC LIMIT 1",
     ).bind(RECORD_ID).bind(EVENT_TYPE).fetch_optional(&mut *tx).await?;
     let payload = serde_json::to_value(&metadata)?;
     if let Some((raw, actor)) = previous {

@@ -34,7 +34,10 @@ pub(crate) fn release_revision(schema: i64) -> Result<u64> {
     match schema {
         87 | 88 => Ok(6),
         89 => Ok(7),
-        90 => Ok(8),
+        // Engine 93 adds a derived partial index only. Engine 92 adds only trigger-maintained folds (`content_event_heads`),
+        // no interchange section. Engine 91 adds derived authorization counters and transaction-only
+        // birth certification; canonical act inventories and wire remain 8.
+        90..=93 => Ok(8),
         _ => Err(Error::engine("unsupported release act-head source schema")),
     }
 }
@@ -173,11 +176,17 @@ fn revision6_binding_seeds() -> Vec<BindingSystemSeedV1> {
 mod tests {
     #[test]
     fn release_current_schema_and_wire_pair_requires_explicit_qualification() {
-        assert_eq!(crate::db::CURRENT_ENGINE_SCHEMA_VERSION, 90);
+        assert_eq!(crate::db::CURRENT_ENGINE_SCHEMA_VERSION, 93);
         assert_eq!(crate::interchange::REVISION, 8);
         assert_eq!(
-            super::release_revision(90).unwrap(),
+            super::release_revision(93).unwrap(),
             crate::interchange::REVISION
+        );
+        assert_eq!(super::release_revision(91).unwrap(), 8);
+        assert_eq!(super::release_revision(90).unwrap(), 8);
+        assert!(
+            super::release_revision(94).is_err(),
+            "future schemas still require qualification"
         );
     }
 }

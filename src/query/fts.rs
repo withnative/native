@@ -112,6 +112,12 @@ pub struct FtsOptions {
     /// is E(m), so lexical visibility is slice presence and the policy/Unit
     /// view predicate is replaced. False for every online caller.
     pub member: bool,
+    /// A trusted, static SQL predicate over the matched record `r`; a record
+    /// that satisfies it is not a hit. It is part of the match query, so it
+    /// applies before the candidate pool, the ranking and every cap, and an
+    /// excluded record cannot displace one that is kept. It must be built
+    /// from constants only (it is spliced into the statement, never bound).
+    pub exclude_predicate: Option<String>,
 }
 
 /// Split free text into FTS5-safe quoted terms: each token is double-quoted
@@ -179,6 +185,14 @@ struct SearchPrincipal<'a> {
 /// Match stream and parent redaction over the caller's connection, so one
 /// search reads one snapshot. Pool callers acquire the connection; declared
 /// tab reads pass their gate transaction's.
+/// The `AND NOT (..)` clause for `opts.exclude_predicate`, or nothing.
+fn exclude_filter(opts: &FtsOptions) -> String {
+    opts.exclude_predicate
+        .as_ref()
+        .map(|predicate| format!("AND NOT ({predicate})"))
+        .unwrap_or_default()
+}
+
 async fn run_match(
     conn: &mut SqliteConnection,
     principal: SearchPrincipal<'_>,
@@ -229,6 +243,7 @@ async fn run_match(
     } else {
         view_predicate("r")
     };
+    let exclude_filter = exclude_filter(opts);
     let sql = format!(
         "{index_sql}
           AND r.deleted_at IS NULL
@@ -237,6 +252,7 @@ async fn run_match(
           {archived_filter}
           {scope_filter}
           {type_filter}
+          {exclude_filter}
           ORDER BY r.id
           LIMIT ?"
     );
@@ -623,6 +639,7 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
     } else {
         view_predicate("r")
     };
+    let exclude_filter = exclude_filter(opts);
     let sql = format!(
         "SELECT COUNT(*) AS n
           FROM records_fts
@@ -633,7 +650,8 @@ pub(crate) async fn search_pool_count_with_policy_bypass(
             AND {view_filter}
             {archived_filter}
             {scope_filter}
-            {type_filter}"
+            {type_filter}
+            {exclude_filter}"
     );
     let mut query = sqlx::query(&sql).bind(&match_expr);
     if !opts.member {
@@ -825,6 +843,7 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
     } else {
         view_predicate("r")
     };
+    let exclude_filter = exclude_filter(opts);
     let sql = format!(
         "SELECT r.id, r.type, r.kind,
                 substr(r.name, 1, {TRUSTED_NAME_CHARS}) AS name, r.home_id,
@@ -838,6 +857,7 @@ pub(crate) async fn name_infix_with_policy_bypass_in(
             {archived_filter}
             {scope_filter}
             {type_filter}
+            {exclude_filter}
           ORDER BY length(r.name), r.name, r.id
           LIMIT ?"
     );

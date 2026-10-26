@@ -11,6 +11,13 @@
 //! writer's connections — and retained TEMP state there cannot shadow the
 //! unqualified names `bootstrap` and `get_structure` rely on.
 
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod named_views;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod view_validation;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use named_views::NamedViewValidators;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,7 +45,7 @@ use crate::schema::DDL_STATEMENTS;
 
 use super::error::contract_violation;
 
-const CONTROLLED_ACCESSORS: [&str; 55] = [
+const CONTROLLED_ACCESSORS: [&str; 57] = [
     "_query_sql_bearer_walk",
     "_query_sql_authorization_subjects",
     "_query_sql_visible_records",
@@ -79,10 +86,12 @@ const CONTROLLED_ACCESSORS: [&str; 55] = [
     "_query_sql_run_declarations",
     "messages_awaiting_reply",
     "facet_times",
+    "facet_keys",
     "_query_sql_my_person",
     "my_message_state",
     "my_participants",
     "message_speakers",
+    "deleted_messages",
     "my_mentions",
     "comment_anchors",
     "message_reactions",
@@ -139,6 +148,7 @@ pub(crate) const MEMBER_QUERY_SQL_SERVED_RELATIONS: &[&str] = &[
     "links",
     "facet_values",
     "facet_times",
+    "facet_keys",
     "bindings",
     "blobs",
     "vocabularies",
@@ -276,7 +286,7 @@ fn build_member_preflight_validator(gate_schema_config: bool) -> Result<rusqlite
             // shipped relation non-authoritative; then it is probed like an
             // excluded relation so a statement reading it refuses, while a
             // same-named CTE/comment/literal never opens the probe.
-            if !(name == "schema_config" && gate_schema_config) {
+            if !(matches!(name, "schema_config" | "facet_keys") && gate_schema_config) {
                 continue;
             }
         }
@@ -371,7 +381,10 @@ pub(crate) fn member_reads_schema_config(portable_statement: &str) -> Result<boo
     let observed = seen.clone();
     conn.authorizer(Some(move |context: AuthContext<'_>| {
         if let AuthAction::Read { table_name, .. } = context.action {
-            if table_name == "_member_probe_schema_config" {
+            if matches!(
+                table_name,
+                "_member_probe_schema_config" | "_member_probe_facet_keys"
+            ) {
                 observed.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
@@ -733,6 +746,8 @@ async fn insert_visible_ids(
 /// request; membership alone matters only when the explicit anchor grants
 /// `native:members`, and guests never match that subject.
 const TEMP_CONTRACT: &str = r#"
+CREATE TEMP VIEW IF NOT EXISTS catalog_view_definitions AS SELECT CAST(NULL AS TEXT) AS relation_name,CAST(NULL AS TEXT) AS view_id,CAST(NULL AS TEXT) AS revision_id,CAST(NULL AS TEXT) AS definition_sha256,CAST(NULL AS TEXT) AS schema_sha256,CAST(NULL AS TEXT) AS origin,CAST(NULL AS TEXT) AS description,CAST(NULL AS TEXT) AS scope_json,CAST(NULL AS TEXT) AS source_pins_json,CAST(NULL AS TEXT) AS dependencies_json,CAST(NULL AS TEXT) AS columns_json WHERE 1=0;
+
 CREATE TEMP TABLE IF NOT EXISTS _query_sql_principal (
   singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
   account_id          TEXT NOT NULL,
@@ -1634,11 +1649,16 @@ SELECT record_id,status,raw,axis_key,axis_label,vocabulary_id,
 FROM temp._query_sql_lifecycle_interpretations
 WHERE record_id IS NOT NULL;
 
--- Typed time facet values on the timeline (D2 slice T2), for the records the
--- caller can see, exactly as facet_values filters. Governed SQL has no date
--- functions, so all-day rows carry floating YYYY-MM-DD text (end exclusive,
--- which orders correctly as text) and timed rows UTC epoch milliseconds (end
--- exclusive, equal to start for a point). No sequence column is exposed.
+-- Snapshot-local discovery rows, populated only for a real dependency.
+CREATE TEMP TABLE IF NOT EXISTS _query_sql_facet_keys (
+  scope_id TEXT, type TEXT, kind TEXT, key TEXT, record_count INTEGER,
+  declared INTEGER, value_type TEXT, vocab_ref TEXT, required INTEGER
+);
+CREATE TEMP VIEW IF NOT EXISTS facet_keys AS
+SELECT scope_id,type,kind,key,record_count,declared,value_type,vocab_ref,required
+FROM temp._query_sql_facet_keys WHERE type IS NOT NULL;
+
+-- Typed time values: floating dates or UTC epoch millis, end exclusive.
 CREATE TEMP VIEW IF NOT EXISTS facet_times AS
 SELECT t.record_id, t.key, t.kind, t.all_day, t.start_date, t.end_date,
        t.start_ms, t.end_ms, t.tz, t.tzdb_version
@@ -1697,6 +1717,40 @@ SELECT s.message_id, s.speaker_kind, 'persona:' || s.persona_id AS speaker_addre
   JOIN main.message_speakers s ON s.message_id=visible.id
   JOIN main.records message ON message.id=s.message_id AND message.type='Message' AND message.deleted_at IS NULL
   LEFT JOIN main.records r ON r.id=s.persona_id;
+
+CREATE TEMP VIEW IF NOT EXISTS deleted_messages AS
+SELECT parent.id AS message_id, reply.source_id AS reply_id,
+       strftime('%Y-%m-%dT%H:%M:%fZ', parent.deleted_at) AS deleted_at,
+       CAST(strftime('%s', parent.deleted_at) AS INTEGER) * 1000 + CAST(substr(strftime('%f', parent.deleted_at), 4, 3) AS INTEGER) AS deleted_at_ms
+  FROM main.links reply
+  JOIN temp._query_sql_visible_ids visible ON visible.id=reply.source_id
+  JOIN main.records source ON source.id=reply.source_id AND source.type='Message' AND source.deleted_at IS NULL
+  JOIN main.records parent ON parent.id=reply.target_id AND parent.type='Message' AND parent.deleted_at IS NOT NULL
+ CROSS JOIN temp._query_sql_principal principal
+ WHERE reply.relationship='reply_to'
+   -- Seeing the reply is not enough: the parent must itself have been visible
+   -- to the caller before the tombstone. A Message is its own authorization
+   -- subject, so this is `_query_sql_visible_records` evaluated for the
+   -- parent without its `deleted_at IS NULL` term.
+   AND EXISTS (SELECT 1 FROM main.record_policies AS explicit_policy
+                WHERE explicit_policy.record_id = parent.policy_anchor_id)
+   AND (principal.trusted_local_bypass = 1
+        OR EXISTS (SELECT 1 FROM main.bindings AS owner_account
+                    WHERE owner_account.record_id = parent.owner_id
+                      AND owner_account.system = 'account'
+                      AND owner_account.identifier = principal.account_id
+                      AND owner_account.is_canonical = 1)
+        OR parent.policy_anchor_id IN (
+             SELECT entry.policy_anchor_id
+               FROM main.policy_entries AS entry
+              CROSS JOIN temp._query_sql_principal AS anchor_principal
+              WHERE entry.effect = 'allow'
+                AND entry.capability IN ('view', 'edit', 'manage')
+                AND ((entry.subject_kind = 'members'
+                      AND entry.subject_id = 'native:members'
+                      AND anchor_principal.is_member = 1)
+                     OR (entry.subject_kind = 'account'
+                         AND entry.subject_id = anchor_principal.account_id))));
 
 CREATE TEMP VIEW IF NOT EXISTS my_message_state AS
 SELECT message.id AS message_id,
@@ -1954,6 +2008,7 @@ DELETE FROM temp.catalog_operations;
 DELETE FROM temp._query_sql_visible_ids;
 DELETE FROM temp._query_sql_messages_awaiting_reply;
 DELETE FROM temp._query_sql_lifecycle_interpretations;
+DELETE FROM temp._query_sql_facet_keys;
 DELETE FROM temp._query_sql_activity_members;
 DELETE FROM temp._query_sql_activity_observations;
 DELETE FROM temp._query_sql_activity_capture;
@@ -2070,6 +2125,7 @@ fn temp_contract_teardown_script() -> &'static str {
             "catalog_operations",
             "_query_sql_messages_awaiting_reply",
             "_query_sql_lifecycle_interpretations",
+            "_query_sql_facet_keys",
             "_query_sql_principal",
             "_query_sql_activity_observations",
             "_query_sql_activity_capture",
@@ -2083,6 +2139,235 @@ fn temp_contract_teardown_script() -> &'static str {
         .map(|name| format!("DROP TABLE IF EXISTS temp.{name};\n"));
         views.chain(tables).collect()
     })
+}
+
+fn facet_key_groups_sql() -> &'static str {
+    static SQL: OnceLock<String> = OnceLock::new();
+    SQL.get_or_init(|| {
+        let excluded = crate::schema::SPINE_FACET_KEYS
+            .iter()
+            .chain(crate::schema::ENGINE_RESERVED_FACET_KEYS.iter())
+            .map(|key| format!("'{}'", key.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "SELECT r.type,r.kind,
+            CASE WHEN r.home_id IN (
+                SELECT applies_to_collection_id FROM temp.schema_config
+                WHERE applies_to_collection_id IS NOT NULL
+            ) THEN r.home_id END AS scope_home_id,
+            f.key,count(DISTINCT f.record_id) AS n
+            FROM temp.facet_values f JOIN temp.records r ON r.id=f.record_id
+            WHERE f.key NOT IN ({excluded})
+            GROUP BY r.type,r.kind,scope_home_id,f.key LIMIT 50001"
+        )
+    })
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static FACET_TEST_EXHAUST_AFTER_POPULATION: bool;
+}
+
+fn check_facet_deadline(deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        Err(governed_sql_timeout())
+    } else {
+        Ok(())
+    }
+}
+
+/// Build discovery from this execution's logical views, after visibility (and
+/// any alpha-tab record scope) has been applied. Never read physical facets.
+async fn populate_facet_keys(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    deadline: Instant,
+) -> Result<()> {
+    // Population precedes the statement's own handler on every entry path.
+    // Bound aggregate work too, including work before the first grouped row.
+    transaction
+        .lock_handle()
+        .await?
+        .set_progress_handler(PROGRESS_OPS, move || Instant::now() < deadline);
+    let result = populate_facet_keys_inner(transaction, deadline).await;
+    transaction.lock_handle().await?.remove_progress_handler();
+    #[cfg(test)]
+    if result.is_ok()
+        && FACET_TEST_EXHAUST_AFTER_POPULATION
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false)
+    {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+    }
+    match result {
+        Err(error)
+            if error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("interrupted") =>
+        {
+            Err(governed_sql_timeout())
+        }
+        other => other,
+    }
+}
+
+async fn populate_facet_keys_inner(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    deadline: Instant,
+) -> Result<()> {
+    use super::field_definitions::{build_fields, BuildError, BuildLimits};
+    let limits = BuildLimits::default();
+    let too_large = || {
+        sql_contract::categorized_error(
+            QuerySqlErrorCategory::ResultTooLarge,
+            "facet_keys discovery snapshot exceeds its input budget",
+        )
+    };
+    // Bound raw cells before parsing/cloning the schema snapshot. This also
+    // keeps unrelated oversized schema data from exhausting adapter memory.
+    let (n, bytes, cell): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(sum(length(CAST(data AS BLOB))),0),
+                coalesce(max(length(CAST(data AS BLOB))),0) FROM temp.schema_config",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if n > limits.input_rows as i64
+        || bytes > limits.input_bytes as i64
+        || cell > limits.cell_bytes as i64
+    {
+        return Err(too_large());
+    }
+    let rows = super::cascade::schema_config_rows_in(transaction).await?;
+    let fields = build_fields(&rows, &[], &[], limits, deadline).map_err(|error| match error {
+        BuildError::Timeout => sql_contract::categorized_error(
+            QuerySqlErrorCategory::Timeout,
+            "facet_keys discovery timed out",
+        ),
+        BuildError::ResultTooLarge(_) => too_large(),
+        BuildError::InvalidInput(reason) => contract_violation(format!("facet_keys: {reason}")),
+    })?;
+    type Key = (Option<String>, String, Option<String>, String);
+    type Metadata = (Option<String>, Option<String>, Option<bool>);
+    let allowed = |key: &str| {
+        !crate::schema::SPINE_FACET_KEYS.contains(&key)
+            && !crate::schema::ENGINE_RESERVED_FACET_KEYS.contains(&key)
+    };
+    let mut discovered: BTreeMap<Key, (i64, Metadata)> = BTreeMap::new();
+    for field in fields.definitions {
+        if !allowed(&field.key) {
+            continue;
+        }
+        discovered.insert(
+            (
+                field.context.scope_id,
+                field.context.r#type,
+                field.context.kind,
+                field.key,
+            ),
+            (
+                0,
+                (
+                    field.constraint.declared_type,
+                    field.constraint.vocab_ref,
+                    Some(field.constraint.required),
+                ),
+            ),
+        );
+    }
+    // Group by home so an anchored declaration counts only direct members.
+    // NULL kind in discovery deliberately means a type-wide aggregate, not
+    // only records whose stored kind happens to be NULL.
+    let mut groups = sqlx::query(facet_key_groups_sql()).fetch(&mut **transaction);
+    let mut group_count = 0;
+    let mut input_bytes = 0;
+    let mut type_counts: BTreeMap<(String, String), i64> = BTreeMap::new();
+    while let Some(row) = groups.try_next().await? {
+        group_count += 1;
+        if group_count > limits.input_rows || discovered.len() > limits.emitted_rows {
+            return Err(too_large());
+        }
+        if Instant::now() >= deadline {
+            return Err(sql_contract::categorized_error(
+                QuerySqlErrorCategory::Timeout,
+                "facet_keys discovery timed out",
+            ));
+        }
+        let key: String = row.try_get("key")?;
+        if !allowed(&key) {
+            continue;
+        }
+        let record_type: String = row.try_get("type")?;
+        let kind: Option<String> = row.try_get("kind")?;
+        let home: Option<String> = row.try_get("scope_home_id")?;
+        let n: i64 = row.try_get("n")?;
+        input_bytes += record_type.len()
+            + kind.as_ref().map_or(0, String::len)
+            + home.as_ref().map_or(0, String::len)
+            + key.len()
+            + 64;
+        if input_bytes > limits.input_bytes {
+            return Err(too_large());
+        }
+        let global = (None, record_type.clone(), kind.clone(), key.clone());
+        let wildcard = (None, record_type.clone(), None, key.clone());
+        *type_counts
+            .entry((record_type.clone(), key.clone()))
+            .or_default() += n;
+        let metadata = discovered
+            .get(&global)
+            .or_else(|| discovered.get(&wildcard))
+            .map(|(_, metadata)| metadata.clone())
+            .unwrap_or((None, None, None));
+        discovered.entry(global.clone()).or_insert((0, metadata)).0 += n;
+        if let Some(home) = home {
+            let scoped = (Some(home), record_type, kind.clone(), key);
+            if let Some(row) = discovered.get_mut(&scoped) {
+                row.0 += n;
+            }
+            if kind.is_some() {
+                let wildcard = (scoped.0, scoped.1, None, scoped.3);
+                if let Some(row) = discovered.get_mut(&wildcard) {
+                    row.0 += n;
+                }
+            }
+        }
+    }
+    drop(groups);
+    for ((record_type, key), count) in type_counts {
+        discovered
+            .entry((None, record_type, None, key))
+            .or_insert((0, (None, None, None)))
+            .0 = count;
+    }
+    if discovered.len() > limits.emitted_rows {
+        return Err(too_large());
+    }
+    let mut emitted_bytes = 0;
+    for ((scope, record_type, kind, key), (count, (value_type, vocab_ref, required))) in discovered
+    {
+        emitted_bytes += scope.as_ref().map_or(0, String::len)
+            + record_type.len()
+            + kind.as_ref().map_or(0, String::len)
+            + key.len()
+            + value_type.as_ref().map_or(0, String::len)
+            + vocab_ref.as_ref().map_or(0, String::len)
+            + 64;
+        if emitted_bytes > limits.emitted_bytes {
+            return Err(too_large());
+        }
+        if Instant::now() >= deadline {
+            return Err(sql_contract::categorized_error(
+                QuerySqlErrorCategory::Timeout,
+                "facet_keys discovery timed out",
+            ));
+        }
+        sqlx::query("INSERT INTO temp._query_sql_facet_keys(scope_id,type,kind,key,record_count,declared,value_type,vocab_ref,required) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(scope).bind(record_type).bind(kind).bind(key).bind(count)
+            .bind(required.is_some()).bind(value_type).bind(vocab_ref).bind(required)
+            .execute(&mut **transaction).await?;
+    }
+    Ok(())
 }
 
 /// Populate caller-relative lifecycle meaning from the same pinned SQLite
@@ -2230,6 +2515,8 @@ async fn cleanup_query_sql_temp_contract(
 /// no main schema at all, structurally rejecting `main.records`, raw relations,
 /// and the colliding-CTE accessor spoof that defeats a view-aware callback.
 pub(crate) const STRICT_LOGICAL_SCHEMA: &str = r#"
+CREATE TEMP TABLE catalog_view_definitions(relation_name TEXT,view_id TEXT,revision_id TEXT,definition_sha256 TEXT,schema_sha256 TEXT,origin TEXT,description TEXT,scope_json TEXT,source_pins_json TEXT,dependencies_json TEXT,columns_json TEXT);
+
 CREATE TEMP TABLE records (
   id TEXT, type TEXT, kind TEXT, name TEXT, body TEXT, home_id TEXT,
   lifecycle TEXT, persistence TEXT, maturity TEXT, summary TEXT,
@@ -2362,6 +2649,7 @@ CREATE TEMP TABLE run_intents (
 CREATE TEMP TABLE messages_awaiting_reply (message_id TEXT);
 CREATE TEMP TABLE my_participants (participant_address TEXT, kind TEXT, persona_id TEXT, display_name TEXT, state TEXT);
 CREATE TEMP TABLE message_speakers (message_id TEXT, speaker_kind TEXT, speaker_address TEXT, display_name TEXT, assurance TEXT);
+CREATE TEMP TABLE deleted_messages (message_id TEXT, reply_id TEXT, deleted_at TEXT, deleted_at_ms INTEGER);
 CREATE TEMP TABLE my_message_state (
   message_id TEXT, stage TEXT, unread INTEGER, is_own INTEGER,
   mentioned INTEGER, flagged INTEGER, muted INTEGER, archived INTEGER,
@@ -2379,6 +2667,10 @@ CREATE TEMP TABLE message_reactions (
   reaction_id TEXT, message_id TEXT, emoji TEXT, actor_record_id TEXT,
   actor_name TEXT, executor_kind TEXT, reacted_at TEXT, reacted_at_ms INTEGER,
   viewer INTEGER
+);
+CREATE TEMP TABLE facet_keys (
+  scope_id TEXT, type TEXT, kind TEXT, key TEXT, record_count INTEGER,
+  declared INTEGER, value_type TEXT, vocab_ref TEXT, required INTEGER
 );
 CREATE TEMP TABLE facet_times (
   record_id TEXT, key TEXT, kind TEXT, all_day INTEGER,
@@ -3119,6 +3411,28 @@ fn authorize_kernel_v2_view_expansion(context: AuthContext<'_>) -> Authorization
     authorize_view_expansion_ad_hoc(context)
 }
 
+#[cfg(feature = "v2-kernel-probe")]
+fn authorize_kernel_v2_portable_view_expansion(context: AuthContext<'_>) -> Authorization {
+    if matches!(context.action, AuthAction::Read { table_name, column_name }
+        if column_name.is_empty() && sql_contract::is_logical_relation(table_name))
+        && matches!(context.database_name, None | Some("main"))
+    {
+        return Authorization::Allow;
+    }
+    authorize_view_expansion(context)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn authorize_kernel_v2_stored_view_expansion(context: AuthContext<'_>) -> Authorization {
+    if matches!(context.action, AuthAction::Read { table_name, column_name }
+        if column_name.is_empty() && sql_contract::is_logical_relation(table_name))
+        && matches!(context.database_name, None | Some("main"))
+    {
+        return Authorization::Allow;
+    }
+    authorize_view_expansion_legacy_saved_sql(context)
+}
+
 /// `table_function_allowed` names the table-valued functions (`json_each`,
 /// `json_tree`) whose eponymous virtual table may be read. SQLite reports
 /// that read against `main` with column names (`value`, `key`, ...) and no
@@ -3189,6 +3503,12 @@ fn strict_heading_source_read(context: &AuthContext<'_>, table_name: &str) -> bo
         && context.accessor == Some("body_block_headings")
 }
 
+fn strict_facet_keys_source_read(context: &AuthContext<'_>, table_name: &str) -> bool {
+    context.database_name == Some("temp")
+        && table_name == "_query_sql_facet_keys_source"
+        && context.accessor == Some("facet_keys")
+}
+
 fn strict_lifecycle_source_read(context: &AuthContext<'_>, table_name: &str) -> bool {
     context.database_name == Some("temp")
         && table_name == "_query_sql_lifecycle_source"
@@ -3235,7 +3555,8 @@ fn authorize_strict_with(
                     || strict_task_source_read(&context, table_name)
                     || strict_heading_source_read(&context, table_name)
                     || strict_reaction_source_read(&context, table_name)
-                    || strict_lifecycle_source_read(&context, table_name)) =>
+                    || strict_lifecycle_source_read(&context, table_name)
+                    || strict_facet_keys_source_read(&context, table_name)) =>
         {
             Authorization::Allow
         }
@@ -3256,7 +3577,8 @@ fn authorize_strict_legacy_saved_sql(context: AuthContext<'_>) -> Authorization 
                     || strict_task_source_read(&context, table_name)
                     || strict_heading_source_read(&context, table_name)
                     || strict_reaction_source_read(&context, table_name)
-                    || strict_lifecycle_source_read(&context, table_name)) =>
+                    || strict_lifecycle_source_read(&context, table_name)
+                    || strict_facet_keys_source_read(&context, table_name)) =>
         {
             Authorization::Allow
         }
@@ -3394,6 +3716,15 @@ fn unknown_column_repair_for(
     sql_contract::unknown_column_repair(column.as_str(), &relations, profile)
 }
 
+/// SQLite has no dedicated unknown-column error code. Require both the
+/// public refusal category and the engine's leading diagnostic, rather than
+/// finding column-shaped text inside an unrelated validation error.
+fn sqlite_records_facet_key_for_refusal(statement: &str, error: &crate::Error) -> Option<String> {
+    let detail = error.to_string();
+    detail.strip_prefix("query_sql [syntax_or_type]: no such column:")?;
+    sql_contract::unknown_records_facet_key(statement, &detail)
+}
+
 /// First FROM/JOIN target that is not a logical relation, qualifiers
 /// (`main.`/`temp.`) stripped. Returns `None` when every target resolves.
 fn first_non_logical_target(statement: &str) -> Option<String> {
@@ -3434,6 +3765,10 @@ static FROZEN_TEMP_CONTRACT_BATCH: OnceLock<String> = OnceLock::new();
 thread_local! {
     static FROZEN_VALIDATOR: RefCell<Option<rusqlite::Connection>> = const { RefCell::new(None) };
     static STRICT_VALIDATOR: RefCell<Option<rusqlite::Connection>> = const { RefCell::new(None) };
+    #[cfg(feature = "v2-kernel-probe")]
+    static KERNEL_FROZEN_VALIDATOR: RefCell<Option<rusqlite::Connection>> = const { RefCell::new(None) };
+    #[cfg(feature = "v2-kernel-probe")]
+    static KERNEL_STRICT_VALIDATOR: RefCell<Option<rusqlite::Connection>> = const { RefCell::new(None) };
     /// Observability for the tier-1.1 acceptance: how many validator
     /// connections this thread built. Thread-local like the caches, so one
     /// thread's warm-up never moves another thread's count. Incremented only
@@ -3458,6 +3793,8 @@ fn frozen_temp_contract_batch() -> &'static str {
 fn build_frozen_validator() -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open_in_memory()
         .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
+    #[cfg(feature = "v2-kernel-probe")]
+    view_validation::arm(&conn)?;
     conn.execute_batch(frozen_ddl_batch())
         .and_then(|_| conn.execute_batch(frozen_temp_contract_batch()))
         .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
@@ -3472,13 +3809,17 @@ fn build_frozen_validator() -> Result<rusqlite::Connection> {
 fn build_strict_validator() -> Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open_in_memory()
         .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
+    #[cfg(feature = "v2-kernel-probe")]
+    view_validation::arm(&conn)?;
     conn.execute_batch(STRICT_LOGICAL_SCHEMA)
         .map_err(|e| contract_violation(format!("query_sql: validator setup failed: {e}")))?;
     // Only this validator substitutes views for the writable public tables.
     // Column-less reads open their private sources and count as dependencies,
     // while same-named CTEs cannot trigger materialization.
     conn.execute_batch(
-        "ALTER TABLE temp.body_task_items RENAME TO _query_sql_task_item_source;
+        "ALTER TABLE temp.facet_keys RENAME TO _query_sql_facet_keys_source;
+         CREATE TEMP VIEW facet_keys AS SELECT * FROM _query_sql_facet_keys_source WHERE type IS NOT NULL;
+         ALTER TABLE temp.body_task_items RENAME TO _query_sql_task_item_source;
          CREATE TEMP VIEW body_task_items AS
          SELECT record_id,item_index,marker,checked,in_quote,start_offset,end_offset
          FROM _query_sql_task_item_source;
@@ -3664,6 +4005,45 @@ fn with_strict_validator<T>(
     })
 }
 
+#[cfg(feature = "v2-kernel-probe")]
+fn configure_kernel_v2_bindings(conn: &rusqlite::Connection, view_expansion: bool) -> Result<()> {
+    let ddl = if view_expansion {
+        "DROP VIEW temp.bindings; CREATE TEMP VIEW bindings AS SELECT record_id,system,identifier,is_canonical FROM main.bindings;"
+    } else {
+        "DROP TABLE temp.bindings; CREATE TEMP TABLE bindings(record_id TEXT,system TEXT,identifier TEXT,is_canonical INTEGER);"
+    };
+    conn.execute_batch(ddl)
+        .map_err(|e| contract_violation(format!("query_sql: v2 validator setup failed: {e}")))
+}
+
+// Separate caches preserve the v1 logical schema, including its wider bindings
+// relation. SQLite must expand stars and describe labels against the same
+// supported v2 binding columns that the execution connection actually serves.
+#[cfg(feature = "v2-kernel-probe")]
+fn with_kernel_v2_validator<T>(
+    view_expansion: bool,
+    operation: impl FnOnce(&rusqlite::Connection) -> Result<T>,
+) -> Result<T> {
+    let use_slot = |slot: &RefCell<Option<rusqlite::Connection>>| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let conn = if view_expansion {
+                build_frozen_validator()?
+            } else {
+                build_strict_validator()?
+            };
+            configure_kernel_v2_bindings(&conn, view_expansion)?;
+            *slot = Some(conn);
+        }
+        operation(slot.as_ref().expect("v2 validator initialized"))
+    };
+    if view_expansion {
+        KERNEL_FROZEN_VALIDATOR.with(use_slot)
+    } else {
+        KERNEL_STRICT_VALIDATOR.with(use_slot)
+    }
+}
+
 fn validate_view_expansion(statement: &str) -> Result<()> {
     with_frozen_validator(|conn| {
         prepare_under_authorizer(conn, statement, authorize_view_expansion)
@@ -3720,19 +4100,53 @@ pub(crate) fn validate_ad_hoc(sql: &str) -> Result<()> {
 pub(crate) fn validate_kernel_v2_ad_hoc(sql: &str) -> Result<()> {
     let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
     super::turso_ast_rules::check_statement(&statement)?;
-    with_frozen_validator(|conn| {
+    with_kernel_v2_validator(true, |conn| {
         prepare_under_authorizer(conn, &statement, authorize_kernel_v2_view_expansion)
     })?;
-    validate_strict_ad_hoc(&statement)
+    with_kernel_v2_validator(false, |conn| {
+        prepare_under_authorizer(conn, &statement, authorize_strict_ad_hoc)
+    })
 }
 
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) fn validated_kernel_v2_output_columns(sql: &str) -> Result<Vec<String>> {
     let statement = sql_contract::classify_sqlite_ad_hoc_statement(sql)?;
-    with_frozen_validator(|conn| {
+    with_kernel_v2_validator(true, |conn| {
         prepare_under_authorizer(conn, &statement, authorize_kernel_v2_view_expansion)
     })?;
-    describe_output_columns(&statement, authorize_strict_ad_hoc)
+    with_kernel_v2_validator(false, |conn| {
+        conn.authorizer(Some(authorize_strict_ad_hoc));
+        let prepared = conn.prepare(&statement);
+        conn.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+        let prepared = prepared.map_err(|e| {
+            sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, e.to_string())
+        })?;
+        Ok(prepared
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect())
+    })
+}
+
+/// Internal execution of already-stored governed definitions. This keeps v1's
+/// retained function/ordering allowance, with the same two physical-read gates
+/// and public-column observer as ordinary kernel SQL. There is no RPC opt-in.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) type KernelSqlInspection = (BTreeSet<(String, String)>, Vec<String>);
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn inspect_kernel_v2_stored_saved_sql(sql: &str) -> Result<KernelSqlInspection> {
+    let statement =
+        sql_contract::classify_stored_saved_sql(sql_contract::QuerySqlProfile::SqliteLocal, sql)?;
+    with_frozen_validator(|conn| {
+        prepare_under_authorizer(conn, &statement, authorize_kernel_v2_stored_view_expansion)
+    })?;
+    validate_strict_legacy_saved_sql(&statement)?;
+    Ok((
+        public_reads_with(&statement, authorize_strict_legacy_saved_sql)?,
+        describe_output_columns(&statement, authorize_strict_legacy_saved_sql)?,
+    ))
 }
 
 /// Validate caller SQL against both the real view expansion and a strict
@@ -3869,6 +4283,11 @@ fn observe_relation_dependencies(
                         .lock()
                         .expect("dependency lock")
                         .insert("message_reactions".to_owned());
+                } else if strict_facet_keys_source_read(&context, table_name) {
+                    observed
+                        .lock()
+                        .expect("dependency lock")
+                        .insert("facet_keys".to_owned());
                 } else if strict_lifecycle_source_read(&context, table_name) {
                     observed
                         .lock()
@@ -3909,9 +4328,17 @@ fn observe_relation_dependencies(
 /// SQLite observes aliases, CTEs, wildcard expansion and column-less counts.
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) fn public_reads_ad_hoc(statement: &str) -> Result<BTreeSet<(String, String)>> {
+    public_reads_with(statement, authorize_strict_ad_hoc)
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+fn public_reads_with(
+    statement: &str,
+    authorizer: fn(AuthContext<'_>) -> Authorization,
+) -> Result<BTreeSet<(String, String)>> {
     let reads = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let observed = reads.clone();
-    with_strict_validator(|conn| {
+    with_kernel_v2_validator(false, |conn| {
         conn.authorizer(Some(move |context: AuthContext<'_>| {
             if let AuthAction::Read {
                 table_name,
@@ -3924,6 +4351,8 @@ pub(crate) fn public_reads_ad_hoc(statement: &str) -> Result<BTreeSet<(String, S
                     "body_block_headings"
                 } else if strict_reaction_source_read(&context, table_name) {
                     "message_reactions"
+                } else if strict_facet_keys_source_read(&context, table_name) {
+                    "facet_keys"
                 } else if strict_lifecycle_source_read(&context, table_name) {
                     "record_lifecycle_interpretations"
                 } else {
@@ -3936,7 +4365,7 @@ pub(crate) fn public_reads_ad_hoc(statement: &str) -> Result<BTreeSet<(String, S
                         .insert((relation.to_owned(), column_name.to_owned()));
                 }
             }
-            authorize_strict_ad_hoc(context)
+            authorizer(context)
         }));
         let result = conn.prepare(statement).map(|_| ()).map_err(|e| {
             sql_contract::categorized_error(QuerySqlErrorCategory::SyntaxOrType, e.to_string())
@@ -3983,6 +4412,10 @@ pub(crate) fn validate_app_sql_dependencies(
                     || (population_read && table_name == "_query_sql_heading_source")
                 {
                     Some("body_block_headings")
+                } else if strict_facet_keys_source_read(&context, table_name)
+                    || (population_read && table_name == "_query_sql_facet_keys_source")
+                {
+                    Some("facet_keys")
                 } else if strict_lifecycle_source_read(&context, table_name)
                     || (population_read && table_name == "_query_sql_lifecycle_source")
                 {
@@ -4105,6 +4538,11 @@ pub(crate) fn validated_relation_dependencies_legacy_saved_sql(
                         .lock()
                         .expect("dependency lock")
                         .insert("message_reactions".to_owned());
+                } else if strict_facet_keys_source_read(&context, table_name) {
+                    observed
+                        .lock()
+                        .expect("dependency lock")
+                        .insert("facet_keys".to_owned());
                 } else if strict_lifecycle_source_read(&context, table_name) {
                     observed
                         .lock()
@@ -4600,29 +5038,90 @@ fn apply_ad_hoc_default_order_with(
     }
 }
 
-/// E2 repair text for refusals that keep refusing: when new governed SQL is
-/// refused for an unordered top-level LIMIT, name the exact default the
-/// ad-hoc path would apply, so the author can paste it. Returns `None`
-/// unless the spliced text validates — i.e. the unordered top-level LIMIT
-/// is the operative defect. Nested defects, duplicate labels and anything
-/// else keep the bare refusal unchanged.
+/// Name ordering repairs only after the complete repaired SQL validates.
+/// Request parameter checks remain at the execution boundaries below.
+/// This is diagnostic text: nested row membership is never changed implicitly.
 pub(crate) fn default_order_repair(sql: &str) -> Option<String> {
-    if !super::turso_ast_rules::top_level_unordered_limit(sql) {
+    default_order_repair_with(sql, validated_output_columns, validate)
+}
+
+fn default_order_repair_with(
+    sql: &str,
+    describe: impl Fn(&str) -> Result<Vec<String>>,
+    validate_repaired: impl Fn(&str) -> Result<()>,
+) -> Option<String> {
+    let levels = super::turso_ast_rules::unordered_limit_levels(sql)?;
+    if levels.is_empty() {
         return None;
     }
-    let labels = validated_output_columns(sql).ok()?;
-    let (rewritten, assumed) = sql_contract::apply_default_order(
-        sql_contract::QuerySqlProfile::SqliteLocal,
-        sql,
-        &labels,
-    )?;
-    // Robustness: only name the default when it cures the statement.
-    validate(&rewritten).ok()?;
+    // Preserve E2's established wording for the top-level-only case.
+    if levels.len() == 1 && levels[0].location == "top level" {
+        let labels = describe(sql).ok()?;
+        let (rewritten, assumed) = sql_contract::apply_default_order(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            sql,
+            &labels,
+        )?;
+        validate_repaired(&rewritten).ok()?;
+        return Some(format!(
+            "the ad-hoc default would order by ({}): add {}",
+            assumed.columns.join(", "),
+            assumed.order_by
+        ));
+    }
+    let mut rewritten = sql.to_owned();
+    let mut fixes = Vec::new();
+    let mut edits: Vec<(std::ops::Range<usize>, isize)> = Vec::new();
+    // Inner ranges precede their parents in this loop. Reapply the shared E2
+    // splice to each updated range so overlapping SELECTs retain child fixes.
+    for level in levels.iter().rev() {
+        let labels = match level.column_count {
+            Some(count) => vec![String::new(); count],
+            None => describe(level.describe_sql.as_deref()?).ok()?,
+        };
+        let growth: isize = edits
+            .iter()
+            .filter(|(range, _)| range.start >= level.range.start && range.end <= level.range.end)
+            .map(|(_, growth)| growth)
+            .sum();
+        let end = level.range.end.checked_add_signed(growth)?;
+        let (fixed, assumed) = sql_contract::apply_default_order(
+            sql_contract::QuerySqlProfile::SqliteLocal,
+            &rewritten[level.range.start..end],
+            &labels,
+        )?;
+        edits.push((
+            level.range.clone(),
+            fixed.len() as isize - (end - level.range.start) as isize,
+        ));
+        rewritten.replace_range(level.range.start..end, &fixed);
+        fixes.push(format!("in {}: add {}", level.location, assumed.order_by));
+    }
+    validate_repaired(&rewritten).ok()?;
+    fixes.reverse();
     Some(format!(
-        "the ad-hoc default would order by ({}): add {}",
-        assumed.columns.join(", "),
-        assumed.order_by
+        "ordering repair (all output columns in projection order): {}",
+        fixes.join("; ")
     ))
+}
+
+fn with_nested_order_repair(
+    sql: &str,
+    error: crate::Error,
+    allowance: sql_contract::FunctionAllowance,
+) -> crate::Error {
+    if error.to_string().contains("LIMIT without ORDER BY") {
+        let repair = match allowance {
+            sql_contract::FunctionAllowance::SqliteAdHoc => {
+                default_order_repair_with(sql, validated_output_columns_ad_hoc, validate_ad_hoc)
+            }
+            _ => default_order_repair(sql),
+        };
+        if let Some(repair) = repair {
+            return crate::Error::Engine(format!("{error}; {repair}"));
+        }
+    }
+    error
 }
 
 pub(crate) fn cap_statement(statement: &str, row_limit: i64) -> String {
@@ -4762,6 +5261,7 @@ async fn query_sql_member_slice(
     for clear in [
         "DELETE FROM temp._query_sql_principal",
         "DELETE FROM temp._query_sql_visible_ids",
+        "DELETE FROM temp._query_sql_facet_keys",
         "DELETE FROM temp._query_sql_messages_awaiting_reply",
         "DELETE FROM temp._query_sql_activity_members",
         "DELETE FROM temp._query_sql_claim_candidates",
@@ -4791,6 +5291,16 @@ async fn query_sql_member_slice(
     )
     .execute(&mut *transaction)
     .await?;
+    let facet_deadline = relation_dependencies
+        .contains("facet_keys")
+        .then(|| Instant::now() + QUERY_DEADLINE);
+    if let Some(deadline) = facet_deadline {
+        if let Err(error) = populate_facet_keys(&mut transaction, deadline).await {
+            drop(transaction);
+            connection.close_on_drop();
+            return Err(error);
+        }
+    }
     let now_ms_ms: Option<i64> = time_dependent
         .then(|| now_ms_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()));
     // Bounded member statement execution inline (same grammar/bounds/value
@@ -4814,6 +5324,9 @@ async fn query_sql_member_slice(
         let vm_callbacks = vm_callbacks.clone();
         let vm_work_active = vm_work_active.clone();
         handle.set_progress_handler(PROGRESS_OPS, move || {
+            if facet_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
             if let (Some(callbacks), Some(active)) = (&vm_callbacks, &vm_work_active) {
                 if active.load(Ordering::Acquire) {
                     callbacks.fetch_add(1, Ordering::Relaxed);
@@ -4837,6 +5350,7 @@ async fn query_sql_member_slice(
         effective_parameters.len(),
     )?;
     let query_result: Result<(Vec<String>, Vec<Value>, bool)> = async {
+        check_facet_deadline(facet_deadline)?;
         let query = bind_parameters(sqlx::query(&capped), &effective_parameters)?;
         let _phase = QueryVmWorkPhase::start(vm_work_active.clone());
         let mut stream = query.fetch(&mut *transaction);
@@ -4885,6 +5399,10 @@ async fn query_sql_member_slice(
         Ok((columns, output, truncated))
     }
     .await;
+    let query_result = query_result.and_then(|rows| {
+        check_facet_deadline(facet_deadline)?;
+        Ok(rows)
+    });
     let query_result = annotate_sqlite_toobig_error(
         &mut transaction,
         &relation_dependencies,
@@ -4924,6 +5442,15 @@ async fn query_sql_member_slice(
         time_dependent,
         assumed_order,
     })
+}
+
+/// This relation is advertised as hosted-writer-only. The v1 and copy paths
+/// may keep an empty validator shape, but never serve it as an empty answer.
+fn refuse_named_view_details(dependencies: &BTreeSet<String>) -> Result<()> {
+    if dependencies.contains("catalog_view_definitions") {
+        return Err(crate::Error::engine("view_profile_unsupported: catalog_view_definitions requires standalone hosted writer reads"));
+    }
+    Ok(())
 }
 
 async fn query_sql_request_owned_observed(
@@ -4975,16 +5502,51 @@ async fn query_sql_request_owned_observed(
     // Never fabricates empty TEMP relations.
     if member_mode {
         if let Some(denied) = member_denied_requirement(&statement)? {
+            refuse_named_view_details(&BTreeSet::from([denied.clone()]))?;
             return Err(crate::error::Error::unavailable_offline(
                 "query_sql",
                 denied,
             ));
         }
     }
-    if ad_hoc {
-        validate_ad_hoc(&statement)?;
+    let validation = if ad_hoc {
+        validate_ad_hoc(&statement)
     } else {
-        validate(&statement)?;
+        validate(&statement)
+    };
+    if let Err(error) = validation {
+        // Validation uses an empty schema. Probe through the ordinary bounded
+        // executor so online policy and member slice visibility stay identical.
+        if let Some(key) = sqlite_records_facet_key_for_refusal(&statement, &error) {
+            let probe = QuerySqlRequest {
+                sql: "SELECT key FROM facet_values WHERE key = ?1 ORDER BY key LIMIT 1".into(),
+                parameters: vec![sql_contract::QuerySqlParameter::Text {
+                    value: Some(key.clone()),
+                }],
+            };
+            if Box::pin(query_sql_request_owned_observed(
+                db,
+                principal,
+                probe,
+                None,
+                None,
+                false,
+                FunctionAllowance::Portable,
+            ))
+            .await
+            .is_ok_and(|result| result.row_count > 0)
+            {
+                return Err(crate::Error::Engine(format!(
+                    "{error} {}",
+                    sql_contract::records_facet_column_hint(&statement, &error.to_string(), &key)
+                )));
+            }
+        }
+        return Err(if apply_default_order {
+            with_nested_order_repair(&request.sql, error, allowance)
+        } else {
+            error
+        });
     }
     // I1 review: `?2` with one parameter must fail, not bind a silent
     // NULL. The `?N` set has to be exactly `1..=parameters.len()`.
@@ -5046,6 +5608,7 @@ async fn query_sql_request_owned_observed(
     } else {
         validated_relation_dependencies(&statement)?
     };
+    refuse_named_view_details(&relation_dependencies)?;
     // Native e25665c: lower `utc_date_label(ms)` to the SQLite `strftime`
     // expression after validation (the validator saw the portable name via
     // the stub above). The lowering introduces no placeholder, so the
@@ -5115,7 +5678,7 @@ async fn query_sql_request_owned_observed(
         connection.close_on_drop();
         return Err(error.into());
     }
-    if let Err(error) = sqlx::query("DELETE FROM temp._query_sql_lifecycle_interpretations")
+    if let Err(error) = sqlx::query("DELETE FROM temp._query_sql_facet_keys; DELETE FROM temp._query_sql_lifecycle_interpretations")
         .execute(&mut *connection)
         .await
     {
@@ -5213,6 +5776,16 @@ async fn query_sql_request_owned_observed(
     populate_visible_ids_owned(&db, &mut transaction, &principal).await?;
     #[cfg(test)]
     slice1_phase_cpu_after(stage_cpu_before, Slice1Phase::Stage);
+    let facet_deadline = relation_dependencies
+        .contains("facet_keys")
+        .then(|| Instant::now() + QUERY_DEADLINE);
+    if let Some(deadline) = facet_deadline {
+        if let Err(error) = populate_facet_keys(&mut transaction, deadline).await {
+            drop(transaction);
+            connection.close_on_drop();
+            return Err(error);
+        }
+    }
     if needs_lifecycle {
         if let Err(error) = populate_lifecycle_interpretations(&mut transaction).await {
             drop(transaction);
@@ -5263,6 +5836,9 @@ async fn query_sql_request_owned_observed(
         let vm_callbacks = vm_callbacks.clone();
         let vm_work_active = vm_work_active.clone();
         handle.set_progress_handler(PROGRESS_OPS, move || {
+            if facet_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
             if let (Some(callbacks), Some(active)) = (&vm_callbacks, &vm_work_active) {
                 if active.load(Ordering::Acquire) {
                     callbacks.fetch_add(1, Ordering::Relaxed);
@@ -5285,6 +5861,7 @@ async fn query_sql_request_owned_observed(
     #[cfg(test)]
     let caller_cpu_before = slice1_phase_cpu_before();
     let query_result: Result<(Vec<String>, Vec<Value>, bool)> = async {
+        check_facet_deadline(facet_deadline)?;
         if needs_reactions {
             let _vm_work_phase = QueryVmWorkPhase::start(vm_work_active.clone());
             populate_reaction_winners(&mut transaction).await?;
@@ -5368,6 +5945,10 @@ async fn query_sql_request_owned_observed(
     #[cfg(test)]
     slice1_phase_cpu_after(caller_cpu_before, Slice1Phase::Caller);
 
+    let query_result = query_result.and_then(|rows| {
+        check_facet_deadline(facet_deadline)?;
+        Ok(rows)
+    });
     let query_result = annotate_sqlite_toobig_error(
         &mut transaction,
         &relation_dependencies,
@@ -5579,17 +6160,52 @@ async fn query_sql_request_in_with_row_limit_scoped(
     } else {
         (statement, None)
     };
-    match allowance {
-        FunctionAllowance::Portable => validate(&statement)?,
-        FunctionAllowance::LegacySavedSql => validate_legacy_saved_sql(&statement)?,
-        FunctionAllowance::SqliteAdHoc => {
-            validate_ad_hoc(&statement)?;
+    let validation = match allowance {
+        FunctionAllowance::Portable => validate(&statement),
+        FunctionAllowance::LegacySavedSql => validate_legacy_saved_sql(&statement),
+        FunctionAllowance::SqliteAdHoc => validate_ad_hoc(&statement).and_then(|()| {
             sql_contract::validate_ad_hoc_clock_bound_args(
                 sql_contract::QuerySqlProfile::SqliteLocal,
                 &statement,
                 &request.parameters,
-            )?;
+            )
+            .map_err(crate::Error::from)
+        }),
+    };
+    if let Err(error) = validation {
+        if let Some(key) = sqlite_records_facet_key_for_refusal(&statement, &error) {
+            let probe = QuerySqlRequest {
+                sql: "SELECT key FROM facet_values WHERE key = ?1 ORDER BY key LIMIT 1".into(),
+                parameters: vec![sql_contract::QuerySqlParameter::Text {
+                    value: Some(key.clone()),
+                }],
+            };
+            if Box::pin(query_sql_request_in_with_row_limit_scoped(
+                transaction,
+                principal,
+                probe,
+                1,
+                FunctionAllowance::Portable,
+                None,
+                None,
+                false,
+                record_scopes,
+                contract,
+            ))
+            .await
+            .is_ok_and(|(result, _)| result.row_count > 0)
+            {
+                return Err(crate::Error::Engine(format!(
+                    "{error} {}",
+                    sql_contract::records_facet_column_hint(&statement, &error.to_string(), &key)
+                )));
+            }
         }
+        return Err(if apply_default_order {
+            with_nested_order_repair(&request.sql, error, allowance)
+        } else {
+            error
+        });
     }
     // I1 review: `?2` with one parameter must fail, not bind a silent
     // NULL. The `?N` set has to be exactly `1..=parameters.len()`.
@@ -5645,6 +6261,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
         }
         FunctionAllowance::SqliteAdHoc => validated_relation_dependencies_ad_hoc(&statement)?,
     };
+    refuse_named_view_details(&relation_dependencies)?;
     // Saved SQL, alpha-tab needs and every other in-transaction execution
     // carry no serving snapshot, so a real reference refuses here instead
     // of reading an empty table. The ad-hoc owned path above populates;
@@ -5693,7 +6310,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
     sqlx::query("DELETE FROM temp._query_sql_messages_awaiting_reply")
         .execute(&mut **transaction)
         .await?;
-    sqlx::query("DELETE FROM temp._query_sql_lifecycle_interpretations")
+    sqlx::query("DELETE FROM temp._query_sql_facet_keys; DELETE FROM temp._query_sql_lifecycle_interpretations")
         .execute(&mut **transaction)
         .await?;
     sqlx::query("DELETE FROM temp._query_sql_activity_members")
@@ -5789,6 +6406,17 @@ async fn query_sql_request_in_with_row_limit_scoped(
         .bind(serde_json::to_string(&scopes)?)
         .execute(&mut **transaction)
         .await?;
+    }
+    let facet_deadline = relation_dependencies
+        .contains("facet_keys")
+        .then(|| Instant::now() + QUERY_DEADLINE);
+    if let Some(deadline) = facet_deadline {
+        if let Err(error) = populate_facet_keys(transaction, deadline).await {
+            if let ContractMode::PerCall = contract {
+                cleanup_query_sql_temp_contract(transaction).await?;
+            }
+            return Err(error);
+        }
     }
     if needs_lifecycle {
         if let Err(error) = populate_lifecycle_interpretations(transaction).await {
@@ -5937,6 +6565,9 @@ async fn query_sql_request_in_with_row_limit_scoped(
         let vm_callbacks = vm_callbacks.clone();
         let vm_work_active = vm_work_active.clone();
         handle.set_progress_handler(PROGRESS_OPS, move || {
+            if facet_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return false;
+            }
             if let (Some(callbacks), Some(active)) = (&vm_callbacks, &vm_work_active) {
                 if active.load(Ordering::Acquire) {
                     callbacks.fetch_add(1, Ordering::Relaxed);
@@ -5952,6 +6583,7 @@ async fn query_sql_request_in_with_row_limit_scoped(
     };
     let capped = cap_statement(&statement, row_limit);
     let query_result: Result<(Vec<String>, Vec<Value>, bool)> = async {
+        check_facet_deadline(facet_deadline)?;
         if needs_reactions {
             let _vm_work_phase = QueryVmWorkPhase::start(vm_work_active.clone());
             let visible_head = bounded_reaction_visible_head(
@@ -6057,6 +6689,10 @@ async fn query_sql_request_in_with_row_limit_scoped(
     // Probe while the progress handler is still installed so the 500ms
     // stored-value scan cannot run unbounded. diagnose() replaces the
     // handler with the probe budget; cleanup below removes it.
+    let query_result = query_result.and_then(|rows| {
+        check_facet_deadline(facet_deadline)?;
+        Ok(rows)
+    });
     let query_result = annotate_sqlite_toobig_error(
         transaction,
         &relation_dependencies,
@@ -6766,6 +7402,65 @@ pub(crate) async fn principal_context_is_empty(db: &Db) -> Result<bool> {
 #[cfg(test)]
 mod frozen_schema_cache_tests {
     use super::*;
+
+    #[test]
+    fn unordered_limit_repair_caps_skip_describing_and_validating() {
+        let mut sql = format!(
+            "SELECT {} LIMIT 5",
+            vec!["(SELECT 1 LIMIT 1)"; 3400].join(",")
+        );
+        sql.extend(std::iter::repeat_n(
+            ' ',
+            sql_contract::MAX_SQL_BYTES - sql.len(),
+        ));
+        assert_eq!(sql.len(), sql_contract::MAX_SQL_BYTES);
+        assert!(default_order_repair_with(
+            &sql,
+            |_| panic!("must not describe"),
+            |_| { panic!("must not validate") }
+        )
+        .is_none());
+        let sql = format!("SELECT {}", vec!["(SELECT 1 LIMIT 1)"; 33].join(","));
+        assert!(default_order_repair(&sql).is_none());
+        // Deep WITH trees must hit a cap without describing or validating.
+        for depth in [40, 600] {
+            let sql = format!(
+                "{}SELECT 1{}",
+                "WITH c AS (".repeat(depth),
+                ") SELECT 1 LIMIT 1".repeat(depth)
+            );
+            assert!(default_order_repair_with(
+                &sql,
+                |_| panic!("must not describe"),
+                |_| panic!("must not validate")
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn unordered_limit_repair_preserves_top_level_wording_past_range_cap() {
+        let values = vec!["coalesce('', '')"; 300].join(", ");
+        let sql = format!("SELECT id FROM records WHERE id IN ({values}) LIMIT 5");
+        validate(&format!(
+            "SELECT id FROM records WHERE id IN ({values}) ORDER BY 1 LIMIT 5"
+        ))
+        .unwrap();
+        assert_eq!(
+            default_order_repair(&sql).as_deref(),
+            Some("the ad-hoc default would order by (id): add ORDER BY 1")
+        );
+    }
+
+    #[test]
+    fn unordered_limit_repair_preserves_top_level_wording_for_unchecked_join_on() {
+        let sql = "SELECT r.id FROM records r JOIN links l ON l.id = (SELECT id FROM links LIMIT 1) LIMIT 5";
+        assert_eq!(
+            default_order_repair(sql).as_deref(),
+            Some("the ad-hoc default would order by (id): add ORDER BY 1")
+        );
+        validate("SELECT r.id FROM records r JOIN links l ON l.id = (SELECT id FROM links LIMIT 1) ORDER BY 1 LIMIT 5").unwrap();
+    }
 
     /// Statements the shipping validator admits. `EXPLAIN QUERY PLAN` is
     /// admitted by the classifier (it plans without running), so it belongs
@@ -11468,16 +12163,84 @@ JOIN temp._qs_legacy_visible_records AS target_visible
 
     #[tokio::test]
     async fn ad_hoc_nested_unordered_limit_still_refuses() {
-        // The default never reaches nested levels: subquery, CTE body, and
-        // top-ordered nests keep the exact refusal.
         let (db, alice, _bea) = protected_fixture().await;
-        for sql in [
-            "SELECT * FROM (SELECT id FROM records LIMIT 1) s LIMIT 2",
-            "WITH c AS (SELECT id FROM records LIMIT 1) SELECT id FROM c LIMIT 2",
-            "SELECT * FROM (SELECT id FROM records LIMIT 1) s ORDER BY id",
+        for (sql, repaired, expected) in [
+            (
+                "SELECT * FROM (SELECT id, name FROM records LIMIT 1) s LIMIT 2",
+                "SELECT * FROM (SELECT id, name FROM records ORDER BY 1, 2 LIMIT 1) s ORDER BY 1, 2 LIMIT 2",
+                vec!["in top level: add ORDER BY 1, 2", "in subquery s: add ORDER BY 1, 2"],
+            ),
+            (
+                "WITH c AS (SELECT id, name FROM records LIMIT 1) SELECT id FROM c LIMIT 2",
+                "WITH c AS (SELECT id, name FROM records ORDER BY 1, 2 LIMIT 1) SELECT id FROM c ORDER BY 1 LIMIT 2",
+                vec!["in top level: add ORDER BY 1", "in CTE c: add ORDER BY 1, 2"],
+            ),
+            (
+                "SELECT * FROM (SELECT id FROM records LIMIT 1) s ORDER BY id",
+                "SELECT * FROM (SELECT id FROM records ORDER BY 1 LIMIT 1) s ORDER BY id",
+                vec!["in subquery s: add ORDER BY 1"],
+            ),
+            (
+                "SELECT id FROM records UNION ALL SELECT id FROM (SELECT id FROM records LIMIT 1) s ORDER BY 1",
+                "SELECT id FROM records UNION ALL SELECT id FROM (SELECT id FROM records ORDER BY 1 LIMIT 1) s ORDER BY 1",
+                vec!["in compound arm subquery s: add ORDER BY 1"],
+            ),
+            (
+                "SELECT id FROM records UNION SELECT id FROM records ORDER BY 1 LIMIT (SELECT 1 LIMIT 1)",
+                "SELECT id FROM records UNION SELECT id FROM records ORDER BY 1 LIMIT (SELECT 1 ORDER BY 1 LIMIT 1)",
+                vec!["in subquery: add ORDER BY 1"],
+            ),
+            (
+                "WITH c AS (SELECT id, name FROM records) SELECT * FROM (SELECT * FROM c LIMIT 1) s",
+                "WITH c AS (SELECT id, name FROM records) SELECT * FROM (SELECT * FROM c ORDER BY 1, 2 LIMIT 1) s",
+                vec!["in subquery s: add ORDER BY 1, 2"],
+            ),
+            (
+                "SELECT * FROM (SELECT id FROM records                                        LIMIT 1) s LIMIT 2",
+                "SELECT * FROM (SELECT id FROM records ORDER BY 1 LIMIT 1) s ORDER BY 1 LIMIT 2",
+                vec!["in top level: add ORDER BY 1", "in subquery s: add ORDER BY 1"],
+            ),
+            (
+                "WITH a AS (SELECT id FROM records LIMIT 1), b AS (SELECT id FROM records LIMIT 1) SELECT a.id FROM a JOIN b ON a.id=b.id",
+                "WITH a AS (SELECT id FROM records ORDER BY 1 LIMIT 1), b AS (SELECT id FROM records ORDER BY 1 LIMIT 1) SELECT a.id FROM a JOIN b ON a.id=b.id",
+                vec!["in CTE a: add ORDER BY 1", "in CTE b: add ORDER BY 1"],
+            ),
+            (
+                "SELECT 'LIMIT (SELECT id FROM records LIMIT 1)' AS note, id FROM (SELECT id FROM records /* LIMIT */ LIMIT 1) s",
+                "SELECT 'LIMIT (SELECT id FROM records LIMIT 1)' AS note, id FROM (SELECT id FROM records /* LIMIT */ ORDER BY 1 LIMIT 1) s",
+                vec!["in subquery s: add ORDER BY 1"],
+            ),
+            (
+                "SELECT a.id FROM (SELECT id FROM records LIMIT 1) a JOIN (SELECT id, name FROM records LIMIT 1) b ON a.id=b.id",
+                "SELECT a.id FROM (SELECT id FROM records ORDER BY 1 LIMIT 1) a JOIN (SELECT id, name FROM records ORDER BY 1, 2 LIMIT 1) b ON a.id=b.id",
+                vec!["in subquery a: add ORDER BY 1", "in subquery b: add ORDER BY 1, 2"],
+            ),
+            (
+                "SELECT * FROM (SELECT * FROM (SELECT id, name FROM records LIMIT 1) a LIMIT 2) b",
+                "SELECT * FROM (SELECT * FROM (SELECT id, name FROM records ORDER BY 1, 2 LIMIT 1) a ORDER BY 1, 2 LIMIT 2) b",
+                vec!["in subquery b: add ORDER BY 1, 2", "in subquery a: add ORDER BY 1, 2"],
+            ),
         ] {
             let error = query_sql(&db, &alice, sql).await.unwrap_err().to_string();
             assert!(error.contains("LIMIT without ORDER BY"), "{sql}: {error}");
+            for fix in expected {
+                assert!(error.contains(fix), "{sql}: missing {fix}: {error}");
+            }
+            validate(repaired).unwrap_or_else(|error| panic!("{repaired}: {error}"));
+            query_sql(&db, &alice, repaired).await.unwrap();
+            let repair = default_order_repair_with(sql, validated_output_columns, |candidate| {
+                assert_eq!(candidate, repaired, "{sql}: repair must change only the named ordering");
+                validate(candidate)
+            });
+            assert!(repair.is_some(), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM (SELECT nosuchcol FROM records LIMIT 1) s",
+            "SELECT * FROM (SELECT id FROM records LIMIT 1) s JOIN forbidden f ON 1=1",
+            "SELECT * FROM (SELECT name, count(*) AS n FROM records LIMIT 1) s",
+            "SELECT s.id AS dup, s.name AS dup FROM (SELECT id, name FROM records LIMIT 1) s",
+        ] {
+            assert!(default_order_repair(sql).is_none(), "{sql}");
         }
     }
 
@@ -11877,7 +12640,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caller_tx_governed_warm_reuse_and_cancel_sanitizes() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, bea) = protected_fixture().await;
         // Warm the governed pool through the ordinary owned path first.
@@ -11992,7 +12755,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn governed_same_connection_gate_after_sql_sees_no_temp_shadows() {
         use sql_contract::FunctionAllowance;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let (db, alice, _) = protected_fixture().await;
         // Baseline from the write pool: the unqualified gate-style read
@@ -13197,6 +13960,118 @@ JOIN temp._qs_legacy_visible_records AS target_visible
                 "{sql}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn facet_keys_population_and_statement_share_deadline() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let principal = QueryPrincipal::authenticated("alice", true);
+        let request = || QuerySqlRequest {
+            sql: "SELECT count(*) AS n FROM facet_keys".into(),
+            parameters: vec![],
+        };
+        let error = FACET_TEST_EXHAUST_AFTER_POPULATION
+            .scope(
+                true,
+                query_sql_request_owned(db.clone(), principal.clone(), request()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("query_sql [timeout]"), "{error}");
+        let mut tx = db.write_pool().begin().await.unwrap();
+        let error = FACET_TEST_EXHAUST_AFTER_POPULATION
+            .scope(true, query_sql_request_in(&mut tx, principal, request()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("query_sql [timeout]"), "{error}");
+        let n: i64 = sqlx::query_scalar("SELECT 42")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(n, 42);
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn facet_keys_schema_loader_interrupt_is_timeout() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut tx = db.write_pool().begin().await.unwrap();
+        tx.lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, || false);
+        let error = crate::query::cascade::schema_config_rows_in(&mut tx)
+            .await
+            .unwrap_err();
+        tx.lock_handle().await.unwrap().remove_progress_handler();
+        assert!(error.to_string().contains("query_sql [timeout]"), "{error}");
+        tx.rollback().await.unwrap();
+    }
+
+    #[test]
+    fn facet_keys_grouping_collapses_unanchored_homes_and_excludes_reserved_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TEMP TABLE records(id TEXT,type TEXT,kind TEXT,home_id TEXT);
+            CREATE TEMP TABLE facet_values(record_id TEXT,key TEXT);
+            CREATE TEMP TABLE schema_config(applies_to_collection_id TEXT);
+            WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<8000)
+            INSERT INTO records SELECT 'r'||i,'WorkItem','task','home'||i FROM n;
+            INSERT INTO facet_values SELECT id,key FROM records CROSS JOIN
+              (SELECT 'area' AS key UNION ALL SELECT 'priority' UNION ALL SELECT 'lifecycle' UNION ALL SELECT 'archived');").unwrap();
+        let read = || {
+            conn.prepare(facet_key_groups_sql())
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let groups = read();
+        assert_eq!(groups.len(), 2);
+        assert!(groups.iter().all(|(home, key, n)| home.is_none()
+            && matches!(key.as_str(), "area" | "priority")
+            && *n == 8000));
+        conn.execute("INSERT INTO schema_config VALUES ('home1')", [])
+            .unwrap();
+        let groups = read();
+        assert_eq!(groups.len(), 4);
+        assert_eq!(
+            groups
+                .iter()
+                .filter(|(home, _, n)| home.as_deref() == Some("home1") && *n == 1)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn facet_keys_dependency_and_member_schema_gate() {
+        for sql in [
+            "SELECT key FROM facet_keys",
+            "SELECT count(*) FROM facet_keys",
+            "SELECT 1 FROM facet_keys WHERE 0",
+            "SELECT * FROM facet_keys LIMIT 0",
+        ] {
+            assert!(
+                validated_relation_dependencies(sql)
+                    .unwrap()
+                    .contains("facet_keys"),
+                "{sql}"
+            );
+            assert!(member_denied_requirement(sql).unwrap().is_none(), "{sql}");
+            assert!(member_reads_schema_config(sql).unwrap(), "{sql}");
+        }
+        let shadow = "WITH facet_keys(key) AS (SELECT 'local') SELECT key FROM facet_keys";
+        assert!(!validated_relation_dependencies(shadow)
+            .unwrap()
+            .contains("facet_keys"));
+        assert!(!member_reads_schema_config(shadow).unwrap());
     }
 
     #[test]
@@ -17422,7 +18297,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         )
         .await
         .unwrap();
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -17455,7 +18330,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
             sql: "SELECT now_ms() AS a, now_ms() AS b".to_string(),
             parameters: Vec::new(),
         };
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut first_rows = Vec::new();
         let mut first_columns = Vec::new();
@@ -17653,7 +18528,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         .await
         .unwrap();
         assert!(callbacks.load(Ordering::Relaxed) > 0);
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let count: i64 = sqlx::query_scalar(TEMP_COUNT_SQL)
             .fetch_one(&mut *tx)
@@ -17685,7 +18560,7 @@ JOIN temp._qs_legacy_visible_records AS target_visible
     #[tokio::test]
     async fn caller_tx_portable_row_limit200_first_delivered_membership_cap_cleanup() {
         let (db, alice, _) = protected_fixture().await;
-        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
+        const TEMP_COUNT_SQL: &str = "SELECT COUNT(*) FROM sqlite_temp_master WHERE name LIKE '_query_sql_%' OR name IN ('records','content_events','links','facet_values','facet_observations','facet_observation_json_nodes','record_body_json_nodes','bindings','blobs','vocabularies','vocabulary_values','vocabulary_value_json_nodes','facet_value_json_nodes','content_event_apps','schema_config_json_nodes','schema_config','effective_relationships','effective_relationship_endpoints','agent_activity','agent_activity_claims','actors','runs','run_intents','messages_awaiting_reply','my_message_state','my_mentions','message_reactions','facet_times','facet_keys','body_task_items','body_blocks','body_block_headings','record_lifecycle_interpretations')";
 
         let mut connection = db.write_pool().acquire().await.unwrap();
         let mut tx = connection.begin().await.unwrap();
@@ -17983,6 +18858,129 @@ JOIN temp._qs_legacy_visible_records AS target_visible
         assert!(error.contains("string or blob too big"), "{error}");
         assert!(error.contains("(first 10 of 11 oversized rows)"), "{error}");
         assert!(error.contains("records.id NOT IN ("), "{error}");
+    }
+
+    #[test]
+    fn sqlite_facet_advice_requires_an_unknown_column_refusal() {
+        let statement = "SELECT area FROM records";
+        for detail in [
+            "query_sql [unauthorized_relation]: no such column: area",
+            "query_sql [syntax_or_type]: bad expression 'no such column: area'",
+            "query_sql [syntax_or_type]: no such function: column area does not exist",
+        ] {
+            assert!(sqlite_records_facet_key_for_refusal(
+                statement,
+                &crate::Error::Engine(detail.into())
+            )
+            .is_none());
+        }
+        assert_eq!(
+            sqlite_records_facet_key_for_refusal(
+                statement,
+                &crate::Error::Engine("query_sql [syntax_or_type]: no such column: area".into())
+            )
+            .as_deref(),
+            Some("area")
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_unknown_column_facet_hint_respects_visibility() {
+        let (db, alice, bea) = protected_fixture().await;
+        for (record_id, key) in [
+            (ALICE_PRIVATE_ID, "area"),
+            (ALICE_PRIVATE_ID, "triage"),
+            (ALICE_PRIVATE_ID, "r"),
+            (BEA_PRIVATE_ID, "secret_key"),
+        ] {
+            set_facet(
+                &db,
+                record_id,
+                FacetSetPayload {
+                    key: key.into(),
+                    value: Some("now".into()),
+                    vocab_ref: None,
+                    as_of: None,
+                    observation_only: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for sql in [
+            "SELECT records.area FROM records",
+            "SELECT r.area FROM records r",
+            "SELECT r.area FROM records r JOIN links f ON f.source_id = r.id",
+            "SELECT r.area FROM records r JOIN links f ON f.source_id = r.id JOIN links f2 ON f2.target_id = r.id",
+            "SELECT r2.area FROM records r JOIN records r2 ON r2.id = r.id",
+            "SELECT id FROM records WHERE triage = 'now'",
+        ] {
+            let error = query_sql(&db, &alice, sql).await.unwrap_err().to_string();
+            let key = if sql.contains("triage") {
+                "triage"
+            } else {
+                "area"
+            };
+            assert!(error.contains("Hint: valid columns of records"), "{error}");
+            assert!(
+                error.ends_with(&sql_contract::records_facet_column_hint(sql, &error, key)),
+                "{error}"
+            );
+            if sql.contains("records r") {
+                let join = error
+                    .split_once(": JOIN facet_values ")
+                    .unwrap()
+                    .1
+                    .split_once(" and filter ")
+                    .unwrap()
+                    .0;
+                let alias = join.split_whitespace().next().unwrap();
+                let repaired =
+                    sql.replace("r.area", &format!("{alias}.value")).replace("r2.area", &format!("{alias}.value")) + " JOIN facet_values " + join;
+                validate(&repaired).unwrap_or_else(|e| panic!("{repaired}: {e}"));
+            }
+        }
+        for (caller, key) in [(&alice, "secret_key"), (&bea, "area")] {
+            let sql = format!("SELECT {key} FROM records");
+            let expected = validate(&sql).unwrap_err().to_string();
+            let actual = query_sql(&db, caller, &sql).await.unwrap_err().to_string();
+            assert_eq!(actual, expected, "hidden key must not change the refusal");
+        }
+        let unicode = query_sql(&db, &alice, "SELECT réalm FROM records")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!unicode.contains("is a facet"), "{unicode}");
+        // Real records columns stay ordinary successful reads.
+        query_sql(
+            &db,
+            &alice,
+            "SELECT lifecycle, persistence, maturity, archived FROM records",
+        )
+        .await
+        .unwrap();
+        // The transaction-owned executor uses the same fence.
+        let mut tx = db.governed_pool().begin().await.unwrap();
+        let error = query_sql_request_in(
+            &mut tx,
+            alice,
+            QuerySqlRequest {
+                sql: "SELECT r.area FROM records r".into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.ends_with(&sql_contract::records_facet_column_hint(
+                "SELECT r.area FROM records r",
+                &error,
+                "area"
+            )),
+            "{error}"
+        );
+        tx.rollback().await.unwrap();
     }
 
     #[tokio::test]
@@ -20963,6 +21961,111 @@ mod facet_observation_json_node_tests;
 #[cfg(test)]
 #[path = "record_body_json_node_tests.rs"]
 mod record_body_json_node_tests;
+
+/// Collect only an already admitted immutable v1 member slice. Reuse its
+/// production logical records/facet views, never the canonical visibility fold
+/// or excluded policy/history tables. The serialized owner supplies identity.
+#[cfg(unix)]
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn member_vault_snapshot(
+    db: &Db,
+    account: &str,
+    origin: &str,
+) -> Result<crate::markdown_vault::SourceSnapshot> {
+    use crate::markdown_vault::{SourceLink, SourceRecord, SourceSnapshot};
+    if db.open_mode() != crate::db::DatabaseOpenMode::MemberReadOnly {
+        return Err(crate::Error::engine(
+            "vault requires an admitted member copy",
+        ));
+    }
+    let mut connection = db.governed_pool().acquire().await?;
+    connection.close_on_drop();
+    install_temp_contract(&mut connection).await?;
+    for statement in [MEMBER_RECORDS_VIEW_DDL, MEMBER_FACET_VALUES_VIEW_DDL] {
+        sqlx::query(statement).execute(&mut *connection).await?;
+    }
+    sqlx::query("BEGIN").execute(&mut *connection).await?;
+    sqlx::query("DELETE FROM temp._query_sql_principal; DELETE FROM temp._query_sql_visible_ids")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("INSERT INTO temp._query_sql_principal(singleton,account_id,trusted_local_bypass,activity_read,is_member,observed_at) VALUES(1,?,0,0,1,?)")
+        .bind(account).bind(chrono::Utc::now().to_rfc3339()).execute(&mut *connection).await?;
+    sqlx::query("INSERT INTO temp._query_sql_visible_ids(id) SELECT id FROM main.records")
+        .execute(&mut *connection)
+        .await?;
+    let mut snapshot = SourceSnapshot {
+        origin: origin.into(),
+        account: account.into(),
+        // Member profiles have no canonical act or author history. Zero is an
+        // internal unused placeholder; the publisher must not report it as act.
+        freshness: serde_json::json!({"source":"member_copy","content_act":"not_held","author_history":"not_held"}),
+        ..Default::default()
+    };
+    for row in sqlx::query("SELECT * FROM temp.records ORDER BY created_at,id")
+        .fetch_all(&mut *connection)
+        .await?
+    {
+        let mut metadata = BTreeMap::new();
+        for key in [
+            "summary",
+            "lifecycle",
+            "maturity",
+            "created_at",
+            "updated_at",
+            "last_activity_at",
+        ] {
+            let value: Option<String> = row.try_get(key)?;
+            if let Some(value) = value {
+                metadata.insert(key.into(), Value::String(value));
+            }
+        }
+        if row.try_get::<Option<i64>, _>("is_current")? == Some(0)
+            || row.try_get::<i64, _>("successor_count")? > 0
+        {
+            metadata.insert("superseded".into(), Value::Bool(true));
+        }
+        let record = SourceRecord {
+            id: row.try_get("id")?,
+            record_type: row.try_get("type")?,
+            kind: row.try_get("kind")?,
+            name: row.try_get("name")?,
+            body: row.try_get("body")?,
+            home_id: row.try_get("home_id")?,
+            archived: row.try_get::<i64, _>("archived")? != 0,
+            metadata,
+            ..Default::default()
+        };
+        snapshot.records.insert(record.id.clone(), record);
+    }
+    for row in
+        sqlx::query("SELECT record_id,key,value FROM temp.facet_values ORDER BY record_id,key,id")
+            .fetch_all(&mut *connection)
+            .await?
+    {
+        if let Some(record) = snapshot
+            .records
+            .get_mut(&row.try_get::<String, _>("record_id")?)
+        {
+            record.facets.insert(
+                row.try_get("key")?,
+                row.try_get::<Option<String>, _>("value")?
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+    for row in sqlx::query("SELECT r.id,p.id AS owner FROM main.records r JOIN temp.records p ON p.id=r.owner_id JOIN temp.records v ON v.id=r.id").fetch_all(&mut *connection).await? {
+        if let Some(record) = snapshot.records.get_mut(&row.try_get::<String,_>("id")?) { record.metadata.insert("owner".into(),Value::String(row.try_get("owner")?)); }
+    }
+    for row in sqlx::query("SELECT a.annotation_id,a.selectors FROM main.annotation_targets a JOIN temp.records annotation ON annotation.id=a.annotation_id JOIN temp.records target ON target.id=a.target_record_id ORDER BY a.annotation_id,a.target_record_id").fetch_all(&mut *connection).await? {
+        if let Some(record) = snapshot.records.get_mut(&row.try_get::<String,_>("annotation_id")?) { record.anchors.push(serde_json::from_str(&row.try_get::<String,_>("selectors")?)?); }
+    }
+    for row in sqlx::query("SELECT source_id,target_id,relationship,note FROM temp.links ORDER BY source_id,relationship,target_id,id").fetch_all(&mut *connection).await? {
+        snapshot.links.push(SourceLink { source_id:row.try_get("source_id")?,target_id:row.try_get("target_id")?,relationship:row.try_get("relationship")?,note:row.try_get("note")? });
+    }
+    sqlx::query("ROLLBACK").execute(&mut *connection).await?;
+    Ok(snapshot)
+}
 
 /// Internal projection source. Uses the exact production governed views, but
 /// does not serialize through the public SQL cell/result/row limits. Every

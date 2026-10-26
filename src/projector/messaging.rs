@@ -709,3 +709,79 @@ async fn invalidate_superseded_message_mentions(
     .await?;
     Ok(())
 }
+
+/// `message.revision.recorded.v1`: the author's replacement text for a live
+/// Message. This is a dedicated body writer rather than `record.updated`, so
+/// the Message immutability guard stays closed to every other path.
+///
+/// The fold is deliberately replay-safe: authorship is the tool's check (it
+/// needs account bindings, which content replay does not carry), and the fold
+/// verifies only what the payload itself can prove. `records.body` becomes the
+/// new text; every earlier body stays in the log. The payload carries the full
+/// effective mention set, so the previous rows are retired and the carried ones
+/// re-asserted against the new text, never left pointing into the old one.
+pub(super) async fn project_message_revision_recorded(
+    conn: &mut SqliteConnection,
+    event: &EventRow,
+    defer: Option<&mut BodyDeferrals>,
+) -> Result<()> {
+    assert_record_live(conn, &event.record_id, &event.event_type).await?;
+    let record_type: String = sqlx::query_scalar("SELECT type FROM records WHERE id=?")
+        .bind(&event.record_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if record_type != "Message" {
+        return Err(Error::engine(
+            "message.revision.recorded.v1 may target only a Message",
+        ));
+    }
+    let payload: crate::events::MessageRevisionRecordedPayload = parse_payload(event)?;
+    payload.validate()?;
+    let updated_at = next_record_updated_at(conn, &event.record_id, &event.created_at).await?;
+    sqlx::query("UPDATE records SET body=?,updated_at=?,last_activity_at=? WHERE id=?")
+        .bind(&payload.body)
+        .bind(updated_at)
+        .bind(&event.created_at)
+        .bind(&event.record_id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("UPDATE message_mentions SET effective=0 WHERE message_id=?")
+        .bind(&event.record_id)
+        .execute(&mut *conn)
+        .await?;
+    for mention in &payload.mentions {
+        sqlx::query(
+            "INSERT INTO message_mentions
+               (message_id,mention_id,target_kind,target_binding,target_record_id,span_start,
+                span_end,authored_label,source_event_seq,effective)
+             VALUES (?,?,?,?,?,?,?,?,?,1)
+             ON CONFLICT(message_id,mention_id) DO UPDATE SET
+               target_kind=excluded.target_kind,target_binding=excluded.target_binding,
+               target_record_id=excluded.target_record_id,span_start=excluded.span_start,
+               span_end=excluded.span_end,authored_label=excluded.authored_label,
+               source_event_seq=excluded.source_event_seq,effective=1",
+        )
+        .bind(&event.record_id)
+        .bind(&mention.mention_id)
+        .bind(&mention.target_kind)
+        .bind(&mention.target_binding)
+        .bind(&mention.target_record_id)
+        .bind(mention.span_start)
+        .bind(mention.span_end)
+        .bind(&mention.authored_label)
+        .bind(event.local_seq)
+        .execute(&mut *conn)
+        .await?;
+    }
+    // A fourth-style body writer: blocks, body references, task rows and
+    // record-body nodes all follow the new text, as for `record.updated`.
+    body_deferral::replace_body_derivations(
+        conn,
+        defer,
+        &event.record_id,
+        event.local_seq,
+        Some(&payload.body),
+        crate::body_blocks::BodyFormat::Markdown,
+    )
+    .await
+}

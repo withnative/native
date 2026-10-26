@@ -28,7 +28,7 @@ fn registry() -> &'static Registry {
 }
 
 /// Wait for exclusive use of `key`; released when the guard drops.
-pub(super) async fn acquire(key: &str) -> OwnedMutexGuard<()> {
+pub(crate) async fn acquire(key: &str) -> OwnedMutexGuard<()> {
     let lock = {
         let mut locks = registry().lock().expect("HCP lock table poisoned");
         // Forget keys nobody holds or waits on, so the table does not grow

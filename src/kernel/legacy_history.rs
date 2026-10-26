@@ -11,11 +11,28 @@ pub(super) const SQL_EVENTS_DDL: &str = "CREATE TABLE kernel_legacy_sql_events (
  actor TEXT, run_key TEXT, parent_key TEXT, created_at TEXT NOT NULL,
  source_stream TEXT NOT NULL)";
 pub(super) const SQL_EVENTS_INDEX_DDL: &str = "CREATE INDEX idx_kernel_legacy_sql_record ON kernel_legacy_sql_events(record_id,source_stream,seq)";
+pub(super) const INTERVENTION_INDEX_DDL: &str = "CREATE INDEX idx_kernel_legacy_interventions ON kernel_legacy_sql_events(event_type,seq) WHERE source_stream='content_events' AND event_type IN ('intervention.raised.v1','intervention.cancelled.v1','intervention.execution_resumed.v1')";
 /// A scanned log position, including legacy events with no SQL header. Older
 /// import binaries do not advance it; explicit preparation catches up without source.
 pub(super) const SQL_PROGRESS_DDL: &str = "CREATE TABLE kernel_legacy_sql_progress (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), scanned_seq INTEGER NOT NULL, gap_free INTEGER NOT NULL DEFAULT 1, provenance_headers INTEGER NOT NULL DEFAULT 1)";
 pub(super) const SUBJECTS_DDL: &str = "CREATE TABLE kernel_legacy_subjects(subject_id TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY(subject_id,seq))";
+
+/// A stale projected header can change placement and disclosure. Check the
+/// canonical retained frontier in the same snapshot as every consumer.
+pub(crate) async fn require_sql_frontier_on(conn: &mut SqliteConnection) -> Result<()> {
+    let key = read_cache::key_on(conn, "", "legacy_sql_frontier").await?;
+    if read_cache::get::<()>(&key).is_some() {
+        return Ok(());
+    }
+    let current: bool = sqlx::query_scalar("WITH head AS (SELECT coalesce(max(seq),0) AS seq FROM main.content_events WHERE type='kernel.legacy_recorded.v1') SELECT CASE WHEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress) THEN EXISTS(SELECT 1 FROM main.kernel_legacy_sql_progress WHERE singleton=1 AND gap_free=1 AND provenance_headers=1 AND scanned_seq=(SELECT seq FROM head)) ELSE (SELECT seq FROM head)=0 END")
+        .fetch_one(&mut *conn).await?;
+    if !current {
+        return Err(Error::engine("v2 database is not ready: legacy SQL projection needs catchup; run explicit v2 preparation before serving"));
+    }
+    read_cache::put(key, std::sync::Arc::new(()));
+    Ok(())
+}
 
 /// Additive upgrade for imported targets created before retained history.
 /// Missing disclosure projections are rebuilt from immutable legacy envelopes.
@@ -61,9 +78,11 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
         sqlx::query("ALTER TABLE kernel_legacy_history ADD COLUMN disclosure_version INTEGER NOT NULL DEFAULT 2")
             .execute(&mut *conn).await?;
     }
-    sqlx::query(&SQL_EVENTS_INDEX_DDL.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
-        .execute(&mut *conn)
-        .await?;
+    for ddl in [SQL_EVENTS_INDEX_DDL, INTERVENTION_INDEX_DDL] {
+        sqlx::query(&ddl.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+            .execute(&mut *conn)
+            .await?;
+    }
     if rebuild {
         for table in [
             "kernel_legacy_sql_events",

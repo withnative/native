@@ -87,8 +87,26 @@ impl KindMetadataV1 {
                 "kind metadata identity.dedup.keys must be non-empty for facet_tuple",
             ));
         }
-        if self.identity.dedup.mode != KindDedupMode::FacetTuple
-            && !self.identity.dedup.keys.is_empty()
+        // External bindings identify through the bindings registry, so no
+        // keys are required; a kind that declares keys is judged on the
+        // facet tuple exactly like facet_tuple, and blank keys are never
+        // meaningful.
+        if self.identity.dedup.mode == KindDedupMode::ExternalBinding
+            && self
+                .identity
+                .dedup
+                .keys
+                .iter()
+                .any(|key| key.trim().is_empty())
+        {
+            return Err(Error::engine(
+                "kind metadata identity.dedup.keys must not contain blank values",
+            ));
+        }
+        if !matches!(
+            self.identity.dedup.mode,
+            KindDedupMode::FacetTuple | KindDedupMode::ExternalBinding
+        ) && !self.identity.dedup.keys.is_empty()
         {
             return Err(Error::engine(
                 "kind metadata identity.dedup.keys is only valid for facet_tuple",

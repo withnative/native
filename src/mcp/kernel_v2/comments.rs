@@ -6,7 +6,6 @@
 //! through `get_record` `include_comments` with v1-shaped summaries. The
 //! body anchor itself is pinned by `kernel::comments_v2`.
 use crate::{
-    db::Db,
     kernel::{self, comments_v2},
     Error, Result,
 };
@@ -473,43 +472,40 @@ pub(super) async fn check_update(
 /// Each child is authorized in the listing snapshot: refused/interrupted
 /// imports can leave an incomplete or duplicate bearer chain, so the parent
 /// read alone cannot establish the child's visibility.
-pub(super) async fn enrich(
-    db: &Db,
+pub(super) async fn enrich_on(
+    snapshot: &mut sqlx::SqliteConnection,
     actor: &str,
     record: &kernel::KernelRecordView,
     include: bool,
     limit: usize,
     offset: usize,
 ) -> Result<Value> {
-    let mut snapshot = db.write_pool().begin().await?;
-    crate::kernel::app_installs::admit_dispatched_on(&mut snapshot, actor).await?;
+    crate::kernel::app_installs::admit_dispatched_on(snapshot, actor).await?;
     let listing = if record_is_comment(record) {
         comments_v2::Position::Reply
     } else {
         comments_v2::Position::Root
     };
     let mut visible = Vec::new();
-    for id in comments_v2::children_on(&mut snapshot, &record.id, listing).await? {
-        if let Some(view) = kernel::read_record_on(&mut snapshot, actor, &id).await? {
+    for id in comments_v2::children_on(snapshot, &record.id, listing).await? {
+        if let Some(view) = kernel::read_record_on(snapshot, actor, &id).await? {
             visible.push(view);
         }
     }
     let mut result = json!({"comment_count": visible.len()});
     if !include {
-        snapshot.rollback().await?;
         return Ok(result);
     }
     // Replies inherit the root's target context without copying anchor rows.
     let root_anchor = if listing == comments_v2::Position::Reply {
-        comments_v2::anchor_on(&mut snapshot, &record.id).await?
+        comments_v2::anchor_on(snapshot, &record.id).await?
     } else {
         None
     };
     let mut comments = Vec::new();
     for view in visible.into_iter().skip(offset).take(limit) {
-        comments.push(entry(&mut snapshot, actor, &view, listing, &root_anchor).await?);
+        comments.push(entry(snapshot, actor, &view, listing, &root_anchor).await?);
     }
-    snapshot.rollback().await?;
     result["comments"] = Value::Array(comments);
     Ok(result)
 }
@@ -529,7 +525,7 @@ async fn entry(
             .fetch_one(&mut *snapshot)
             .await?;
     let updated_at: String =
-        sqlx::query_scalar("SELECT created_at FROM content_events WHERE seq = ?")
+        sqlx::query_scalar("SELECT created_at FROM main.content_events WHERE seq = ?")
             .bind(view.revision)
             .fetch_one(&mut *snapshot)
             .await?;

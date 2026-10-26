@@ -3359,6 +3359,7 @@ async fn status_filters_narrow_the_uncertain_list_too() {
         parent_run: parent.map(str::to_owned),
         states: states.iter().map(|s| s.to_string()).collect(),
         limit: 10,
+        newest_first: false,
     };
     let by_run = rig.gate.status(&filter(Some("run-a"), None, &[]));
     assert_eq!(by_run["uncertain"].as_array().unwrap().len(), 1);
@@ -4295,6 +4296,40 @@ async fn gate_injects_no_run_or_intent_on_the_saver_path() {
 }
 
 #[tokio::test]
+async fn kernel_v2_upstream_refuses_holding_and_preserves_old_pending_writes() {
+    let rig = Rig::new(fast()).await;
+    // Establish a genuine pending v1 write, then change upstream engine.
+    hold_create(&rig, "v1-before-cutover", "retained").await;
+    assert_eq!(rig.gate.status(&Default::default())["queue"]["pending"], 1);
+    let sent_before = rig.state().writes().len();
+    rig.gate.set_kernel_v2_upstream(true);
+    assert_eq!(
+        rig.gate.drain(&rig.upstream, None, None, None).await,
+        queue::Halt::EngineV2
+    );
+    assert_eq!(
+        rig.state().writes().len(),
+        sent_before,
+        "v1 envelope never replayed into v2"
+    );
+    let down = FakeOutage::new(true);
+    down.known.store(true, Ordering::SeqCst);
+    let reply = forward_with(&rig, create(Some("v2-refused"), "new"), Some(&down)).await;
+    assert_eq!(reply["error"]["data"]["outcome"], "not_sent", "{reply}");
+    assert_eq!(rig.state().writes().len(), sent_before);
+    let status = rig.gate.status(&Default::default());
+    assert_eq!(status["holding"]["supported"], false);
+    assert_eq!(
+        status["holding"]["reason"],
+        "kernel_v2_upstream_drain_first"
+    );
+    assert_eq!(
+        status["queue"]["pending"], 1,
+        "retained for explicit resolution or rollback"
+    );
+}
+
+#[tokio::test]
 async fn database_freeze_refusal_enters_the_existing_node_hold_path() {
     let dir = tempfile::tempdir().unwrap();
     let store = crate::mcp::database_freeze::DatabaseFreezeStore::new(dir.path());
@@ -4328,4 +4363,14 @@ async fn database_freeze_refusal_enters_the_existing_node_hold_path() {
         "refusal must not trigger an immediate retry"
     );
     assert_eq!(rig.state().created.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn duplicate_gate_engine_error_settles_as_refused_never_a_receipt() {
+    let detail = json!({"code":"likely_duplicate", "applied":false, "outcome":"refused",
+        "message":"Nothing was created.", "candidates":[{"id":"existing"}]});
+    let reply = json!({"result":{"isError":true,
+        "structuredContent":{"error":detail.to_string()},
+        "content":[{"type":"text", "text":detail.to_string()}]}});
+    assert_eq!(answer_of(Some(&reply.to_string())), Answer::Refused);
 }

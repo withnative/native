@@ -4,6 +4,11 @@ use super::*;
 use serde_json::Value;
 
 const TABLES: &[(&str, &str, &[&str])] = &[
+    (
+        "account_configs",
+        "account_configs",
+        &["account_id", "kind"],
+    ),
     ("vocabularies", "vocabularies", &["id"]),
     ("vocabulary_values", "vocabulary_values", &["id"]),
     ("schema_config", "schema_config", &["id"]),
@@ -38,9 +43,15 @@ pub struct StateCounts {
 }
 #[derive(Default, Serialize)]
 pub struct StateReport {
+    pub member_contexts_prepared: bool,
+    pub member_contexts_source_present: bool,
+    pub member_contexts_invalid: usize,
+    pub identity_directory_prepared: bool,
+    pub surface_bindings_prepared: bool,
     pub sections: BTreeMap<String, StateCounts>,
     pub run_intents_source_present: bool,
     pub directory_self_only_accounts: usize,
+    pub account_configs_prepared: bool,
     pub nonfinite_vocabulary_ordinals: usize,
     pub claims_held_at_snapshot: usize,
     pub claims_historical_nonoccupying: usize,
@@ -81,6 +92,8 @@ async fn table_rows(source: &mut SqliteConnection, table: &str) -> Result<Vec<Va
     // The sealed lane stores this canonical row text without reparsing it.
     let extra = if table == "vocabulary_values" {
         ",ordinal AS raw_ordinal"
+    } else if table == "account_configs" {
+        ",NOT EXISTS(SELECT 1 FROM records r WHERE r.id=account_configs.record_id) AS target_missing,EXISTS(SELECT 1 FROM records r WHERE r.id=account_configs.record_id AND r.deleted_at IS NOT NULL) AS target_deleted"
     } else {
         ""
     };
@@ -92,6 +105,10 @@ async fn table_rows(source: &mut SqliteConnection, table: &str) -> Result<Vec<Va
     rows.into_iter()
         .map(|row| {
             let mut value: Value = serde_json::from_str(row.get::<&str, _>("row_json"))?;
+            if table == "account_configs" {
+                value["_target_missing"] = Value::Bool(row.get::<bool, _>("target_missing"));
+                value["_target_deleted"] = Value::Bool(row.get::<bool, _>("target_deleted"));
+            }
             if table == "vocabulary_values" {
                 let number: Option<f64> = row.try_get("raw_ordinal")?;
                 if let Some(number) = number.and_then(serde_json::Number::from_f64) {
@@ -105,7 +122,9 @@ async fn table_rows(source: &mut SqliteConnection, table: &str) -> Result<Vec<Va
 pub(super) async fn accounts(source: &mut SqliteConnection) -> Result<BTreeSet<String>> {
     let mut accounts = BTreeSet::new();
     for table in [
+        "member_contexts",
         "agent_runs",
+        "account_configs",
         "alpha_tab_orders",
         "member_obligations",
         "member_obligation_progress",
@@ -144,6 +163,12 @@ pub(super) async fn import(
 ) -> Result<()> {
     let mut sections = BTreeMap::<String, Vec<(String, Value)>>::new();
     for (table, section, keys) in TABLES {
+        if *table == "account_configs" && !present(source, table).await? {
+            let previous: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_v1_state WHERE section='account_configs' AND origin=?)").bind(origin).fetch_one(db.pool()).await?;
+            if previous {
+                return Err("account_configs source table missing after previous capture".into());
+            }
+        }
         let rows = table_rows(source, table).await?;
         let rows = rows
             .into_iter()
@@ -159,13 +184,19 @@ pub(super) async fn import(
             .collect::<Result<Vec<_>>>()?;
         sections.insert((*section).into(), rows);
     }
+    super::member_context::capture(source, db, origin, report, &mut sections).await?;
     deletion_guards(source, &mut sections).await?;
+    sections.insert(
+        "surface_bindings".into(),
+        super::surface_bindings::rows(source).await?,
+    );
     // Preserve v1 directory privacy: another account's runs/intents require
     // its verified, visible Person record, never a blanket root-view bypass.
     let mut account_map = report.principals.clone();
     let prior:Vec<(String,String)>=sqlx::query_as("SELECT DISTINCT p.auth_binding,p.principal_id FROM kernel_v1_state s JOIN kernel_principals p ON p.principal_id=s.account_principal WHERE p.kind='account'").fetch_all(db.write_pool()).await?;
     account_map.extend(prior);
     let mut directory = vec![];
+    let mut ambiguous_native_principals = 0;
     for account in account_map.keys() {
         let people:Vec<String>=sqlx::query_scalar("SELECT DISTINCT b.record_id FROM bindings b JOIN records p ON p.id=b.record_id WHERE b.system='account' AND b.is_canonical=1 AND b.identifier=? AND p.type='Entity' AND p.kind='person' AND p.deleted_at IS NULL").bind(account).fetch_all(&mut *source).await?;
         let person = if people.len() == 1 {
@@ -174,9 +205,26 @@ pub(super) async fn import(
             report.state.directory_self_only_accounts += 1;
             None
         };
+        let native_principal = if let Some(person) = person.as_ref() {
+            let values:Vec<String>=sqlx::query_scalar("SELECT identifier FROM bindings WHERE record_id=? AND system='native-principal' AND is_canonical=1 ORDER BY identifier").bind(person).fetch_all(&mut *source).await?;
+            if values.len() > 1 {
+                ambiguous_native_principals += 1;
+                report.refusals.push(issue(
+                    person,
+                    "ambiguous canonical native-principal in account directory",
+                ));
+            }
+            if values.len() == 1 {
+                values.into_iter().next()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         directory.push((
             account.clone(),
-            json!({"account_id":account,"person_record_id":person}),
+            json!({"account_id":account,"person_record_id":person,"native_principal_id":native_principal}),
         ));
     }
     sections.insert("account_directory".into(), directory);
@@ -274,7 +322,9 @@ pub(super) async fn import(
                 })
                 .transpose()?;
             let record_id = value
-                .get(if section == "account_directory" {
+                .get(if section == "member_contexts" {
+                    "root_record_id"
+                } else if section == "account_directory" {
                     "person_record_id"
                 } else {
                     "record_id"
@@ -388,7 +438,69 @@ pub(super) async fn import(
             count.verified += 1;
         }
     }
-    Ok(())
+    let directory = report
+        .state
+        .sections
+        .get("account_directory")
+        .ok_or("identity directory not inspected")?;
+    // Publish a negative readiness receipt too: a prior successful resume must
+    // not leave a usable marker behind when the source becomes ambiguous.
+    let refused = directory.refused + ambiguous_native_principals;
+    let complete = refused == 0 && directory.verified == directory.source + directory.removed;
+    let accounts = directory.source;
+    report
+        .state
+        .sections
+        .get_mut("account_directory")
+        .unwrap()
+        .refused = refused;
+    {
+        k::v1_state::import_state_batch_as(
+            db,
+            host,
+            &[k::v1_state::ImportedState {
+                section: k::v1_state::IDENTITY_CAPTURE.into(),
+                source_id: "identity-directory/v1".into(),
+                origin: origin.into(),
+                value_json: Some(
+                    serde_json::json!({"version":k::v1_state::IDENTITY_CAPTURE_VERSION,"accounts":accounts,"refused":refused})
+                        .to_string(),
+                ),
+                account_principal: None,
+                record_id: None,
+                observed_at: observed_at.clone(),
+                snapshot: snapshot.clone(),
+            }],
+        )
+        .await?;
+        report.state.identity_directory_prepared = complete;
+    }
+    let configs = report
+        .state
+        .sections
+        .get("account_configs")
+        .ok_or("account config section not inspected")?;
+    if configs.refused == 0 && configs.verified == configs.source + configs.removed {
+        // A derived preparation receipt, never counted as a source row.
+        k::v1_state::import_state_batch_as(
+            db,
+            host,
+            &[k::v1_state::ImportedState {
+                section: "account_config_capture".into(),
+                source_id: "account_configs/v1".into(),
+                origin: origin.into(),
+                value_json: Some(serde_json::json!({"version":1}).to_string()),
+                account_principal: None,
+                record_id: None,
+                observed_at: observed_at.clone(),
+                snapshot: snapshot.clone(),
+            }],
+        )
+        .await?;
+        report.state.account_configs_prepared = true;
+    }
+    super::member_context::receipt(db, host, origin, &observed_at, &snapshot, report).await?;
+    super::surface_bindings::receipt(db, host, origin, observed_at, snapshot, report).await
 }
 
 // Preserve exactly the two v1 store deletion guards. The derivation runtime

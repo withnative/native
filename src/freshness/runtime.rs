@@ -239,7 +239,7 @@ async fn body_head_at_on(
 ) -> Result<RevisionRef> {
     let event_id: String = sqlx::query_scalar(
         "SELECT id FROM content_events
-          WHERE record_id=? AND seq <= ? AND type IN ('record.created','record.updated','receipt.committed.v1')
+          WHERE record_id=? AND seq <= ? AND type IN ('record.created','record.updated','receipt.committed.v1','message.revision.recorded.v1')
             AND json_type(payload,'$.body') IS NOT NULL
           ORDER BY seq DESC LIMIT 1",
     )

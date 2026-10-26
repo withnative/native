@@ -135,7 +135,7 @@ pub(super) async fn reconcile(
                 .await?;
             }
         }
-        return Ok(());
+        return home_reviews(db, host, source, true, report).await;
     }
     let links: Vec<String> = sqlx::query_scalar(
         "SELECT link_id FROM kernel_generic_links WHERE imported=1 AND active=1",
@@ -290,6 +290,16 @@ pub(super) async fn reconcile(
             .await?;
         }
     }
+    home_reviews(db, host, source, false, report).await
+}
+
+async fn home_reviews(
+    db: &Db,
+    host: &str,
+    source: &mut SqliteConnection,
+    after_records: bool,
+    report: &mut Report,
+) -> Result<()> {
     // Missing homes cannot be erased while they bear records. Retain their
     // durable source mapping and disclose the absence for placement review.
     let homes:Vec<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE type='kernel.import_home.v1'").fetch_all(db.pool()).await?;
@@ -305,12 +315,47 @@ pub(super) async fn reconcile(
         .fetch_one(&mut *source)
         .await?;
         if deleted {
+            let folder: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM records WHERE id=? AND type='Collection' AND kind='folder')").bind(&id).fetch_one(&mut *source).await?;
+            let home = derived(&id);
+            let occupied: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r WHERE r.home_id=? AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id)) OR EXISTS(SELECT 1 FROM kernel_roots WHERE parent_id=?) OR EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND actor IS NOT ?)")
+                .bind(&home).bind(&home).bind(&home).bind(host).fetch_one(db.pool()).await?;
+            if !folder && !occupied {
+                // Keep the policy namespace and all history. Only the original
+                // bearer and its verified tombstones occupied it; no live
+                // placement or native namespace edit is being accepted away.
+                report.review.retain(|issue| {
+                    !(issue.id == id
+                        && issue.reason
+                            == "imported home is a source tombstone; retained for placement review")
+                });
+                if after_records {
+                    *report
+                        .delta
+                        .entry("retained_empty_self_policy_homes".into())
+                        .or_default() += 1;
+                }
+                continue;
+            }
+        }
+        if deleted
+            && !report.review.iter().any(|i| {
+                i.id == id
+                    && i.reason
+                        == "imported home is a source tombstone; retained for placement review"
+            })
+        {
             report.review.push(issue(
                 &id,
                 "imported home is a source tombstone; retained for placement review",
             ));
         }
-        if !present {
+        if !present
+            && !report.review.iter().any(|i| {
+                i.id == id
+                    && i.reason
+                        == "imported home missing from source; retained for placement review"
+            })
+        {
             report.review.push(issue(
                 &id,
                 "imported home missing from source; retained for placement review",

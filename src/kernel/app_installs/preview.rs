@@ -46,6 +46,8 @@ pub(super) fn issue(
     let expires_at_secs = now
         .checked_add(ALPHA_TAB_PREVIEW_RECEIPT_TTL_SECS)
         .ok_or_else(|| invalid("preview clock overflow"))?;
+    let declaration: Value = serde_json::from_str(string(pin, "consented_declaration")?)?;
+    let (needs, effects) = declarations::consent_names(&declaration)?;
     let receipt = AlphaTabPreviewReceipt {
         receipt_id: format!("preview_{}", &random_hex()[..16]),
         nonce: random_hex(),
@@ -56,8 +58,8 @@ pub(super) fn issue(
         artifact_id: string(pin, "artifact_id")?.into(),
         source_revision: string(pin, "source_revision")?.into(),
         declaration_digest: string(pin, "declaration_digest")?.into(),
-        needs: vec![],
-        effects: vec![],
+        needs,
+        effects,
         preview_session: format!("sess_{}", &random_hex()[..16]),
         last_update_event_id: Some(binding.install_generation.clone()),
         issued_at_secs: now,
@@ -165,7 +167,7 @@ mod tests {
     fn pin() -> Value {
         json!({"package":"agent.docs","version":"0.8.2","digest":"digest",
             "artifact_id":"artifact","source_revision":"frozen-source",
-            "declaration_digest":"declaration"})
+            "declaration_digest":"declaration", "consented_declaration":json!({"contract":"native.app.v2","needs":[],"effects":[]}).to_string()})
     }
 
     fn confirm(r: &AlphaTabPreviewReceipt) -> AlphaTabAdoptConfirm {

@@ -65,6 +65,42 @@ impl AppBundleDelivery {
         }))
     }
 
+    /// Ordinary artifacts have separate signed authority from installs/previews.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn artifact_launch(
+        &self,
+        caller: &Caller,
+        artifact: &str,
+        digest: &str,
+        parent: Option<&str>,
+        now: u64,
+    ) -> Option<Value> {
+        if !self.enabled || caller.is_trusted_local() {
+            return None;
+        }
+        let fields = bundle_url::IssueFields {
+            principal: caller.hosting_principal()?.into(),
+            database: caller.hosting_database()?.into(),
+            session: caller.hosting_session_id()?.into(),
+            package: "native.artifact-render".into(),
+            install_event: artifact.into(),
+            parent_origin: self.runtime.resolve_parent_origin(parent).ok()?,
+            adapter_revision: crate::artifact_html::ADAPTER_REVISION,
+        };
+        let cap = bundle_url::issue_artifact(
+            self.keyring.as_ref()?,
+            &self.runtime.artifact_origin,
+            digest,
+            &fields,
+            now,
+        )
+        .ok()?;
+        Some(
+            json!({"url":format!("{}{}{digest}/{cap}",self.runtime.artifact_origin,bundle_url::ROUTE_PATH),
+            "expires_in_ms":bundle_url::ARTIFACT_LIFETIME_SECONDS*1000,"bridge_version":crate::artifact_html::BRIDGE_VERSION}),
+        )
+    }
+
     /// A failed eligibility or cap bound always leaves the ticket path available.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch(

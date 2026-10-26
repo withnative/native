@@ -77,3 +77,6 @@ mod v2_structured_values;
 #[cfg(feature = "v2-kernel-probe")]
 #[path = "kernel/v2_structured_values_text_formats.rs"]
 mod v2_structured_values_text_formats;
+
+#[path = "kernel/named_view_compat.rs"]
+mod named_view_compat;

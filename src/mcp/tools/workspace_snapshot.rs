@@ -77,7 +77,11 @@ fn restart(reason: &str) -> Value {
     })
 }
 
-async fn get_workspace_snapshot(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(crate) async fn get_workspace_snapshot(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+) -> Result<Value> {
     let args: WorkspaceSnapshotArgs = parse_args("get_workspace_snapshot", arguments)?;
     let principal = (&caller).into();
     match args.action.as_str() {

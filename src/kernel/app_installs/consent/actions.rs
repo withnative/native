@@ -119,9 +119,44 @@ pub(crate) async fn start_app_action_in(
     let Some(admitted) = crate::kernel::app_installs::admit_dispatched_on(tx, actor).await? else {
         return Ok(None);
     };
+    start_declared_app_action_in(
+        db,
+        tx,
+        actor,
+        admitted,
+        operation,
+        request_digest,
+        reason,
+        acts,
+    )
+    .await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_declared_app_action_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    actor: &str,
+    admitted: AppSourceAdmission,
+    operation: &str,
+    request_digest: String,
+    reason: Option<String>,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<Option<Box<PendingAppAction>>> {
+    if admitted.principal != actor {
+        return Err(invalid("app action principal changed"));
+    }
     if !matches!(
         operation,
-        "attach_text" | "create_record" | "update_record" | "manage_links" | "archive_record"
+        "attach_text"
+            | "create_record"
+            | "update_record"
+            | "manage_links"
+            | "archive_record"
+            | "manage_canvas"
+            | "manage_messages"
+            | "invoke_artifact_interaction"
     ) {
         return Err(Error::engine(
             "native app write attribution is unavailable for this operation",
@@ -249,7 +284,7 @@ pub(in crate::kernel::app_installs) async fn project_started(
         || row["artifact_id"] != request.artifact_id
         || row["consented_source_revision"] != request.source_revision
         || declaration != request.declaration
-        || row["adoption"] != "shell_adopt.v1"
+        || !row["adoption"].as_str().is_some_and(verified_adoption)
         || row["consent_revocation_seq"].as_i64().unwrap_or(0) != p.revocation_epoch
         || revocation_on(conn, actor, event.local_seq).await? != p.revocation_epoch
     {

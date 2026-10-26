@@ -76,9 +76,12 @@ fn tools_with_a_renderer_default_to_text_others_to_json() {
     // tools/list: if it can render, it renders.
     let registry = registry();
     for spec in registry.specs() {
-        if spec.name == "manage_account_config" {
-            // Canonical account configuration has a machine-readable receipt
-            // and deliberately offers JSON only.
+        if matches!(
+            spec.name.as_str(),
+            "manage_account_config" | "read_hcp_audit" | "manage_named_views"
+        ) {
+            // Canonical configuration receipts and the per-person JSON-LD
+            // audit deliberately offer JSON only; do not invent text renderers.
             assert!(!render::has_renderer(&spec.name));
             assert_eq!(render::default_format(&spec.name), Format::Json);
             assert!(render::render(&spec.name, &json!({})).is_none());
@@ -86,7 +89,7 @@ fn tools_with_a_renderer_default_to_text_others_to_json() {
                 .descriptor_projection(ExposureProfile::Complete)
                 .into_iter()
                 .find(|tool| tool.name == spec.name)
-                .expect("account configuration is advertised in Complete");
+                .expect("JSON-only tool is advertised in Complete");
             let format = &advertised.descriptor["inputSchema"]["properties"]["format"];
             assert_eq!(format["enum"], json!(["json"]));
             assert_eq!(format["default"], json!("json"));
@@ -672,7 +675,7 @@ fn manage_messages_rendering_is_truthful_complete_and_boundary_safe() {
     let inbox = render::render(
         "manage_messages",
         &json!({
-            "schema":"native.message-inbox.v2",
+            "schema":"native.message-inbox.v3",
             "view":"all_new",
             "items":[{"message_id":"inbox-message-full-id","body":"inbox body"}],
             "snapshot":"snapshot-full-token",

@@ -3,7 +3,7 @@
 #[tokio::test]
 async fn v2_two_principals_no_person() {
     // The v2 path uses the current frozen engine schema.
-    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 373);
+    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 402);
     assert_eq!(
         crate::schema::ddl_sha256(),
         crate::schema::FROZEN_DDL_SHA256,
@@ -699,12 +699,12 @@ async fn v2_specimen_pinned_file_db() {
     use crate::kernel as v2;
 
     // Current frozen statements, digest, prod event types, and v1 roots.
-    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 373);
+    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 402);
     assert_eq!(
         crate::schema::ddl_sha256(),
         crate::schema::FROZEN_DDL_SHA256
     );
-    assert_eq!(crate::events::EVENT_TYPES.len(), 49);
+    assert_eq!(crate::events::EVENT_TYPES.len(), 50);
     let v1 = crate::db::create_database(":memory:").await.unwrap();
     let v1roots: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM records WHERE id IN ('native:root', 'native:unfiled')",

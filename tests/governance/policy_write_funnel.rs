@@ -25,6 +25,23 @@ fn normalized(text: &str) -> String {
 
 fn without_query_sql_test_fixture_writes(relative: &Path, source: &str) -> String {
     let normalized_source = normalized(source);
+    if relative == Path::new("src/authorization_grant.rs") {
+        // Exact corruption/classification fixtures in the test module only.
+        // The certification helpers must never acquire a runtime policy writer.
+        let (runtime, tests) = normalized_source
+            .split_once("#[cfg(test)] mod subject_tests")
+            .expect("subject revision fixtures remain test-only");
+        let mut tests = tests.to_owned();
+        for fixture in [
+            "\"UPDATE policy_entries SET subject_id='bob' WHERE policy_anchor_id=? AND subject_id='alice'\"",
+            "\"INSERT INTO record_policies(record_id,created_at) VALUES(?,'2026-10-22T00:00:00Z')\"",
+        ] {
+            let fixture = normalized(fixture);
+            assert_eq!(tests.matches(&fixture).count(), 1, "exact subject fixture only");
+            tests = tests.replacen(&fixture, "", 1);
+        }
+        return format!("{runtime} {tests}");
+    }
     if relative == Path::new("src/meta/workspace_rule_installation/tests.rs") {
         // This separate module is admitted only under cfg(test). Its two exact
         // deletes construct the content-free replay fixture; every other new
@@ -166,6 +183,13 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
         // Main's 26 sites plus the shape fixture's two sites total 28.
         // These 28 sites never write the v2 target or run in production.
         ("src/v1_import/tests.rs", 28),
+        // Probe-only imported-app visibility fixture: one hidden-child anchor
+        // and one owner entry in the independent temporary v1 source snapshot.
+        ("src/v1_import/tests/app_state.rs", 2),
+        // Caller-context tests seed only their independent temporary v1 source:
+        // one record_policies insert and two policy_entries inserts. The
+        // cfg(test) ancestor and single child declaration are verified below.
+        ("src/v1_import/tests/member_context.rs", 3),
         // Grant revision regression fixture: an explicit policy insert and
         // entry insert/delete distinguish user edits from cascade cleanup.
         ("src/db.rs", 3),
@@ -189,6 +213,17 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
             let parent = normalized(&fs::read_to_string(root.join("v1_import.rs")).unwrap());
             assert_eq!(parent.matches("mod tests;").count(), 1);
             assert_eq!(parent.matches("#[cfg(test)] mod tests;").count(), 1);
+        }
+        if relative == Path::new("src/v1_import/tests/member_context.rs") {
+            let ancestor = normalized(&fs::read_to_string(root.join("v1_import.rs")).unwrap());
+            assert_eq!(ancestor.matches("mod tests;").count(), 1);
+            assert_eq!(ancestor.matches("#[cfg(test)] mod tests;").count(), 1);
+            let parent = normalized(&fs::read_to_string(root.join("v1_import/tests.rs")).unwrap());
+            assert_eq!(parent.matches("mod member_context;").count(), 1);
+        }
+        if relative == Path::new("src/v1_import/tests/app_state.rs") {
+            let parent = normalized(&fs::read_to_string(root.join("v1_import/tests.rs")).unwrap());
+            assert_eq!(parent.matches(&normalized("#[cfg(feature = \"v2-kernel-probe\")] #[path = \"tests/app_state.rs\"] mod app_state;")).count(), 1);
         }
         let normalized_source = without_query_sql_test_fixture_writes(relative, &source);
         let matches = mutation.find_iter(&normalized_source).collect::<Vec<_>>();
@@ -217,5 +252,41 @@ fn policy_projection_writes_are_confined_to_the_projector_and_explicit_exception
     assert!(
         violations.is_empty(),
         "policy projection writes bypass the policy projector: {violations:#?}"
+    );
+}
+
+/// Birth certification is a runtime authority: only these two helpers may
+/// create or consume markers. Checking function bodies keeps this narrower
+/// than allowing all writes in authorization_grant.rs.
+#[test]
+fn authorization_birth_writes_use_certification_funnel() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mutation = Regex::new(r#"(?i)\b(?:insert(?:\s+or\s+\w+)?\s+into|replace\s+into|delete\s+from|update)\s+[\"`\[]?authorization_subject_births\b"#).unwrap();
+    let helper =
+        Regex::new(r"(?s)pub\(crate\) async fn (certify_birth_on|finish_birth_on)\(.*?\n}")
+            .unwrap();
+    let mut sources = Vec::new();
+    rust_sources(&root.join("src"), &mut sources);
+    let mut allowed = 0;
+    for path in sources {
+        let source = fs::read_to_string(&path).unwrap();
+        let source = if path == root.join("src/authorization_grant.rs") {
+            for body in helper.find_iter(&source) {
+                assert_eq!(mutation.find_iter(body.as_str()).count(), 1);
+                allowed += 1;
+            }
+            helper.replace_all(&source, "").into_owned()
+        } else {
+            source
+        };
+        assert!(
+            !mutation.is_match(&source),
+            "birth marker writer outside certification helpers: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        allowed, 2,
+        "both certification helpers remain the only writers"
     );
 }

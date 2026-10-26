@@ -1,6 +1,6 @@
 {
   "format": "native.backend-contract-classifications.v1",
-  "revision": 21,
+  "revision": 23,
   "profiles": [
     {
       "id": "sqlite-local",
@@ -412,6 +412,19 @@
       }
     },
     {
+      "id": "read_hcp_audit",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "F|sqlite-reference-ci:read_hcp_audit",
+        "postgres-server": "N",
+        "turso-local": "N",
+        "turso-remote": "N",
+        "turso-embedded-sync": "N",
+        "libsql-embedded-replica": "U"
+      }
+    },
+    {
       "id": "whats_changed",
       "kind": "tool",
       "surface": "primary",
@@ -619,6 +632,20 @@
         "turso-embedded-sync": "N",
         "libsql-embedded-replica": "U"
       }
+    },
+    {
+      "id": "manage_named_views",
+      "kind": "tool",
+      "surface": "primary",
+      "profiles": {
+        "sqlite-local": "U",
+        "postgres-server": "U",
+        "turso-local": "U",
+        "turso-remote": "U",
+        "turso-embedded-sync": "U",
+        "libsql-embedded-replica": "U"
+      },
+      "notes": "Default-off hosted KernelV2 operation source, qualified by the named-view v2 probe tests. Ordinary storage-profile handlers and lens/member serving refuse it; reader event-fold compatibility does not grant serving or activation authority."
     },
     {
       "id": "instantiate_artifact",

@@ -9,7 +9,9 @@
 //! [`Refusal`] discriminant, and this module emits no log records.
 
 use base64::Engine as _;
+use chacha20poly1305::aead::{Aead, Payload};
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use sha2::Sha256;
 use uuid::Uuid;
 
@@ -21,6 +23,11 @@ type HmacSha256 = Hmac<Sha256>;
 pub const CAP_VERSION: u8 = 0x01;
 /// Preview payloads additionally bind a server-held, single-use consent receipt.
 pub const PREVIEW_CAP_VERSION: u8 = 0x02;
+/// Opaque frozen artifact delivery; grants no install or preview authority.
+/// The former readable 0x03 format is deliberately no longer admitted.
+pub const ARTIFACT_CAP_VERSION: u8 = 0x04;
+/// Ordinary HTML only needs a short delivery lease, not an app session lease.
+pub const ARTIFACT_LIFETIME_SECONDS: u64 = 300;
 /// Supported clock skew in either direction (seconds).
 pub const SKEW_SECONDS: u64 = 60;
 /// `exp = iat + 3540`: one hour minus the 60 s skew reserve.
@@ -102,6 +109,7 @@ pub struct VerifiedFields {
     /// Some always selects preview admission; it must never fall back to an
     /// installed-app check when the receipt is missing, expired or consumed.
     pub preview_receipt: Option<String>,
+    pub artifact_render: bool,
 }
 
 /// Why issuance failed. `TooLong` is distinct so a later slice can fall
@@ -227,6 +235,93 @@ fn compute_tag(secret: &[u8], artifact_origin: &str, hex: &str, payload: &[u8]) 
     mac.finalize().into_bytes().into()
 }
 
+fn artifact_cipher(secret: &[u8]) -> chacha20poly1305::ChaCha20Poly1305 {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(b"native.artifact-render-cap.aead.v1");
+    let key = mac.finalize().into_bytes();
+    <chacha20poly1305::ChaCha20Poly1305 as chacha20poly1305::KeyInit>::new_from_slice(&key)
+        .expect("HMAC-SHA256 produces a 256-bit key")
+}
+
+fn artifact_header_len(payload: &[u8]) -> Option<usize> {
+    let len = usize::from(*payload.get(1)?);
+    let end = 2 + len;
+    let kid = std::str::from_utf8(payload.get(2..end)?).ok()?;
+    is_safe_id(kid, MAX_KID_BYTES).then_some(end)
+}
+
+/// Leave only the format and deployment key id readable. A fresh nonce makes
+/// the rest an opaque handle without process-local state or restart affinity.
+fn seal_artifact_payload(secret: &[u8], payload: &[u8]) -> Result<Vec<u8>, IssueError> {
+    let end = artifact_header_len(payload).ok_or(IssueError::InvalidField("kid"))?;
+    let mut nonce = [0_u8; 12];
+    rand::rng().fill_bytes(&mut nonce);
+    let nonce_value: chacha20poly1305::Nonce = nonce.into();
+    let ciphertext = artifact_cipher(secret)
+        .encrypt(
+            &nonce_value,
+            Payload {
+                msg: &payload[end..],
+                aad: &payload[..end],
+            },
+        )
+        .map_err(|_| IssueError::InvalidField("artifact_payload"))?;
+    let mut sealed = payload[..end].to_vec();
+    sealed.extend_from_slice(&nonce);
+    sealed.extend_from_slice(&ciphertext);
+    Ok(sealed)
+}
+
+fn open_artifact_payload(
+    key_ring: &DeploymentKeyring,
+    artifact_origin: &str,
+    hex: &str,
+    payload: &[u8],
+    tag: &[u8],
+) -> Result<Vec<u8>, Refusal> {
+    let end = artifact_header_len(payload).ok_or(Refusal::Malformed)?;
+    let kid = std::str::from_utf8(&payload[2..end]).map_err(|_| Refusal::Malformed)?;
+    let secret = key_ring.secret(kid).ok_or(Refusal::UnknownKey)?;
+    // Authenticate the original envelope and its origin/source binding before
+    // decryption. The common parser below checks the same original bytes too.
+    verify_tag(secret.as_slice(), artifact_origin, hex, payload, tag)?;
+    let nonce = payload.get(end..end + 12).ok_or(Refusal::Malformed)?;
+    let ciphertext = payload.get(end + 12..).ok_or(Refusal::Malformed)?;
+    let nonce_value: chacha20poly1305::Nonce = <[u8; 12]>::try_from(nonce)
+        .map_err(|_| Refusal::Malformed)?
+        .into();
+    let clear = artifact_cipher(secret.as_slice())
+        .decrypt(
+            &nonce_value,
+            Payload {
+                msg: ciphertext,
+                aad: &payload[..end],
+            },
+        )
+        .map_err(|_| Refusal::BadTag)?;
+    let mut opened = payload[..end].to_vec();
+    opened.extend_from_slice(&clear);
+    Ok(opened)
+}
+
+fn verify_tag(
+    secret: &[u8],
+    artifact_origin: &str,
+    hex: &str,
+    payload: &[u8],
+    tag: &[u8],
+) -> Result<(), Refusal> {
+    let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| Refusal::Malformed)?;
+    mac.update(TAG_DOMAIN.as_bytes());
+    mac.update(&[0]);
+    mac.update(artifact_origin.as_bytes());
+    mac.update(&[0]);
+    mac.update(hex.as_bytes());
+    mac.update(&[0]);
+    mac.update(payload);
+    mac.verify_slice(tag).map_err(|_| Refusal::BadTag)
+}
+
 /// Mint a cap for `hex` under the keyring's active key, with `iat = now`
 /// and `exp = iat + 3540` (checked). No text field may be empty;
 /// `parent_origin` must already be an exact canonical origin. Fails without
@@ -242,7 +337,31 @@ pub fn issue(
     let expires = now
         .checked_add(LIFETIME_SECONDS)
         .ok_or(IssueError::TimeOverflow)?;
-    issue_cap(key_ring, artifact_origin, hex, fields, now, expires, None)
+    issue_cap(
+        key_ring,
+        artifact_origin,
+        hex,
+        fields,
+        now,
+        expires,
+        None,
+        false,
+    )
+}
+
+/// Issue ordinary frozen artifact delivery, in a distinct signed domain byte.
+/// `install_event` carries the artifact id, not a consent generation.
+pub fn issue_artifact(
+    key_ring: &DeploymentKeyring,
+    artifact_origin: &str,
+    hex: &str,
+    fields: &IssueFields,
+    now: u64,
+) -> Result<String, IssueError> {
+    let exp = now
+        .checked_add(ARTIFACT_LIFETIME_SECONDS)
+        .ok_or(IssueError::TimeOverflow)?;
+    issue_cap(key_ring, artifact_origin, hex, fields, now, exp, None, true)
 }
 
 /// Issue a preview URL with the receipt's exact expiry. Delivery must also
@@ -268,6 +387,7 @@ pub fn issue_preview(
         now,
         expires,
         Some(receipt),
+        false,
     )
 }
 
@@ -280,6 +400,7 @@ fn issue_cap(
     now: u64,
     exp: u64,
     preview_receipt: Option<&str>,
+    artifact_render: bool,
 ) -> Result<String, IssueError> {
     if artifact_origin.is_empty() {
         return Err(IssueError::InvalidField("artifact_origin"));
@@ -313,12 +434,19 @@ fn issue_cap(
     {
         return Err(IssueError::InvalidField("parent_origin"));
     }
-    if exp <= now || exp - now > MAX_LIFETIME_SECONDS {
+    let lifetime = if artifact_render {
+        ARTIFACT_LIFETIME_SECONDS
+    } else {
+        MAX_LIFETIME_SECONDS
+    };
+    if exp <= now || exp - now > lifetime {
         return Err(IssueError::InvalidField("expiry"));
     }
 
     let mut payload = Vec::with_capacity(128);
-    payload.push(if preview_receipt.is_some() {
+    payload.push(if artifact_render {
+        ARTIFACT_CAP_VERSION
+    } else if preview_receipt.is_some() {
         PREVIEW_CAP_VERSION
     } else {
         CAP_VERSION
@@ -340,6 +468,11 @@ fn issue_cap(
     let secret = key_ring
         .active_secret()
         .ok_or(IssueError::InvalidField("kid"))?;
+    let payload = if artifact_render {
+        seal_artifact_payload(secret.as_slice(), &payload)?
+    } else {
+        payload
+    };
     let tag = compute_tag(secret.as_slice(), artifact_origin, hex, &payload);
     let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let cap = format!("{}.{}", engine.encode(&payload), engine.encode(tag));
@@ -379,16 +512,24 @@ pub fn verify(
     if payload_b64.is_empty() || tag_b64.is_empty() || tag_b64.contains('.') {
         return Err(Refusal::Malformed);
     }
-    let payload = decode_canonical(payload_b64).ok_or(Refusal::Malformed)?;
+    let wire_payload = decode_canonical(payload_b64).ok_or(Refusal::Malformed)?;
     let tag = decode_canonical(tag_b64).ok_or(Refusal::Malformed)?;
     if tag.len() != TAG_BYTES {
         return Err(Refusal::Malformed);
     }
-    if payload.len() > MAX_PAYLOAD_BYTES {
+    if wire_payload.len() > MAX_PAYLOAD_BYTES {
         return Err(Refusal::Malformed);
     }
+    let payload = if wire_payload.first() == Some(&ARTIFACT_CAP_VERSION) {
+        open_artifact_payload(key_ring, artifact_origin, hex, &wire_payload, &tag)?
+    } else {
+        wire_payload.clone()
+    };
     let (version, mut rest) = payload.split_first().ok_or(Refusal::Malformed)?;
-    if !matches!(*version, CAP_VERSION | PREVIEW_CAP_VERSION) {
+    if !matches!(
+        *version,
+        CAP_VERSION | PREVIEW_CAP_VERSION | ARTIFACT_CAP_VERSION
+    ) {
         return Err(Refusal::Malformed);
     }
     let mut raw: [&[u8]; 11] = [&[]; 11];
@@ -451,15 +592,7 @@ pub fn verify(
     };
 
     let secret = key_ring.secret(kid).ok_or(Refusal::UnknownKey)?;
-    let mut mac = HmacSha256::new_from_slice(secret.as_slice()).map_err(|_| Refusal::Malformed)?;
-    mac.update(TAG_DOMAIN.as_bytes());
-    mac.update(&[0]);
-    mac.update(artifact_origin.as_bytes());
-    mac.update(&[0]);
-    mac.update(hex.as_bytes());
-    mac.update(&[0]);
-    mac.update(&payload);
-    mac.verify_slice(&tag).map_err(|_| Refusal::BadTag)?;
+    verify_tag(secret.as_slice(), artifact_origin, hex, &wire_payload, &tag)?;
 
     // Expiry, all checked: refuse `expired` unless iat < exp,
     // exp - iat <= 3600 and now < exp; `not_yet_valid` past the skew window.
@@ -468,7 +601,12 @@ pub fn verify(
     if iat >= exp {
         return Err(Refusal::Expired);
     }
-    if exp - iat > MAX_LIFETIME_SECONDS {
+    let lifetime = if *version == ARTIFACT_CAP_VERSION {
+        ARTIFACT_LIFETIME_SECONDS
+    } else {
+        MAX_LIFETIME_SECONDS
+    };
+    if exp - iat > lifetime {
         return Err(Refusal::Expired);
     }
     if now >= exp {
@@ -488,6 +626,7 @@ pub fn verify(
     }
 
     Ok(VerifiedFields {
+        artifact_render: *version == ARTIFACT_CAP_VERSION,
         kid: kid.to_owned(),
         principal: principal.to_owned(),
         database: database.to_owned(),
@@ -542,6 +681,102 @@ mod tests {
             parent_origin: "https://app.example".into(),
             adapter_revision: crate::html::ADAPTER_REVISION,
         }
+    }
+
+    #[test]
+    fn ordinary_artifact_cap_is_distinct_from_install_and_preview_authority() {
+        let ring = test_keyring();
+        let fields = test_fields();
+        let hex = "a".repeat(64);
+        let cap = issue_artifact(&ring, "https://artifact.example", &hex, &fields, 1000).unwrap();
+        let verified = verify(&ring, "https://artifact.example", &hex, &cap, 1000).unwrap();
+        assert!(verified.artifact_render);
+        assert!(verified.preview_receipt.is_none());
+        let installed = issue(&ring, "https://artifact.example", &hex, &fields, 1000).unwrap();
+        assert!(
+            !verify(&ring, "https://artifact.example", &hex, &installed, 1000)
+                .unwrap()
+                .artifact_render
+        );
+        let (payload, tag) = cap.split_once('.').unwrap();
+        let mut bytes = b64url().decode(payload).unwrap();
+        bytes[0] = CAP_VERSION;
+        let forged = format!("{}.{}", b64url().encode(bytes), tag);
+        assert!(verify(&ring, "https://artifact.example", &hex, &forged, 1000).is_err());
+    }
+
+    #[test]
+    fn ordinary_artifact_cap_hides_caller_context_and_survives_keyring_reload() {
+        let ring = test_keyring();
+        let mut fields = test_fields();
+        fields.principal = "principal-opaque-context-0123456789abcdef".into();
+        fields.database = "database-opaque-context-0123456789abcdef".into();
+        let cap = issue_artifact(&ring, ORIGIN, HEX, &fields, IAT0).unwrap();
+        let (payload, _) = cap.split_once('.').unwrap();
+        let wire = b64url().decode(payload).unwrap();
+        assert_eq!(wire[0], ARTIFACT_CAP_VERSION);
+        for value in [&fields.principal, &fields.database, &fields.session] {
+            assert!(!wire
+                .windows(value.len())
+                .any(|part| part == value.as_bytes()));
+        }
+        assert_ne!(
+            cap,
+            issue_artifact(&ring, ORIGIN, HEX, &fields, IAT0).unwrap()
+        );
+        // A freshly constructed verifier needs only the durable deployment key,
+        // never a process-local lookup table or readable caller identifiers.
+        let verified = verify(&test_keyring(), ORIGIN, HEX, &cap, IAT0 + 299).unwrap();
+        assert_eq!(verified.principal, fields.principal);
+        assert_eq!(verified.database, fields.database);
+        assert_eq!(verified.session, fields.session);
+        assert_eq!(verified.exp - verified.iat, ARTIFACT_LIFETIME_SECONDS);
+        assert_eq!(
+            verify(&ring, ORIGIN, HEX, &cap, IAT0 + 300),
+            Err(Refusal::Expired)
+        );
+        assert_eq!(
+            verify(&ring, "https://another.example", HEX, &cap, IAT0),
+            Err(Refusal::BadTag)
+        );
+        assert_eq!(
+            verify(&ring, ORIGIN, &"a".repeat(64), &cap, IAT0),
+            Err(Refusal::BadTag)
+        );
+    }
+
+    #[test]
+    fn ordinary_artifact_cap_refuses_readable_legacy_and_damaged_ciphertext() {
+        let ring = test_keyring();
+        let cap = issue_artifact(&ring, ORIGIN, HEX, &test_fields(), IAT0).unwrap();
+        let (payload, tag) = cap.split_once('.').unwrap();
+        let mut wire = b64url().decode(payload).unwrap();
+        let tag = b64url().decode(tag).unwrap();
+        let mut old = open_artifact_payload(&ring, ORIGIN, HEX, &wire, &tag).unwrap();
+        old[0] = 0x03;
+        assert_eq!(
+            verify(
+                &ring,
+                ORIGIN,
+                HEX,
+                &sign_raw(&ring, ORIGIN, HEX, &old),
+                IAT0
+            ),
+            Err(Refusal::Malformed)
+        );
+        // Even a correctly framed outer MAC cannot turn malformed encrypted
+        // bytes into a caller context. No claims are returned on either error.
+        *wire.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            verify(
+                &ring,
+                ORIGIN,
+                HEX,
+                &sign_raw(&ring, ORIGIN, HEX, &wire),
+                IAT0
+            ),
+            Err(Refusal::BadTag)
+        );
     }
 
     fn b64url() -> base64::engine::GeneralPurpose {
@@ -616,6 +851,61 @@ mod tests {
             b"evt-1".as_slice(),
             b"https://app.example".as_slice(),
         ]
+    }
+
+    #[test]
+    fn preview_urls_match_the_shell_contract_vectors() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/preview-urls.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let field = |name: &str| case["fields"][name].as_str().unwrap().to_owned();
+            let fields = IssueFields {
+                principal: field("principal"),
+                database: field("database"),
+                session: field("session"),
+                package: field("package"),
+                install_event: field("install_event"),
+                parent_origin: field("parent_origin"),
+                adapter_revision: crate::html::ADAPTER_REVISION,
+            };
+            let kid = case["kid"].as_str().unwrap();
+            let ring = DeploymentKeyring::from_json_bundle(&json!({"active_key_id":kid,
+                "keys":[{"id":kid,"key":base64::engine::general_purpose::STANDARD.encode([7u8;32])}]}).to_string()).unwrap();
+            let origin = case["origin"].as_str().unwrap();
+            let digest = case["digest"].as_str().unwrap();
+            let receipt = case["receipt"].as_str().unwrap();
+            let now = case["issued"].as_u64().unwrap();
+            let cap = issue_preview(
+                &ring,
+                origin,
+                digest,
+                &fields,
+                receipt,
+                now,
+                case["expires"].as_u64().unwrap(),
+            )
+            .unwrap();
+            let url = format!("{origin}{ROUTE_PATH}{digest}/{cap}");
+            assert_eq!(url, case["url"].as_str().unwrap(), "{}", case["label"]);
+            assert_eq!(
+                verify(&ring, origin, digest, &cap, now)
+                    .unwrap()
+                    .preview_receipt
+                    .as_deref(),
+                Some(receipt)
+            );
+            assert_eq!(
+                b64url()
+                    .decode(cap.split_once('.').unwrap().0)
+                    .unwrap()
+                    .len(),
+                case["payload_bytes"].as_u64().unwrap() as usize
+            );
+        }
+        assert_eq!(
+            cases.as_array().unwrap().last().unwrap()["payload_bytes"],
+            MAX_PAYLOAD_BYTES
+        );
     }
 
     #[test]
@@ -837,9 +1127,9 @@ mod tests {
     #[test]
     fn parse_rules_fire_with_valid_tags() {
         let ring = test_keyring();
-        // Bad version.
+        // Unknown purpose version.
         let mut payload = payload_with_times(IAT0, IAT0 + 3540);
-        payload[0] = 0x02;
+        payload[0] = 0x7f;
         assert_eq!(
             verify(
                 &ring,

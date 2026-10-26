@@ -41,6 +41,7 @@ impl BodyEventRef {
                     | "record.updated"
                     | "receipt.committed.v1"
                     | "unit.revision.recorded.v1"
+                    | "message.revision.recorded.v1"
             )
         {
             return Err(refuse("invalid_history_reference"));
@@ -155,7 +156,7 @@ pub(crate) async fn strict_history_on(
     };
     let row = sqlx::query("WITH candidate AS (
         SELECT id,seq,type,payload FROM content_events WHERE record_id=? AND seq<=?
-        AND type IN ('record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1')
+        AND type IN ('record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1','message.revision.recorded.v1')
         AND CASE WHEN json_valid(payload) THEN
             CASE WHEN json_type(payload)='object' THEN
                 type IN ('record.created','unit.revision.recorded.v1') OR json_type(payload,'$.body') IS NOT NULL

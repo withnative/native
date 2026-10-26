@@ -68,6 +68,8 @@ pub(crate) struct Entry {
     pub decode: fn(&Value) -> Result<Decoded>,
     pub fold: fn(&FoldInput<'_>, Option<&StoredState>) -> Result<Folded>,
     pub state_codec: fn(&StoredState) -> Result<Value>,
+    /// Derived read data from this exact interpreter view; never authority.
+    pub link_read: Option<fn(Value) -> Result<super::provider_link_reads::LinkView>>,
 }
 const ENTRIES: &[Entry] = &[
     crate::v2_standard::claims_retained::V1,

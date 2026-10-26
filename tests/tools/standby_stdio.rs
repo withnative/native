@@ -25,6 +25,46 @@ const FIXTURE_ID: &str = "70110000-0000-4000-8000-000000000001";
 const WRITABLE_ID: &str = "70110000-0000-4000-8000-000000000002";
 const HOSTED_ROUTE_ID: &str = "standby-process-route";
 
+fn mcp_stdio_binary() -> &'static str {
+    // `cargo check --all-targets` does not inject executable paths; tests do.
+    #[allow(clippy::option_env_unwrap)]
+    option_env!("CARGO_BIN_EXE_mcp-stdio")
+        .expect("the mcp-stdio binary path must be supplied when this test runs")
+}
+
+// This exercises the production library, where cfg(test) is absent. Engine
+// recognition must protect the v1 journal even without the v2 serving feature.
+#[test]
+fn standby_transport_recognizes_v2_head_without_enabling_serving() {
+    let value = json!({
+        "contract": "native.standby-authority-act-head-response.v1",
+        "version": 1,
+        "route_database_id": HOSTED_ROUTE_ID,
+        "head": {
+            "contract": "native.standby-kernel-v2-head.v1",
+            "origin_database_id": "ndb_70110000000040008000000000000001",
+            "generation": {
+                "application_id": native_ce::db::V2_APPLICATION_ID,
+                "genesis_event_id": FIXTURE_ID,
+                "content_event_seq": 1,
+                "meta_event_seq": 0,
+                "head_act": 1,
+                "schema_sha256": "a".repeat(64),
+                "projection_tables": ["kernel_roots"],
+                "blob_count": 0
+            }
+        }
+    });
+    let head: native_ce::standby::delta_transport::AuthorityActHeadResponseV1 =
+        serde_json::from_value(value.clone()).expect("production transport recognizes v2");
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    assert_eq!(
+        head.refresh_pause_reason(),
+        Some("engine v2 requires v2-kernel-probe build")
+    );
+    assert_eq!(serde_json::to_value(head).unwrap(), value);
+}
+
 // Standby rehearsal hosts. Fixture generations must carry the real runner
 // platform: the serving binary validates the accepted generation against its
 // own observed identity, so a hardcoded linux-x86_64 generation cannot boot
@@ -462,7 +502,7 @@ fn run_mcp_with_env(
         .as_ref()
         .map(|(command, _)| command.clone())
         .or_else(|| std::env::var_os("NATIVE_STANDBY_TEST_BINARY").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let mut command = Command::new(binary);
     command
         .env_clear()
@@ -815,7 +855,7 @@ async fn snapshot_fixture(
 ) {
     let executable = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let artifact_sha256 = sha256_path(&executable);
     let consumer = StandbyConsumerIdentity {
         contract: STANDBY_CONSUMER_CONTRACT.into(),
@@ -860,6 +900,7 @@ async fn snapshot_fixture(
         consumer,
         frontier,
         head_act: Some(head_act),
+        kernel_v2: None,
         materialization: StandbyGenerationMaterialization::Snapshot,
         snapshot: StandbySnapshotBytes {
             media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
@@ -1128,7 +1169,7 @@ async fn standby_process_refreshes_in_background_for_the_next_activation() {
         .as_ref()
         .map(|(command, _)| command.clone())
         .or_else(|| std::env::var_os("NATIVE_STANDBY_TEST_BINARY").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     assert_binary_platform_matches_runner(&binary);
     let mut command = Command::new(binary);
     command
@@ -1328,7 +1369,7 @@ fn standby_one_shot_refresh_rejects_invalid_cause_selectors_without_side_effects
     let refresh_config = directory.path().join("refresh.json");
     let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
 
     let rejected: &[&[&str]] = &[
         // `manual` is reachable only through the legacy two-positional form.
@@ -1428,7 +1469,7 @@ fn standby_one_shot_refresh_enqueues_selected_automatic_cause_under_daemon_lock(
 
     let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     for cause in ["after_admitted_write", "wake"] {
         for expected in ["accepted", "coalesced"] {
             let output = Command::new(&binary)
@@ -2004,7 +2045,7 @@ impl ConnectedMcp {
     fn start(config: &Path, surface: &str) -> Self {
         let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+            .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
         assert_binary_platform_matches_runner(&binary);
         let child = Command::new(binary)
             .env_clear()
@@ -2507,7 +2548,7 @@ async fn configured_owner_relay_keeps_one_stdio_connection_across_external_gener
     write_runtime_config(&config, &replica_root, &origin);
     let consumer = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let (relay, socket) = RelayFixture::start(&root, &consumer, &config, &account);
     assert_eq!(
         std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
@@ -2692,7 +2733,7 @@ async fn node_serve_emits_bounded_startup_phase_timings() {
     .unwrap();
     let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let mut node = NodeProcess(
@@ -2815,7 +2856,7 @@ async fn node_serve_creates_default_vault_and_prints_notice() {
     );
     let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let mut node = NodeProcess(
@@ -2928,7 +2969,7 @@ async fn node_serve_disables_vault_for_unsafe_default_and_warns() {
     );
     let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_mcp-stdio")));
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
     let stderr = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
     let mut node = NodeProcess(
@@ -2979,4 +3020,247 @@ async fn node_serve_disables_vault_for_unsafe_default_and_warns() {
         "diagnostics must stay off stdout"
     );
     assert!(!logs.contains("node-vault-guard-test-token"));
+}
+
+/// Native-host delivery gate. The external executable can be the exact packed
+/// artifact installed by the rehearsal, not a cargo-test replacement binary.
+#[cfg(all(unix, feature = "v2-kernel-probe", feature = "mcp-executor-prototype"))]
+#[tokio::test]
+async fn standby_process_v2_vault_delivery_restart_and_unavailable() {
+    if !supported_standby_host() || !lowercase_hex(native_ce::FULL_GIT_SHA, 40) {
+        return;
+    }
+    use native_ce::{
+        kernel as k,
+        standby_snapshot::{HostedStandbyManifestContext, ProducerBuildIdentity},
+    };
+    struct Node(std::process::Child);
+    impl Drop for Node {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn state(vault: &Path) -> Value {
+        std::fs::read(vault.join(".native/state.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null)
+    }
+    fn status(vault: &Path) -> String {
+        std::fs::read_to_string(vault.join(".native/STATUS.md")).unwrap_or_default()
+    }
+    fn has_body(root: &Path) -> bool {
+        std::fs::read_dir(root).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".native" {
+                return false;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                has_body(&entry.path())
+            } else {
+                std::fs::read_to_string(entry.path())
+                    .unwrap()
+                    .contains("Packaged v2 vault delivery text")
+            }
+        })
+    }
+    async fn wait(node: &mut Node, condition: impl Fn() -> bool, stderr: &Path) {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                assert!(
+                    node.0.try_wait().unwrap().is_none(),
+                    "disposable node exited: {}",
+                    std::fs::read_to_string(stderr).unwrap()
+                );
+                if condition() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("installed v2 artifact must publish its authorized vault");
+    }
+    let directory = tempfile::tempdir().unwrap();
+    // macOS /var aliases /private/var: the credential/vault walkers require
+    // physical absolute paths, not paths through symlink components.
+    let root = std::fs::canonicalize(directory.path()).unwrap();
+    let binary = std::env::var_os("NATIVE_STANDBY_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(mcp_stdio_binary()));
+    assert_binary_platform_matches_runner(&binary);
+    let identity: Value = serde_json::from_slice(
+        &Command::new(&binary)
+            .arg("--standby-identity")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(identity["source_sha"], native_ce::FULL_GIT_SHA);
+    let artifact_sha256 = sha256_path(&binary);
+    let consumer = StandbyConsumerIdentity {
+        contract: STANDBY_CONSUMER_CONTRACT.into(),
+        version: 1,
+        platform: standby_test_platform(),
+        source_sha: native_ce::FULL_GIT_SHA.into(),
+        artifact_sha256: artifact_sha256.clone(),
+        engine_schema_version: native_ce::CURRENT_ENGINE_SCHEMA_VERSION,
+        ddl_sha256: native_ce::schema::FROZEN_DDL_SHA256.into(),
+    };
+    let observed = ObservedInstalledConsumerIdentity {
+        platform: consumer.platform,
+        source_sha: consumer.source_sha.clone(),
+        artifact_sha256,
+        engine_schema_version: consumer.engine_schema_version,
+        ddl_sha256: consumer.ddl_sha256.clone(),
+    };
+    let (db, owner) = k::create_v2_database(
+        root.join("source-v2.db").to_str().unwrap(),
+        "account",
+        "Delivery owner",
+        "acct:delivery",
+    )
+    .await
+    .unwrap();
+    let record = k::create_record_as(&db, &owner, native_ce::events::KERNEL_ROOT_ID)
+        .await
+        .unwrap();
+    let revision = k::read_record_as(&db, &owner, &record)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    k::set_body_as(
+        &db,
+        &owner,
+        &record,
+        "Packaged v2 vault delivery text",
+        revision,
+    )
+    .await
+    .unwrap();
+    let head =
+        native_ce::standby::delta_transport::observe_authority_act_head(&db, HOSTED_ROUTE_ID)
+            .await
+            .unwrap();
+    let origin = serde_json::to_value(head).unwrap()["head"]["origin_database_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let replica = root.join("replica");
+    let store = GenerationStore::open(&replica, HOSTED_ROUTE_ID, Some(origin.clone())).unwrap();
+    let context = HostedStandbyManifestContext::new_with_producer(
+        HOSTED_ROUTE_ID.into(),
+        consumer,
+        ProducerBuildIdentity::new(
+            native_ce::FULL_GIT_SHA.into(),
+            native_ce::schema::FROZEN_DDL_SHA256.into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let snapshot = store.staging_dir().join("v2-package.db");
+    let destination = snapshot.clone();
+    let coordinator = native_ce::export::ExportCoordinator::new();
+    let source = db.clone();
+    let page = coordinator
+        .tool_page("fixture-owner".into(), None, 0, 1, move || async move {
+            let export = native_ce::export::export_connected_db(&source, None).await?;
+            std::fs::copy(export.path(), destination)?;
+            Ok(export.with_hosted_standby_context(context))
+        })
+        .await
+        .unwrap();
+    let manifest = store.staging_dir().join("v2-package.json");
+    std::fs::write(&manifest, page.manifest.unwrap().canonical_json().unwrap()).unwrap();
+    let generation = store
+        .install_staged(&snapshot, &manifest, &observed)
+        .await
+        .unwrap();
+    coordinator.drain().await;
+    let before = sha256_path(&generation.snapshot_path);
+    let standby_config = root.join("standby.json");
+    write_runtime_config(&standby_config, &replica, &origin);
+    let credential = root.join("token");
+    create_private_empty_file(&credential);
+    std::fs::write(&credential, "disposable-v2-delivery-token").unwrap();
+    let offline = TcpListener::bind("127.0.0.1:0").unwrap();
+    let offline_address = offline.local_addr().unwrap();
+    // The listener stays reserved; no HTTP endpoint or production service is used.
+    let node_config = root.join("node.json");
+    let vault = root.join("vault");
+    let config = json!({"hosted_base_url":format!("http://{offline_address}"),"home_id":"disposable-v2-delivery",
+        "db_id":HOSTED_ROUTE_ID,"credential_file":credential,"socket_directory":root.join("socket"),
+        "standby_config":standby_config,"account_id":"acct:delivery","markdown_folder":vault});
+    std::fs::write(&node_config, serde_json::to_vec(&config).unwrap()).unwrap();
+    let spawn = |phase: &str| {
+        let stderr = root.join(format!("{phase}.stderr"));
+        let stdout = root.join(format!("{phase}.stdout"));
+        let node = Node(
+            Command::new(&binary)
+                .env_clear()
+                .env("NATIVE_CE_MCP_SURFACE", "executor")
+                .args(["node", "serve", "--config"])
+                .arg(&node_config)
+                .stdin(Stdio::null())
+                .stdout(std::fs::File::create(stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        (node, stderr)
+    };
+    let (mut node, stderr) = spawn("first");
+    wait(
+        &mut node,
+        || state(&vault)["successful_generation"] == generation.id,
+        &stderr,
+    )
+    .await;
+    assert_eq!(state(&vault)["account"], "acct:delivery");
+    assert_eq!(state(&vault)["origin"], origin);
+    assert!(has_body(&vault));
+    let first = state(&vault);
+    drop(node);
+    let (mut node, stderr) = spawn("restart");
+    wait(
+        &mut node,
+        || {
+            state(&vault)["rendered_at"] != first["rendered_at"]
+                && status(&vault).contains("authorized copy available")
+        },
+        &stderr,
+    )
+    .await;
+    assert_eq!(state(&vault)["successful_generation"], generation.id);
+    assert_eq!(
+        sha256_path(&generation.snapshot_path),
+        before,
+        "vault source stays physically read-only"
+    );
+    drop(node);
+    assert!(has_body(&vault));
+    let successful = state(&vault);
+    let empty = root.join("empty-replica");
+    GenerationStore::open(&empty, HOSTED_ROUTE_ID, Some(origin.clone())).unwrap();
+    write_runtime_config(&standby_config, &empty, &origin);
+    let (mut node, stderr) = spawn("unavailable");
+    wait(
+        &mut node,
+        || status(&vault).contains("Availability: unavailable"),
+        &stderr,
+    )
+    .await;
+    let unavailable = state(&vault);
+    for field in ["successful_generation", "successful_act", "rendered_at"] {
+        assert_eq!(
+            unavailable[field], successful[field],
+            "unavailable startup cannot mint a successful vault cycle"
+        );
+    }
+    drop(node);
+    drop(offline);
+    db.close().await;
 }

@@ -17,6 +17,9 @@ use crate::error::{Error, Result};
 use crate::events::{LinkAddedPayload, LinkRemovedPayload, MessageSharedPayload};
 use crate::store::{append_in, AppendSpec};
 
+#[path = "messaging_inbox_identity.rs"]
+mod inbox_identity;
+
 use super::super::registry::{Caller, ToolRegistry};
 use super::super::ToolKind;
 use super::{
@@ -130,6 +133,23 @@ enum ManageMessagesArgs {
         idempotency_key: String,
         reason: String,
     },
+    /// Author-only replacement of one Message's text; earlier text stays in
+    /// stored history. `mentions`, when given, re-spans mentions of people the
+    /// Message already mentions; it cannot add a new mention target.
+    Edit {
+        message_id: String,
+        body: String,
+        #[serde(default)]
+        mentions: Option<Vec<crate::awareness::MentionInput>>,
+        idempotency_key: String,
+        reason: String,
+    },
+    /// Author-only tombstone of one Message; the body stays in stored history.
+    Delete {
+        message_id: String,
+        idempotency_key: String,
+        reason: String,
+    },
     ListMessageState {
         message_ids: Vec<String>,
     },
@@ -186,6 +206,15 @@ enum ManageMessagesArgs {
         snapshot: Option<String>,
         #[serde(default)]
         after: Option<usize>,
+        /// `"direct"` narrows the inbox to the viewer's own direct contexts
+        /// before visibility and hydration (see `direct_scope_candidates`).
+        #[serde(default)]
+        scope: Option<String>,
+        /// Truncate each `body` to this many characters (`body_truncated`
+        /// says whether it was cut). Default 360 with `scope:"direct"`;
+        /// otherwise the full body, as before.
+        #[serde(default)]
+        preview_chars: Option<usize>,
     },
     SetDestination {
         collection_id: String,
@@ -205,12 +234,35 @@ enum ManageMessagesArgs {
         limit: usize,
     },
     GetAttention,
+    GetNotificationPreference,
+    SetNotificationPreference {
+        arrival: String,
+        idempotency_key: String,
+        reason: String,
+    },
 }
 
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) fn validate_kernel_arguments(arguments: &Value) -> Result<()> {
     let _: ManageMessagesArgs = parse_args("manage_messages", arguments.clone())?;
     Ok(())
+}
+
+/// Cut an item's `body` to `limit` characters and say whether it was cut.
+/// (`body_preview` semantics: characters, never a split code point.)
+pub(crate) fn apply_preview(item: &mut Value, limit: usize) {
+    let Some(body) = item["body"].as_str() else {
+        item["body_truncated"] = json!(false);
+        return;
+    };
+    match body.char_indices().nth(limit) {
+        Some((cut, _)) => {
+            let clipped = body[..cut].to_owned();
+            item["body"] = json!(clipped);
+            item["body_truncated"] = json!(true);
+        }
+        None => item["body_truncated"] = json!(false),
+    }
 }
 
 fn default_inbox_view() -> String {
@@ -245,6 +297,46 @@ struct InboxSnapshot {
     control_head: i64,
     authorization_revision: i64,
     items: Vec<Value>,
+    /// `Some("direct")` for a scoped inbox; binds the cursor like `view`.
+    #[serde(default)]
+    scope: Option<String>,
+    /// The scoped candidate set hit `DIRECT_SCOPE_CANDIDATE_CAP` and dropped
+    /// the oldest messages.
+    #[serde(default)]
+    truncated: bool,
+}
+
+/// Most direct-scope candidates one snapshot will consider. Newest first, so
+/// truncation drops the oldest; it is always disclosed in the response.
+pub(crate) const DIRECT_SCOPE_CANDIDATE_CAP: usize = 2000;
+pub(crate) const DIRECT_SCOPE_DEFAULT_PREVIEW_CHARS: usize = 360;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override of the candidate cap (tokio tests are single-thread).
+    pub(crate) static DIRECT_SCOPE_CAP_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn direct_scope_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = DIRECT_SCOPE_CAP_OVERRIDE.with(std::cell::Cell::get) {
+        return cap;
+    }
+    DIRECT_SCOPE_CANDIDATE_CAP
+}
+pub(crate) const MAX_PREVIEW_CHARS: usize = 1000;
+
+/// Test seam: runs inside the page read transaction, after authorization and
+/// before hydration, so a test can land a revocation and edit exactly there.
+#[cfg(test)]
+type PageSeam = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static INBOX_PAGE_SEAM: std::cell::RefCell<Option<PageSeam>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn decode_snapshot(db: &Db, raw: &str) -> Result<InboxSnapshot> {
@@ -1573,6 +1665,669 @@ async fn own_no_longer_relevant_marks_in(
     .await?)
 }
 
+/// Delete one of the caller's own Messages: the existing `record.deleted`
+/// tombstone (every listing already filters it, a later reaction is refused by
+/// the projector, and its notification candidates are withdrawn in the same
+/// transaction). The body is not erased; it stays in stored history.
+///
+/// Only the author may delete: the Message's `owner_id` must be the Person
+/// bound to the authenticated caller, on top of the Edit capability the
+/// sibling operations require. A persona-voiced Message has the same owner as
+/// its sender, so its owner may delete it and nobody else can. A repeat with
+/// the same idempotency key replays the first receipt; an already-deleted
+/// Message sent again under a new key is refused by name to its author.
+async fn delete_message(
+    db: &Db,
+    caller: &Caller,
+    message_id: String,
+    idempotency_key: String,
+    reason: String,
+    provenance_arguments: Option<&Value>,
+) -> Result<Value> {
+    const TOOL: &str = "manage_messages.delete";
+    require_nonblank_reason(TOOL, &reason)?;
+    super::keyed_replay::idempotency_key(TOOL, Some(&idempotency_key))?
+        .ok_or_else(|| Error::engine("manage_messages.delete idempotency_key must not be blank"))?;
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    // The lookup is scoped to the caller's own keyed commands, so it runs
+    // before the live-Message gate that the first call's tombstone now fails.
+    if let Some(replay) = super::keyed_replay::keyed_replay_in(
+        &mut tx,
+        caller,
+        "manage_messages",
+        provenance_arguments
+            .ok_or_else(|| Error::engine("manage_messages: keyed delete lost its arguments"))?,
+    )
+    .await?
+    {
+        if !replay
+            .content()
+            .iter()
+            .any(|output| output.event_type == "record.deleted" && output.record_id == message_id)
+        {
+            return Err(Error::engine(
+                "manage_messages.delete retry has no valid durable evidence",
+            ));
+        }
+        let deleted_at = message_deleted_at_in(&mut tx, &message_id).await?;
+        tx.rollback().await?;
+        replay.settle();
+        return echo_act(
+            json!({"status":"deleted","message_id":message_id,"deleted_at":deleted_at}),
+            replay.act(),
+        );
+    }
+    require_author_in(&mut tx, caller, &message_id, AuthorAction::Delete).await?;
+    let deletion = append_in(
+        db,
+        &mut tx,
+        AppendSpec {
+            record_id: message_id.clone(),
+            event_type: "record.deleted".into(),
+            payload: json!({ "reason": reason }),
+            actor: Some(caller.actor().into()),
+        },
+        &mut act_alloc,
+    )
+    .await?;
+    crate::awareness::withdraw_message_candidates_in(
+        &mut tx,
+        &message_id,
+        "record.deleted",
+        &deletion.id,
+        &mut act_alloc,
+    )
+    .await?;
+    db.commit_content(tx).await?;
+    let deleted_at =
+        sqlx::query_scalar::<_, Option<String>>("SELECT deleted_at FROM records WHERE id=?")
+            .bind(&message_id)
+            .fetch_one(db.write_pool())
+            .await?;
+    echo_act(
+        json!({"status":"deleted","message_id":message_id,"deleted_at":deleted_at}),
+        act_alloc.get(),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AuthorAction {
+    Delete,
+    Edit,
+}
+
+impl AuthorAction {
+    fn tool(self) -> &'static str {
+        match self {
+            Self::Delete => "manage_messages.delete",
+            Self::Edit => "manage_messages.edit",
+        }
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Edit => "edit",
+        }
+    }
+}
+
+/// The checks shared by the author-only Message operations, in order: a
+/// deleted Message is named as such to its author (and reads as missing to
+/// anyone else), the Message must be visible, local and Edit-able by the
+/// caller, and the caller must be its author. A Message sent as a persona is
+/// held to the same rule: its owner is its sender.
+async fn require_author_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    message_id: &str,
+    action: AuthorAction,
+) -> Result<()> {
+    let is_author = message_author_is_caller_in(tx, caller, message_id).await?;
+    if is_author == Some(true) && message_deleted_at_in(tx, message_id).await?.is_some() {
+        return Err(Error::engine(match action {
+            AuthorAction::Delete => {
+                format!("manage_messages.delete: Message {message_id} is already deleted")
+            }
+            AuthorAction::Edit => format!(
+                "manage_messages.edit: Message {message_id} is deleted and cannot be edited"
+            ),
+        }));
+    }
+    require_local_message_in(tx, caller, message_id).await?;
+    require_record_in(tx, caller, "manage_messages", message_id, Capability::Edit).await?;
+    if is_author != Some(true) {
+        let persona: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM message_speakers WHERE message_id=?)")
+                .bind(message_id)
+                .fetch_one(&mut **tx)
+                .await?;
+        return Err(Error::engine(format!(
+            "{}: only the author can {} a Message{}",
+            action.tool(),
+            action.verb(),
+            if persona { " sent as a persona" } else { "" }
+        )));
+    }
+    Ok(())
+}
+
+/// Replace the text of one of the caller's own Messages. The new text is
+/// recorded as a dedicated `message.revision.recorded.v1` event on the same
+/// Message, so every earlier text stays in the log and the Message
+/// immutability guard stays closed to every other path.
+///
+/// Authorship is exactly delete's. An edit never alerts anyone: awareness,
+/// read state and notification candidates are untouched (candidates carry no
+/// text, so none can go stale), except that a person whose mention the edit
+/// removes has their mention candidate withdrawn. Structured mention spans
+/// index the body, so they are re-established against the new text: given
+/// `mentions` they replace the old set, and absent `mentions` the old ones are
+/// relocated to wherever their label now sits (in order, scanning forward from
+/// the previous match) or dropped if the label is gone. A mention of
+/// someone not already mentioned is refused; that is a new alert, so it
+/// needs a new Message. An unchanged body is refused, not silently ignored.
+#[allow(clippy::too_many_arguments)]
+async fn edit_message(
+    db: &Db,
+    caller: &Caller,
+    message_id: String,
+    body: String,
+    mentions: Option<Vec<crate::awareness::MentionInput>>,
+    idempotency_key: String,
+    reason: String,
+    provenance_arguments: Option<&Value>,
+) -> Result<Value> {
+    const TOOL: &str = "manage_messages.edit";
+    require_nonblank_reason(TOOL, &reason)?;
+    super::keyed_replay::idempotency_key(TOOL, Some(&idempotency_key))?
+        .ok_or_else(|| Error::engine("manage_messages.edit idempotency_key must not be blank"))?;
+    if body.trim().is_empty() {
+        return Err(Error::engine(
+            "manage_messages.edit: body must not be blank",
+        ));
+    }
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut act_alloc = crate::act::ActAllocation::new();
+    if let Some(replay) = super::keyed_replay::keyed_replay_in(
+        &mut tx,
+        caller,
+        "manage_messages",
+        provenance_arguments
+            .ok_or_else(|| Error::engine("manage_messages: keyed edit lost its arguments"))?,
+    )
+    .await?
+    {
+        let revision = replay
+            .content()
+            .iter()
+            .find(|output| {
+                output.event_type == "message.revision.recorded.v1"
+                    && output.record_id == message_id
+            })
+            .ok_or_else(|| {
+                Error::engine("manage_messages.edit retry has no valid durable evidence")
+            })?
+            .clone();
+        let edit_count = message_edit_count_in(&mut tx, &message_id, revision.seq).await?;
+        tx.rollback().await?;
+        replay.settle();
+        return echo_act(
+            json!({"status":"edited","message_id":message_id,"edited_at":revision.created_at,"edit_count":edit_count}),
+            replay.act(),
+        );
+    }
+    require_author_in(&mut tx, caller, &message_id, AuthorAction::Edit).await?;
+    let (current_body, audience_status): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT r.body,s.status FROM records r
+           LEFT JOIN message_audience_state s ON s.message_id=r.id WHERE r.id=?",
+    )
+    .bind(&message_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if audience_status.as_deref() != Some("declared") {
+        return Err(Error::engine(format!(
+            "{TOOL}: only a delivered Message can be edited"
+        )));
+    }
+    if current_body.as_deref() == Some(body.as_str()) {
+        return Err(Error::engine(format!(
+            "{TOOL}: body is unchanged; there is nothing to edit"
+        )));
+    }
+    let existing = sqlx::query(
+        "SELECT mention_id,target_kind,target_binding,target_record_id,span_start,span_end,authored_label
+           FROM message_mentions WHERE message_id=? AND effective=1 ORDER BY mention_id",
+    )
+    .bind(&message_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(crate::events::MessageRevisionMention {
+            mention_id: row.try_get("mention_id")?,
+            target_kind: row.try_get("target_kind")?,
+            target_binding: row.try_get("target_binding")?,
+            target_record_id: row.try_get("target_record_id")?,
+            span_start: row.try_get("span_start")?,
+            span_end: row.try_get("span_end")?,
+            authored_label: row.try_get("authored_label")?,
+        })
+    })
+    .collect::<Result<Vec<_>>>()?;
+    let revised = match mentions {
+        Some(given) => {
+            let mut revised = Vec::with_capacity(given.len());
+            for mention in given {
+                crate::awareness::validate_mention_span(&body, &mention).map_err(|_| {
+                    Error::engine(format!(
+                        "{TOOL}: mention span must exactly match the edited prose"
+                    ))
+                })?;
+                let known = existing.iter().find(|old| {
+                    old.target_kind == mention.target_kind
+                        && old.target_record_id == mention.target_id
+                });
+                let Some(known) = known else {
+                    return Err(Error::engine(format!(
+                        "{TOOL}: an edit cannot add a mention of someone the Message did not already mention; send a new Message to alert them"
+                    )));
+                };
+                revised.push(crate::events::MessageRevisionMention {
+                    mention_id: mention.mention_id,
+                    target_kind: known.target_kind.clone(),
+                    target_binding: known.target_binding.clone(),
+                    target_record_id: known.target_record_id.clone(),
+                    span_start: mention.span_start as i64,
+                    span_end: mention.span_end as i64,
+                    authored_label: mention.authored_label,
+                });
+            }
+            revised
+        }
+        // No mentions given: relocate the existing ones into the new text (see
+        // `relocate_mentions`). Targets never change and nobody is added, so
+        // this cannot alert anyone new.
+        None => relocate_mentions(current_body.as_deref(), &body, &existing),
+    };
+    let payload = crate::events::MessageRevisionRecordedPayload {
+        format: crate::events::MESSAGE_REVISION_FORMAT.into(),
+        body_sha256: hex::encode(Sha256::digest(body.as_bytes())),
+        body,
+        mentions: revised,
+        reason,
+    };
+    payload.validate()?;
+    let revision = append_in(
+        db,
+        &mut tx,
+        AppendSpec {
+            record_id: message_id.clone(),
+            event_type: "message.revision.recorded.v1".into(),
+            payload: serde_json::to_value(&payload)?,
+            actor: Some(caller.actor().into()),
+        },
+        &mut act_alloc,
+    )
+    .await?;
+    // A mention candidate does not record which mention target it was proposed
+    // for; it records only the recipient account. So the target is recovered
+    // from proposal time: the Person that account was bound to in the audited
+    // binding ledger as of the candidate's own proposal (its act, else its
+    // timestamp). Today's bindings are never consulted for that, so an account
+    // later re-pointed or aliased onto another Person cannot change which
+    // mention a candidate belongs to. Exactly the candidates proposed for a
+    // dropped Person (and not also for one still mentioned) are withdrawn.
+    let kept = payload
+        .mentions
+        .iter()
+        .map(|mention| {
+            (
+                mention.target_kind.as_str(),
+                mention.target_record_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let dropped_persons = existing
+        .iter()
+        .filter(|old| {
+            old.target_kind == "principal"
+                && !kept.contains(&(old.target_kind.as_str(), old.target_record_id.as_str()))
+        })
+        .map(|old| old.target_record_id.clone())
+        .collect::<BTreeSet<_>>();
+    if !dropped_persons.is_empty() {
+        let kept_persons = payload
+            .mentions
+            .iter()
+            .filter(|mention| mention.target_kind == "principal")
+            .map(|mention| mention.target_record_id.clone())
+            .collect::<BTreeSet<_>>();
+        let candidates = sqlx::query(
+            "SELECT c.recipient_account_id, c.created_at,
+                    (SELECT e.act FROM notification_candidate_events e
+                      WHERE e.candidate_key=c.candidate_key AND e.action='proposed'
+                      ORDER BY e.seq LIMIT 1) AS act
+               FROM notification_candidates c
+              WHERE c.message_id=? AND c.reason='principal_mention' AND c.status='effective'
+              ORDER BY c.recipient_account_id",
+        )
+        .bind(&message_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut withdraw = BTreeSet::<String>::new();
+        for candidate in candidates {
+            let recipient: String = candidate.try_get("recipient_account_id")?;
+            let proposed_for = account_person_at_proposal_in(
+                &mut tx,
+                &recipient,
+                candidate.try_get::<Option<i64>, _>("act")?,
+                &candidate.try_get::<String, _>("created_at")?,
+            )
+            .await?;
+            let drop = match proposed_for {
+                Some(person) => {
+                    dropped_persons.contains(&person) && !kept_persons.contains(&person)
+                }
+                // No audited binding history for the account (a legacy row):
+                // fall back to who it is bound to now, withdrawing unless that
+                // is someone still mentioned.
+                None => {
+                    let bound: Option<String> = sqlx::query_scalar(
+                        "SELECT record_id FROM bindings WHERE system='account' AND identifier=?",
+                    )
+                    .bind(&recipient)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    !bound.is_some_and(|person| kept_persons.contains(&person))
+                }
+            };
+            if drop {
+                withdraw.insert(recipient);
+            }
+        }
+        for recipient in &withdraw {
+            crate::awareness::withdraw_notification_candidates_in(
+                &mut tx,
+                recipient,
+                &message_id,
+                Some("principal_mention"),
+                "message.revision.recorded.v1",
+                &revision.id,
+                &mut act_alloc,
+            )
+            .await?;
+        }
+    }
+    let edit_count = message_edit_count_in(&mut tx, &message_id, revision.local_seq).await?;
+    db.commit_content(tx).await?;
+    echo_act(
+        json!({"status":"edited","message_id":message_id,"edited_at":revision.created_at,"edit_count":edit_count}),
+        act_alloc.get(),
+    )
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Byte ranges of `body` where a mention label must not be matched: fenced
+/// code blocks, inline code spans, and URLs (an `http://` or `https://` run up
+/// to the next whitespace).
+fn mention_exclusions(body: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    // Fenced blocks: a line opening with ``` or ~~~ runs to the matching
+    // closing line, or to the end of the body if it never closes.
+    let mut fence_start: Option<usize> = None;
+    let mut offset = 0usize;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            match fence_start.take() {
+                Some(start) => ranges.push((start, offset + line.len())),
+                None => fence_start = Some(offset),
+            }
+        }
+        offset += line.len();
+    }
+    if let Some(start) = fence_start {
+        ranges.push((start, body.len()));
+    }
+    // Inline code spans: a run of n backticks closes at the next run of exactly
+    // n. An unclosed run is plain text.
+    let bytes = body.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if let Some(&(_, end)) = ranges
+            .iter()
+            .find(|(start, end)| index >= *start && index < *end)
+        {
+            index = end;
+            continue;
+        }
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let run_start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let run = index - run_start;
+        let mut probe = index;
+        let mut closed = None;
+        while probe < bytes.len() {
+            if bytes[probe] == b'`' {
+                let close_start = probe;
+                while probe < bytes.len() && bytes[probe] == b'`' {
+                    probe += 1;
+                }
+                if probe - close_start == run {
+                    closed = Some(probe);
+                    break;
+                }
+            } else {
+                probe += 1;
+            }
+        }
+        if let Some(end) = closed {
+            ranges.push((run_start, end));
+            index = end;
+        }
+    }
+    // URLs.
+    let lowered = body.to_ascii_lowercase();
+    for scheme in ["http://", "https://"] {
+        for (start, _) in lowered.match_indices(scheme) {
+            let end = body[start..]
+                .find(char::is_whitespace)
+                .map_or(body.len(), |length| start + length);
+            ranges.push((start, end));
+        }
+    }
+    ranges
+}
+
+/// Where each existing mention now sits in an edited body, when the caller gave
+/// no new `mentions`. Mentions are taken in the order of their current spans.
+/// Each is searched for by its authored label, starting after the previous
+/// match: if the original spans overlapped, from that match's start (so two
+/// overlapping mentions both survive), otherwise from its end. When a label
+/// appears more than once, the first acceptable occurrence wins, so repeats
+/// match in order.
+///
+/// An occurrence is acceptable only if it is not inside a fenced or inline code
+/// span or a URL, and is bounded as the author wrote it: on a side where the
+/// original mention stood against a non-word character (or the edge of the
+/// body) the new one must too, so `Bob` never relocates into `Bobby`; and a
+/// label that was preceded by `@` must be again. Word characters are Unicode
+/// letters, digits and `_`. Anything not found drops the mention. Targets are
+/// never changed.
+fn relocate_mentions(
+    original: Option<&str>,
+    body: &str,
+    existing: &[crate::events::MessageRevisionMention],
+) -> Vec<crate::events::MessageRevisionMention> {
+    let exclusions = mention_exclusions(body);
+    let before = |text: &str, at: usize| text.get(..at).and_then(|head| head.chars().next_back());
+    let after = |text: &str, at: usize| text.get(at..).and_then(|tail| tail.chars().next());
+    let mut ordered = existing.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        (left.span_start, &left.mention_id).cmp(&(right.span_start, &right.mention_id))
+    });
+    // (original end, new start, new end) of the last mention that matched.
+    let mut previous: Option<(i64, usize, usize)> = None;
+    let mut relocated = Vec::with_capacity(ordered.len());
+    for old in ordered {
+        let label = old.authored_label.as_str();
+        if label.is_empty() {
+            continue;
+        }
+        let (start_at, end_at) = (old.span_start as usize, old.span_end as usize);
+        let bounded_left =
+            original.is_none_or(|text| before(text, start_at).is_none_or(|c| !is_word_char(c)));
+        let bounded_right =
+            original.is_none_or(|text| after(text, end_at).is_none_or(|c| !is_word_char(c)));
+        let needs_at = !label.starts_with('@')
+            && original.is_some_and(|text| before(text, start_at) == Some('@'));
+        let cursor = match previous {
+            Some((original_end, new_start, _)) if old.span_start < original_end => new_start,
+            Some((_, _, new_end)) => new_end,
+            None => 0,
+        };
+        let found = body[cursor..].match_indices(label).find_map(|(offset, _)| {
+            let start = cursor + offset;
+            let end = start + label.len();
+            let ok = (!bounded_left || before(body, start).is_none_or(|c| !is_word_char(c)))
+                && (!bounded_right || after(body, end).is_none_or(|c| !is_word_char(c)))
+                && (!needs_at || before(body, start) == Some('@'))
+                && !exclusions
+                    .iter()
+                    .any(|(from, to)| start < *to && end > *from);
+            ok.then_some((start, end))
+        });
+        let Some((start, end)) = found else { continue };
+        previous = Some((old.span_end, start, end));
+        relocated.push(crate::events::MessageRevisionMention {
+            span_start: start as i64,
+            span_end: end as i64,
+            ..old.clone()
+        });
+    }
+    relocated.sort_by(|left, right| left.mention_id.cmp(&right.mention_id));
+    relocated
+}
+
+/// The Person an account was bound to when a candidate was proposed: the last
+/// audited `binding_audit` row for that account at or before the proposal.
+/// Order is by act, with the cutover enforced first: an unstamped (NULL-act,
+/// pre-cutover) row precedes every stamped proposal, and a stamped row never
+/// precedes an unstamped proposal, whatever their timestamps say. Timestamps
+/// order only two unstamped sides. `None` when the ledger has no row for it (a
+/// removal also ends the binding).
+async fn account_person_at_proposal_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    account: &str,
+    proposal_act: Option<i64>,
+    proposal_created_at: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(
+        "SELECT new_record_id FROM binding_audit
+          WHERE system='account' AND identifier=?1
+            AND CASE WHEN ?2 IS NOT NULL THEN (act IS NULL OR act<=?2)
+                     ELSE (act IS NULL AND created_at<=?3) END
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(account)
+    .bind(proposal_act)
+    .bind(proposal_created_at)
+    .fetch_optional(&mut **tx)
+    .await?
+    .flatten())
+}
+
+/// How many revisions the Message has recorded up to and including `seq`.
+async fn message_edit_count_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    message_id: &str,
+    seq: i64,
+) -> Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT COUNT(*) FROM content_events
+          WHERE record_id=? AND type='message.revision.recorded.v1' AND seq<=?",
+    )
+    .bind(message_id)
+    .bind(seq)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+async fn message_deleted_at_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    message_id: &str,
+) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar("SELECT deleted_at FROM records WHERE id=? AND type='Message'")
+            .bind(message_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten(),
+    )
+}
+
+/// Whether the authenticated caller is the Message's author. Two independent
+/// facts must both hold: the Message's `owner_id` is the live Person currently
+/// bound to the caller's account, and the Message's creation event was written
+/// by that same credential. The binding alone is mutable (re-pointing an
+/// account at a Person would otherwise hand that Person's Messages to it); the
+/// creation actor is the immutable send-time evidence.
+///
+/// A credential migration is the one accepted difference. The creation actor
+/// may be a different credential if it is still bound to the owning Person
+/// (a retained alias or reconciled predecessor) *and* the caller's own binding
+/// to that Person was established through the identity layer: `binding_audit`
+/// holds an `add`, `canonicalize` or `transfer` of the caller's account onto
+/// the owner. A binding that appears with no audit row (a raw re-point) is not
+/// verified continuity and does not qualify.
+///
+/// `None` when there is no such Message. Independent of visibility and
+/// tombstone state.
+async fn message_author_is_caller_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    message_id: &str,
+) -> Result<Option<bool>> {
+    Ok(sqlx::query_scalar(
+        "WITH creator(actor) AS (
+            SELECT e.actor FROM content_events e
+             WHERE e.record_id=?1 AND e.type='record.created'
+             ORDER BY e.seq LIMIT 1)
+         SELECT COALESCE(
+                  r.owner_id IS NOT NULL
+                  AND r.owner_id=(
+                    SELECT account.record_id FROM bindings account
+                      JOIN records person ON person.id=account.record_id
+                     WHERE account.system='account' AND account.identifier=?2 AND account.is_canonical=1
+                       AND person.type='Entity' AND person.kind='person' AND person.deleted_at IS NULL
+                     ORDER BY account.record_id LIMIT 1)
+                  AND ((SELECT actor FROM creator)=?2
+                       OR (EXISTS(SELECT 1 FROM bindings predecessor
+                                   WHERE predecessor.record_id=r.owner_id
+                                     AND predecessor.system='account'
+                                     AND predecessor.identifier=(SELECT actor FROM creator))
+                           AND EXISTS(SELECT 1 FROM binding_audit audit
+                                       WHERE audit.system='account' AND audit.identifier=?2
+                                         AND audit.new_record_id=r.owner_id
+                                         AND audit.action IN ('add','canonicalize','transfer')))), 0)
+           FROM records r WHERE r.id=?1 AND r.type='Message'",
+    )
+    .bind(message_id)
+    .bind(caller.credential())
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
 async fn mark_message_no_longer_relevant(
     db: &Db,
     caller: &Caller,
@@ -1747,7 +2502,7 @@ async fn mark_message_no_longer_relevant(
         &mut act_alloc,
     )
     .await?;
-    append_in(
+    let mark_link_event = append_in(
         db,
         &mut tx,
         AppendSpec {
@@ -1762,6 +2517,17 @@ async fn mark_message_no_longer_relevant(
             })?,
             actor: Some(caller.actor().into()),
         },
+        &mut act_alloc,
+    )
+    .await?;
+    // The mark may close the obligation for the marking recipient, or for every
+    // recipient when the sender withdrew the request. A third party's mark
+    // closes nothing, and the same derivation leaves those candidates alone.
+    crate::awareness::withdraw_closed_obligation_candidates_in(
+        &mut tx,
+        &message_id,
+        "message.no_longer_relevant.marked",
+        &mark_link_event.id,
         &mut act_alloc,
     )
     .await?;
@@ -2114,6 +2880,52 @@ async fn list_context(
             }
         }
     }
+    // A deleted parent of a live reply stays addressable as a body-less stub,
+    // so a client can render "This message was deleted" in place with the
+    // replies kept. Only replies this call already returns can reach a stub,
+    // and a stub carries no body, name, author or audience.
+    let reply_parents = reply_targets
+        .values()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut deleted_parents = Vec::new();
+    if !reply_parents.is_empty() {
+        let placeholders = vec!["?"; reply_parents.len()].join(",");
+        let sql = format!(
+            "SELECT id,created_at,deleted_at FROM records
+              WHERE id IN ({placeholders}) AND type='Message' AND deleted_at IS NOT NULL
+              ORDER BY created_at,id"
+        );
+        let mut query = sqlx::query(&sql);
+        for parent in &reply_parents {
+            query = query.bind(parent);
+        }
+        for row in query.fetch_all(&mut *snapshot).await? {
+            // Seeing the reply is not enough: the stub names the parent's
+            // times, so the caller must be able to see the parent itself, as
+            // it was before the tombstone.
+            let parent_id: String = row.try_get("id")?;
+            let visible = crate::authorization::effective_capability_including_tombstone_on(
+                &mut snapshot,
+                super::principal(caller),
+                &parent_id,
+            )
+            .await
+            .is_ok_and(|capability| capability.allows(Capability::View));
+            if !visible {
+                continue;
+            }
+            deleted_parents.push(json!({
+                "id":parent_id,
+                "deleted":true,
+                "body":null,
+                "created_at":row.try_get::<String,_>("created_at")?,
+                "deleted_at":row.try_get::<Option<String>,_>("deleted_at")?,
+            }));
+        }
+    }
     let mut messages = Vec::with_capacity(candidates.len());
     for (id, _) in &candidates {
         let mut items = crate::query::read::get_records_live_in(
@@ -2160,6 +2972,7 @@ async fn list_context(
     Ok(json!({
         "origin": origin,
         "messages": messages,
+        "deleted_parents": deleted_parents,
         "viewer_relative": true,
         "has_more": has_more,
         "next_cursor": next_cursor,
@@ -2184,11 +2997,124 @@ async fn require_visible_message_in(
     Ok(())
 }
 
+/// The viewer's direct-context candidates, newest first.
+///
+/// - Declared direct origins naming the viewer come from
+///   `idx_message_origin_principals_principal`.
+/// - Notes to self come from `idx_records_unfiled_message_owner` (engine 92):
+///   exactly the viewer's Person's Messages in Unfiled, then origin collection
+///   `native:unfiled`, the viewer's own sender row and no `addressed_to` row,
+///   each probed by primary key. The viewer's channel posts and other people's
+///   notes never enter the read, and `owner_id` (not the mutable principal
+///   binding) is the authorship fact.
+/// - Legacy Messages (no declared origin) are found from the viewer's own
+///   sender and `addressed_to` audience rows via `idx_message_audiences_principal`
+///   (not by `owner_id`: a legacy Message the viewer sent stays theirs even if
+///   its owner differs). The index has no `source` column, so every audience
+///   row of the viewer is visited: the cost is O(the viewer's own sent and
+///   addressed traffic), never a function of other people's activity.
+///
+/// Every join is a `CROSS JOIN` over a driving set, which pins the order so
+/// the planner cannot start from a scan of `records`, `message_audiences` or
+/// `message_origin_state` even once `ANALYZE` statistics exist; the indexes
+/// are named with `INDEXED BY`. Legacy and note-to-self Messages must sit in
+/// Unfiled; collection posts are never selected. `?1` is the JSON array of the
+/// viewer's principals (retained aliases included); `?2` is the viewer's
+/// Person id.
+pub(crate) const DIRECT_SCOPE_IDS_SQL: &str = "WITH
+     direct_ids AS MATERIALIZED (
+       SELECT mop.message_id AS id FROM json_each(?1) j
+         CROSS JOIN message_origin_principals mop INDEXED BY idx_message_origin_principals_principal
+           ON mop.principal_id=j.value
+     ),
+     legacy_ids AS MATERIALIZED (
+       SELECT DISTINCT ma.message_id AS id FROM json_each(?1) j
+         CROSS JOIN message_audiences ma INDEXED BY idx_message_audiences_principal
+           ON ma.principal_id=j.value
+         CROSS JOIN message_origin_state s ON s.message_id=ma.message_id
+        WHERE ma.source IN ('sender','addressed_to') AND s.status='legacy_unknown'
+     ),
+     self_ids AS MATERIALIZED (
+       SELECT r.id AS id FROM records r INDEXED BY idx_records_unfiled_message_owner
+         CROSS JOIN message_origin_state s ON s.message_id=r.id
+        WHERE r.type='Message' AND r.home_id='native:unfiled' AND r.deleted_at IS NULL
+          AND r.owner_id=?2
+          AND s.status='declared' AND s.origin_type='collection'
+          AND s.collection_id='native:unfiled'
+          AND EXISTS (SELECT 1 FROM json_each(?1) j
+                        CROSS JOIN message_audiences ma ON ma.message_id=r.id AND ma.principal_id=j.value
+                       WHERE ma.source='sender')
+          AND NOT EXISTS (SELECT 1 FROM message_audiences x
+                           WHERE x.message_id=r.id AND x.source='addressed_to')
+     ),
+     mine(id, direct) AS MATERIALIZED (
+       SELECT id, 1 FROM direct_ids
+       UNION
+       SELECT id, 0 FROM legacy_ids
+       UNION
+       SELECT id, 0 FROM self_ids
+     )
+     SELECT r.id FROM mine CROSS JOIN records r ON r.id=mine.id
+      WHERE r.type='Message' AND r.deleted_at IS NULL
+        AND (mine.direct=1 OR r.home_id IS NULL OR r.home_id='native:unfiled')
+      ORDER BY r.created_at DESC, r.id DESC";
+
+/// Visible direct-scope Message ids, newest first, capped. Selection is by
+/// indexed principal probes before any hydration; visibility is applied
+/// **before** the cap, in newest-first batches, until `cap + 1` visible
+/// messages are found or the candidates run out. So unreadable messages never
+/// use up the cap or push older readable ones out, and `truncated` means
+/// "more *visible* direct messages exist". The viewer's principals include
+/// retained aliases (every `native-principal` binding on their Person), since
+/// a stored direct origin names the principal that was current when it was
+/// sent. An unresolved viewer fails closed rather than listing nothing.
+async fn direct_scope_candidates(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+) -> Result<(Vec<String>, bool)> {
+    let principals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT p.identifier, a.record_id FROM bindings a
+           JOIN records person ON person.id=a.record_id
+           JOIN bindings p ON p.record_id=a.record_id AND p.system='native-principal'
+          WHERE a.system='account' AND a.identifier=? AND a.is_canonical=1
+            AND person.type='Entity' AND person.kind='person' AND person.deleted_at IS NULL",
+    )
+    .bind(caller.credential())
+    .fetch_all(&mut **tx)
+    .await?;
+    if principals.is_empty() {
+        return Err(Error::engine(
+            "manage_messages.list_inbox: scope direct needs a current member identity",
+        ));
+    }
+    let viewer_person = principals[0].1.clone();
+    let principals: Vec<&str> = principals.iter().map(|(p, _)| p.as_str()).collect();
+    let principals_json = serde_json::to_string(&principals)?;
+    let candidates: Vec<String> = sqlx::query_scalar(DIRECT_SCOPE_IDS_SQL)
+        .bind(&principals_json)
+        .bind(&viewer_person)
+        .fetch_all(&mut **tx)
+        .await?;
+    let cap = direct_scope_cap();
+    let mut visible_ids: Vec<String> = Vec::new();
+    for batch in candidates.chunks(500) {
+        let visible = super::visible_ids_in(tx, caller, batch.to_vec()).await?;
+        visible_ids.extend(batch.iter().filter(|id| visible.contains(*id)).cloned());
+        if visible_ids.len() > cap {
+            break;
+        }
+    }
+    let truncated = visible_ids.len() > cap;
+    visible_ids.truncate(cap);
+    Ok((visible_ids, truncated))
+}
+
 async fn build_inbox_snapshot(
     db: &Db,
     caller: &Caller,
     view: &str,
     conversation_id: Option<&str>,
+    scope: Option<&str>,
 ) -> Result<InboxSnapshot> {
     if !matches!(
         view,
@@ -2196,7 +3122,7 @@ async fn build_inbox_snapshot(
     ) {
         return Err(Error::engine("invalid inbox view"));
     }
-    build_inbox_snapshot_attempt(db, caller, view, conversation_id, 3).await
+    build_inbox_snapshot_attempt(db, caller, view, conversation_id, scope, 3).await
 }
 
 async fn visible_in_snapshot(
@@ -2224,6 +3150,7 @@ async fn build_inbox_snapshot_attempt(
     caller: &Caller,
     view: &str,
     conversation_id: Option<&str>,
+    scope: Option<&str>,
     remaining: usize,
 ) -> Result<InboxSnapshot> {
     let mut tx = db.write_pool().begin().await?;
@@ -2256,7 +3183,12 @@ async fn build_inbox_snapshot_attempt(
         sqlx::query_scalar("SELECT epoch FROM authorization_revision WHERE id=1")
             .fetch_one(&mut *tx)
             .await?;
-    let candidates: Vec<String> = if let Some(conversation_id) = conversation_id {
+    let mut truncated = false;
+    let candidates: Vec<String> = if scope == Some("direct") {
+        let (ids, cut) = direct_scope_candidates(&mut tx, caller).await?;
+        truncated = cut;
+        ids
+    } else if let Some(conversation_id) = conversation_id {
         sqlx::query_scalar(
             "SELECT r.id FROM records r JOIN message_conversations mc ON mc.message_id=r.id
               WHERE r.type='Message' AND r.deleted_at IS NULL AND mc.conversation_id=?
@@ -2270,7 +3202,7 @@ async fn build_inbox_snapshot_attempt(
             "SELECT id FROM records WHERE type='Message' AND deleted_at IS NULL ORDER BY created_at DESC,id DESC LIMIT 10001",
         ).fetch_all(&mut *tx).await?
     };
-    if candidates.len() > 10_000 {
+    if scope != Some("direct") && candidates.len() > 10_000 {
         return Err(Error::engine(
             "Inbox snapshot exceeds the bounded 10000 Message selection",
         ));
@@ -2287,12 +3219,31 @@ async fn build_inbox_snapshot_attempt(
     // actor-resolution queries, and the three-statement expectation base
     // preload); per-Message evidence walks inside the shared evaluator remain
     // linear and are the explicitly measured residual cost.
-    let mut hydrated = hydrate_inbox_items_in(&mut tx, caller, &message_ids).await?;
+    // A direct-scope browse pins only the ordered ids: items are hydrated for
+    // the requested page alone (page time), so page one costs `limit` items
+    // however many DMs the viewer has. Other scoped views need the state to
+    // decide membership, so they hydrate the (bounded) scoped set here to
+    // decide it, then pin ids only and re-hydrate each page at page time.
+    let lazy = scope == Some("direct") && view == "browse";
+    let mut hydrated = if lazy {
+        message_ids
+            .iter()
+            .map(|id| json!({"message_id": id, "_predicates": {}}))
+            .collect()
+    } else {
+        hydrate_inbox_items_in(&mut tx, caller, &message_ids).await?
+    };
     tx.commit().await?;
     let mut items = Vec::new();
     for mut item in hydrated.drain(..) {
         if item_in_view(&item, view) {
             item.as_object_mut().unwrap().remove("_predicates");
+            // A scoped inbox pins only which messages belong (decided from the
+            // state just read); page-time hydration re-reads their content, so
+            // an edit between pages shows, on every view.
+            if scope == Some("direct") {
+                item = json!({"message_id": item["message_id"]});
+            }
             items.push(item);
         }
     }
@@ -2329,6 +3280,7 @@ async fn build_inbox_snapshot_attempt(
                 caller,
                 view,
                 conversation_id,
+                scope,
                 remaining - 1,
             ))
             .await;
@@ -2343,6 +3295,8 @@ async fn build_inbox_snapshot_attempt(
         account_id: caller.credential().into(),
         view: view.into(),
         conversation_id: conversation_id.map(str::to_owned),
+        scope: scope.map(str::to_owned),
+        truncated,
         content_head,
         awareness_head,
         candidate_head,
@@ -2769,7 +3723,7 @@ pub(crate) fn item_in_view(item: &Value, view: &str) -> bool {
 
 /// Typed response for `get_attention`. It is deliberately not an inbox
 /// response: [`crate::awareness::validate_messaging_surface_response`] only
-/// accepts `native.message-inbox.v2` shapes, and this endpoint never builds
+/// accepts `native.message-inbox.v3` shapes, and this endpoint never builds
 /// one.
 const ATTENTION_SCHEMA: &str = "native.message-attention.v1";
 
@@ -2923,6 +3877,8 @@ async fn manage_messages(db: Db, caller: Caller, arguments: Value) -> Result<Val
                 | "move"
                 | "mark_no_longer_relevant"
                 | "unmark_no_longer_relevant"
+                | "delete"
+                | "edit"
         )
     )
     .then(|| arguments.clone());
@@ -3328,6 +4284,40 @@ async fn manage_messages_non_send(
             )
             .await
         }
+        ManageMessagesArgs::Edit {
+            message_id,
+            body,
+            mentions,
+            idempotency_key,
+            reason,
+        } => {
+            edit_message(
+                &db,
+                &caller,
+                message_id,
+                body,
+                mentions,
+                idempotency_key,
+                reason,
+                provenance_arguments.as_ref(),
+            )
+            .await
+        }
+        ManageMessagesArgs::Delete {
+            message_id,
+            idempotency_key,
+            reason,
+        } => {
+            delete_message(
+                &db,
+                &caller,
+                message_id,
+                idempotency_key,
+                reason,
+                provenance_arguments.as_ref(),
+            )
+            .await
+        }
         ManageMessagesArgs::ListMessageState { mut message_ids } => {
             if message_ids.is_empty() || message_ids.len() > 200 {
                 return Err(Error::engine(
@@ -3659,10 +4649,25 @@ async fn manage_messages_non_send(
             limit,
             snapshot,
             after,
+            scope,
+            preview_chars,
         } => {
             if limit == 0 || limit > 200 {
                 return Err(Error::engine("inbox limit must be 1..=200"));
             }
+            if scope.as_deref().is_some_and(|scope| scope != "direct") {
+                return Err(Error::engine("inbox scope must be \"direct\""));
+            }
+            if scope.is_some() && conversation_id.is_some() {
+                return Err(Error::engine(
+                    "inbox scope and conversation_id are mutually exclusive",
+                ));
+            }
+            if preview_chars.is_some_and(|n| n == 0 || n > MAX_PREVIEW_CHARS) {
+                return Err(Error::engine("inbox preview_chars must be 1..=1000"));
+            }
+            let preview_chars =
+                preview_chars.or((scope.is_some()).then_some(DIRECT_SCOPE_DEFAULT_PREVIEW_CHARS));
             let (snapshot, snapshot_token) = if let Some(raw) = snapshot {
                 let parsed = decode_snapshot(&db, &raw)?;
                 let current_db: String = sqlx::query_scalar(
@@ -3674,6 +4679,7 @@ async fn manage_messages_non_send(
                     || parsed.account_id != caller.credential()
                     || parsed.view != view
                     || parsed.conversation_id != conversation_id
+                    || parsed.scope != scope
                 {
                     return Err(Error::engine(
                         "cursor_reset_required: inbox snapshot binding mismatch",
@@ -3681,8 +4687,14 @@ async fn manage_messages_non_send(
                 }
                 (parsed, raw)
             } else {
-                let parsed =
-                    build_inbox_snapshot(&db, &caller, &view, conversation_id.as_deref()).await?;
+                let parsed = build_inbox_snapshot(
+                    &db,
+                    &caller,
+                    &view,
+                    conversation_id.as_deref(),
+                    scope.as_deref(),
+                )
+                .await?;
                 let token = db.put_inbox_snapshot(serde_json::to_value(&parsed)?)?;
                 (parsed, token)
             };
@@ -3694,6 +4706,13 @@ async fn manage_messages_non_send(
             }
             let mut items = Vec::new();
             let mut cursor = offset;
+            // One read transaction (one snapshot) for authorization, hydration
+            // and identity, so a revocation or edit that lands between the
+            // check and the read cannot return content the viewer was not
+            // authorized for in the snapshot being read. Messages that fail
+            // the check are dropped from the page, as a revoked message always
+            // was.
+            let mut tx = db.write_pool().begin().await?;
             while cursor < snapshot.items.len() && items.len() < limit {
                 let item = snapshot.items[cursor].clone();
                 let message_id = item["message_id"].as_str().ok_or_else(|| {
@@ -3701,10 +4720,62 @@ async fn manage_messages_non_send(
                 })?;
                 // The semantic/view state is frozen; only live revocation can
                 // shrink a later page.
-                if can_record(&db, &caller, message_id, Capability::View).await? {
+                if can_record_in(&mut tx, &caller, message_id, Capability::View).await? {
                     items.push(item);
                 }
                 cursor += 1;
+            }
+            #[cfg(test)]
+            {
+                let seam = INBOX_PAGE_SEAM.with(|seam| seam.borrow().clone());
+                if let Some(seam) = seam {
+                    seam().await;
+                }
+            }
+            // Page-time work: hydrate a lazily pinned page, then resolve the
+            // v3 identity fields for this page only, under the viewer's
+            // authority at this moment. Neither is part of the frozen
+            // snapshot, so a later page cannot replay a name or reply target
+            // the viewer has since lost sight of.
+            if !items.is_empty() {
+                if items.iter().any(|item| item.get("human").is_none()) {
+                    let ids: Vec<String> = items
+                        .iter()
+                        .filter_map(|item| item["message_id"].as_str().map(str::to_owned))
+                        .collect();
+                    let mut hydrated: std::collections::HashMap<String, Value> =
+                        hydrate_inbox_items_in(&mut tx, &caller, &ids)
+                            .await?
+                            .into_iter()
+                            .filter_map(|mut item| {
+                                item.as_object_mut()?.remove("_predicates");
+                                Some((item["message_id"].as_str()?.to_owned(), item))
+                            })
+                            .collect();
+                    items = ids.iter().filter_map(|id| hydrated.remove(id)).collect();
+                }
+                let page_ids: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| item["message_id"].as_str().map(str::to_owned))
+                    .collect();
+                let mut identity = Box::pin(inbox_identity::batched_identity_in(
+                    &mut tx, &caller, &page_ids,
+                ))
+                .await?;
+                for item in &mut items {
+                    if let Some(extra) = item["message_id"]
+                        .as_str()
+                        .and_then(|id| identity.remove(id))
+                    {
+                        item.as_object_mut().unwrap().extend(extra);
+                    }
+                }
+            }
+            tx.rollback().await?;
+            if let Some(limit_chars) = preview_chars {
+                for item in &mut items {
+                    apply_preview(item, limit_chars);
+                }
             }
             let heads = crate::awareness::heads_on(db.write_pool()).await?;
             let current_content: i64 =
@@ -3720,6 +4791,12 @@ async fn manage_messages_non_send(
                     .fetch_one(db.write_pool())
                     .await?;
             let response = json!({"schema":crate::awareness::MESSAGE_INBOX_SCHEMA,"view":view,"items":items,"snapshot":snapshot_token,"next_after":(cursor<snapshot.items.len()).then_some(cursor),"newer_available":current_content>snapshot.content_head||heads.0>snapshot.awareness_head||heads.1>snapshot.candidate_head||current_control>snapshot.control_head||current_authorization!=snapshot.authorization_revision,"heads":{"content":snapshot.content_head,"awareness":snapshot.awareness_head,"candidates":snapshot.candidate_head,"control":snapshot.control_head,"authorization":snapshot.authorization_revision},"counts_are_distinct_message_ids":true});
+            let mut response = response;
+            if let Some(scope) = &snapshot.scope {
+                response["scope"] = json!(scope);
+                response["candidate_cap"] = json!(direct_scope_cap());
+                response["truncated"] = json!(snapshot.truncated);
+            }
             crate::awareness::validate_messaging_surface_response(&response)?;
             Ok(response)
         }
@@ -3835,6 +4912,32 @@ async fn manage_messages_non_send(
             )
         }
         ManageMessagesArgs::GetAttention => get_attention(&db, &caller).await,
+        ManageMessagesArgs::GetNotificationPreference => Ok(json!({
+            "arrival": crate::awareness::notification_arrival_on(db.write_pool(), caller.credential()).await?,
+            "values": crate::control::NOTIFICATION_ARRIVAL_VALUES,
+        })),
+        ManageMessagesArgs::SetNotificationPreference {
+            arrival,
+            idempotency_key,
+            reason,
+        } => {
+            require_nonblank_reason("manage_messages.set_notification_preference", &reason)?;
+            let mut tx = crate::db::begin_write(db.write_pool()).await?;
+            let mut act_alloc = crate::act::ActAllocation::new();
+            let result = crate::awareness::set_notification_arrival_in(
+                &mut tx,
+                caller.credential(),
+                caller.actor(),
+                caller.run_key(),
+                &arrival,
+                &idempotency_key,
+                &reason,
+                &mut act_alloc,
+            )
+            .await?;
+            db.commit_control(tx).await?;
+            Ok(echo_act(result, act_alloc.get())?)
+        }
     }
 }
 
@@ -3842,7 +4945,7 @@ fn manage_messages_schema() -> Value {
     json!({
             "type":"object",
             "properties":{
-                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","mark_no_longer_relevant","unmark_no_longer_relevant","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates","get_attention"]},
+                "action":{"type":"string","enum":["send","list_context","classify","unclassify","move","share_history","add_reaction","remove_reaction","satisfy_acknowledgement_expectation_with_reaction","mark_no_longer_relevant","unmark_no_longer_relevant","delete","edit","list_message_state","list_conversation","list_unclassified","list_my_conversations","mutate_human_awareness","set_agent_disposition","set_preference","set_routing","set_destination","list_destinations","list_inbox","list_notification_candidates","get_attention","get_notification_preference","set_notification_preference"]},
                 "id":{"type":"string"},
                 "body":{"type":"string","minLength":1},
                 "speaker":{"type":"object","properties":{"persona_id":{"type":"string","pattern":"\\S"}},"required":["persona_id"],"additionalProperties":false,"description":"Persona claim."},
@@ -3876,6 +4979,7 @@ fn manage_messages_schema() -> Value {
                 "evidence":{"type":"array","items":{"type":"object","properties":{"record_id":{"type":"string"},"role":{"type":"string","enum":["reply","work","decision","resolution","other"]}},"required":["record_id","role"],"additionalProperties":false}},
                 "preference":{"type":"string","enum":["mark_read","mark_unread","flag_attention","clear_attention","mute","unmute","snooze","clear_snooze","archive","restore"],"description":"Private read/unread."},
                 "snoozed_until":{"type":"string","format":"date-time"},
+                "arrival":{"type":"string","enum":["all","dms_and_mentions","off"],"description":"Routine arrivals that notify: all (DMs and thread replies), dms_and_mentions (DMs only), off. Mentions and obligations always notify. Default all."},
                 "obligation_state":{"type":"string","enum":["none","open","satisfied","withdrawn"]},
                 "executor_route":{"type":"string","enum":["unassigned","human","agent","joint","closed"]},
                 "policy_version":{"type":"string"},
@@ -3883,6 +4987,8 @@ fn manage_messages_schema() -> Value {
                 "limit":{"type":"integer","minimum":1,"maximum":200},
                 "snapshot":{"type":"string"},
                 "after":{"type":"integer","minimum":0},
+                "scope":{"enum":["direct"]},
+                "preview_chars":{"type":"integer"},
                 "after_seq":{"type":"integer","minimum":0},
                 "reason":{"type":"string","minLength":1,"description":REASON_DESCRIPTION}
             },
@@ -3997,7 +5103,7 @@ pub(crate) fn manage_messages_send_operation_schema() -> Value {
     describe_send_property(
         &mut send_properties,
         "mentions",
-        "Mentions into immutable prose. Spans are zero-based half-open UTF-8 byte offsets [span_start, span_end) into body; both ends must be UTF-8 character boundaries and body[span_start..span_end] must equal authored_label. A principal mention target must already be addressed.",
+        "Mentions into immutable prose. Spans are zero-based half-open UTF-8 byte offsets [span_start, span_end) into body; both ends must be UTF-8 character boundaries and body[span_start..span_end] must equal authored_label. A principal mention target must already be addressed, except in a Collection-origin send, where a person who can see that Collection may be mentioned without being addressed: the mention alerts them, adds no obligation, and does not change who can read the Message.",
     );
     if let Some(items) = send_properties
         .get_mut("mentions")
@@ -4015,7 +5121,7 @@ pub(crate) fn manage_messages_send_operation_schema() -> Value {
             ),
             (
                 "target_id",
-                "Mentioned Person or record. A principal target must already be addressed.",
+                "Mentioned Person or record. A principal target must already be addressed, unless the origin is a Collection the person can see.",
             ),
             (
                 "span_start",
@@ -4249,9 +5355,10 @@ mod inbox_snapshot_batching_tests {
     }
 
     async fn snapshot_acquisitions(db: &Db, caller: &Caller) -> (usize, u64) {
-        let (result, acquisitions) =
-            with_write_pool_acquisition_counter(build_inbox_snapshot(db, caller, "browse", None))
-                .await;
+        let (result, acquisitions) = with_write_pool_acquisition_counter(build_inbox_snapshot(
+            db, caller, "browse", None, None,
+        ))
+        .await;
         let snapshot = result.unwrap();
         (snapshot.items.len(), acquisitions)
     }
@@ -4414,3 +5521,15 @@ mod inbox_snapshot_batching_tests {
         db.close().await;
     }
 }
+
+#[cfg(test)]
+#[path = "messaging_delete_tests.rs"]
+mod delete_tests;
+
+#[cfg(test)]
+#[path = "messaging_inbox_scope_tests.rs"]
+pub(crate) mod inbox_scope_tests;
+
+#[cfg(test)]
+#[path = "messaging_inbox_identity_tests.rs"]
+pub(crate) mod inbox_identity_tests;

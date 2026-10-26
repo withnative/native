@@ -680,17 +680,20 @@ mod tests {
     #[test]
     fn render_reports_every_profile_and_the_lens_only_capability() {
         let rendered = String::from_utf8(render().expect("render")).expect("utf8");
-        // Both profiles are asserted with their own counts. The ordinary and
-        // lens surfaces differ by exactly the lens-only tool, so repeating one
-        // pair of strings for both sections — as this test used to — passes on
-        // whichever section happens to match and checks neither deliberately.
-        assert!(rendered.contains("- **focused**: 27 tools,"));
-        assert!(rendered.contains("- **complete**: 88 tools,"));
-        assert!(rendered.contains("| `manage_memberships` | identity | atomicity | — |"));
-        assert!(rendered.contains("| `workspace_read` | identity | bounded-context-or-calls | — |"));
-        assert!(rendered.contains("## Federated lens projection"));
-        assert!(rendered.contains("- **focused**: 28 tools,"));
-        assert!(rendered.contains("- **complete**: 89 tools,"));
-        assert!(rendered.contains("| `materialize_record` | identity | atomicity | yes |"));
+        // Equal complete counts must not let one surface satisfy both checks:
+        // audit belongs only to Native; materialization belongs only to lens.
+        let (ordinary, lens) = rendered.split_once("## Federated lens projection").unwrap();
+        assert!(ordinary.contains("- **focused**: 27 tools,"));
+        assert!(ordinary.contains("- **complete**: 90 tools,"));
+        assert!(
+            ordinary.contains("| `read_hcp_audit` | history | correctness-under-ignorance | — |")
+        );
+        assert!(ordinary.contains("| `manage_memberships` | identity | atomicity | — |"));
+        assert!(ordinary.contains("| `workspace_read` | identity | bounded-context-or-calls | — |"));
+        assert!(!ordinary.contains("| `materialize_record` |"));
+        assert!(lens.contains("- **focused**: 28 tools,"));
+        assert!(lens.contains("- **complete**: 90 tools,"));
+        assert!(lens.contains("| `materialize_record` | identity | atomicity | yes |"));
+        assert!(!lens.contains("| `read_hcp_audit` |"));
     }
 }

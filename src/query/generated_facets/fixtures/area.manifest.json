@@ -1,0 +1,57 @@
+{
+  "provisional": true,
+  "generator": "native.declared-relational-defaults",
+  "version": "facet-spike-1",
+  "workspace": "workspace",
+  "bearer": "bearer",
+  "source_identity": "hq-tasks",
+  "context": {
+    "type": "WorkItem",
+    "kind": "task",
+    "logical_home": "H",
+    "membership": "direct members; kind null means kindless"
+  },
+  "selection": {
+    "mode": "keys",
+    "keys": [
+      "area"
+    ]
+  },
+  "declarations": {
+    "area": {
+      "description": "Area"
+    }
+  },
+  "context_evidence": [
+    {
+      "id": "base",
+      "layer": "pack",
+      "home": null,
+      "lineage": "fixture-source-revision",
+      "created_at": "2026-10-26T00:00:00Z",
+      "shape_key": "WorkItem",
+      "selected": {
+        "area": {
+          "description": "Area"
+        }
+      }
+    }
+  ],
+  "vocabularies": [],
+  "inclusion": "all visible matching records, including archived/superseded; no inferred defaults",
+  "governance_basis": [
+    {
+      "id": "local",
+      "layer": "user",
+      "home": "H",
+      "lineage": "fixture-source-revision",
+      "created_at": "2026-10-26T00:00:00Z",
+      "shape_key": "WorkItem:task",
+      "context": {
+        "type": "WorkItem",
+        "kind": "task",
+        "logical_home": "H"
+      }
+    }
+  ]
+}

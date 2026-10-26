@@ -251,6 +251,15 @@ impl IsolatedProjection {
     }
 }
 
+fn turso_unknown_column_detail(error: &turso::core::LimboError) -> Option<&str> {
+    match error {
+        turso::core::LimboError::ParseError(message) if message.starts_with("no such column:") => {
+            Some(message)
+        }
+        _ => None,
+    }
+}
+
 struct CoreProjection {
     connection: Arc<turso::core::Connection>,
     control: ExecutionControl,
@@ -342,6 +351,21 @@ impl CoreProjection {
             as_of_seq: projection.as_of_seq,
             principal: projection.principal,
         })
+    }
+
+    /// Refusal-only probe over the bounded caller-visible isolated projection.
+    fn visible_facet_key(&self, key: &str) -> bool {
+        self.execute(
+            QuerySqlRequest {
+                sql: "SELECT 1 AS present FROM facet_values WHERE key = ?1 ORDER BY key LIMIT 1"
+                    .into(),
+                parameters: vec![QuerySqlParameter::Text {
+                    value: Some(key.to_owned()),
+                }],
+            },
+            false,
+        )
+        .is_ok_and(|result| result.row_count > 0)
     }
 
     fn execute(
@@ -460,15 +484,28 @@ impl CoreProjection {
             // is read with an unknown column. Rewords an already-rejected
             // prepare; the shared contract repair keeps the message identical
             // on every engine by construction.
-            if let Some(column) = sql_contract::unknown_column_in_detail(&detail) {
+            if let Some(column) =
+                turso_unknown_column_detail(&error).and_then(sql_contract::unknown_column_in_detail)
+            {
                 let scope = sql_contract::statement_scope(&request.sql);
                 let relations: Vec<&str> =
                     sql_contract::resolve_column_scope(column.as_str(), &scope);
-                if let Some(repair) = sql_contract::unknown_column_repair(
+                if let Some(mut repair) = sql_contract::unknown_column_repair(
                     column.as_str(),
                     &relations,
                     sql_contract::QuerySqlProfile::TursoLocal,
                 ) {
+                    if let Some(key) =
+                        sql_contract::unknown_records_facet_key(&request.sql, &detail)
+                            .filter(|key| self.visible_facet_key(key))
+                    {
+                        repair.push(' ');
+                        repair.push_str(&sql_contract::records_facet_column_hint(
+                            &request.sql,
+                            &detail,
+                            &key,
+                        ));
+                    }
                     return sql_contract::categorized_error(
                         QuerySqlErrorCategory::SyntaxOrType,
                         sql_contract::join_detail_repair(&detail, &repair),
@@ -1074,6 +1111,77 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(oversized.contains("result_too_large"));
+    }
+
+    #[test]
+    fn facet_advice_requires_a_turso_unknown_column_refusal() {
+        use turso::core::LimboError;
+        assert!(turso_unknown_column_detail(&LimboError::ParseError(
+            "bad expression 'no such column: area'".into()
+        ))
+        .is_none());
+        assert!(turso_unknown_column_detail(&LimboError::InternalError(
+            "no such column: area".into()
+        ))
+        .is_none());
+        assert_eq!(
+            turso_unknown_column_detail(&LimboError::ParseError("no such column: area".into())),
+            Some("no such column: area")
+        );
+    }
+
+    #[test]
+    fn unknown_column_facet_hint_uses_only_visible_projection() {
+        for sql in [
+            "SELECT records.area FROM records",
+            "SELECT r.area FROM records r",
+            "SELECT id FROM records WHERE area = 'now'",
+            "SELECT réalm FROM records",
+        ] {
+            let mut projection = projection_with_records(vec![record("visible", "hello")]);
+            let mut facet = sql_contract::LOGICAL_RELATIONS
+                .iter()
+                .find(|r| r.name == "facet_values")
+                .unwrap()
+                .columns
+                .iter()
+                .map(|c| (c.to_string(), NormalizedValue::Null))
+                .collect::<NormalizedRow>();
+            facet.insert(
+                "key".into(),
+                NormalizedValue::Text(if sql.contains("réalm") { "r" } else { "area" }.into()),
+            );
+            facet.insert("record_id".into(), NormalizedValue::Text("visible".into()));
+            projection.relations.insert("facet_values", vec![facet]);
+            let error = execute(
+                projection,
+                request(sql),
+                ExecutionControl::with_timeout(Duration::from_secs(2)),
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            if sql.contains("réalm") {
+                assert!(!error.contains("is a facet"), "{error}");
+            } else {
+                assert!(
+                    error.ends_with(&sql_contract::records_facet_column_hint(
+                        sql, &error, "area"
+                    )),
+                    "{error}"
+                );
+            }
+            // A key absent from the visible projection cannot generate advice.
+            let error = execute(
+                projection_with_records(vec![record("visible", "hello")]),
+                request(sql),
+                ExecutionControl::with_timeout(Duration::from_secs(2)),
+                false,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains("is a facet"), "{error}");
+        }
     }
 
     #[test]

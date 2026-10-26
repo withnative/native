@@ -43,14 +43,14 @@ enum Args {
 }
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Status {
+pub(crate) enum Status {
     Healthy,
     Absent,
     Unusable,
 }
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Outcome {
+pub(crate) enum Outcome {
     Inspected,
     Created,
     Existing,
@@ -60,7 +60,7 @@ enum Outcome {
 }
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Reason {
+pub(crate) enum Reason {
     Deleted,
     Forbidden,
     WrongKind,
@@ -70,7 +70,7 @@ enum Reason {
 }
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum Refusal {
+pub(crate) enum Refusal {
     Absent,
     NotUnusable,
     CasMismatch,
@@ -79,18 +79,18 @@ enum Refusal {
     AlreadyReplaced,
 }
 #[derive(Debug, Serialize)]
-struct Receipt {
-    status: Status,
-    outcome: Outcome,
-    reason: Option<Reason>,
-    refusal: Option<Refusal>,
-    record_id: Option<String>,
-    content_revision: Option<String>,
-    policy_revision: Option<String>,
-    created: Option<bool>,
+pub(crate) struct Receipt {
+    pub(crate) status: Status,
+    pub(crate) outcome: Outcome,
+    pub(crate) reason: Option<Reason>,
+    pub(crate) refusal: Option<Refusal>,
+    pub(crate) record_id: Option<String>,
+    pub(crate) content_revision: Option<String>,
+    pub(crate) policy_revision: Option<String>,
+    pub(crate) created: Option<bool>,
 }
 impl Receipt {
-    fn absent() -> Self {
+    pub(crate) fn absent() -> Self {
         Self {
             status: Status::Absent,
             outcome: Outcome::Inspected,
@@ -102,7 +102,7 @@ impl Receipt {
             created: None,
         }
     }
-    fn unusable(id: &str, reason: Reason) -> Self {
+    pub(crate) fn unusable(id: &str, reason: Reason) -> Self {
         Self {
             status: Status::Unusable,
             reason: Some(reason),
@@ -110,7 +110,7 @@ impl Receipt {
             ..Self::absent()
         }
     }
-    fn refused(mut self, refusal: Option<Refusal>) -> Self {
+    pub(crate) fn refused(mut self, refusal: Option<Refusal>) -> Self {
         self.outcome = Outcome::Refused;
         self.refusal = refusal;
         self.created = None;
@@ -140,11 +140,11 @@ async fn mapping(conn: &mut SqliteConnection, account: &str) -> Result<Option<St
             .await?,
     )
 }
-async fn registered(conn: &mut SqliteConnection) -> Result<bool> {
+pub(crate) async fn registered(conn: &mut SqliteConnection) -> Result<bool> {
     let kind = crate::meta::kind::resolve_on(conn, "Configuration", KIND).await?;
     Ok(kind.canonical_kind_for_write() == Some(KIND))
 }
-async fn shape(conn: &mut SqliteConnection) -> Result<Option<Value>> {
+pub(crate) async fn shape(conn: &mut SqliteConnection) -> Result<Option<Value>> {
     let rows = cascade::schema_config_rows_with(
         &mut crate::portable_sql::BorrowedSqliteStatementExecutor::new(&mut *conn),
     )
@@ -160,7 +160,7 @@ async fn shape(conn: &mut SqliteConnection) -> Result<Option<Value>> {
         })
         .cloned())
 }
-fn valid_value(shape: &Value, value: &Value) -> bool {
+pub(crate) fn valid_value(shape: &Value, value: &Value) -> bool {
     let approved: Value = serde_json::from_str(APPROVED).expect("checked-in approved shapes");
     if crate::meta::schema_config::validate_object_facet_value(shape, value).is_err()
         || crate::meta::schema_config::validate_object_facet_value(&approved, value).is_err()
@@ -301,6 +301,7 @@ async fn create_in(
     .await?;
     let id = Uuid::new_v4().to_string();
     let mut act = crate::act::ActAllocation::new();
+    crate::authorization_grant::certify_birth_on(tx, &id).await?;
     append_in(
         db,
         tx,
@@ -339,6 +340,7 @@ async fn create_in(
     )
     .await?;
     super::private_create::install_account_only_policy_in(tx, caller, TOOL, &id, &mut act).await?;
+    crate::authorization_grant::finish_birth_on(tx, &id).await?;
     let missing = super::lifecycle::required_violations_in(tx, &rows, &[&id]).await?;
     crate::domain_transaction::assert_required_not_worsened(TOOL, &Default::default(), &missing)?;
     let created_at = crate::store::now_iso();

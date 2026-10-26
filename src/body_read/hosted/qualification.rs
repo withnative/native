@@ -34,6 +34,59 @@ enum FixtureConsent {
     HumanReceipt,
     TrustedAuthored,
 }
+/// Preview + expose with bounded retry on transient `Busy`.
+///
+/// `expose` commits through `try_lock` on the process-wide preview-receipt
+/// store and the delivery sample store, mapping `WouldBlock` to
+/// `PreviewPublicationFailure::Busy`. Under parallel-test load another test
+/// can hold that lock for the instant `expose` runs, so a single `unwrap`
+/// flakes. `Busy` is the documented transient contract there (the existing
+/// `publication_busy_receipt_and_missing_receipt_keep_new_sample_unpublished`
+/// test holds the lock and asserts `Busy`; the HTTP lookup path maps the same
+/// lock contention to 503 `SERVICE_UNAVAILABLE`), so retry with a fresh
+/// preview until the short deadline, then fail. Any non-`Busy` error panics
+/// immediately: genuine refusals still fail fast. `preview` itself maps the
+/// same two lock contentions to the generic producer refusal; a test-only
+/// classification (`take_preview_refusal`) lets this retry only those.
+async fn preview_bytes_with_retry(
+    db: &Db,
+    caller: &Caller,
+    raw: &Value,
+    delivery: &crate::artifact_html::LaunchDelivery,
+) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let request = producer::Request::parse(&serde_json::to_vec(raw).unwrap()).unwrap();
+        // Fresh ingress per attempt so each retry gets the full 5s publication
+        // deadline instead of sharing one that the wait consumed.
+        let ingress =
+            unsafe { producer::Ingress::from_verified_host(db, caller, &request, Instant::now()) }
+                .unwrap();
+        let pending = match producer::preview(&ingress, delivery).await {
+            Ok(pending) => pending,
+            // `preview` reports a held process-global receipt store or a busy
+            // sample store as the generic producer refusal. Retry exactly
+            // that proven contention; any other refusal fails with its reason.
+            Err(error) => match producer::take_preview_refusal() {
+                Some(
+                    producer::PreviewRefusal::ReceiptStoreBusy
+                    | producer::PreviewRefusal::SampleStoreBusy,
+                ) if Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    continue;
+                }
+                reason => panic!("fixture preview refused: {error:?} (classified: {reason:?})"),
+            },
+        };
+        match pending.expose() {
+            Ok(bytes) => return bytes,
+            Err(producer::PreviewPublicationFailure::Busy) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(other) => panic!("fixture preview expose failed: {other:?}"),
+        }
+    }
+}
 async fn fixture() -> Fixture {
     fixture_with_consent(FixtureConsent::HumanReceipt).await
 }
@@ -121,17 +174,8 @@ async fn fixture_with_consent(consent: FixtureConsent) -> Fixture {
     );
     let (intent, root_nonce) = match consent {
         FixtureConsent::HumanReceipt => {
-            let request = producer::Request::parse(&serde_json::to_vec(&raw).unwrap()).unwrap();
-            let ingress = unsafe {
-                producer::Ingress::from_verified_host(&db, &caller, &request, Instant::now())
-            }
-            .unwrap();
             let preview: Value = serde_json::from_slice(
-                &producer::preview(&ingress, &delivery)
-                    .await
-                    .unwrap()
-                    .expose()
-                    .unwrap(),
+                &preview_bytes_with_retry(&db, &caller, &raw, &delivery).await,
             )
             .unwrap();
             raw["action"] = json!("adopt");
@@ -482,18 +526,10 @@ async fn current_preview(f: &Fixture, key: &str) -> (adoption::Intent, String) {
             crate::mcp::OperationAccess::Mutation,
         )
         .unwrap();
-    let request = producer::Request::parse(&serde_json::to_vec(&raw).unwrap()).unwrap();
     // SAFETY: same explicit native operator trust as fixture(); no browser consent claim.
-    let ingress = unsafe {
-        producer::Ingress::from_verified_host(&f.db, &f.caller, &request, Instant::now())
-    }
-    .unwrap();
+    // Retry helper rebuilds the request/ingress per attempt (fresh 5s deadline).
     let packet: Value = serde_json::from_slice(
-        &producer::preview(&ingress, &f.delivery)
-            .await
-            .unwrap()
-            .expose()
-            .unwrap(),
+        &preview_bytes_with_retry(&f.db, &f.caller, &raw, &f.delivery).await,
     )
     .unwrap();
     raw["action"] = json!("adopt");

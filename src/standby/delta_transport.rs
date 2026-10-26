@@ -184,6 +184,59 @@ fn rendered_response_upper_bound(structured_len: usize) -> usize {
         .saturating_add(RENDERED_ENVELOPE_MARGIN)
 }
 
+// Engine recognition also protects the v1 journal in builds without v2 serving.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum AuthorityHead {
+    V1(AuthorityActDeltaHeadV1),
+    KernelV2(KernelHead),
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KernelHead {
+    contract: String,
+    origin_database_id: String,
+    pub(crate) generation: super::kernel_v2::KernelGeneration,
+}
+impl AuthorityHead {
+    pub(crate) fn head_act(&self) -> i64 {
+        match self {
+            Self::V1(h) => h.head_act(),
+            Self::KernelV2(h) => h.generation.head_act,
+        }
+    }
+    pub(crate) fn origin_database_id(&self) -> &str {
+        match self {
+            Self::V1(h) => h.origin_database_id(),
+            Self::KernelV2(h) => &h.origin_database_id,
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::V1(h) => h.validate(),
+            Self::KernelV2(h) => {
+                require(
+                    h.contract == "native.standby-kernel-v2-head.v1",
+                    "unknown kernel-v2 head contract",
+                )?;
+                h.generation.validate()
+            }
+        }
+    }
+    pub(crate) fn is_kernel_v2(&self) -> bool {
+        match self {
+            Self::V1(_) => false,
+            Self::KernelV2(_) => true,
+        }
+    }
+    pub(crate) fn matches_authority_head(&self, head: &super::AuthorityActHeadV1) -> bool {
+        match self {
+            Self::V1(h) => h.matches_authority_head(head),
+            Self::KernelV2(_) => false,
+        }
+    }
+}
+
 /// The authority's answer to a cheap head probe. Unknown fields are ignored
 /// so additive extensions parse tolerantly; contract/version and the
 /// coordinate validator still refuse what this build cannot understand.
@@ -192,7 +245,7 @@ pub struct AuthorityActHeadResponseV1 {
     contract: String,
     version: u32,
     route_database_id: String,
-    head: AuthorityActDeltaHeadV1,
+    head: AuthorityHead,
     /// The executor annotates every result with run correlation. It is not
     /// authority evidence, but `deny_unknown_fields` must admit it or no real
     /// response parses. Never serialized by the authority itself.
@@ -205,13 +258,23 @@ pub struct AuthorityActHeadResponseV1 {
 }
 
 impl AuthorityActHeadResponseV1 {
+    /// An older serving build can identify v2 for the journal fence, but must
+    /// pause acquisition rather than repeatedly download unusable generations.
+    pub fn refresh_pause_reason(&self) -> Option<&'static str> {
+        if self.head.is_kernel_v2() && !cfg!(feature = "v2-kernel-probe") {
+            Some("engine v2 requires v2-kernel-probe build")
+        } else {
+            None
+        }
+    }
+
     pub fn route_database_id(&self) -> &str {
         &self.route_database_id
     }
 
     /// The replicated authority-head evidence, exactly the coordinate set the
     /// delta wire carries (the advisory engine schema is not replicated).
-    pub(crate) fn head(&self) -> &AuthorityActDeltaHeadV1 {
+    pub(crate) fn head(&self) -> &AuthorityHead {
         &self.head
     }
 }
@@ -285,12 +348,33 @@ pub async fn observe_authority_act_head(
     route_database_id: &str,
 ) -> Result<AuthorityActHeadResponseV1> {
     validate_route_database_id(route_database_id)?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    {
+        let mut tx = db.pool().begin().await?;
+        if super::kernel_v2::is_v2(&mut tx).await? {
+            let generation = super::kernel_v2::coordinates(&mut tx).await?;
+            let origin_database_id = super::kernel_v2::origin(&mut tx, &generation).await?;
+            tx.rollback().await?;
+            return Ok(AuthorityActHeadResponseV1 {
+                contract: AUTHORITY_ACT_HEAD_RESPONSE_CONTRACT.into(),
+                version: AUTHORITY_ACT_RESPONSE_VERSION,
+                route_database_id: route_database_id.into(),
+                head: AuthorityHead::KernelV2(KernelHead {
+                    contract: "native.standby-kernel-v2-head.v1".into(),
+                    origin_database_id,
+                    generation,
+                }),
+                _run_context: Value::Null,
+            });
+        }
+        tx.rollback().await?;
+    }
     let head = crate::standby::authority_probe::read_authority_act_head(db).await?;
     Ok(AuthorityActHeadResponseV1 {
         contract: AUTHORITY_ACT_HEAD_RESPONSE_CONTRACT.into(),
         version: AUTHORITY_ACT_RESPONSE_VERSION,
         route_database_id: route_database_id.to_string(),
-        head: AuthorityActDeltaHeadV1::from_head(&head),
+        head: AuthorityHead::V1(AuthorityActDeltaHeadV1::from_head(&head)),
         _run_context: Value::Null,
     })
 }
@@ -322,6 +406,16 @@ pub async fn observe_authority_act_delta(
     route_database_id: &str,
     from_exclusive_act: i64,
 ) -> Result<AuthorityActDeltaResponseV1> {
+    observe_authority_act_delta_with_inventory(db, route_database_id, from_exclusive_act, None)
+        .await
+}
+
+pub async fn observe_authority_act_delta_with_inventory(
+    db: &crate::Db,
+    route_database_id: &str,
+    from_exclusive_act: i64,
+    blob_inventory: Option<&[String]>,
+) -> Result<AuthorityActDeltaResponseV1> {
     validate_route_database_id(route_database_id)?;
     require(
         from_exclusive_act >= 0,
@@ -329,7 +423,7 @@ pub async fn observe_authority_act_delta(
     )?;
 
     let mut tx = db.pool().begin().await?;
-    let outcome = read_cut_on(&mut tx, from_exclusive_act).await;
+    let outcome = read_cut_on(&mut tx, from_exclusive_act, blob_inventory).await;
     let rollback = tx.rollback().await;
     let (head_act, origin_database_id, bytes) = match (outcome, rollback) {
         (Err(error), _) => return Err(error),
@@ -345,8 +439,7 @@ pub async fn observe_authority_act_delta(
 
     // Re-validate the exact bytes we are about to publish, so the carried
     // content digest is the one the authority itself proved.
-    let validated = validate_authority_act_delta(&bytes)?;
-    let content_sha256 = validated.content_sha256().to_string();
+    let content_sha256 = delta_content_digest(&bytes)?;
     let outer_sha256 = hex::encode(Sha256::digest(&bytes));
     let data_base64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
@@ -391,13 +484,32 @@ pub async fn capture_authority_act_delta_export(
     export_root: &std::path::Path,
     ceiling: usize,
 ) -> Result<(crate::export::Export, crate::export::BinaryDeltaMeta)> {
+    capture_authority_act_delta_export_with_inventory(
+        db,
+        route_database_id,
+        from_exclusive_act,
+        export_root,
+        ceiling,
+        None,
+    )
+    .await
+}
+
+pub async fn capture_authority_act_delta_export_with_inventory(
+    db: &crate::Db,
+    route_database_id: &str,
+    from_exclusive_act: i64,
+    export_root: &std::path::Path,
+    ceiling: usize,
+    blob_inventory: Option<&[String]>,
+) -> Result<(crate::export::Export, crate::export::BinaryDeltaMeta)> {
     validate_route_database_id(route_database_id)?;
     require(
         from_exclusive_act >= 0,
         "authority act delta lower bound must be non-negative",
     )?;
     let mut tx = db.pool().begin().await?;
-    let outcome = read_cut_on(&mut tx, from_exclusive_act).await;
+    let outcome = read_cut_on(&mut tx, from_exclusive_act, blob_inventory).await;
     let rollback = tx.rollback().await;
     let (head_act, origin_database_id, bytes) = match (outcome, rollback) {
         (Err(error), _) => return Err(error),
@@ -407,13 +519,13 @@ pub async fn capture_authority_act_delta_export(
     if bytes.len() > ceiling {
         return Err(Error::engine(crate::export::BINARY_DELTA_TOO_LARGE));
     }
-    let validated = validate_authority_act_delta(&bytes)?;
+    let content_sha256 = delta_content_digest(&bytes)?;
     let meta = crate::export::BinaryDeltaMeta {
         route_database_id: route_database_id.to_string(),
         origin_database_id,
         from_exclusive_act,
         to_inclusive_act: head_act,
-        content_sha256: validated.content_sha256().to_string(),
+        content_sha256,
         outer_sha256: hex::encode(Sha256::digest(&bytes)),
     };
     let export = crate::export::spool_bytes_export(
@@ -431,7 +543,28 @@ pub async fn capture_authority_act_delta_export(
 async fn read_cut_on(
     conn: &mut sqlx::SqliteConnection,
     from_exclusive_act: i64,
+    blob_inventory: Option<&[String]>,
 ) -> Result<(i64, String, Vec<u8>)> {
+    #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+    let _ = blob_inventory;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if super::kernel_v2::is_v2(conn).await? {
+        let inventory = match blob_inventory {
+            Some(inventory) => inventory,
+            None if from_exclusive_act == 0 => &[],
+            None => {
+                return Err(Error::engine(
+                    "kernel-v2 delta requires a verified base blob inventory",
+                ))
+            }
+        };
+        let delta = super::kernel_v2_delta::cut(conn, from_exclusive_act, inventory).await?;
+        return Ok((
+            delta.head.head_act,
+            delta.origin_database_id.clone(),
+            delta.bytes()?,
+        ));
+    }
     let head = crate::standby::authority_probe::read_authority_act_head_on(conn).await?;
     require(
         from_exclusive_act <= head.head_act,
@@ -442,6 +575,14 @@ async fn read_cut_on(
             .await?;
     let bytes = build_authority_act_delta(&cut)?;
     Ok((head.head_act, head.origin_database_id, bytes))
+}
+
+fn delta_content_digest(bytes: &[u8]) -> Result<String> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if serde_json::from_slice::<Value>(bytes)?["contract"] == "native.standby-kernel-v2-delta.v1" {
+        return Ok(super::kernel_v2_delta::KernelDelta::parse(bytes)?.content_sha256);
+    }
+    Ok(validate_authority_act_delta(bytes)?.content_sha256().into())
 }
 
 /// The sealed witness that the exact bytes came from the authenticated hosted
@@ -467,6 +608,17 @@ impl AuthenticatedAuthorityActDelta {
             self.from_exclusive_act,
             self.to_inclusive_act,
         )
+    }
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(super) struct AuthenticatedKernelDelta {
+    delta: super::kernel_v2_delta::KernelDelta,
+}
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+impl AuthenticatedKernelDelta {
+    pub(super) fn into_delta(self) -> super::kernel_v2_delta::KernelDelta {
+        self.delta
     }
 }
 
@@ -836,6 +988,77 @@ impl AuthorityActTransport {
         }
     }
 
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) async fn kernel_delta(
+        &self,
+        from: i64,
+        blob_inventory: &[String],
+    ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
+        super::kernel_v2_delta::validate_blob_inventory(blob_inventory)?;
+        if let Some(handle) = self
+            .start_delta_export_with_inventory(from, Some(blob_inventory))
+            .await?
+        {
+            let fetched = self.fetch_delta_export(&handle, from).await;
+            self.cancel_delta_export(&handle).await;
+            let (claim, bytes) = fetched?;
+            return self.verify_kernel_delta(from, claim, &bytes);
+        }
+        let response = self
+            .call::<AuthorityActDeltaResponseV1>(authority_act_call(
+                AUTHORITY_ACT_DELTA_OPERATION,
+                json!({"from_exclusive_act":from,"blob_inventory":blob_inventory}),
+            ))
+            .await?;
+        require(
+            response.contract == AUTHORITY_ACT_DELTA_RESPONSE_CONTRACT
+                && response.version == AUTHORITY_ACT_RESPONSE_VERSION,
+            "invalid kernel-v2 delta response",
+        )?;
+        let bytes = decode_canonical_delta(&response.data_base64)?;
+        self.verify_kernel_delta(
+            from,
+            DeltaClaim {
+                route_database_id: response.route_database_id,
+                origin_database_id: response.origin_database_id,
+                from_exclusive_act: response.from_exclusive_act,
+                to_inclusive_act: response.to_inclusive_act,
+                content_sha256: response.content_sha256,
+                outer_sha256: response.outer_sha256,
+            },
+            &bytes,
+        )
+    }
+
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    fn verify_kernel_delta(
+        &self,
+        from: i64,
+        claim: DeltaClaim,
+        bytes: &[u8],
+    ) -> Result<super::kernel_v2_delta::TrustedKernelDelta> {
+        require(
+            claim.route_database_id == self.expected_route_database_id
+                && claim.origin_database_id == self.expected_origin_database_id
+                && claim.from_exclusive_act == from
+                && claim.outer_sha256 == hex::encode(Sha256::digest(bytes)),
+            "kernel-v2 delta response binding or digest mismatch",
+        )?;
+        let delta = super::kernel_v2_delta::KernelDelta::parse(bytes)?;
+        require(
+            delta.origin_database_id == claim.origin_database_id
+                && delta.from_exclusive_act == from
+                && delta.head.head_act == claim.to_inclusive_act
+                && delta.content_sha256 == claim.content_sha256,
+            "kernel-v2 delta response disagrees with document",
+        )?;
+        Ok(
+            super::kernel_v2_delta::TrustedKernelDelta::from_authenticated(
+                AuthenticatedKernelDelta { delta },
+            ),
+        )
+    }
+
     async fn delta_mcp(&self, from_exclusive_act: i64) -> Result<TrustedAuthorityActDelta> {
         let body = authority_act_call(
             AUTHORITY_ACT_DELTA_OPERATION,
@@ -961,16 +1184,25 @@ impl AuthorityActTransport {
 
     /// `Ok(None)` only for a 404 that carries no Native error code.
     async fn start_delta_export(&self, from_exclusive_act: i64) -> Result<Option<String>> {
+        self.start_delta_export_with_inventory(from_exclusive_act, None)
+            .await
+    }
+
+    async fn start_delta_export_with_inventory(
+        &self,
+        from_exclusive_act: i64,
+        blob_inventory: Option<&[String]>,
+    ) -> Result<Option<String>> {
+        let mut body = json!({"contract": AUTHORITY_ACT_DELTA_EXPORT_CONTRACT, "version":1,"from_exclusive_act":from_exclusive_act});
+        if let Some(inventory) = blob_inventory {
+            body["blob_inventory"] = json!(inventory);
+        }
         let response = self
             .delta_http
             .send(self.delta_request(
                 DeltaHttpMethod::Post,
                 self.export_base.clone(),
-                Some(json!({
-                    "contract": AUTHORITY_ACT_DELTA_EXPORT_CONTRACT,
-                    "version": 1,
-                    "from_exclusive_act": from_exclusive_act,
-                })),
+                Some(body),
                 None,
                 DELTA_CONTROL_MAX_BYTES,
             ))
@@ -1336,16 +1568,32 @@ fn delta_status_error(response: &DeltaHttpResponse) -> Error {
 }
 
 fn authority_act_call(operation: &str, arguments: Value) -> Value {
+    executor_call(AUTHORITY_ACT_EXECUTOR, operation, arguments, None)
+}
+
+/// The JSON-RPC `tools/call` that reaches one hosted executor operation. The
+/// optional `format` is the envelope's response representation (for example
+/// `json`), kept outside the nested arguments.
+pub(crate) fn executor_call(
+    executor: &str,
+    operation: &str,
+    arguments: Value,
+    format: Option<&str>,
+) -> Value {
+    let mut envelope = json!({
+        "operation": operation,
+        "arguments": arguments,
+    });
+    if let Some(format) = format {
+        envelope["format"] = json!(format);
+    }
     json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": AUTHORITY_ACT_EXECUTOR,
-            "arguments": {
-                "operation": operation,
-                "arguments": arguments,
-            },
+            "name": executor,
+            "arguments": envelope,
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": crate::mcp::PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientInfo": {

@@ -175,6 +175,9 @@ pub(super) struct StatusFilter {
     /// not_sent, unrecognised.
     pub(super) states: Vec<String>,
     pub(super) limit: usize,
+    /// List the newest writes first (`order: "newest_first"`). The default is
+    /// the order they were accepted in.
+    pub(super) newest_first: bool,
 }
 
 /// A stored reply larger than this is dropped rather than kept.
@@ -905,6 +908,9 @@ impl Journal {
             rows.push(entry);
         }
         rows.sort_by_key(|e| e.seq);
+        if filter.newest_first {
+            rows.reverse();
+        }
         let matched = rows.len();
         let limit = filter.limit.max(1);
         let writes: Vec<Value> = rows
@@ -960,6 +966,7 @@ impl Journal {
         json!({
             "matched": matched,
             "shown": writes.len(),
+            "order": if filter.newest_first { "newest_first" } else { "oldest_first" },
             "counts": counts,
             "writes": writes,
         })
@@ -987,8 +994,34 @@ impl Journal {
         (Value::Object(own), Value::Object(children))
     }
 
+    /// When the oldest write that still needs attention was accepted: the same
+    /// states a status reader counts as waiting (pending, hosted_pending,
+    /// uncertain, not_sent, refused, unrecognised), not just the send queue.
+    fn oldest_waiting(&self) -> Option<String> {
+        let entries = self.entries.lock().expect("journal entries");
+        entries
+            .values()
+            .filter(|e| {
+                e.state == EntryState::Uncertain
+                    || matches!(
+                        Self::view_state(e),
+                        Some(
+                            "pending"
+                                | "hosted_pending"
+                                | "uncertain"
+                                | "not_sent"
+                                | "refused"
+                                | "unrecognised"
+                        )
+                    )
+            })
+            .min_by_key(|e| (e.seq, e.received_unix_ms))
+            .map(|e| e.received_at.clone())
+    }
+
     /// The queue: how many writes wait and how much they hold.
     pub(super) fn queue_summary(&self) -> Value {
+        let oldest_waiting = self.oldest_waiting();
         let entries = self.entries.lock().expect("journal entries");
         let pending: Vec<&Entry> = entries
             .values()
@@ -998,6 +1031,7 @@ impl Journal {
             "pending": pending.len(),
             "bytes": pending.iter().map(|e| e.arguments_bytes).sum::<usize>(),
             "oldest_accepted_at": pending.iter().min_by_key(|e| e.seq).map(|e| e.received_at.clone()),
+            "oldest_waiting_accepted_at": oldest_waiting,
         })
     }
 

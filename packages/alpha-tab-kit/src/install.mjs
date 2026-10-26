@@ -164,7 +164,7 @@ export function planInstall(p) {
       const before = prefix;
       prefix += chunk;
       const args = index === 0
-        ? { type: "Document", kind: "note", name, home_id: p.homeId, summary: p.summary ?? `Source bytes of alpha tab ${descriptor.package} ${descriptor.version}; staged as a note, then switched to native.html.v1.`, body: chunk, reason: p.reason, sources }
+        ? { type: "Document", kind: "note", name, home_id: p.homeId, summary: p.summary ?? `Source bytes of alpha tab ${descriptor.package} ${descriptor.version}; staged as a note, then switched to native.html.v1.`, body: chunk, reason: p.reason, sources, confirm: true }
         : { id: "{{record_id}}", body_append: chunk, if_body_digest: sha256(before), reason: `${p.reason} (chunk ${index + 1} of ${chunks.length})`, sources };
       steps.push({
         step: index === 0 ? "create-note" : `append-${index + 1}`,
@@ -207,6 +207,9 @@ export function planInstall(p) {
       ...encodeBody(html, bodyEncoding),
       facets: { runtime: LIMITS.install.runtime, ...packageFacet, ...iconFacets },
       reason: p.reason, sources,
+      // Each install generation intentionally owns a fresh source record,
+      // even when earlier versions have the same display name.
+      confirm: true,
       response_mode: "summary",
     };
     steps.push({
@@ -416,6 +419,12 @@ async function runInstallSteps(plan, client, options, vars, progress) {
         throw new Error(`Server predates manage_alpha_tabs.update; use --replace explicitly for remove-then-install. Staged source record ${vars.record_id} can be archived. ${error.message}`, { cause: error });
       }
       throw error;
+    }
+    // A client may return a parsed refusal instead of throwing a tool error.
+    // Never mistake candidate ids in that refusal for the new source's id.
+    const createResult = result?.write_receipt ?? result;
+    if (step.operation === "create_record" && (createResult?.outcome === "refused" || createResult?.applied === false)) {
+      throw new Error(`${step.step}: create_record refused${createResult.code ? ` [${createResult.code}]` : ""}. ${createResult.message ?? "No source record was created."}`);
     }
     // The mutation has succeeded even if validating its receipt or a later
     // inspect fails. Its source is now live, so do not label it as staged.

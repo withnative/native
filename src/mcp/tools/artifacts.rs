@@ -55,7 +55,7 @@ pub(crate) fn mdx_sha256_for_projection(value: &Value) -> String {
 /// authoritative revisions are two different snapshots. Per-port digests make
 /// it possible to explain which input changed without returning the rows a
 /// second time in plan provenance.
-fn named_input_bundle_receipt(
+pub(crate) fn named_input_bundle_receipt(
     input: &Value,
     snapshot_event_id: &str,
     snapshot_event_seq: i64,
@@ -544,14 +544,14 @@ fn root_authored_input(root_context_inputs: &Map<String, Value>) -> Value {
 /// repository's RFC 8785 serializer rather than the historical MDX receipt
 /// serializer: HTML named-input attestation must have one cross-language
 /// number, string, and object-key representation.
-fn named_html_input_digest_bytes(value: &Value) -> Vec<u8> {
+pub(crate) fn named_html_input_digest_bytes(value: &Value) -> Vec<u8> {
     crate::canonical_json::canonical_json(value)
 }
 
 /// JSON integers outside JavaScript's exactly representable range cannot
 /// survive browser JSON/MessagePort delivery without changing value. Reject
 /// them before the named input is hashed or handed to the HTML bridge.
-fn named_html_input_unsafe_integer_path(value: &Value) -> Option<String> {
+pub(crate) fn named_html_input_unsafe_integer_path(value: &Value) -> Option<String> {
     fn visit(value: &Value, path: &mut String) -> Option<String> {
         match value {
             Value::Number(number) if number.is_i64() => number
@@ -1685,6 +1685,9 @@ async fn governed_sql_query_in(
                 super::querying::SavedQueryInspection::Valid { .. } => {
                     Ok(QueryRelationKind::LegacyRecords)
                 }
+                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(
+                    Error::engine("view_profile_unsupported: use hosted pinned SQL"),
+                ),
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion {
                     diagnostic, ..
@@ -1692,6 +1695,9 @@ async fn governed_sql_query_in(
                 super::querying::SavedQueryInspection::GovernedSql { .. } => unreachable!(),
             }
         }
+        super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(Error::engine(
+            "view_profile_unsupported: use hosted pinned SQL",
+        )),
         super::querying::SavedQueryInspection::Invalid { diagnostic }
         | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
             Err(Error::engine(diagnostic))
@@ -1726,7 +1732,7 @@ async fn validate_input_binding_relation_in(
     }
 }
 
-fn grouped_count_envelope(
+pub(crate) fn grouped_count_envelope(
     collection_id: &str,
     collection_kind: &str,
     binding_event_seq: i64,
@@ -1801,7 +1807,7 @@ fn grouped_count_envelope(
     }))
 }
 
-fn safe_tree_render_sha256(
+pub(crate) fn safe_tree_render_sha256(
     tree: &Value,
     interactions: &Value,
     observed: &BTreeMap<String, BTreeMap<String, String>>,
@@ -4077,7 +4083,7 @@ fn mdx_engine_error(record_id: &str, mut failure: mdx::Failure) -> Error {
     )
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct InputRecord {
     pub(crate) id: String,
     #[serde(rename = "type")]
@@ -4406,6 +4412,7 @@ async fn collection_member_values(
                         "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
                     ))
                 }
+                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(Error::engine("view_profile_unsupported: use hosted pinned SQL")),
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
                     Err(Error::engine(diagnostic))
@@ -4480,6 +4487,7 @@ async fn collection_member_values_in(
                         "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
                     ))
                 }
+                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(Error::engine("view_profile_unsupported: use hosted pinned SQL")),
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion { diagnostic, .. } => {
                     Err(Error::engine(diagnostic))
@@ -4531,6 +4539,11 @@ async fn resolve_governed_sql_relation_in(
         super::querying::SavedQueryInspection::Valid { .. } => {
             return Err(Error::engine(
                 "native.relation-envelope.v1 requires a saved governed SQL query",
+            ))
+        }
+        super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => {
+            return Err(Error::engine(
+                "view_profile_unsupported: use hosted pinned SQL",
             ))
         }
         super::querying::SavedQueryInspection::Invalid { diagnostic }
@@ -4955,6 +4968,9 @@ async fn collection_member_values_member(
                 }
                 super::querying::SavedQueryInspection::GovernedSql { .. } => Err(
                     Error::unavailable_offline("open_collection", "saved_governed_sql"),
+                ),
+                super::querying::SavedQueryInspection::GovernedSqlPinned { .. } => Err(
+                    Error::engine("view_profile_unsupported: use hosted pinned SQL"),
                 ),
                 super::querying::SavedQueryInspection::Invalid { diagnostic }
                 | super::querying::SavedQueryInspection::UnsupportedVersion {
@@ -6960,7 +6976,7 @@ const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANU
     .remove(b'.')
     .remove(b'~');
 
-fn styles_plan_field(
+pub(crate) fn styles_plan_field(
     hosting_database: Option<&str>,
     artifact_id: &str,
     styles_sha256: Option<&str>,
@@ -7274,7 +7290,7 @@ async fn render_observed_versions(
     Ok(observed)
 }
 
-fn record_create_is_render_supported(create: &mdx_v2::RecordCreateDecl) -> bool {
+pub(crate) fn record_create_is_render_supported(create: &mdx_v2::RecordCreateDecl) -> bool {
     const CREATE_FIELDS: &[&str] = &[
         "name",
         "body",
@@ -7705,6 +7721,61 @@ struct RuntimeFailure {
 
 struct BoardRuntime;
 
+/// Storage-independent v1 board adapter, shared by native render admission.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) fn render_board_compat(
+    body: &str,
+    mode: &'static str,
+    collection: Option<Value>,
+    rows: Vec<Value>,
+) -> std::result::Result<Value, Value> {
+    let records = rows
+        .into_iter()
+        .map(|row| {
+            let text = |key: &str| row[key].as_str().map(str::to_owned);
+            InputRecord {
+                id: text("id").unwrap_or_default(),
+                record_type: text("type").unwrap_or_default(),
+                kind: text("kind"),
+                name: text("name").unwrap_or_default(),
+                summary: text("summary"),
+                lifecycle: row
+                    .pointer("/lifecycle_interpretation/value/raw")
+                    .or_else(|| row.pointer("/lifecycle_interpretation/raw"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                lifecycle_interpretation: row["lifecycle_interpretation"].clone(),
+                maturity: text("maturity"),
+                persistence: text("persistence"),
+                facets: row["facets"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }
+        })
+        .collect();
+    BoardRuntime
+        .render(
+            body,
+            RuntimeContext {
+                mode,
+                collection,
+                records,
+                artifact_id: String::new(),
+                event_seq: 0,
+                cache_partition: String::new(),
+            },
+        )
+        .map_err(|failure| diagnostic(failure.code, failure.message, failure.details))
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn board_descriptor_compat() -> Value {
+    BoardRuntime.descriptor()
+}
+
 struct HtmlRuntime;
 
 pub(crate) struct ResolvedArtifact {
@@ -7998,7 +8069,7 @@ fn verification_state(runtime_id: &str) -> Value {
 
 /// Overlay `verification` into an emitted runtime descriptor. Success paths
 /// only: diagnostics keep their exact existing shapes.
-fn with_verification(mut descriptor: Value, runtime_id: &str) -> Value {
+pub(crate) fn with_verification(mut descriptor: Value, runtime_id: &str) -> Value {
     if let Some(object) = descriptor.as_object_mut() {
         object.insert("verification".into(), verification_state(runtime_id));
     }
@@ -8585,6 +8656,46 @@ pub(crate) async fn render_live_as_viewer(
         json!({ "id": artifact_id }),
     ))
     .await
+}
+
+/// Enumerate the same governed artifact identity as ordinary v1 rendering,
+/// including active kind aliases and archived records. Absence of a runtime
+/// stays absence: it is a v1 refusal, never a default runtime selection.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn frozen_artifact_sources(db: &Db) -> Result<Vec<(String, Option<String>)>> {
+    let predicate = identity_predicate("r", "Document", ARTIFACT_KIND_VALUE_ID);
+    let sql=format!("SELECT r.id,f.value FROM records r LEFT JOIN facet_values f ON f.record_id=r.id AND f.key='runtime' WHERE r.deleted_at IS NULL AND {predicate} ORDER BY r.id");
+    Ok(sqlx::query_as(&sql).fetch_all(db.pool()).await?)
+}
+
+/// Local cutover preflight uses the ordinary source/input/grant resolver without
+/// issuing a browser bearer. Delivery configuration is checked separately by
+/// the hosted readiness gate; it cannot confer source authority.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn frozen_render_outcome(db: &Db, caller: &Caller, id: &str) -> Result<Value> {
+    require_record(db, caller, "render_artifact", id, Capability::View).await?;
+    let runtime: Option<String> =
+        sqlx::query_scalar("SELECT value FROM facet_values WHERE record_id=? AND key='runtime'")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await?
+            .flatten();
+    if runtime.as_deref() != Some(HTML_RUNTIME) {
+        return render_live_as_viewer(db, caller, id).await;
+    }
+    if let Some(materialized) = materialize_live_html(db, caller, id, "render_artifact").await? {
+        return Ok(materialized.rendered);
+    }
+    let lens = lens::ReadLens::live(db);
+    let resolved =
+        match resolve_artifact(&lens, caller, id, V2SnapshotMode::Materialize, false).await? {
+            Ok(resolved) => resolved,
+            Err(diagnostic) => return Ok(diagnostic),
+        };
+    Ok(match prepare_html(&resolved) {
+        Ok(_) => json!({"status":"rendered"}),
+        Err(diagnostic) => diagnostic,
+    })
 }
 
 async fn render_artifact(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -9322,7 +9433,7 @@ fn empty_render_timing() -> Value {
 /// Real v2 renders already embed timing in `report_v2_render`; this covers
 /// every other path. Rendered plans gain `plan.timing`, diagnostics gain a
 /// top-level `timing`. Never overwrites timing a v2 measured path attached.
-fn attach_empty_timing_if_requested(mut result: Value, include_timing: bool) -> Value {
+pub(crate) fn attach_empty_timing_if_requested(mut result: Value, include_timing: bool) -> Value {
     if !include_timing || result.get("timing").is_some() {
         return result;
     }

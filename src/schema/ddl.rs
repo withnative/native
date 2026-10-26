@@ -293,6 +293,9 @@
 //! have ON DELETE RESTRICT; replacement advances lineage without changing the
 //! old record. No binding registry or query-catalog surface is added.
 
+//! ENGINE SCHEMA 92: `content_event_heads` (trigger-maintained causal heads)
+//! and the partial `idx_content_events_basis_run` index.
+
 //! ENGINE SCHEMA 90: immutable plan-bound SQL batch receipts, stamped by act
 //! independently of content events so no-event archive receipts survive copies.
 
@@ -743,7 +746,160 @@ pub(crate) const SQL_WRITE_RECEIPTS_DDL: [&str; 4] = [
        BEGIN SELECT RAISE(ABORT, 'sql_write_receipts is append-only'); END"#,
 ];
 
-pub const DDL_STATEMENTS: [&str; 373] = [
+/// Engine 93: the viewer's own Messages in Unfiled (notes to self) as a keyed
+/// read. `DDL_STATEMENTS` embeds it, and the 92 → 93 migration installs the
+/// same text.
+pub(crate) const UNFILED_MESSAGE_OWNER_INDEX_DDL: &str = r#"CREATE INDEX idx_records_unfiled_message_owner
+       ON records(owner_id)
+       WHERE type='Message' AND home_id='native:unfiled' AND deleted_at IS NULL"#;
+
+/// Engine 91: conservative, subject-addressed realtime authority fences.
+pub(crate) const AUTHORIZATION_SUBJECT_DDL: [&str; 22] = [
+    r#"CREATE TABLE authorization_subject_revision (
+     subject_kind TEXT NOT NULL CHECK (subject_kind IN ('global','account','members')),
+     subject_id TEXT NOT NULL,
+     revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision >= 0),
+     PRIMARY KEY (subject_kind, subject_id),
+     CHECK ((subject_kind = 'global' AND subject_id = '')
+         OR (subject_kind = 'members' AND subject_id = 'native:members')
+         OR (subject_kind = 'account' AND length(subject_id) > 0))
+   )"#,
+    r#"INSERT INTO authorization_subject_revision VALUES ('global', '', 0)"#,
+    // A marker cannot survive COMMIT: its deferred parent can never exist.
+    r#"CREATE TABLE authorization_subject_birth_fence (
+       id INTEGER PRIMARY KEY CHECK (0)
+    )"#,
+    r#"CREATE TABLE authorization_subject_births (
+       record_id TEXT PRIMARY KEY NOT NULL,
+       fence INTEGER NOT NULL DEFAULT 0 CHECK (fence = 0),
+       FOREIGN KEY (fence) REFERENCES authorization_subject_birth_fence(id)
+         DEFERRABLE INITIALLY DEFERRED
+    )"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_record_policies_insert AFTER INSERT ON record_policies
+       WHEN NOT EXISTS (SELECT 1 FROM authorization_subject_births WHERE record_id = NEW.record_id)
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_record_policies_delete AFTER DELETE ON record_policies
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.record_id)
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_record_policies_update AFTER UPDATE ON record_policies
+       WHEN OLD.record_id IS NOT NEW.record_id
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_policy_entries_insert AFTER INSERT ON policy_entries
+       BEGIN INSERT INTO authorization_subject_revision(subject_kind, subject_id, revision) VALUES (NEW.subject_kind, NEW.subject_id, 1) ON CONFLICT(subject_kind, subject_id) DO UPDATE SET revision = revision + 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_policy_entries_delete AFTER DELETE ON policy_entries
+       WHEN EXISTS (SELECT 1 FROM records WHERE id = OLD.policy_anchor_id)
+       BEGIN INSERT INTO authorization_subject_revision(subject_kind, subject_id, revision) VALUES (OLD.subject_kind, OLD.subject_id, 1) ON CONFLICT(subject_kind, subject_id) DO UPDATE SET revision = revision + 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_policy_entries_update AFTER UPDATE ON policy_entries
+       WHEN OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.subject_kind IS NOT NEW.subject_kind
+         OR OLD.subject_id IS NOT NEW.subject_id
+         OR OLD.effect IS NOT NEW.effect
+         OR OLD.capability IS NOT NEW.capability
+       BEGIN INSERT INTO authorization_subject_revision(subject_kind, subject_id, revision) VALUES (OLD.subject_kind, OLD.subject_id, 1) ON CONFLICT(subject_kind, subject_id) DO UPDATE SET revision = revision + 1; INSERT INTO authorization_subject_revision(subject_kind, subject_id, revision) VALUES (NEW.subject_kind, NEW.subject_id, 1) ON CONFLICT(subject_kind, subject_id) DO UPDATE SET revision = revision + 1; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_bindings_insert AFTER INSERT ON bindings
+       WHEN NEW.system = 'account'
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_bindings_delete AFTER DELETE ON bindings
+       WHEN OLD.system = 'account'
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_bindings_update AFTER UPDATE ON bindings
+       WHEN (OLD.system = 'account' OR NEW.system = 'account')
+        AND (OLD.record_id IS NOT NEW.record_id
+          OR OLD.system IS NOT NEW.system
+          OR OLD.identifier IS NOT NEW.identifier
+          OR OLD.is_canonical IS NOT NEW.is_canonical)
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_records_update
+       AFTER UPDATE OF policy_anchor_id, deleted_at, type, kind ON records
+       WHEN (OLD.policy_anchor_id IS NOT NEW.policy_anchor_id
+         OR OLD.type IS NOT NEW.type
+         OR OLD.kind IS NOT NEW.kind
+         OR (OLD.deleted_at IS NOT NEW.deleted_at
+           AND (EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+             OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)))
+       ) AND NOT (OLD.type IS NEW.type AND OLD.kind IS NEW.kind
+          AND OLD.deleted_at IS NEW.deleted_at
+          AND EXISTS (SELECT 1 FROM authorization_subject_births WHERE record_id = NEW.id))
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_records_delete BEFORE DELETE ON records
+       WHEN EXISTS (SELECT 1 FROM links JOIN records src ON src.id = links.source_id WHERE links.target_id = OLD.id AND links.relationship = 'part_of' AND src.deleted_at IS NULL AND (src.type = 'Annotation' OR (src.type = 'Document' AND src.kind = 'attachment')))
+         OR EXISTS (SELECT 1 FROM semantic_units JOIN records u ON u.id = semantic_units.unit_id WHERE semantic_units.authority_bearer_record_id = OLD.id AND u.deleted_at IS NULL)
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_links_insert AFTER INSERT ON links
+       WHEN NEW.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = NEW.source_id AND relationship = 'part_of') > 1
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_links_delete AFTER DELETE ON links
+       WHEN OLD.relationship = 'part_of'
+        AND EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+        AND (SELECT COUNT(*) FROM links WHERE source_id = OLD.source_id AND relationship = 'part_of') = 0
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_links_update AFTER UPDATE ON links
+       WHEN (OLD.relationship = 'part_of' OR NEW.relationship = 'part_of')
+        AND (OLD.source_id IS NOT NEW.source_id
+          OR OLD.target_id IS NOT NEW.target_id
+          OR OLD.relationship IS NOT NEW.relationship)
+        AND (EXISTS (SELECT 1 FROM records WHERE id = OLD.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment')))
+          OR EXISTS (SELECT 1 FROM records WHERE id = NEW.source_id AND deleted_at IS NULL AND (type = 'Annotation' OR (type = 'Document' AND kind = 'attachment'))))
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_semantic_units_write AFTER INSERT ON semantic_units
+       WHEN NOT EXISTS (SELECT 1 FROM authorization_subject_births WHERE record_id = NEW.unit_id)
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_semantic_units_delete AFTER DELETE ON semantic_units
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_semantic_units_update AFTER UPDATE OF unit_id, authority_bearer_record_id ON semantic_units
+       WHEN OLD.unit_id IS NOT NEW.unit_id OR OLD.authority_bearer_record_id IS NOT NEW.authority_bearer_record_id
+       BEGIN UPDATE authorization_subject_revision SET revision = revision + 1 WHERE subject_kind = 'global' AND subject_id = ''; END"#,
+    r#"CREATE TRIGGER IF NOT EXISTS authorization_subject_records_owner AFTER UPDATE OF owner_id ON records
+       WHEN OLD.owner_id IS NOT NEW.owner_id
+       BEGIN
+         INSERT INTO authorization_subject_revision(subject_kind, subject_id, revision)
+           SELECT 'account', identifier, 1 FROM bindings
+            WHERE system = 'account' AND is_canonical = 1
+              AND record_id IN (OLD.owner_id, NEW.owner_id)
+           ON CONFLICT(subject_kind, subject_id) DO UPDATE SET revision = revision + 1;
+       END"#,
+];
+
+/// Causal heads (engine 92): the content events no other event names as a
+/// parent, maintained by triggers so local append reads the frontier from this
+/// table instead of anti-joining the whole log. The basis index serves the
+/// per-run "already declared a basis" probe; its predicate text must match the
+/// query (`RUN_BASIS_DECLARED_SQL`) exactly. The `json_valid` guard is
+/// load-bearing: an index expression is evaluated on every insert, and legacy
+/// or imported payloads may be malformed JSON, which must not fail the append.
+pub(crate) const CONTENT_EVENT_HEADS_DDL: [&str; 6] = [
+    r#"CREATE TABLE content_event_heads (
+     event_id TEXT PRIMARY KEY NOT NULL
+   )"#,
+    r#"CREATE INDEX idx_content_events_basis_run
+       ON content_events(run_key, seq) WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.basis') END IS NOT NULL"#,
+    r#"CREATE TRIGGER content_event_heads_event_insert AFTER INSERT ON content_events
+       BEGIN
+         INSERT OR IGNORE INTO content_event_heads(event_id)
+         SELECT NEW.id
+          WHERE NOT EXISTS (SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id = NEW.id);
+       END"#,
+    r#"CREATE TRIGGER content_event_heads_event_delete AFTER DELETE ON content_events
+       BEGIN
+         DELETE FROM content_event_heads WHERE event_id = OLD.id;
+       END"#,
+    r#"CREATE TRIGGER content_event_heads_frontier_insert AFTER INSERT ON content_event_causal_frontier
+       BEGIN
+         DELETE FROM content_event_heads WHERE event_id = NEW.parent_event_id;
+       END"#,
+    r#"CREATE TRIGGER content_event_heads_frontier_delete AFTER DELETE ON content_event_causal_frontier
+       BEGIN
+         INSERT OR IGNORE INTO content_event_heads(event_id)
+         SELECT event.id
+           FROM content_events event
+          WHERE event.id = OLD.parent_event_id
+            AND NOT EXISTS (SELECT 1 FROM content_event_causal_frontier WHERE parent_event_id = OLD.parent_event_id);
+       END"#,
+];
+
+pub const DDL_STATEMENTS: [&str; 402] = [
     r#"CREATE TABLE content_events (
      seq                     INTEGER PRIMARY KEY AUTOINCREMENT,
      id                      TEXT NOT NULL UNIQUE,
@@ -897,6 +1053,7 @@ pub const DDL_STATEMENTS: [&str; 373] = [
     r#"CREATE INDEX idx_records_kind      ON records(type, kind) WHERE deleted_at IS NULL"#,
     r#"CREATE INDEX idx_records_home      ON records(home_id)  WHERE deleted_at IS NULL"#,
     r#"CREATE INDEX idx_records_owner     ON records(owner_id)"#,
+    UNFILED_MESSAGE_OWNER_INDEX_DDL,
     r#"CREATE INDEX idx_records_policy_anchor ON records(policy_anchor_id)"#,
     r#"CREATE INDEX idx_records_lifecycle ON records(lifecycle)  WHERE deleted_at IS NULL"#,
     r#"CREATE INDEX idx_records_open_claims
@@ -2980,7 +3137,35 @@ pub const DDL_STATEMENTS: [&str; 373] = [
     SQL_WRITE_RECEIPTS_DDL[1],
     SQL_WRITE_RECEIPTS_DDL[2],
     SQL_WRITE_RECEIPTS_DDL[3],
-    r#"PRAGMA user_version = 90"#,
+    AUTHORIZATION_SUBJECT_DDL[0],
+    AUTHORIZATION_SUBJECT_DDL[1],
+    AUTHORIZATION_SUBJECT_DDL[2],
+    AUTHORIZATION_SUBJECT_DDL[3],
+    AUTHORIZATION_SUBJECT_DDL[4],
+    AUTHORIZATION_SUBJECT_DDL[5],
+    AUTHORIZATION_SUBJECT_DDL[6],
+    AUTHORIZATION_SUBJECT_DDL[7],
+    AUTHORIZATION_SUBJECT_DDL[8],
+    AUTHORIZATION_SUBJECT_DDL[9],
+    AUTHORIZATION_SUBJECT_DDL[10],
+    AUTHORIZATION_SUBJECT_DDL[11],
+    AUTHORIZATION_SUBJECT_DDL[12],
+    AUTHORIZATION_SUBJECT_DDL[13],
+    AUTHORIZATION_SUBJECT_DDL[14],
+    AUTHORIZATION_SUBJECT_DDL[15],
+    AUTHORIZATION_SUBJECT_DDL[16],
+    AUTHORIZATION_SUBJECT_DDL[17],
+    AUTHORIZATION_SUBJECT_DDL[18],
+    AUTHORIZATION_SUBJECT_DDL[19],
+    AUTHORIZATION_SUBJECT_DDL[20],
+    AUTHORIZATION_SUBJECT_DDL[21],
+    CONTENT_EVENT_HEADS_DDL[0],
+    CONTENT_EVENT_HEADS_DDL[1],
+    CONTENT_EVENT_HEADS_DDL[2],
+    CONTENT_EVENT_HEADS_DDL[3],
+    CONTENT_EVENT_HEADS_DDL[4],
+    CONTENT_EVENT_HEADS_DDL[5],
+    r#"PRAGMA user_version = 93"#,
 ];
 
 /// The six triggers that keep the two external-content FTS5 indexes

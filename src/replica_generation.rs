@@ -93,13 +93,47 @@ pub enum ReplicaOrdering {
     },
 }
 
+/// A declaration carried by the authenticated native member manifest, not
+/// authority inferred from a candidate file. Native admission must compare it
+/// with independent request/install footing and the actual opened file before
+/// domain reads. It deliberately omits canonical heads and authorization fences.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMemberProfileIdentity {
+    pub account_binding: String,
+    pub principal_id: String,
+    pub genesis_event_id: String,
+}
+
+impl NativeMemberProfileIdentity {
+    fn validate(&self) -> Result<()> {
+        if [&self.account_binding, &self.principal_id]
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 4096)
+            || uuid::Uuid::parse_str(&self.genesis_event_id).is_err()
+        {
+            return Err(Error::engine("native member profile identity is invalid"));
+        }
+        Ok(())
+    }
+}
+
 /// Read profile dimension (§1.3). The member variant carries the compiled
 /// member-schema digest the consumer must match at admission (§3.1).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReplicaProfile {
     CanonicalEngine,
-    MemberReadV1 { member_schema_digest: String },
+    MemberReadV1 {
+        member_schema_digest: String,
+    },
+    /// Reserved native current-state member profile. Recognizing this envelope
+    /// does not admit its bytes through the v1 member schema or opener.
+    MemberReadKernelV2 {
+        engine: String,
+        member_schema_digest: String,
+        identity: NativeMemberProfileIdentity,
+    },
 }
 
 impl ReplicaProfile {
@@ -110,6 +144,12 @@ impl ReplicaProfile {
             Self::MemberReadV1 {
                 member_schema_digest,
             } => format!("member-read-v1/{member_schema_digest}"),
+            Self::MemberReadKernelV2 {
+                member_schema_digest,
+                ..
+            } => {
+                format!("member-read-kernel-v2/{member_schema_digest}")
+            }
         }
     }
 }
@@ -236,6 +276,15 @@ impl ReplicaGenerationManifest {
                 "replica generation content digest is invalid",
             ));
         }
+        if let ReplicaProfile::MemberReadKernelV2 {
+            engine, identity, ..
+        } = &self.profile
+        {
+            if engine != crate::standby::kernel_v2::ENGINE {
+                return Err(Error::engine("native member profile engine is invalid"));
+            }
+            identity.validate()?;
+        }
         match (&self.scope, &self.ordering, &self.profile) {
             (
                 ReplicaScope::Everything,
@@ -254,6 +303,10 @@ impl ReplicaGenerationManifest {
                 ReplicaOrdering::Scoped { ordinal },
                 ReplicaProfile::MemberReadV1 {
                     member_schema_digest,
+                }
+                | ReplicaProfile::MemberReadKernelV2 {
+                    member_schema_digest,
+                    ..
                 },
             ) => {
                 if scope_ref.trim().is_empty() {
@@ -365,6 +418,124 @@ mod tests {
             frontier: None,
             schema_incomplete_for: Vec::new(),
         }
+    }
+
+    fn native_member_manifest() -> ReplicaGenerationManifest {
+        let mut manifest = member_manifest();
+        manifest.profile = ReplicaProfile::MemberReadKernelV2 {
+            engine: crate::standby::kernel_v2::ENGINE.to_owned(),
+            member_schema_digest: "1".repeat(64),
+            identity: NativeMemberProfileIdentity {
+                account_binding: "synthetic-member-account".to_owned(),
+                principal_id: "synthetic-member-principal".to_owned(),
+                genesis_event_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            },
+        };
+        manifest
+    }
+
+    #[test]
+    fn native_member_profile_round_trips_without_canonical_coordinates() {
+        let manifest = native_member_manifest();
+        manifest.validate().unwrap();
+        let value = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(value["profile"]["kind"], "member_read_kernel_v2");
+        assert_eq!(
+            value["profile"]["engine"],
+            crate::standby::kernel_v2::ENGINE
+        );
+        assert_eq!(
+            value["profile"]["identity"]["account_binding"],
+            "synthetic-member-account"
+        );
+        assert!(value.get("frontier").is_none());
+        assert!(value["ordering"].get("head_act").is_none());
+        assert!(!serde_json::to_string(&value)
+            .unwrap()
+            .contains("content_event_seq"));
+        let decoded: ReplicaGenerationManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded, manifest);
+        assert_ne!(
+            manifest.generation_id(),
+            member_manifest().generation_id(),
+            "identical visible bytes cannot reuse a v1 generation identity"
+        );
+    }
+
+    #[test]
+    fn native_member_profile_refuses_wrong_engine_or_canonical_scope() {
+        let mut wrong = native_member_manifest();
+        if let ReplicaProfile::MemberReadKernelV2 { engine, .. } = &mut wrong.profile {
+            *engine = "sqlite".to_owned();
+        }
+        assert_eq!(
+            wrong.validate().unwrap_err().to_string(),
+            "native member profile engine is invalid"
+        );
+        let mut wrong = owner_manifest();
+        wrong.profile = native_member_manifest().profile;
+        assert!(wrong.validate().is_err());
+        let mut wrong = native_member_manifest();
+        wrong.frontier = owner_manifest().frontier;
+        assert_eq!(
+            wrong.validate().unwrap_err().to_string(),
+            "member generation must omit the frontier"
+        );
+        let mut wrong = native_member_manifest();
+        if let ReplicaProfile::MemberReadKernelV2 {
+            member_schema_digest,
+            ..
+        } = &mut wrong.profile
+        {
+            *member_schema_digest = "unknown".to_owned();
+        }
+        assert_eq!(
+            wrong.validate().unwrap_err().to_string(),
+            "member generation schema digest is invalid"
+        );
+    }
+
+    #[test]
+    fn native_member_profile_identity_is_required_validated_and_transport_bound() {
+        let original = native_member_manifest();
+        let value = serde_json::to_value(&original).unwrap();
+        for field in ["account_binding", "principal_id", "genesis_event_id"] {
+            let mut missing = value.clone();
+            missing["profile"]["identity"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<ReplicaGenerationManifest>(missing).is_err());
+            let mut invalid = value.clone();
+            invalid["profile"]["identity"][field] = serde_json::json!("");
+            let invalid: ReplicaGenerationManifest = serde_json::from_value(invalid).unwrap();
+            assert_eq!(
+                invalid.validate().unwrap_err().to_string(),
+                "native member profile identity is invalid"
+            );
+            let mut changed = value.clone();
+            changed["profile"]["identity"][field] =
+                serde_json::json!(if field == "genesis_event_id" {
+                    "22222222-2222-4222-8222-222222222222"
+                } else {
+                    "another-synthetic-identity"
+                });
+            let changed: ReplicaGenerationManifest = serde_json::from_value(changed).unwrap();
+            changed.validate().unwrap();
+            assert_ne!(changed.canonical_bytes(), original.canonical_bytes());
+        }
+        for field in ["account_binding", "principal_id"] {
+            for (length, valid) in [(4096, true), (4097, false)] {
+                let mut bounded = value.clone();
+                bounded["profile"]["identity"][field] = serde_json::json!("a".repeat(length));
+                let bounded: ReplicaGenerationManifest = serde_json::from_value(bounded).unwrap();
+                assert_eq!(bounded.validate().is_ok(), valid);
+            }
+        }
+        let mut injected = value;
+        injected["profile"]["identity"]["authorization_fence"] =
+            serde_json::json!("not-member-data");
+        assert!(serde_json::from_value::<ReplicaGenerationManifest>(injected).is_err());
     }
 
     fn owner_manifest() -> ReplicaGenerationManifest {

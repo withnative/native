@@ -733,6 +733,7 @@ pub(super) async fn advance_artifact_port_pin(
                 "{TOOL}: the saved query would still be invalid after advancing '{relation_name}' to {target_version}: {diagnostic}"
             )))
         }
+        crate::mcp::tools::querying::SavedQueryInspection::GovernedSqlPinned { .. } => return Err(Error::engine("view_profile_unsupported: named pins require explicit revision authoring")),
         crate::mcp::tools::querying::SavedQueryInspection::Valid { .. } => {
             return Err(Error::engine(format!(
                 "{TOOL}: bound Collection is not governed SQL"

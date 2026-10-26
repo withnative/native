@@ -24,7 +24,45 @@ use crate::store::now_iso;
 
 pub const AWARENESS_RETENTION_FLOOR: i64 = 0;
 pub const CANDIDATE_RETENTION_FLOOR: i64 = 0;
-pub const MESSAGE_INBOX_SCHEMA: &str = "native.message-inbox.v2";
+pub const MESSAGE_INBOX_SCHEMA: &str = "native.message-inbox.v3";
+
+/// Item fields added by v3 (viewer-relative identity disclosure).
+pub const MESSAGE_INBOX_V3_ITEM_FIELDS: [&str; 5] = [
+    "sender",
+    "participants",
+    "participant_count",
+    "reply_to_id",
+    "conversation",
+];
+
+/// Most participants listed on one item; `participant_count` carries the total.
+pub const INBOX_PARTICIPANT_CAP: usize = 8;
+
+/// A person the viewer cannot see (or who has no Person record). Only the
+/// single `sender` field may carry this; participants are never padded with
+/// hidden slots, so membership the viewer cannot see is not disclosed.
+pub fn inbox_hidden_person() -> Value {
+    json!({"person_id": null, "name": null, "viewer": false, "state": "hidden"})
+}
+
+/// The one ordering and cap rule for `participants`, shared by every route so
+/// they cannot drift: the viewer first, then the other visible people by
+/// Person record id (an order that needs no name lookups), at most
+/// `INBOX_PARTICIPANT_CAP`. Callers pass only slots the viewer may see and
+/// report `participant_count` as the number they passed.
+pub fn inbox_participants(mut slots: Vec<Value>) -> Vec<Value> {
+    slots.sort_by(|a, b| {
+        let key = |slot: &Value| {
+            (
+                slot["viewer"] != true,
+                slot["person_id"].as_str().unwrap_or_default().to_owned(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    slots.truncate(INBOX_PARTICIPANT_CAP);
+    slots
+}
 
 /// The schema this surface used before `home_id` joined every item. Retained
 /// so the version story is legible in code rather than only in a changelog:
@@ -50,11 +88,18 @@ pub const MESSAGE_INBOX_SCHEMA_V1: &str = "native.message-inbox.v1";
 /// always emitted, carrying `native:unfiled` for a Message sent without a home
 /// and `null` only for a record with no home at all, so grouping by destination
 /// is total rather than something a client has to special-case.
+///
+/// VERSION 3 (22 Oct 2026) adds `sender`, `participants`, `participant_count`,
+/// `reply_to_id` and `conversation` (`MESSAGE_INBOX_V3_ITEM_FIELDS`), all
+/// additive and viewer-relative, resolved per page under the viewer's current
+/// authority: participants the viewer cannot see are omitted and uncounted, and
+/// an unseen sender is the opaque `state:"hidden"` object. Hosted and kernel v2
+/// both emit it, with a route-stable `conversation.key`.
 pub fn messaging_surface_contract() -> Value {
     json!({
         "schema": MESSAGE_INBOX_SCHEMA,
         "response_fields": ["schema","view","items","snapshot","next_after","newer_available","heads","counts_are_distinct_message_ids"],
-        "item_fields": ["message_id","home_id","name","body","created_at","human","agent","obligation","route","mention","attention","delivery"],
+        "item_fields": ["message_id","home_id","name","body","created_at","human","agent","obligation","route","mention","attention","delivery","sender","participants","participant_count","reply_to_id","conversation"],
         "human_stages": ["unsurfaced","presented","opened","acknowledged"],
         "agent_states": ["unhandled","triaged","deferred","escalated","acted","resolved"],
         "head_fields": ["content","awareness","candidates","control","authorization"],
@@ -146,6 +191,66 @@ pub struct HostNotificationRevalidation {
     pub effective_viewable_unmuted: bool,
 }
 
+/// Whether delivery must withhold a candidate at harvest or revalidation: the
+/// recipient muted its Message, muted the conversation it arrived in (for a
+/// routine arrival), or their arrival preference no longer admits its reason.
+/// A live `human_obligation` candidate (`obligation_live`) is also withheld
+/// once its obligation is closed (see [`obligation_closed_on`]). The write
+/// paths withdraw it in their own transaction; this read is the backstop for
+/// closures they cannot see, such as a WorkItem completing or a decision
+/// recorded through a generic record write. It derives on the connection
+/// already held, since a second pool connection here could exhaust the pool
+/// under concurrent callers, and it propagates errors rather than reading a
+/// failure as "deliverable".
+/// Hosted delivery already drops muted candidates, so a preference rides the
+/// same flag rather than a second one.
+async fn notification_withheld_on(
+    db: &crate::Db,
+    cache: &mut ThreadCache,
+    recipient_account_id: &str,
+    message_id: &str,
+    reason: &str,
+    obligation_live: bool,
+) -> Result<bool> {
+    let mut conn = db.write_pool().acquire().await?;
+    let muted: bool = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT muted FROM message_preferences WHERE subject_account_id=? AND message_id=?),0)",
+    )
+    .bind(recipient_account_id)
+    .bind(message_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if muted {
+        return Ok(true);
+    }
+    if reason == "human_obligation" {
+        return if obligation_live {
+            obligation_closed_on(&mut conn, recipient_account_id, message_id).await
+        } else {
+            Ok(false)
+        };
+    }
+    if reason != "routine_arrival" {
+        // Mentions, obligations, reminders and interventions are not governed
+        // by the arrival preference.
+        return Ok(false);
+    }
+    let direct_context = is_direct_context_on(&mut conn, message_id).await?;
+    if !arrival_preference_allows(
+        &notification_arrival_on(&mut *conn, recipient_account_id).await?,
+        reason,
+        direct_context,
+    ) {
+        return Ok(true);
+    }
+    // One walk per thread per batch; each recipient's own mutes are then
+    // checked against the shared set.
+    Conversation::load(&mut conn, Some(cache), message_id)
+        .await?
+        .muted_by(&mut conn, recipient_account_id)
+        .await
+}
+
 /// Read a bounded notification-candidate suffix under portable authorization.
 /// Authorization errors are denials, matching ordinary record reads.
 /// `is_member` is the recipient's live catalog footing: guests evaluate the
@@ -183,6 +288,7 @@ pub async fn harvest_host_notification_candidates(
     .await?;
     let mut scanned_through = after_candidate_seq;
     let mut candidates = Vec::new();
+    let mut thread_cache = ThreadCache::default();
     for row in rows {
         scanned_through = scanned_through.max(row.try_get("candidate_event_seq")?);
         if row.try_get::<String, _>("status")? != "effective" {
@@ -199,16 +305,19 @@ pub async fn harvest_host_notification_candidates(
         {
             continue;
         }
-        let muted = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT muted FROM message_preferences WHERE subject_account_id=? AND message_id=?),0)",
+        let reason: String = row.try_get("reason")?;
+        let muted = notification_withheld_on(
+            db,
+            &mut thread_cache,
+            recipient_account_id,
+            &message_id,
+            &reason,
+            true,
         )
-        .bind(recipient_account_id)
-        .bind(&message_id)
-        .fetch_one(db.write_pool())
         .await?;
         candidates.push(HostNotificationCandidate {
             candidate_id: row.try_get("candidate_id")?,
-            reason: row.try_get("reason")?,
+            reason,
             priority: row.try_get("priority")?,
             redaction_class: row.try_get("redaction_class")?,
             evaluator_kind: row.try_get("evaluator_kind")?,
@@ -238,7 +347,7 @@ pub async fn revalidate_host_notification_candidate(
             .await;
     }
     let candidate = sqlx::query(
-        "SELECT message_id,not_before,status,priority,evaluator_kind,policy_version FROM notification_candidates WHERE candidate_id=? AND recipient_account_id=?",
+        "SELECT message_id,not_before,status,priority,reason,evaluator_kind,policy_version FROM notification_candidates WHERE candidate_id=? AND recipient_account_id=?",
     )
     .bind(candidate_id)
     .bind(recipient_account_id)
@@ -254,12 +363,15 @@ pub async fn revalidate_host_notification_candidate(
         &message_id,
     )
     .await;
-    let muted: bool = sqlx::query_scalar(
-        "SELECT COALESCE((SELECT muted FROM message_preferences WHERE subject_account_id=? AND message_id=?),0)",
+    let reason: String = candidate.try_get("reason")?;
+    let muted = notification_withheld_on(
+        db,
+        &mut ThreadCache::default(),
+        recipient_account_id,
+        &message_id,
+        &reason,
+        candidate.try_get::<String, _>("status")? == "effective",
     )
-    .bind(recipient_account_id)
-    .bind(&message_id)
-    .fetch_one(db.write_pool())
     .await?;
     let not_before = candidate.try_get("not_before")?;
     let priority = candidate.try_get("priority")?;
@@ -1622,6 +1734,21 @@ pub async fn set_preference(
     }
     project_awareness_event(&mut *tx, &event).await?;
     let next_version = current_version + 1;
+    // Archiving puts the message away, so whatever was proposed to notify this
+    // recipient about it goes too: every kind, like opening it. Restoring
+    // proposes nothing back.
+    if matches!(action, PreferenceAction::Archive) {
+        withdraw_notification_candidates_in(
+            tx,
+            account,
+            message_id,
+            None,
+            "awareness.preference.changed",
+            &event.id,
+            act_alloc,
+        )
+        .await?;
+    }
     if matches!(
         action,
         PreferenceAction::Snooze | PreferenceAction::ClearSnooze
@@ -2697,6 +2824,395 @@ pub async fn withdraw_message_candidates_in(
         .await
 }
 
+/// A Message counts as delivered when its send evaluation delivered it or an
+/// authorised intervention later did (`resume_delivery`). Policy-blocked
+/// sends and private drafts are neither, so their authors never become thread
+/// participants and their links never join threads. `{id}` is replaced by the
+/// SQL expression naming the Message.
+const DELIVERED_MESSAGE_SQL: &str = "(EXISTS(SELECT 1 FROM content_events delivered_event
+        WHERE delivered_event.record_id={id}
+          AND delivered_event.type='message.send_evaluated.v1'
+          AND json_extract(delivered_event.payload,'$.delivered')=1)
+      OR EXISTS(SELECT 1 FROM content_events delivered_event
+        WHERE delivered_event.record_id={id}
+          AND delivered_event.type='message.delivery.authorized.v1'))";
+
+/// The Messages of the thread containing `message_id`: the connected component
+/// of `reply_to` links around it, which is the root, every reply and every
+/// reply to a reply. A Message that is not a reply is the root of a thread of
+/// its own. Only edges between delivered Messages are walked, so an undelivered
+/// draft can never bridge two threads. `UNION` dedupes by message id, so a
+/// malformed cycle terminates, and there is no depth cutoff that could mistake
+/// a deep reply for the root.
+async fn thread_messages_on(conn: &mut SqliteConnection, message_id: &str) -> Result<Vec<String>> {
+    let sql = format!(
+        "WITH RECURSIVE thread(id) AS (
+           SELECT ?
+           UNION
+           SELECT link.target_id FROM thread
+             JOIN links link ON link.source_id=thread.id AND link.relationship='reply_to'
+            WHERE {to_delivered}
+           UNION
+           SELECT link.source_id FROM thread
+             JOIN links link ON link.target_id=thread.id AND link.relationship='reply_to'
+            WHERE {from_delivered})
+         SELECT id FROM thread",
+        to_delivered = DELIVERED_MESSAGE_SQL.replace("{id}", "link.target_id"),
+        from_delivered = DELIVERED_MESSAGE_SQL.replace("{id}", "link.source_id"),
+    );
+    Ok(sqlx::query_scalar(&sql)
+        .bind(message_id)
+        .fetch_all(conn)
+        .await?)
+}
+
+/// What a mute of a conversation means for one Message: the Message itself,
+/// every Message of its thread, and (for a direct context) every Message
+/// among the exact same participants. The thread is walked once; recipients
+/// are then checked against the shared set.
+#[derive(Clone, Debug)]
+pub(crate) struct Conversation {
+    message_id: String,
+    thread: std::sync::Arc<std::collections::HashSet<String>>,
+}
+
+/// Thread sets shared across one harvest batch: every Message of a walked
+/// thread maps to the same set, so each thread is walked once per batch.
+#[derive(Default)]
+pub(crate) struct ThreadCache {
+    by_message:
+        std::collections::HashMap<String, std::sync::Arc<std::collections::HashSet<String>>>,
+}
+
+impl Conversation {
+    pub(crate) async fn load(
+        conn: &mut SqliteConnection,
+        cache: Option<&mut ThreadCache>,
+        message_id: &str,
+    ) -> Result<Self> {
+        if let Some(thread) = cache.as_ref().and_then(|c| c.by_message.get(message_id)) {
+            return Ok(Self {
+                message_id: message_id.to_owned(),
+                thread: thread.clone(),
+            });
+        }
+        let members = thread_messages_on(&mut *conn, message_id).await?;
+        let thread: std::collections::HashSet<String> = members.iter().cloned().collect();
+        let thread = std::sync::Arc::new(thread);
+        if let Some(cache) = cache {
+            // Share the set with every member only when the walk started at a
+            // delivered Message: an undelivered start sees a different component
+            // than its delivered neighbours do.
+            let start_delivered: bool = sqlx::query_scalar(&format!(
+                "SELECT {}",
+                DELIVERED_MESSAGE_SQL.replace("{id}", "?")
+            ))
+            .bind(message_id)
+            .bind(message_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if start_delivered {
+                for member in &members {
+                    cache.by_message.insert(member.clone(), thread.clone());
+                }
+            }
+        }
+        Ok(Self {
+            message_id: message_id.to_owned(),
+            thread,
+        })
+    }
+
+    pub(crate) fn thread_ids(&self) -> impl Iterator<Item = &String> {
+        self.thread.iter()
+    }
+
+    /// True when the account muted any Message of this conversation. Muting is
+    /// per Message, so this is what makes a mute keep applying to the replies
+    /// that arrive after it.
+    pub(crate) async fn muted_by(
+        &self,
+        conn: &mut SqliteConnection,
+        account: &str,
+    ) -> Result<bool> {
+        let muted: Vec<String> = sqlx::query_scalar(
+            "SELECT message_id FROM message_preferences
+              WHERE subject_account_id=? AND muted=1",
+        )
+        .bind(account)
+        .fetch_all(&mut *conn)
+        .await?;
+        if muted
+            .iter()
+            .any(|id| *id == self.message_id || self.thread.contains(id))
+        {
+            return Ok(true);
+        }
+        if muted.is_empty() {
+            return Ok(false);
+        }
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(
+               SELECT 1 FROM message_origin_state own
+                 JOIN message_origin_state sibling
+                   ON sibling.origin_type='direct'
+                  AND sibling.direct_set_digest=own.direct_set_digest
+                  AND sibling.participant_count=own.participant_count
+                WHERE own.message_id=? AND own.origin_type='direct'
+                  AND sibling.message_id IN (SELECT value FROM json_each(?)))",
+        )
+        .bind(&self.message_id)
+        .bind(serde_json::to_string(&muted)?)
+        .fetch_one(conn)
+        .await?)
+    }
+}
+
+/// The closed vocabulary of the per-person arrival preference.
+pub const NOTIFICATION_ARRIVAL_ALL: &str = "all";
+
+/// Read an account's arrival preference: the newest `notification_preference.set`
+/// control event, or `all` when the person never chose.
+pub async fn notification_arrival_on<'e, E>(executor: E, account: &str) -> Result<String>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT json_extract(payload,'$.arrival') FROM control_events
+          WHERE type='notification_preference.set' AND aggregate_kind='notification_preference'
+            AND aggregate_id=?
+          ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(crate::control::notification_preference_aggregate_id(
+        account,
+    ))
+    .fetch_optional(executor)
+    .await?;
+    Ok(stored.unwrap_or_else(|| NOTIFICATION_ARRIVAL_ALL.to_string()))
+}
+
+/// Set the account's arrival preference (`all`, `dms_and_mentions`, `off`).
+/// A repeated `idempotency_key` with the same value converges without writing;
+/// a different value under a used key is refused. Every first use of a key
+/// appends its event, including when the value is already in force, so the key
+/// is reserved durably (`changed` reports whether the value moved).
+#[allow(clippy::too_many_arguments)]
+pub async fn set_notification_arrival_in(
+    tx: &mut sqlx::Transaction<'static, Sqlite>,
+    account: &str,
+    actor: &str,
+    run_key: Option<&str>,
+    arrival: &str,
+    idempotency_key: &str,
+    reason: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<Value> {
+    if !crate::control::NOTIFICATION_ARRIVAL_VALUES.contains(&arrival) {
+        return Err(Error::engine(
+            "notification arrival must be all, dms_and_mentions, or off",
+        ));
+    }
+    if idempotency_key.trim().is_empty() {
+        return Err(Error::engine(
+            "notification preference requires a non-blank idempotency_key",
+        ));
+    }
+    let key = format!("notification-preference:{account}:{idempotency_key}");
+    let prior = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT type,actor,json_extract(payload,'$.arrival') FROM control_events WHERE idempotency_key=?",
+    )
+    .bind(&key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((event_type, prior_actor, prior_arrival)) = prior {
+        if event_type != "notification_preference.set"
+            || prior_actor != actor
+            || prior_arrival != arrival
+        {
+            return Err(Error::engine(
+                "notification preference idempotency_key was reused for different intent",
+            ));
+        }
+        return Ok(json!({"arrival":arrival,"changed":false,"idempotent":true}));
+    }
+    // The event is appended even when the value is already in force: it is
+    // the durable receipt that reserves the key, so a later retry of this key
+    // converges to this intent instead of replaying it over a newer choice, and
+    // reusing the key for another value stays refused.
+    let changed = notification_arrival_on(&mut **tx, account).await? != arrival;
+    crate::control::append_control_event_in(
+        tx,
+        crate::control::NewControlEvent::authored(
+            key,
+            crate::control::notification_preference_aggregate_id(account),
+            actor,
+            run_key.map(str::to_owned),
+            reason,
+            crate::control::ControlEventPayload::NotificationPreferenceSet(
+                crate::control::NotificationPreferencePayload {
+                    account_id: account.to_owned(),
+                    arrival: arrival.to_owned(),
+                },
+            ),
+        )?,
+        act_alloc,
+    )
+    .await?;
+    Ok(json!({"arrival":arrival,"changed":changed,"idempotent":false}))
+}
+
+/// The preference value that delivers DM arrivals but not thread-reply
+/// arrivals outside a direct context.
+pub const NOTIFICATION_ARRIVAL_DMS_AND_MENTIONS: &str = "dms_and_mentions";
+
+/// Whether the person's arrival preference lets a candidate of `reason`
+/// notify. The preference governs `routine_arrival` only: `all` delivers DMs
+/// and thread replies, `dms_and_mentions` delivers only arrivals in a direct
+/// context (`direct_context`: the Message was sent in a DM, which includes a
+/// reply inside a DM), and `off` delivers none. Mentions, obligations
+/// addressed to the person, reminders and policy interventions always notify,
+/// whatever the preference.
+pub fn arrival_preference_allows(arrival: &str, reason: &str, direct_context: bool) -> bool {
+    if reason != "routine_arrival" {
+        return true;
+    }
+    match arrival {
+        NOTIFICATION_ARRIVAL_DMS_AND_MENTIONS => direct_context,
+        NOTIFICATION_ARRIVAL_ALL => true,
+        _ => false,
+    }
+}
+
+/// True when the Message was sent in a direct (DM) context, as opposed to a
+/// Collection channel.
+async fn is_direct_context_on(conn: &mut SqliteConnection, message_id: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM message_origin_state
+          WHERE message_id=? AND status='declared' AND origin_type='direct')",
+    )
+    .bind(message_id)
+    .fetch_one(conn)
+    .await?)
+}
+
+/// Propose `routine_arrival` candidates for a delivered Message: the other
+/// participants of a direct context, and the participants of the thread when
+/// the Message is a reply (the root's author plus everyone who has replied).
+/// The sender is never a recipient. A recipient who already holds an effective
+/// mention or obligation candidate for the Message keeps just that one, and a
+/// recipient whose preference is not `all`, who muted the conversation, or who
+/// cannot currently read the Message gets none. Thread participants come only
+/// from delivered Messages. Following is not modelled, so nothing else widens
+/// the audience.
+async fn append_routine_arrival_candidates_in(
+    tx: &mut sqlx::Transaction<'static, Sqlite>,
+    message_id: &str,
+    source_event_type: &str,
+    source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<()> {
+    let sender: Option<String> = sqlx::query_scalar(
+        "SELECT principal_id FROM message_audiences
+          WHERE message_id=? AND source='sender' ORDER BY principal_id LIMIT 1",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(sender) = sender else {
+        return Ok(());
+    };
+    let direct_context = is_direct_context_on(tx, message_id).await?;
+    let conversation = Conversation::load(tx, None, message_id).await?;
+    let is_reply: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM links WHERE source_id=? AND relationship='reply_to')",
+    )
+    .bind(message_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    // The thread's participants are the authors of its delivered Messages;
+    // the thread set holds delivered Messages only (plus this one).
+    let thread_ids = serde_json::to_string(&conversation.thread_ids().collect::<Vec<_>>())?;
+    let principals: Vec<String> = sqlx::query_scalar(
+        "SELECT principal_id FROM message_origin_principals WHERE message_id=?
+         UNION
+         SELECT audience.principal_id FROM message_audiences audience
+          WHERE ? AND audience.source='sender'
+            AND audience.message_id IN (SELECT value FROM json_each(?))
+         ORDER BY 1",
+    )
+    .bind(message_id)
+    .bind(is_reply)
+    .bind(&thread_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    for principal in principals.into_iter().filter(|value| *value != sender) {
+        let account: Option<String> = sqlx::query_scalar(
+            "SELECT account.identifier FROM bindings person
+               JOIN bindings account
+                 ON account.record_id=person.record_id
+                AND account.system='account' AND account.is_canonical=1
+              WHERE person.system='native-principal' AND person.is_canonical=1
+                AND person.identifier=?
+              ORDER BY account.identifier LIMIT 1",
+        )
+        .bind(&principal)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(account) = account else {
+            continue;
+        };
+        let held: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM notification_candidates
+              WHERE recipient_account_id=? AND message_id=? AND status='effective'
+                AND reason IN ('principal_mention','human_obligation'))",
+        )
+        .bind(&account)
+        .bind(message_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        // Best effort only. The engine cannot know a recipient's live role
+        // here, so this checks as a member, the widest footing, and rejects
+        // just what even a member could not read (for example an explicit
+        // policy revocation). Harvest and revalidation hold the live footing
+        // and are the binding authorization check; nothing is shown or
+        // delivered on the strength of this one.
+        let can_read = crate::authorization::effective_capability_on(
+            tx,
+            crate::authorization::Principal::bound(&account, true),
+            message_id,
+        )
+        .await
+        .is_ok_and(|capability| capability.allows(crate::authorization::Capability::View));
+        if held
+            || !can_read
+            || !arrival_preference_allows(
+                &notification_arrival_on(&mut **tx, &account).await?,
+                "routine_arrival",
+                direct_context,
+            )
+            || conversation.muted_by(tx, &account).await?
+        {
+            continue;
+        }
+        append_notification_candidate_in(
+            tx,
+            &account,
+            message_id,
+            "routine_arrival",
+            "routine",
+            None,
+            "metadata_only",
+            "recipient_policy",
+            "routine-arrival-v1",
+            source_event_type,
+            source_event_id,
+            act_alloc,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Apply awareness effects that are meaningful only once a Message has been
 /// delivered. Blocked sends retain their authored facets, mentions, and
 /// correction links, but none of those facts may surface or alter another
@@ -2736,6 +3252,29 @@ pub(crate) async fn apply_delivered_message_awareness_in(
             )
             .await?;
         }
+    }
+
+    // A delivered reply may be what closes the expectation on the Message it
+    // answers, for its author. Withdraw that recipient's obligation candidate
+    // now: satisfaction is derived, so nothing else will.
+    let replied_to: Vec<String> = sqlx::query_scalar(
+        "SELECT link.target_id FROM links link
+           JOIN records target ON target.id=link.target_id AND target.type='Message'
+          WHERE link.source_id=? AND link.relationship='reply_to'
+          ORDER BY link.target_id",
+    )
+    .bind(message_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for target_id in replied_to {
+        withdraw_closed_obligation_candidates_in(
+            tx,
+            &target_id,
+            source_event_type,
+            source_event_id,
+            act_alloc,
+        )
+        .await?;
     }
 
     // A correction participates in awareness conflict handling only after it
@@ -2821,6 +3360,14 @@ pub(crate) async fn apply_delivered_message_awareness_in(
             )
             .await?;
         }
+        append_routine_arrival_candidates_in(
+            tx,
+            message_id,
+            source_event_type,
+            source_event_id,
+            act_alloc,
+        )
+        .await?;
     }
 
     let superseded: Vec<String> = sqlx::query_scalar(
@@ -2887,6 +3434,78 @@ pub async fn withdraw_notification_candidates_in(
         project_notification_candidate_event(&mut *tx, &event).await?;
     }
     Ok(rows.len())
+}
+
+/// Whether `account`'s obligation on `message_id` is closed, in the sense the
+/// inbox uses for "needs you": an explicit routing row decides (anything but
+/// `open` is closed, so an explicit reopen outranks earlier evidence, and an
+/// explicit open outranks closing evidence the routing was never told about);
+/// with no routing row, the derived expectation decides, and only a satisfied
+/// one is closed. The write paths' withdrawal and the delivery backstop share
+/// this one predicate.
+pub(crate) async fn obligation_closed_on(
+    conn: &mut SqliteConnection,
+    account: &str,
+    message_id: &str,
+) -> Result<bool> {
+    let routed: Option<String> = sqlx::query_scalar(
+        "SELECT obligation_state FROM message_inbox_routing
+          WHERE subject_account_id=? AND message_id=?",
+    )
+    .bind(account)
+    .bind(message_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(state) = routed {
+        return Ok(state != "open");
+    }
+    Ok(
+        crate::message_expectation::derive_message_expectation_state_on(conn, message_id, account)
+            .await?
+            .state
+            == crate::message_expectation::MessageExpectationState::Satisfied,
+    )
+}
+
+/// Withdraw the `human_obligation` candidates of every recipient whose
+/// obligation on `message_id` is now closed ([`obligation_closed_on`]): a
+/// delivered reply, an acknowledgement, other completing evidence or a closing
+/// no-longer-relevant mark. Satisfaction is derived from evidence at read time
+/// and has no event of its own, so each write that can add closing evidence
+/// calls this in its own transaction. A recipient the evidence does not close
+/// for keeps theirs, and other kinds (`principal_mention` among them) are
+/// untouched: they clear on open, not on closure.
+pub(crate) async fn withdraw_closed_obligation_candidates_in(
+    tx: &mut sqlx::Transaction<'static, Sqlite>,
+    message_id: &str,
+    source_event_type: &str,
+    source_event_id: &str,
+    act_alloc: &mut crate::act::ActAllocation,
+) -> Result<usize> {
+    let recipients: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT recipient_account_id FROM notification_candidates
+          WHERE message_id=? AND reason='human_obligation' AND status='effective'
+          ORDER BY recipient_account_id",
+    )
+    .bind(message_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut withdrawn = 0;
+    for account in recipients {
+        if obligation_closed_on(tx, &account, message_id).await? {
+            withdrawn += withdraw_notification_candidates_in(
+                tx,
+                &account,
+                message_id,
+                Some("human_obligation"),
+                source_event_type,
+                source_event_id,
+                act_alloc,
+            )
+            .await?;
+        }
+    }
+    Ok(withdrawn)
 }
 
 /// Privileged host/internal consistency fence over the entire database.
@@ -4690,7 +5309,7 @@ mod tests {
     fn the_inbox_contract_carries_home_id_under_a_new_version() {
         let contract = messaging_surface_contract();
         assert_eq!(contract["schema"], MESSAGE_INBOX_SCHEMA);
-        assert_eq!(contract["schema"], "native.message-inbox.v2");
+        assert_eq!(contract["schema"], "native.message-inbox.v3");
         assert_ne!(MESSAGE_INBOX_SCHEMA, MESSAGE_INBOX_SCHEMA_V1);
         let fields: Vec<&str> = contract["item_fields"]
             .as_array()
@@ -4699,11 +5318,12 @@ mod tests {
             .map(|field| field.as_str().unwrap())
             .collect();
         assert!(fields.contains(&"home_id"));
-        // An item without home_id is not a v2 item, even when every other
+        // An item without home_id is not a v2+ item, even when every other
         // canonical field is present.
         let item = json!({
             "message_id":"m","name":"n","body":null,"created_at":"t","human":{},"agent":{},
-            "obligation":{},"route":{},"mention":{},"attention":{},"delivery":{}
+            "obligation":{},"route":{},"mention":{},"attention":{},"delivery":{},
+            "sender":{},"participants":[],"participant_count":0,"reply_to_id":null,"conversation":{}
         });
         let response = json!({
             "schema":MESSAGE_INBOX_SCHEMA,"view":"browse","items":[item.clone()],
@@ -4719,6 +5339,14 @@ mod tests {
         let mut response = response;
         response["items"] = json!([complete]);
         validate_messaging_surface_response(&response).unwrap();
+
+        // A v3 item missing an identity field is not a v3 item.
+        let mut thin = response.clone();
+        thin["items"][0].as_object_mut().unwrap().remove("sender");
+        assert!(validate_messaging_surface_response(&thin)
+            .unwrap_err()
+            .to_string()
+            .contains("sender"));
 
         // A v1 schema string is no longer served, and is not accepted either.
         let mut stale = response;
@@ -4755,7 +5383,9 @@ mod guest_footing_tests {
             &mut tx,
             "acct:a",
             record_id,
-            "human_obligation",
+            // Not an obligation: this record is a Document, and closure is
+            // derived only for Messages. The test is about guest footing.
+            "principal_mention",
             "routine",
             None,
             "metadata_only",

@@ -20,9 +20,10 @@ use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 
 use crate::authorization::Capability;
 use crate::canvas::{
-    self, BatchEnvelope, CanvasVersion, Detached, Expected, FoldError, ObjectKind, Op, PatchSet,
-    PreImage, Refusal, SceneObject, StoredBatch, BATCH_VERSION, CANVAS_BATCH_EVENT_TYPE,
-    CHANGES_VERSION, PROMOTE_VERSION, RESULT_VERSION, SCENE_VERSION, WITHHELD,
+    self, compare_and_preimage, versions_after, BatchEnvelope, CanvasVersion, Detached, Expected,
+    FoldError, ObjectKind, Op, PatchSet, PreImage, Refusal, SceneObject, StoredBatch,
+    BATCH_VERSION, CANVAS_BATCH_EVENT_TYPE, CHANGES_VERSION, PROMOTE_VERSION, RESULT_VERSION,
+    SCENE_VERSION, WITHHELD,
 };
 use crate::db::Db;
 use crate::error::{Error, Result};
@@ -54,24 +55,24 @@ pub const EXPORT_MAX_BATCHES: usize = 10_000;
 /// At most this many objects in one promotion plan. Deliberately far below the
 /// batch op limit: a promotion mints records, and a plan a person is expected
 /// to review should stay reviewable.
-const MAX_PROMOTE_ITEMS: usize = 50;
+pub(crate) const MAX_PROMOTE_ITEMS: usize = 50;
 
 /// One object to turn into a record.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PromoteItem {
-    object_id: String,
+pub(crate) struct PromoteItem {
+    pub(crate) object_id: String,
     #[serde(rename = "type")]
-    record_type: String,
-    kind: String,
+    pub(crate) record_type: String,
+    pub(crate) kind: String,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    summary: Option<String>,
+    pub(crate) summary: Option<String>,
     #[serde(default)]
-    facets: Option<Map<String, Value>>,
+    pub(crate) facets: Option<Map<String, Value>>,
     #[serde(default)]
-    home_id: Option<String>,
+    pub(crate) home_id: Option<String>,
 }
 
 /// One link to write once the records exist. An endpoint naming a promoted
@@ -79,21 +80,21 @@ struct PromoteItem {
 /// record id that already exists.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PromoteLink {
-    from: String,
-    to: String,
-    relationship: String,
+pub(crate) struct PromoteLink {
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) relationship: String,
     #[serde(default)]
-    note: Option<String>,
+    pub(crate) note: Option<String>,
 }
 
 /// What the plan was made against.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PromoteExpected {
-    canvas_version: String,
+pub(crate) struct PromoteExpected {
+    pub(crate) canvas_version: String,
     #[serde(default)]
-    objects: BTreeMap<String, Expected>,
+    pub(crate) objects: BTreeMap<String, Expected>,
 }
 
 #[derive(Deserialize)]
@@ -156,7 +157,7 @@ fn record_id_of_card(props: &Map<String, Value>) -> Option<&str> {
 }
 
 /// Every record id a scene object or op could disclose.
-fn referenced_record_ids(objects: &[Value], ops: &[Op]) -> Vec<String> {
+pub(crate) fn referenced_record_ids(objects: &[Value], ops: &[Op]) -> Vec<String> {
     let mut ids = BTreeSet::new();
     for object in objects {
         if object.get("kind").and_then(Value::as_str) == Some("record_card") {
@@ -229,7 +230,11 @@ async fn record_face(conn: &mut SqliteConnection, record_id: &str) -> Result<Opt
 /// Withhold every record reference the caller may not see. `faces` supplies
 /// the resolved record summary for visible cards; withheld cards keep their
 /// geometry and lose everything else.
-fn redact_object(object: &mut Value, visible: &HashSet<String>, faces: &HashMap<String, Value>) {
+pub(crate) fn redact_object(
+    object: &mut Value,
+    visible: &HashSet<String>,
+    faces: &HashMap<String, Value>,
+) {
     if object.get("kind").and_then(Value::as_str) != Some("record_card") {
         return;
     }
@@ -365,7 +370,7 @@ fn withhold_record_reference(props: &mut Map<String, Value>, visible: &HashSet<S
     }
 }
 
-fn redact_op(op: &Op, visible: &HashSet<String>) -> Value {
+pub(crate) fn redact_op(op: &Op, visible: &HashSet<String>) -> Value {
     let mut value = serde_json::to_value(op).expect("ops serialize");
     let pointer = match op {
         // Every create, not just a record card: an engine-authored batch may
@@ -383,7 +388,10 @@ fn redact_op(op: &Op, visible: &HashSet<String>) -> Value {
     value
 }
 
-fn redact_pre_images(pre_images: &BTreeMap<String, PreImage>, visible: &HashSet<String>) -> Value {
+pub(crate) fn redact_pre_images(
+    pre_images: &BTreeMap<String, PreImage>,
+    visible: &HashSet<String>,
+) -> Value {
     let mut value = serde_json::to_value(pre_images).expect("pre-images serialize");
     if let Some(entries) = value.as_object_mut() {
         for entry in entries.values_mut() {
@@ -1342,7 +1350,7 @@ fn batch_has_caller_withheld(batch: &Value) -> bool {
 // ---- manage_canvas -------------------------------------------------------
 
 /// commit_batch's refusal envelope.
-fn rejected(
+pub(crate) fn rejected(
     batch_id: Option<&str>,
     canvas_version: Option<CanvasVersion>,
     refusal: &Refusal,
@@ -1350,7 +1358,7 @@ fn rejected(
     refused("commit_batch", batch_id, canvas_version, refusal)
 }
 
-fn refused(
+pub(crate) fn refused(
     action: &str,
     batch_id: Option<&str>,
     canvas_version: Option<CanvasVersion>,
@@ -1375,183 +1383,13 @@ fn refused(
     })
 }
 
-fn refusal(code: &'static str, message: impl Into<String>) -> Refusal {
+pub(crate) fn refusal(code: &'static str, message: impl Into<String>) -> Refusal {
     Refusal {
         code,
         object_id: None,
         message: message.into(),
         limit: None,
     }
-}
-
-struct Conflict {
-    id: String,
-    group: Option<&'static str>,
-    code: &'static str,
-    current: Option<Value>,
-    competing_seq: Option<i64>,
-}
-
-/// The groups an op touches, so replay can reproduce the versions a batch
-/// left without re-reading the scene.
-fn touched_groups(op: &Op) -> (bool, bool) {
-    match op {
-        Op::Create { .. } | Op::Delete { .. } | Op::Restore { .. } => (true, true),
-        Op::Patch { set, .. } => (set.touches_geometry(), set.touches_content()),
-    }
-}
-
-fn versions_after(
-    seq: i64,
-    ops: &[Op],
-    pre_images: &BTreeMap<String, PreImage>,
-    detached: &[String],
-) -> Value {
-    let mut objects = Map::new();
-    for op in ops {
-        let (geometry, content) = touched_groups(op);
-        let geometry = geometry || detached.iter().any(|id| id == op.object_id());
-        let pre = pre_images.get(op.object_id());
-        let geometry_seq = if geometry {
-            seq
-        } else {
-            pre.map_or(seq, |pre| pre.geometry)
-        };
-        let content_seq = if content {
-            seq
-        } else {
-            pre.map_or(seq, |pre| pre.content)
-        };
-        objects.insert(
-            op.object_id().to_owned(),
-            json!({
-                "geometry": CanvasVersion(geometry_seq).encode(),
-                "content": CanvasVersion(content_seq).encode(),
-            }),
-        );
-    }
-    // Children detached by a frame delete moved too, without an op of their
-    // own; a client holding their old geometry token must learn the new one.
-    for id in detached {
-        if objects.contains_key(id) {
-            continue;
-        }
-        let content_seq = pre_images.get(id).map_or(seq, |pre| pre.content);
-        objects.insert(
-            id.clone(),
-            json!({
-                "geometry": CanvasVersion(seq).encode(),
-                "content": CanvasVersion(content_seq).encode(),
-            }),
-        );
-    }
-    Value::Object(objects)
-}
-
-fn expected_version(expected: &Expected, group: &str) -> Option<i64> {
-    let token = match group {
-        "geometry" => expected.geometry.as_deref(),
-        _ => expected.content.as_deref(),
-    }?;
-    CanvasVersion::parse(token).map(|version| version.0)
-}
-
-/// Compare every op's `expected` against the snapshot and collect the
-/// pre-image the event will carry. Runs before the dry fold so a stale
-/// precondition is reported as a conflict, never as a referential refusal.
-async fn compare_and_preimage(
-    tx: &mut Transaction<'_, Sqlite>,
-    canvas_id: &str,
-    ops: &[Op],
-) -> Result<(Vec<Conflict>, BTreeMap<String, PreImage>)> {
-    let mut conflicts = Vec::new();
-    let mut pre_images = BTreeMap::new();
-    for op in ops {
-        let (id, expected) = match op {
-            Op::Create { .. } => continue,
-            Op::Patch { id, expected, .. }
-            | Op::Delete { id, expected }
-            | Op::Restore { id, expected } => (id, expected),
-        };
-        let Some(current) = canvas::load_object(tx, canvas_id, id).await? else {
-            // Referential; the dry fold names it as `unknown_object`.
-            continue;
-        };
-        let current_versions = json!({
-            "geometry": CanvasVersion(current.geometry_seq).encode(),
-            "content": CanvasVersion(current.content_seq).encode(),
-        });
-        if current.deleted && !matches!(op, Op::Restore { .. }) {
-            conflicts.push(Conflict {
-                id: id.clone(),
-                group: None,
-                code: "object_deleted",
-                current: Some(current_versions),
-                competing_seq: Some(current.geometry_seq),
-            });
-            continue;
-        }
-        let mut stale = false;
-        for (group, actual) in [
-            ("geometry", current.geometry_seq),
-            ("content", current.content_seq),
-        ] {
-            if let Some(expected_seq) = expected_version(expected, group) {
-                if expected_seq != actual {
-                    stale = true;
-                    conflicts.push(Conflict {
-                        id: id.clone(),
-                        group: Some(group),
-                        code: "version_mismatch",
-                        current: Some(current_versions.clone()),
-                        competing_seq: Some(actual),
-                    });
-                }
-            }
-        }
-        if stale {
-            continue;
-        }
-        let mut pre = PreImage {
-            geometry: current.geometry_seq,
-            content: current.content_seq,
-            ..PreImage::default()
-        };
-        match op {
-            Op::Patch { set, .. } => {
-                if set.x.is_some() {
-                    pre.x = Some(current.x);
-                }
-                if set.y.is_some() {
-                    pre.y = Some(current.y);
-                }
-                if set.w.is_some() {
-                    pre.w = Some(current.w);
-                }
-                if set.h.is_some() {
-                    pre.h = Some(current.h);
-                }
-                if set.z.is_some() {
-                    pre.z = Some(current.z.clone());
-                }
-                if set.parent.is_some() {
-                    pre.parent = Some(current.parent.clone());
-                }
-                if let Some(patch) = &set.props {
-                    let (_, previous) = canvas::merge_props(&current.props, patch);
-                    pre.props = Some(previous);
-                }
-            }
-            Op::Delete { .. } => pre.deleted = Some(false),
-            Op::Restore { .. } => {
-                pre.deleted = Some(true);
-                pre.parent = Some(current.parent.clone());
-            }
-            Op::Create { .. } => unreachable!("creates carry no pre-image"),
-        }
-        pre_images.insert(id.clone(), pre);
-    }
-    Ok((conflicts, pre_images))
 }
 
 async fn manage_canvas(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
@@ -2882,7 +2720,7 @@ async fn promote(
 }
 
 /// Does this frame still hold live children?
-async fn frame_has_children(
+pub(crate) async fn frame_has_children(
     tx: &mut Transaction<'static, Sqlite>,
     canvas_id: &str,
     frame_id: &str,
@@ -2899,7 +2737,7 @@ async fn frame_has_children(
 
 /// True when a pinned `canvas:N` token names a different version than the one
 /// the object actually carries. An unparsable pin counts as drift.
-fn version_moved(pinned: Option<&str>, current: i64) -> bool {
+pub(crate) fn version_moved(pinned: Option<&str>, current: i64) -> bool {
     match pinned {
         None => false,
         Some(token) => CanvasVersion::parse(token) != Some(CanvasVersion(current)),
@@ -2911,7 +2749,7 @@ fn version_moved(pinned: Option<&str>, current: i64) -> bool {
 /// Covers the canvas version, every promoted object's two versions, and the
 /// records and links the plan intends, so any drift in either the scene or the
 /// request changes the digest and the execution is refused.
-fn promotion_digest(
+pub(crate) fn promotion_digest(
     canvas_id: &str,
     reason: &str,
     head: CanvasVersion,

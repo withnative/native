@@ -2617,6 +2617,298 @@ mod tests {
         source.close().await;
     }
 
+    /// Archiving and closing an obligation withdraw candidates through the same
+    /// logged `withdrawn` events as every other withdrawal, so a replica that
+    /// folds the delta ends with the same candidate projection as the source.
+    #[tokio::test]
+    async fn archive_and_obligation_withdrawals_materialise_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = fresh_source().await;
+        append_record(&source, SEED_RECORD_ID, "withdrawal seed").await;
+        let f1 = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "f1.db").await;
+
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut alloc = crate::act::ActAllocation::new();
+        for (reason, source_id) in [
+            ("human_obligation", "src-w-obligation"),
+            ("principal_mention", "src-w-mention"),
+            ("routine_arrival", "src-w-arrival"),
+        ] {
+            crate::awareness::append_notification_candidate_in(
+                &mut tx,
+                "acct:w41",
+                "message:w41",
+                reason,
+                "routine",
+                None,
+                "metadata_only",
+                if reason == "routine_arrival" {
+                    "recipient_policy"
+                } else {
+                    "portable_default"
+                },
+                "policy-w41",
+                "record.updated",
+                source_id,
+                &mut alloc,
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let (bytes, _) = build_delta(&source, f1).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        let f2 = head_act(&source).await;
+
+        // One act closes the obligation; the next archives everything left.
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut alloc = crate::act::ActAllocation::new();
+        crate::awareness::withdraw_notification_candidates_in(
+            &mut tx,
+            "acct:w41",
+            "message:w41",
+            Some("human_obligation"),
+            "message.no_longer_relevant.marked",
+            "src-w-close",
+            &mut alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = crate::db::begin_write(source.write_pool()).await.unwrap();
+        let mut alloc = crate::act::ActAllocation::new();
+        crate::awareness::set_preference(
+            &mut tx,
+            "acct:w41",
+            "message:w41",
+            crate::awareness::PreferenceAction::Archive,
+            None,
+            0,
+            "idem-archive-w41",
+            "test",
+            &mut alloc,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            count_where(&source, "notification_candidates", "status='effective'").await,
+            0
+        );
+
+        let (bytes, _) = build_delta(&source, f2).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            log_rows(&destination, "notification_candidate_events").await,
+            log_rows(&source, "notification_candidate_events").await
+        );
+        let projection = |db: crate::Db| async move {
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "SELECT candidate_key, reason, status, candidate_event_seq
+                   FROM notification_candidates ORDER BY candidate_key",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            projection(destination.clone()).await,
+            projection(source.clone()).await
+        );
+        assert_eq!(
+            count_where(
+                &destination,
+                "notification_candidates",
+                "status='effective'"
+            )
+            .await,
+            0
+        );
+        source.close().await;
+        destination.close().await;
+    }
+
+    /// A real reply and a real closing no-longer-relevant mark, driven through
+    /// the production write paths, withdraw their obligations in the same act
+    /// as the write, and a replica that folds the delta agrees.
+    #[tokio::test]
+    async fn real_reply_and_no_longer_relevant_withdrawals_materialise_exactly() {
+        const SENDER: (&str, &str, &str) = (
+            "6d340000-0000-4000-8000-000000000001",
+            "native/standby-sender",
+            "acct_standby_sender",
+        );
+        const RECIPIENT: (&str, &str, &str) = (
+            "6d340000-0000-4000-8000-000000000002",
+            "native/standby-recipient",
+            "acct_standby_recipient",
+        );
+        async fn send_as(db: &crate::Db, account: &str, name: &str, mut args: Value) -> Value {
+            let mut registry = crate::mcp::ToolRegistry::new();
+            crate::mcp::register_surface_tools(&mut registry).unwrap();
+            args["reason"] = serde_json::json!("Exercise withdrawal replication");
+            registry
+                .call(
+                    db.clone(),
+                    crate::mcp::Caller::authenticated(account),
+                    name,
+                    args,
+                )
+                .await
+                .unwrap()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = fresh_source().await;
+        for (person, principal, account) in [SENDER, RECIPIENT] {
+            crate::store::create_record(
+                &source,
+                serde_json::json!({"id":person,"type":"Entity","kind":"person","name":person}),
+            )
+            .await
+            .unwrap();
+            for (system, identifier) in [("native-principal", principal), ("account", account)] {
+                // The audited writer: a raw binding would stop the replica opening.
+                crate::identity::add_binding(
+                    &source,
+                    &crate::identity::MutationContext {
+                        actor: "test:standby-withdrawal",
+                        reason: "Standby withdrawal fixture binding",
+                        run_key: None,
+                        parent_key: None,
+                        intent: None,
+                        is_member: true,
+                        internal: true,
+                        source_read_authorized: false,
+                    },
+                    person,
+                    &crate::identity::BindingClaim {
+                        system: system.into(),
+                        identifier: identifier.into(),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let f1 = head_act(&source).await;
+        let destination = destination_at_current_head(&source, dir.path(), "f1.db").await;
+
+        let request = |key: &str| {
+            serde_json::json!({
+                "action":"send","body":"please answer","expectation":"reply",
+                "idempotency_key":key,
+                "origin":{"type":"direct","participant_ids":[SENDER.0, RECIPIENT.0]},
+                "addressed_to":[RECIPIENT.0],
+            })
+        };
+        let replied = send_as(&source, SENDER.2, "manage_messages", request("req-reply")).await
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let marked = send_as(&source, SENDER.2, "manage_messages", request("req-mark")).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            count_where(
+                &source,
+                "notification_candidates",
+                "reason='human_obligation' AND status='effective'"
+            )
+            .await,
+            2
+        );
+        send_as(
+            &source,
+            RECIPIENT.2,
+            "manage_messages",
+            serde_json::json!({
+                "action":"send","body":"here you go","expectation":"none",
+                "idempotency_key":"the-reply",
+                "origin":{"type":"direct","participant_ids":[SENDER.0, RECIPIENT.0]},
+                "addressed_to":[SENDER.0],
+                "links":[{"target_id":replied,"relationship":"reply_to"}],
+            }),
+        )
+        .await;
+        send_as(
+            &source,
+            RECIPIENT.2,
+            "manage_messages",
+            serde_json::json!({
+                "action":"mark_no_longer_relevant","message_id":marked,
+                "idempotency_key":"the-mark",
+            }),
+        )
+        .await;
+        assert_eq!(
+            count_where(
+                &source,
+                "notification_candidates",
+                "reason='human_obligation' AND status='effective'"
+            )
+            .await,
+            0,
+            "both obligations were withdrawn by their write paths"
+        );
+
+        let (bytes, _) = build_delta(&source, f1).await;
+        apply_authority_act_delta_and_finalize_head(
+            &destination,
+            &trust(validate_authority_act_delta(&bytes).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            log_rows(&destination, "notification_candidate_events").await,
+            log_rows(&source, "notification_candidate_events").await
+        );
+        let projection = |db: crate::Db| async move {
+            sqlx::query_as::<_, (String, String, String, i64)>(
+                "SELECT candidate_key, reason, status, candidate_event_seq
+                   FROM notification_candidates ORDER BY candidate_key",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            projection(destination.clone()).await,
+            projection(source.clone()).await
+        );
+        assert_eq!(
+            count_where(
+                &destination,
+                "notification_candidates",
+                "reason='human_obligation' AND status='effective'"
+            )
+            .await,
+            0
+        );
+        source.close().await;
+        destination.close().await;
+    }
+
+    async fn count_where(db: &crate::Db, table: &str, predicate: &str) -> i64 {
+        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE {predicate}"))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
     /// Finding 2: a shape-valid carried withdrawal whose proposal is absent
     /// reaches the shared candidate projector, fails closed, and rolls back the
     /// whole transaction.

@@ -109,6 +109,14 @@ path = "src/bin/asof_fold_time.rs"
 required-features = ["dev-tools"]
 test = false
 
+# `native` is the local-first CLI (slice 1): `mcp --local`, the `node`
+# passthrough, `--help`/`--version`. It reuses the library and the local
+# `mcp-stdio` code paths. Appended last so the earlier `bin[N]` indices the
+# source-boundary manifest freezes do not shift.
+[[bin]]
+name = "native"
+path = "src/bin/native.rs"
+
 # Fresh-agent harness for the v2 kernel slice (trial binary, not a product
 # surface). Cargo auto-discovers `examples/`; `required-features` keeps it
 # out of default builds exactly like the dev-tools binaries above.
@@ -303,6 +311,8 @@ url = "2"
 yrs = "0.28"
 
 [dev-dependencies]
+# Governance maps whole-file syn attributes back to original source bytes.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 # Pure bridge controls exercise the actual native scalar-kind admission.
 cel = { package = "cel-subset", path = "crates/cel-subset" }
 indexmap = "2"
@@ -348,6 +358,26 @@ path = "examples/v2_digest_bench.rs"
 required-features = ["v2-kernel-probe"]
 
 [[example]]
+name = "v2-html-census"
+path = "examples/v2_html_census.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
 name = "v2-history-bench"
 path = "examples/v2_history_bench.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v2-snapshot-measure"
+path = "examples/v2_snapshot_measure.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v2-read-bench"
+path = "examples/v2_read_bench.rs"
+required-features = ["v2-kernel-probe"]
+
+[[example]]
+name = "v1-v2-read-bench"
+path = "examples/v1_v2_read_bench.rs"
 required-features = ["v2-kernel-probe"]

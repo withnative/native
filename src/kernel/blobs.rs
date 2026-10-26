@@ -87,7 +87,7 @@ pub(crate) async fn bind(
 
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     if event.event_type == "kernel.facet_observed.v1" {
-        let facet: FacetObservation = event_payload(event)?;
+        let facet = hq::decode_facet_observation(event_payload(event)?)?;
         if facet.key == "blob_ref" {
             let handle:Option<String>=sqlx::query_scalar("SELECT json_extract(metadata,'$.id') FROM kernel_attachment_blobs WHERE record_id=?").bind(&event.record_id).fetch_optional(&mut *conn).await?;
             if handle.is_none()

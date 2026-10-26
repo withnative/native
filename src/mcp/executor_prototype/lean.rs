@@ -11,7 +11,7 @@
 //!
 //! What lean tracks separately is *direct advertisement*, per operation: a
 //! lean server refuses a direct call to an operation it does not advertise
-//! directly (for example a cached `records_read.get_record` schema) and the
+//! directly (for example a cached `records_read.get_history` schema) and the
 //! repair names the equivalent `call_executor` call.
 
 use std::collections::BTreeMap;
@@ -37,8 +37,10 @@ const LEAN_DIRECT_EXECUTORS: &[&str] = &[
     "records_lifecycle",
 ];
 
-/// Directly advertised executors narrowed to a subset of their operations.
-const LEAN_NARROWED_OPERATIONS: &[(&str, &[&str])] = &[("records_read", &["search"])];
+/// Directly advertised executors narrowed to a small allowed-operations
+/// list. `records_read` advertises direct lookup and search; everything else
+/// on it stays reachable only through `call_executor`.
+const LEAN_NARROWED_OPERATIONS: &[(&str, &[&str])] = &[("records_read", &["search", "get_record"])];
 
 /// `call_executor` never wraps these: they are advertised directly and are
 /// not ordinary operation contracts on the generic path.
@@ -47,10 +49,10 @@ const CALL_EXECUTOR_EXCLUDED_TARGETS: &[&str] = &["bootstrap", "describe_operati
 /// Exact enumeration of everything reachable only through `call_executor`.
 pub(super) const LEAN_CATALOG_QUERY: &str = "SELECT executor, operation, access, plan_required FROM catalog_operations WHERE advertised_directly = 0 ORDER BY executor, operation";
 
-/// Search-only prose for the narrowed `records_read` descriptor. The audited
-/// prose names `get_record` and `query_record`, which are not advertised
+/// Direct-lookup and search prose for the narrowed `records_read`
+/// descriptor. The audited prose names `query_record`, which is not advertised
 /// directly here.
-const LEAN_RECORDS_READ_DESCRIPTION: &str = "Search authorized records by lexical text: {operation:'search', arguments:{query:'...'}}. Prefer sql_read query_sql for structured reads. Every other records_read operation (get_record, query_record, get_structure, get_history, whats_changed and more) stays callable through call_executor, e.g. {executor:'records_read', operation:'get_record', arguments:{ids:[reference]}}.";
+const LEAN_RECORDS_READ_DESCRIPTION: &str = "Search authorized records by lexical text: {operation:'search', arguments:{query:'...'}}. Open a known reference with {operation:'get_record', arguments:{ids:[reference]}}. Prefer sql_read query_sql for structured reads. Every other records_read operation (query_record, get_structure, get_history, whats_changed and more) stays callable through call_executor, e.g. {executor:'records_read', operation:'get_history', arguments:{record_id:reference}}.";
 
 /// How a `tools/call` reached the governed dispatch path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,7 +218,7 @@ pub(super) fn call_executor_descriptor(
         ));
     }
     let description = format!(
-        "Call any contracted operation that is not advertised directly, through the same contract, authorization, validation and plan gating as a direct executor call. {reach} List them with sql_read query_sql: {LEAN_CATALOG_QUERY}; describe_operation {{executor, operation}} returns any contract. Example: {{executor:'records_read', operation:'get_record', arguments:{{ids:[reference]}}}}. Plan-required operations: prepare with {{executor, operation, arguments}}, then execute only with the returned {{executor, operation, plan_id, target, effect_summary}}."
+        "Call any contracted operation that is not advertised directly, through the same contract, authorization, validation and plan gating as a direct executor call. {reach} List them with sql_read query_sql: {LEAN_CATALOG_QUERY}; describe_operation {{executor, operation}} returns any contract. Example: {{executor:'records_read', operation:'get_history', arguments:{{record_id:reference}}}}. Plan-required operations: prepare with {{executor, operation, arguments}}, then execute only with the returned {{executor, operation, plan_id, target, effect_summary}}."
     );
     json!({
         "name": CALL_EXECUTOR,
@@ -296,7 +298,7 @@ pub(super) fn exposure_summary(
             "hidden_operation_count": hidden_operation_count(callable, direct),
             "catalog_query": LEAN_CATALOG_QUERY,
             "examples": [
-                {"executor": "records_read", "operation": "get_record", "arguments": {"ids": ["<id or short reference>"]}},
+                {"executor": "records_read", "operation": "get_history", "arguments": {"record_id": "<id or short reference>"}},
                 {"executor": "sql_read", "operation": "query_sql", "arguments": {"sql": "SELECT id, name FROM records WHERE type = 'WorkItem' ORDER BY id LIMIT 20"}},
                 {"executor": "records_read", "operation": "search", "arguments": {"query": "<words>"}},
                 {"executor": "coordination_read", "operation": "get_run_activity", "arguments": {}}

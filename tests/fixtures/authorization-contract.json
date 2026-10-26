@@ -3,7 +3,7 @@
   "claim": {
     "backend": "sqlite-local",
     "evidence_suite": "sqlite-reference-ci",
-    "scope": "Production MCP dispatch over the SQLite reference profile. Other backend profiles do not inherit this authorization claim."
+    "scope": "Production MCP dispatch over the SQLite reference profile. Other backend profiles do not inherit this authorization claim. Named-view operations are hosted-v2-only: positive evidence is from the separately gated hosted-v2 suite, with explicit ordinary SQLite refusal evidence; no local-success claim."
   },
   "operations": [
     {
@@ -1351,6 +1351,54 @@
     },
     {
       "tool": "manage_messages",
+      "action": "delete",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-reactions",
+      "expected_threshold": "message-author-with-edit",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/messaging_delete_tests.rs",
+        "test": "author_delete_tombstones_hides_withdraws_and_keeps_history",
+        "claim": "Authorized manage_messages.delete tombstones the author's own Message at threshold message-author-with-edit, withdraws its notification candidates and keeps its body in stored history."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/messaging_delete_tests.rs",
+        "test": "only_the_author_can_delete_including_persona_messages",
+        "claim": "manage_messages.delete rejects a caller who is not the Message's author, including a view-only recipient and a Message sent as a persona, refuses an account with no access as missing, and leaves its governed writes unchanged."
+      },
+      "rationale": "Deleting is author-only: the caller must hold Edit on the Message and be the Person who owns it, so another editor of the shared Collection cannot delete someone else's Message."
+    },
+    {
+      "tool": "manage_messages",
+      "action": "edit",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-reactions",
+      "expected_threshold": "message-author-with-edit",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/messaging_delete_tests.rs",
+        "test": "author_edit_replaces_the_text_keeps_history_and_shows_as_edited_through_sql",
+        "claim": "Authorized manage_messages.edit replaces the author's own Message text at threshold message-author-with-edit, records the change as a message revision event and keeps the earlier text in stored history."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "src/mcp/tools/messaging_delete_tests.rs",
+        "test": "edit_refuses_non_authors_persona_messages_deleted_blank_and_unchanged",
+        "claim": "manage_messages.edit rejects a caller who is not the Message's author, including a view-only recipient and a Message sent as a persona, refuses an account with no access as missing, and leaves its governed writes unchanged."
+      },
+      "rationale": "Editing is author-only, with delete's exact check: Edit on the Message and ownership by the caller's Person, so another editor of the shared Collection cannot rewrite someone else's Message."
+    },
+    {
+      "tool": "manage_messages",
       "action": "list_message_state",
       "disposition": "specialized",
       "risk_tier": "specialized",
@@ -1636,6 +1684,54 @@
         "claim": "manage_messages.set_destination rejects a caller who cannot see the Collection and leaves its governed writes unchanged."
       },
       "rationale": "The destination rail is per-member awareness-tier state whose subject is a Collection, so the gate is the caller's own visibility of that Collection rather than any record capability on the rail itself."
+    },
+    {
+      "tool": "manage_messages",
+      "action": "get_notification_preference",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-audience",
+      "expected_threshold": "caller-self",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/records/routine_arrival.rs",
+        "test": "the_arrival_preference_governs_creation_and_harvest",
+        "claim": "Authorized manage_messages.get_notification_preference returns the caller's own arrival preference at threshold caller-self."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/records/routine_arrival.rs",
+        "test": "the_arrival_preference_belongs_to_the_caller_alone",
+        "claim": "manage_messages.get_notification_preference never discloses another member's arrival preference to a caller below caller-self."
+      },
+      "rationale": "The arrival preference is per-account notification state, so the gate is the caller's own account rather than any record capability: no argument names another account, and a caller can neither read nor change another member's preference."
+    },
+    {
+      "tool": "manage_messages",
+      "action": "set_notification_preference",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "messaging-audience",
+      "expected_threshold": "caller-self",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/records/routine_arrival.rs",
+        "test": "the_arrival_preference_governs_creation_and_harvest",
+        "claim": "Authorized manage_messages.set_notification_preference changes the caller's own arrival preference at threshold caller-self."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/records/routine_arrival.rs",
+        "test": "the_arrival_preference_belongs_to_the_caller_alone",
+        "claim": "manage_messages.set_notification_preference cannot change another member's preference, and a refused value leaves the control log unchanged."
+      },
+      "rationale": "The arrival preference is per-account notification state, so the gate is the caller's own account rather than any record capability: no argument names another account, and a caller can neither read nor change another member's preference."
     },
     {
       "tool": "manage_interventions",
@@ -5172,6 +5268,30 @@
       "rationale": "Reset removes the caller's own scoped override; it never reaches a scope the caller cannot edit."
     },
     {
+      "tool": "read_hcp_audit",
+      "action": "$tool",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "caller-private-hcp-audit",
+      "expected_threshold": "authenticated-caller-own-audit-aggregates",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": {
+        "status": "test",
+        "file": "tests/tools/counter_guard.rs",
+        "test": "hcp_audit_non_owner_reads_only_own_events_and_refuses_foreign_cursors",
+        "claim": "A non-owner reads and paginates its non-empty sealed audit across interleaved accounts without counters; the other account independently sees only its own event."
+      },
+      "negative_evidence": {
+        "status": "test",
+        "file": "tests/tools/counter_guard.rs",
+        "test": "hcp_audit_non_owner_reads_only_own_events_and_refuses_foreign_cursors",
+        "claim": "Account selectors are refused; foreign, unknown and malformed event cursors receive the same refusal without revealing another account history or writing content."
+      },
+      "rationale": "Both state and read audit aggregates are derived solely from caller credentials. Opaque event identities resolve only inside that account snapshot; editable views and request fields grant no audit authority. Main Native only, JSON-only, and unavailable offline."
+    },
+    {
       "tool": "manage_account_config",
       "action": "inspect",
       "disposition": "specialized",
@@ -5680,6 +5800,282 @@
         "claim": "advance_artifact_port_pin refuses a declaration change that is more than the named version pin and writes nothing."
       },
       "rationale": "Re-pinning a governed-SQL relation version rewrites the saved query, the artifact port declaration, its binding and its capability grants together; the operation accepts only the version change and refuses every other declaration diff."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "get_view_revision",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "bearer-and-closure-View",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on get_view_revision succeeds through the source handler; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_details_are_one_read_bounded_and_visibility_safe",
+          "claim": "Hidden bearer/dependency metadata is withheld; pagination rechecks visibility."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "list_view_revisions",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "bearer-and-visible-revision-closure-View",
+      "access": "read",
+      "non_disclosure": true,
+      "no_write_on_deny": false,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on list_view_revisions succeeds through the source handler; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_details_are_one_read_bounded_and_visibility_safe",
+          "claim": "Hidden bearer/dependency metadata is withheld; pagination rechecks visibility."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "record_view_revision",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "bearer-Edit-and-pin-View",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on record_view_revision succeeds through the source handler; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "activate_view",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "live-workspace-owner-and-bearer-Edit-and-closure-View",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on activate_view succeeds through the source handler; no ordinary SQLite success is claimed."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_publication_owners_and_demotion_are_serialized",
+          "claim": "Publication uses live workspace-owner proof and retains existing publications after demotion."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_publication_owners_and_demotion_are_serialized",
+          "claim": "Members and demoted owners cannot change publication; concurrent role changes serialize."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "unpublish_view",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "live-workspace-owner-and-bearer-Edit-and-CAS",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on unpublish_view succeeds through the source handler; no ordinary SQLite success is claimed."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_publication_owners_and_demotion_are_serialized",
+          "claim": "Publication uses live workspace-owner proof and retains existing publications after demotion."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_publication_owners_and_demotion_are_serialized",
+          "claim": "Members and demoted owners cannot change publication; concurrent role changes serialize."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
+    },
+    {
+      "tool": "manage_named_views",
+      "action": "prepare_named_views",
+      "disposition": "specialized",
+      "risk_tier": "specialized",
+      "fixture": "hosted-v2-named-view-and-ordinary-profile-refusal",
+      "expected_threshold": "workspace-root-Manage",
+      "access": "mutation",
+      "non_disclosure": true,
+      "no_write_on_deny": true,
+      "positive_evidence": [
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "Hosted v2 gate-on prepare_named_views succeeds through the source handler; no ordinary SQLite success is claimed."
+        }
+      ],
+      "negative_evidence": [
+        {
+          "status": "test",
+          "file": "tests/tools/authorization_contract.rs",
+          "test": "named_view_operations_refuse_the_ordinary_sqlite_profile_without_events",
+          "claim": "All six source operations refuse ordinary SQLite without appending content events."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_real_executor_gate_off",
+          "claim": "Source, app and indirect executor routes refuse while the feature gate is closed without events or preparation."
+        },
+        {
+          "status": "test",
+          "file": "src/named_views/execution_tests.rs",
+          "test": "named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic",
+          "claim": "With the hosted-v2 gate open, reader-only drafting and outsider metadata reads refuse; preparation without workspace Manage creates no index. Publication also requires an executor plan and owner proof."
+        }
+      ],
+      "rationale": "Hosted v2 only and default-off. Ordinary SQLite refuses. These are separate serving-profile qualifications, not inherited ordinary-SQLite success coverage. Unpublish does not require an executable closure; source privacy and owner/bearer gates remain enforced."
     }
   ]
 }

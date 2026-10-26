@@ -67,7 +67,7 @@ use intervention::{
 use messaging::{
     project_message_audience_declared, project_message_audience_legacy_unknown,
     project_message_delivery_authorized, project_message_origin_declared, project_message_reaction,
-    project_message_send_evaluated, project_message_shared,
+    project_message_revision_recorded, project_message_send_evaluated, project_message_shared,
 };
 
 use std::collections::BTreeMap;
@@ -462,6 +462,7 @@ async fn project_intent_with(
     if event.event_type.starts_with("kernel.") {
         crate::kernel::v1_state::validate_native_event(conn, event).await?;
         crate::kernel::record_metadata::touch_event(conn, event).await?;
+        crate::kernel::facet_time_reads::project_on(conn, event).await?;
     }
     Ok(())
 }
@@ -494,6 +495,10 @@ async fn project_extended(
             crate::kernel::messaging::project_destination(conn, event).await
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.notification_preference_set.v1" => {
+            crate::kernel::notifications::project_preference(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.message_command_committed.v1" => {
             crate::kernel::messaging::project_command(conn, event).await
         }
@@ -511,6 +516,18 @@ async fn project_extended(
         }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.app_state_imported.v1" => crate::kernel::app_state::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.canvas_activated.v1" | "kernel.canvas_batch_committed.v1" => {
+            crate::kernel::canvas_v2::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.artifact_excluded.v1" => {
+            crate::kernel::artifact_closures::project_exclusion(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.artifact_closure_activated.v1" => {
+            crate::kernel::artifact_closures::project(conn, event).await
+        }
 
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.app_installs_activated.v1"
@@ -525,6 +542,17 @@ async fn project_extended(
         "kernel.record_deleted.v1" => crate::kernel::deletion::project(conn, event).await,
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.v1_state_imported.v1" => crate::kernel::v1_state::project(conn, event).await,
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.identity_binding_added.v1" => {
+            crate::kernel::identity_bindings::project(conn, event).await
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        "kernel.account_config_bound.v1" => {
+            crate::kernel::account_config::project(conn, event).await
+        }
+        kind if crate::named_views::is_new_event(kind) || kind == crate::named_views::LEGACY => {
+            crate::named_views::project(conn, event).await
+        }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.metadata_set.v1" => crate::kernel::record_metadata::project(conn, event).await,
         #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -587,6 +615,16 @@ async fn project_extended(
         "kernel.run_opened.v1" | "kernel.run_closed.v1" | "kernel.run_intent_set.v1" => {
             crate::kernel::run_ledger::project(conn, event).await
         }
+        ty if ty.starts_with("kernel.hcp_") => {
+            #[cfg(any(test, feature = "v2-kernel-probe"))]
+            {
+                crate::mcp::tools::hcp_v2::kernel::project(conn, event).await
+            }
+            #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+            {
+                Err(Error::engine("kernel HCP events require kernel support"))
+            }
+        }
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         "kernel.slot_provisioned.v1" | "kernel.slot_replaced.v1" | "kernel.home_created_for.v1" => {
             crate::kernel::slots::project(conn, event).await
@@ -634,6 +672,9 @@ async fn project_extended(
         "persona.registered.v1" => persona::project_persona_registered(conn, event).await,
         "persona.retired.v1" => persona::project_persona_retired(conn, event).await,
         "message.speaker.declared.v1" => persona::project_message_speaker(conn, event).await,
+        "message.revision.recorded.v1" => {
+            project_message_revision_recorded(conn, event, defer).await
+        }
         "message.audience.declared" => project_message_audience_declared(conn, event).await,
         "message.audience.legacy_unknown" => {
             project_message_audience_legacy_unknown(conn, event).await

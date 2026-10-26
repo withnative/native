@@ -136,6 +136,10 @@ pub(super) type Ready<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// What the gate needs from the router that owns hosted's health and the
 /// own-write floor.
 pub(super) trait Outage: Send + Sync {
+    /// Consult the monitor/persisted engine flag; never perform network probes here.
+    fn held_replay_allowed(&self) -> Ready<'_, bool> {
+        Box::pin(async { true })
+    }
     /// A second, independent look at whether hosted is unreachable.
     fn confirm_down(&self) -> Ready<'_, bool>;
     fn known_unreachable(&self) -> Ready<'_, bool> {
@@ -199,6 +203,7 @@ struct Cached<T> {
 type Lookups = StdMutex<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>;
 
 pub(super) struct WriteGate {
+    upstream_v2: std::sync::atomic::AtomicBool,
     journal: Journal,
     local_contracts: Arc<crate::mcp::executor_prototype::NodeOperationContracts>,
     config: GateConfig,
@@ -241,10 +246,19 @@ const NOT_WRITES: [&str; 4] = [
 ];
 
 impl WriteGate {
+    pub(super) fn set_kernel_v2_upstream(&self, value: bool) {
+        self.upstream_v2
+            .store(value, std::sync::atomic::Ordering::Release);
+    }
+    fn kernel_v2_upstream(&self) -> bool {
+        self.upstream_v2.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(super) fn open(socket_directory: &Path, config: GateConfig) -> Result<Self> {
         let journal =
             Journal::open_with(socket_directory, config.retention, config.refusal_retention)?;
         Ok(Self {
+            upstream_v2: std::sync::atomic::AtomicBool::new(false),
             journal,
             local_contracts: crate::mcp::executor_prototype::NodeOperationContracts::local()?,
             config,
@@ -281,6 +295,7 @@ impl WriteGate {
                 .held_writes(filter, self.config.record_url_base.as_deref()),
         );
         object.insert("queue".into(), pending.clone());
+        object.insert("holding".into(), json!({"supported":!self.kernel_v2_upstream(),"reason":if self.kernel_v2_upstream() {"kernel_v2_upstream_drain_first"} else {"kernel_v2_not_observed"}}));
         object.insert("disk".into(), disk);
         let unrecognised = self.journal.unrecognised();
         if !unrecognised.is_empty() {
@@ -524,7 +539,7 @@ impl WriteGate {
             &operation,
             envelope.get("arguments").unwrap_or(&Value::Null),
         );
-        let holdable = holdable && !request.no_hold;
+        let holdable = holdable && !request.no_hold && !self.kernel_v2_upstream();
         let keyed = if access == Access::Write {
             match self
                 .accepts_key(upstream, &executor, &operation, started, cancel)
@@ -678,7 +693,7 @@ impl WriteGate {
         // — the condition that would otherwise hold it — report not-sent
         // without sending, instead of burning the retry budget against a
         // dead endpoint. The caller (S3's spool) owns the key and the retry.
-        if !holdable && request.no_hold && key.is_some() {
+        if !holdable && (request.no_hold || self.kernel_v2_upstream()) && key.is_some() {
             if let Some(outage) = request.outage {
                 if outage.known_unreachable().await
                     && self
@@ -688,7 +703,11 @@ impl WriteGate {
                     let id = request.message.get("id");
                     return not_sent_report(
                         id,
-                        "Hosted is unreachable; the write was not sent and not held (saver opt-out)",
+                        if self.kernel_v2_upstream() {
+                            "Kernel-v2 upstream: held writes are disabled; the write was not sent or held"
+                        } else {
+                            "Hosted is unreachable; the write was not sent and not held (saver opt-out)"
+                        },
                     );
                 }
             }
@@ -936,6 +955,16 @@ impl WriteGate {
             attempt: Attempt::Stopped,
             status: None,
         };
+        if let Some(outage) = request.outage {
+            if !outage.held_replay_allowed().await {
+                return Some(refusal("Kernel-v2 upstream: holding v1 write envelopes is disabled; drain before cutover"));
+            }
+        }
+        if self.kernel_v2_upstream() {
+            return Some(refusal(
+                "Kernel-v2 upstream: holding v1 write envelopes is disabled; drain before cutover",
+            ));
+        }
         let Some(local) = self.local_contracts.digest(&executor, &operation) else {
             return Some(refusal(
                 "Local operation contract unavailable; write was not held",
@@ -1228,6 +1257,9 @@ impl WriteGate {
         id: Option<&Value>,
         modern: bool,
     ) -> Option<Option<String>> {
+        if self.kernel_v2_upstream() {
+            return None;
+        }
         let detail = match (reason, maybe_applied) {
             (HoldReason::DeploymentReadOnly, false) => {
                 "hosted refused the write as read-only for a deployment; held to send later"

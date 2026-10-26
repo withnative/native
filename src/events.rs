@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 /// The canonical event types the projector folds into projections.
-pub const EVENT_TYPES: [&str; 49] = [
+pub const EVENT_TYPES: [&str; 50] = [
     "record.created",
     "record.updated",
     "record.type_corrected.v1",
@@ -28,6 +28,7 @@ pub const EVENT_TYPES: [&str; 49] = [
     "persona.registered.v1",
     "persona.retired.v1",
     "message.speaker.declared.v1",
+    "message.revision.recorded.v1",
     "message.audience.declared",
     "message.audience.legacy_unknown",
     "message.origin.declared.v1",
@@ -74,6 +75,77 @@ pub const KERNEL_GENESIS_EVENT: &str = "kernel.root_created.v1";
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 /// The only actor the kernel-root fold accepts.
 pub const KERNEL_GENESIS_ACTOR: &str = "test:bare-kernel";
+
+pub const MESSAGE_REVISION_FORMAT: &str = "native.message-revision.v1";
+
+/// One structured mention as it stands after an edit, carried as the full
+/// `message_mentions` row so the fold needs no body or binding lookups.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageRevisionMention {
+    pub mention_id: String,
+    pub target_kind: String,
+    pub target_binding: String,
+    pub target_record_id: String,
+    pub span_start: i64,
+    pub span_end: i64,
+    pub authored_label: String,
+}
+
+/// `message.revision.recorded.v1`: the author's replacement text for one
+/// Message record. `body` becomes the record's current body; every earlier
+/// body stays in the log (`record.created` and prior revisions). `mentions`
+/// is the complete effective structured-mention set after the edit, so a
+/// span can never point into text it was not written against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageRevisionRecordedPayload {
+    pub format: String,
+    pub body: String,
+    pub body_sha256: String,
+    pub mentions: Vec<MessageRevisionMention>,
+    pub reason: String,
+}
+
+impl MessageRevisionRecordedPayload {
+    pub fn validate(&self) -> crate::Result<()> {
+        use sha2::{Digest, Sha256};
+        if self.format != MESSAGE_REVISION_FORMAT {
+            return Err(crate::Error::engine("invalid Message revision format"));
+        }
+        if self.body.trim().is_empty() || self.reason.trim().is_empty() {
+            return Err(crate::Error::engine(
+                "Message revision body and reason must not be blank",
+            ));
+        }
+        if hex::encode(Sha256::digest(self.body.as_bytes())) != self.body_sha256 {
+            return Err(crate::Error::engine(
+                "Message revision body does not match its digest",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for mention in &self.mentions {
+            let start = usize::try_from(mention.span_start).ok();
+            let end = usize::try_from(mention.span_end).ok();
+            let valid = matches!(mention.target_kind.as_str(), "principal" | "record")
+                && !mention.mention_id.trim().is_empty()
+                && !mention.target_binding.trim().is_empty()
+                && start.zip(end).is_some_and(|(start, end)| {
+                    start < end
+                        && end <= self.body.len()
+                        && self.body.is_char_boundary(start)
+                        && self.body.is_char_boundary(end)
+                        && self.body[start..end] == mention.authored_label
+                });
+            if !valid || !seen.insert(mention.mention_id.as_str()) {
+                return Err(crate::Error::engine(
+                    "Message revision mention does not match the revised body",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 pub const MESSAGE_REACTION_FORMAT: &str = "native.message-reaction.v1";
 pub const MESSAGE_REACTION_EMOJIS: [&str; 5] = ["👍", "❤️", "😂", "🎉", "👀"];

@@ -524,7 +524,7 @@ async fn the_inbox_groups_by_destination_without_a_second_query() {
     )
     .await
     .unwrap();
-    assert_eq!(inbox["schema"], "native.message-inbox.v2");
+    assert_eq!(inbox["schema"], "native.message-inbox.v3");
     let items = inbox["items"].as_array().unwrap();
     assert_eq!(items.len(), 4);
 

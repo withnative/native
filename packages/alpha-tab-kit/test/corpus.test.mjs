@@ -37,3 +37,11 @@ test("every finding names the source it mirrors", () => {
     for (const finding of lintSql(item.sql, params)) assert.match(finding.mirrors, /\.(rs|js)(:\d+)?/);
   }
 });
+
+
+test("view definition details stay outside saved alpha-tab SQL needs", () => {
+  for (const name of ["catalog_view_definitions", '"catalog_view_definitions"', "temp.catalog_view_definitions"]) {
+    assert.ok(errors(lintSql(`SELECT relation_name FROM ${name}`)).some((f) => f.rule === "sql.view-profile"));
+  }
+  assert.equal(errors(lintSql("WITH catalog_view_definitions AS (SELECT 1 AS n) SELECT n FROM catalog_view_definitions")).length, 0);
+});

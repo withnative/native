@@ -100,6 +100,21 @@ impl Export {
         if self.hosted_standby_context.is_none() {
             return Ok(());
         }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        {
+            let mut conn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(self.path())
+                    .create_if_missing(false)
+                    .read_only(true),
+            )
+            .await?;
+            let kernel_v2 = crate::standby::kernel_v2::is_v2(&mut conn).await?;
+            conn.close().await?;
+            if kernel_v2 {
+                return Ok(());
+            }
+        }
         self.size_bytes = strip_disposable_bookkeeping(&self.path()).await?;
         Ok(())
     }
@@ -368,6 +383,17 @@ async fn strip_read_log_from_snapshot(target: &std::path::Path) -> Result<u64> {
         .read_only(true)
         .connect()
         .await?;
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut conn)
+        .await?;
+    if marker == crate::db::V2_APPLICATION_ID {
+        let unexpected: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name IN ('read_log_calls','read_log_touches','read_log_record_ids'))").fetch_one(&mut conn).await?;
+        conn.close().await?;
+        if unexpected {
+            return Err(Error::engine("v2 export has unexpected v1 read-log tables"));
+        }
+        return Ok(tokio::fs::metadata(target).await?.len());
+    }
     let present = stripped_tables_leave_traces(&mut conn, READ_LOG_TABLES).await?;
     conn.close().await?;
     if !present {

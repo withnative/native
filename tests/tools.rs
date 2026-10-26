@@ -79,6 +79,8 @@ mod keyed_replay_a2;
 mod mcp;
 #[path = "tools/mcp_apps.rs"]
 mod mcp_apps;
+#[path = "tools/native_cli.rs"]
+mod native_cli;
 #[path = "tools/overlap_measurement.rs"]
 mod overlap_measurement;
 #[path = "tools/position_inputs.rs"]
@@ -127,3 +129,6 @@ mod tools_stage8;
 mod update_record_links;
 #[path = "tools/workspace_naming.rs"]
 mod workspace_naming;
+
+#[path = "tools/duplicate_gate.rs"]
+mod duplicate_gate;

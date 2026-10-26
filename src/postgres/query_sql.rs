@@ -175,6 +175,37 @@ fn type_check_error(error: sqlx::Error, statement: &str) -> Error {
     reject(QuerySqlErrorCategory::SyntaxOrType, detail)
 }
 
+/// Refusal-only advisory lookup. The temp projection and principal were
+/// installed before the failed transaction, so they survive its rollback.
+async fn visible_facet_after_refusal(
+    connection: &mut sqlx::PgConnection,
+    query_role: &str,
+    key: &str,
+) -> Result<bool> {
+    let mut probe = connection.begin().await?;
+    for setting in [
+        "SET TRANSACTION READ ONLY",
+        "SET LOCAL statement_timeout='2000ms'",
+        "SET LOCAL lock_timeout='250ms'",
+        "SET LOCAL idle_in_transaction_session_timeout='2500ms'",
+        "SET LOCAL search_path=pg_temp,pg_catalog",
+        "SET LOCAL jit=off",
+    ] {
+        probe.execute(setting).await?;
+    }
+    probe
+        .execute(format!("SET LOCAL ROLE {query_role}").as_str())
+        .await?;
+    let visible = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_temp.facet_values WHERE key = $1)",
+    )
+    .bind(key)
+    .fetch_one(&mut *probe)
+    .await;
+    let rollback = probe.rollback().await;
+    Ok(visible? && rollback.is_ok())
+}
+
 /// First meaningful line only, redacted then capped at 300 chars.
 /// Never emits PG detail/hint/where text, internal view names, physical
 /// table names, or DDL: only the message head with internals scrubbed.
@@ -2185,10 +2216,41 @@ async fn execute_qualified(
             "SELECT * FROM ({statement}) AS _native_query LIMIT {}",
             MAX_ROWS + 1
         );
-        let prepared = transaction
-            .prepare_with(&capped, &types)
-            .await
-            .map_err(|error| type_check_error(error, &statement))?;
+        let prepared = match transaction.prepare_with(&capped, &types).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let undefined_column = matches!(&error, sqlx::Error::Database(database)
+                    if database.code().as_deref() == Some("42703"));
+                let refusal = type_check_error(error, &statement);
+                let key = undefined_column
+                    .then(|| {
+                        sql_contract::unknown_records_facet_key(&statement, &refusal.to_string())
+                    })
+                    .flatten();
+                // A failed prepare aborts the transaction. Advisory existence
+                // needs no shared snapshot: roll back, then probe the same
+                // caller-filtered view under a fresh read-only transaction.
+                // Successful queries pay no SAVEPOINT/RELEASE round trips.
+                if transaction.rollback().await.is_ok() {
+                    if let Some(key) = key {
+                        if visible_facet_after_refusal(&mut connection, &query_role, &key)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            return Err(Error::Engine(format!(
+                                "{refusal} {}",
+                                sql_contract::records_facet_column_hint(
+                                    &statement,
+                                    &refusal.to_string(),
+                                    &key
+                                )
+                            )));
+                        }
+                    }
+                }
+                return Err(refusal);
+            }
+        };
         if prepared.columns().len() > MAX_COLUMNS {
             return Err(reject(
                 QuerySqlErrorCategory::ResultTooLarge,
@@ -3518,6 +3580,7 @@ mod tests {
     #[test]
     fn sqlite_only_relations_fail_with_explicit_profile_diagnostic() {
         for relation in [
+            "facet_keys",
             "body_block_headings",
             "effective_relationship_endpoints",
             "facet_value_json_nodes",

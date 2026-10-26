@@ -300,6 +300,18 @@ pub struct StandbyDispatcher {
 }
 
 impl StandbyDispatcher {
+    pub(crate) fn serving_kernel_v2(&self) -> bool {
+        match self.session.capture() {
+            SessionSnapshot::Serving(served) => served
+                .resources
+                .active
+                .generation
+                .manifest
+                .kernel_v2
+                .is_some(),
+            SessionSnapshot::StatusOnly(_) => false,
+        }
+    }
     pub async fn handle_message(&self, message: Value) -> Option<Value> {
         self.session.handle_message(message).await
     }
@@ -325,6 +337,16 @@ struct GenerationResources {
     db: crate::Db,
     active: Arc<ActivatedGeneration>,
     retirements: Arc<Retirements>,
+}
+
+impl GenerationResources {
+    fn engine(&self) -> EngineHandle {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.active.generation.manifest.kernel_v2.is_some() {
+            return EngineHandle::KernelV2(self.db.clone());
+        }
+        EngineHandle::Sqlite(self.db.clone())
+    }
 }
 
 impl Drop for GenerationResources {
@@ -374,7 +396,7 @@ impl ServedGeneration {
             ServedDispatcher::Legacy { registry, caller } => {
                 dispatch_engine_message(
                     registry.clone(),
-                    EngineHandle::Sqlite(self.resources.db.clone()),
+                    self.resources.engine(),
                     if outage_bootstrap {
                         caller.clone().with_outage_bootstrap()
                     } else {
@@ -395,7 +417,7 @@ impl ServedGeneration {
                 {
                     dispatch_engine_message(
                         diagnostic_registry.clone(),
-                        EngineHandle::Sqlite(self.resources.db.clone()),
+                        self.resources.engine(),
                         caller.clone(),
                         message,
                     )
@@ -516,7 +538,6 @@ impl StandbyStdioSession {
                 let mut connection = db.pool().acquire().await?;
                 let head = crate::act::current_act(&mut connection).await?;
                 drop(connection);
-                let status = serde_json::to_value(served.status.status().await)?;
                 if !crate::markdown_vault::needs_projection(
                     last.as_ref(),
                     head,
@@ -524,7 +545,7 @@ impl StandbyStdioSession {
                     last_check.elapsed(),
                 ) {
                     let source = last.as_mut().unwrap();
-                    source.freshness = status;
+                    source.freshness = serde_json::to_value(served.status.status().await)?;
                     let mut writer = publisher.take().unwrap();
                     let source_copy = source.status_only();
                     let issues = conflicts.clone();
@@ -557,10 +578,15 @@ impl StandbyStdioSession {
                         .origin_database_id
                         .clone();
                     source.generation = served.resources.active.generation.id.clone();
-                    source.freshness = status;
                     let mut writer = publisher.take().unwrap();
+                    let runtime = tokio::runtime::Handle::current();
+                    let status_provider = served.status.clone();
                     let (writer, source, result) = tokio::task::spawn_blocking(move || {
-                        let result = writer.cycle(&source);
+                        let result = writer.cycle_with_freshness(&source, || {
+                            Ok(serde_json::to_value(
+                                runtime.block_on(status_provider.status()),
+                            )?)
+                        });
                         (writer, source.status_only(), result)
                     })
                     .await
@@ -755,6 +781,8 @@ impl StandbyStdioSession {
         registry.set_exposure_profile(config.profile);
         super::register_builtin_tools(&mut registry)?;
         super::register_surface_tools(&mut registry)?;
+        #[cfg(feature = "v2-kernel-probe")]
+        super::kernel_v2::register_hosted_kernel_v2_tools(&mut registry)?;
         super::register_build_enabled_experimental_tools(&mut registry)?;
         super::register_allowlisted_experimental_tools(&mut registry, &config.experimental)?;
         super::register_snapshot_tool(
@@ -787,14 +815,22 @@ impl StandbyStdioSession {
     ) -> Result<ServedGeneration> {
         crate::standby::generation_store::check_verification_cancellation()?;
         let active = Arc::new(active);
-        let db = crate::db::open_existing_database_standby_read_only(
-            active
-                .generation
-                .snapshot_path
-                .to_str()
-                .ok_or_else(|| Error::engine("invalid standby snapshot path"))?,
-        )
-        .await?;
+        let path = active
+            .generation
+            .snapshot_path
+            .to_str()
+            .ok_or_else(|| Error::engine("invalid standby snapshot path"))?;
+        let kernel_v2 = active.generation.manifest.kernel_v2.is_some();
+        let db = if kernel_v2 {
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                crate::db::open_kernel_v2_standby_read_only(path).await?
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
+        } else {
+            crate::db::open_existing_database_standby_read_only(path).await?
+        };
         self.retirements
             .live
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -803,7 +839,33 @@ impl StandbyStdioSession {
             active,
             retirements: self.retirements.clone(),
         };
-        let account = resolve_standby_account_identity(&resources.db, account).await?;
+        let account = if kernel_v2 {
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                resolve_kernel_account(&resources.db, account).await?
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
+        } else {
+            resolve_standby_account_identity(&resources.db, account).await?
+        };
+        #[cfg(feature = "v2-kernel-probe")]
+        if kernel_v2 {
+            let principal =
+                crate::kernel::resolve_caller_principal_by_binding(&resources.db, &account)
+                    .await?
+                    .ok_or_else(|| Error::engine("standby kernel principal unavailable"))?
+                    .0;
+            let mut snapshot = resources.db.pool().begin().await?;
+            crate::kernel::kernel_require(
+                &mut snapshot,
+                &principal,
+                crate::events::KERNEL_ROOT_ID,
+                crate::authorization::Capability::View,
+            )
+            .await?;
+            snapshot.rollback().await?;
+        }
         #[cfg(test)]
         {
             let hook = self.warmup_hook.lock().unwrap().clone();
@@ -844,7 +906,7 @@ impl StandbyStdioSession {
                         server: Box::new(
                             super::ExecutorPrototypeStdioServer::new_standby_read_only(
                                 registry.clone(),
-                                resources.db.clone(),
+                                resources.engine(),
                                 caller.clone(),
                             )
                             .await?
@@ -872,27 +934,37 @@ impl StandbyStdioSession {
         // Readiness uses the actual authenticated production dispatch path.
         // A readable SQLite file or built catalogue alone proves no authorised
         // kernel root can be served by this exact candidate/caller.
-        let (name, arguments) = match &prepared.dispatcher {
-            ServedDispatcher::Legacy { .. } => (
-                "get_record",
-                serde_json::json!({"ids":["native:root"],"format":"json"}),
-            ),
-            #[cfg(feature = "mcp-executor-prototype")]
-            ServedDispatcher::Executor { .. } => (
-                "records_read",
-                serde_json::json!({"operation":"get_record","arguments":{"ids":["native:root"]},"format":"json"}),
-            ),
+        let (name, arguments) = if kernel_v2 {
+            ("bootstrap", serde_json::json!({"format":"json"}))
+        } else {
+            match &prepared.dispatcher {
+                ServedDispatcher::Legacy { .. } => (
+                    "get_record",
+                    serde_json::json!({"ids":["native:root"],"format":"json"}),
+                ),
+                #[cfg(feature = "mcp-executor-prototype")]
+                ServedDispatcher::Executor { .. } => (
+                    "records_read",
+                    serde_json::json!({"operation":"get_record","arguments":{"ids":["native:root"]},"format":"json"}),
+                ),
+            }
         };
         let response = prepared.dispatch(serde_json::json!({"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":name,"arguments":arguments}}), false).await
             .ok_or_else(|| Error::engine("standby authorised readiness unavailable"))?;
         let value = &response["result"]["structuredContent"];
         let context = &value["standby_context"];
-        if response["result"]["isError"] != false
-            || !value["records"].as_array().is_some_and(|records| {
+        let ready_root = if kernel_v2 {
+            value["workspace"]["primary_workspace"]["id"] == "kernel:root"
+                && value["run"]["read_only"] == true
+        } else {
+            value["records"].as_array().is_some_and(|records| {
                 records
                     .iter()
                     .any(|record| record["id"] == "native:root" && record["status"] == "found")
             })
+        };
+        if response["result"]["isError"] != false
+            || !ready_root
             || context["mode"] != "standby"
             || context["serving_generation_id"] != prepared.resources.active.generation.id
             || context["status_scope"] != "serving_generation_freshness_only"
@@ -1160,6 +1232,19 @@ impl StandbyStdioSession {
         }
     }
 }
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn resolve_kernel_account(
+    db: &crate::Db,
+    selected: Option<&str>,
+) -> Result<String> {
+    let mut conn = db.pool().acquire().await?;
+    Ok(
+        crate::standby::kernel_v2::resolve_account_on(&mut conn, selected)
+            .await?
+            .0,
+    )
+}
+
 pub async fn resolve_standby_account_identity(
     db: &crate::Db,
     selected_account: Option<&str>,
@@ -1903,9 +1988,47 @@ mod tests {
                 "eligible G1 survives physical pool drain"
             );
             assert!(fs2::FileExt::try_lock_exclusive(&old_lease).is_err());
+            // Physical retirement releases the serving lease, not leases held
+            // by a concurrent retention verifier. Force that permitted overlap
+            // instead of relying on background maintenance's scheduling.
+            let verifier_lease = lease(&session, &first);
+            fs2::FileExt::lock_shared(&verifier_lease).unwrap();
             drop(old_checkout);
             session.retirements.drain().await;
             assert!(old_db.pool().is_closed());
+            assert_eq!(
+                fs2::FileExt::try_lock_exclusive(&old_lease)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock,
+            );
+            let store = session.config.store.clone();
+            assert!(tokio::task::spawn_blocking(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(store.prune_retention(&observed()))
+                    .unwrap()
+            })
+            .await
+            .unwrap()
+            .is_empty());
+            assert!(
+                old_path.is_dir(),
+                "a verifier lease still protects drained G1"
+            );
+            drop(verifier_lease);
+            // publish() schedules independent background retention. A single
+            // explicit prune may skip a candidate leased by that worker even
+            // after Retirements::drain has completed. Join it before requiring
+            // deletion, without changing any lease or retained-floor check.
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                session.config.store.maintenance_idle(),
+            )
+            .await
+            .expect("background retention finishes before unleased deletion");
             fs2::FileExt::try_lock_exclusive(&old_lease).unwrap();
             fs2::FileExt::unlock(&old_lease).unwrap();
             let store = session.config.store.clone();

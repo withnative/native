@@ -17,7 +17,7 @@ the kit policy grants no permissions. Explain this choice before adoption.
 Find folders with `sql_read.query_sql`: `SELECT id, name FROM records WHERE
  type = 'Collection' AND kind = 'folder' AND deleted_at IS NULL ORDER BY name,
  id LIMIT 50`. Ask the person which destination they want if ambiguous. Resolve
-short references through `records_read.get_record` via `call_executor` before
+short references with direct `records_read` `get_record` before
 using a full id. Replace the starter's `FOLDERS` with selected real ids/names.
 The folder chooser switches a parameterized newest-50 query with 160-character
 excerpts and 160-character names. Selecting a note starts a separate id-and-folder

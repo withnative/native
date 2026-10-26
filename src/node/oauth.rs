@@ -130,7 +130,10 @@ fn read_auth_file(path: &Path) -> std::result::Result<serde_json::Value, RenewEr
 }
 
 /// Atomic 0600 write with fsync, mirroring `atomic_private_write`.
-fn atomic_private_write(path: &Path, data: &[u8]) -> std::result::Result<(), RenewError> {
+pub(crate) fn atomic_private_write(
+    path: &Path,
+    data: &[u8],
+) -> std::result::Result<(), RenewError> {
     validate_credential_path(path, "node oauth")
         .map_err(|_| RenewError::Refused("oauth destination path refused".into()))?;
     let parent = path
@@ -259,6 +262,19 @@ async fn acquire_auth_lock(auth_path: &Path) -> std::result::Result<File, RenewE
     }
 }
 
+/// Read-only: is the saved grant inside its renewal window (or expired)?
+/// Applies the same guarded read and contract check as a renewal pass, but
+/// takes no lock and writes nothing, so a caller that must not touch the
+/// credential files (a dry run) can ask without side effects.
+pub(crate) fn grant_is_due(
+    auth_path: &Path,
+    expected_endpoint: &str,
+) -> std::result::Result<bool, RenewError> {
+    let auth = read_auth_file(auth_path)?;
+    validate_auth_contract(&auth, expected_endpoint)?;
+    Ok(is_due(expires_at_of(&auth), now_ms()))
+}
+
 /// Build the token-endpoint client: reqwest, no redirects, no retries.
 pub fn renew_client() -> std::result::Result<reqwest::Client, RenewError> {
     reqwest::Client::builder()
@@ -299,7 +315,7 @@ fn validate_auth_contract(
     ))
 }
 
-fn check_refresh_response(
+pub(crate) fn check_refresh_response(
     refreshed: &serde_json::Value,
     current_refresh: &str,
 ) -> std::result::Result<(String, String, i64), RenewError> {
@@ -423,6 +439,43 @@ pub async fn renew_once(
     atomic_private_write(auth_path, &serialized)?;
     atomic_private_write(token_path, token.as_bytes())?;
     Ok(RenewOutcome::Renewed)
+}
+
+/// How long an interactive login waits for the shared `<auth>.lock` before
+/// giving up (a running renewer holds it only for one token POST).
+const LOGIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Publish the grant from an interactive `native login`: take the same
+/// `<auth>.lock` the renewer takes, write the auth file (rotating refresh
+/// grant first), then the access-token file the node sends. Both are atomic
+/// 0600 writes. Returns the grant's `expires_at` (Unix ms). The caller has
+/// already validated the token response with [`check_refresh_response`].
+pub async fn store_login_grant(
+    auth_path: &Path,
+    token_path: &Path,
+    token_endpoint: &str,
+    client_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+    lifetime_secs: i64,
+) -> std::result::Result<i64, RenewError> {
+    let _lock = tokio::time::timeout(LOGIN_LOCK_WAIT, acquire_auth_lock(auth_path))
+        .await
+        .map_err(|_| RenewError::Refused("oauth lock busy".into()))??;
+    let expires_at = now_ms().saturating_add(lifetime_secs.saturating_mul(1000));
+    let auth = serde_json::json!({
+        "contract": CONTRACT,
+        "token_endpoint": token_endpoint,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "expires_at": expires_at,
+    });
+    let serialized = serde_json::to_vec(&auth)
+        .map_err(|_| RenewError::Refused("oauth auth serialization failed".into()))?;
+    atomic_private_write(auth_path, &serialized)?;
+    atomic_private_write(token_path, access_token.as_bytes())?;
+    Ok(expires_at)
 }
 
 /// Persistent renewal state for one node binding.
@@ -845,5 +898,51 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, RenewError::Refused(_)));
+    }
+
+    #[tokio::test]
+    async fn login_grant_waits_for_the_renewer_lock_and_is_then_renewable() {
+        let (url, fake) = start_fake(
+            StatusCode::OK,
+            serde_json::json!({"access_token": "x", "refresh_token": "y",
+                "expires_in": 3600, "token_type": "Bearer"}),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.json");
+        let token_path = dir.path().join("native.token");
+        let holder = open_lock_file(&auth_path).unwrap();
+        {
+            use fs2::FileExt as _;
+            holder.lock_exclusive().unwrap();
+        }
+        let (a, t, u) = (auth_path.clone(), token_path.clone(), url.clone());
+        let store = tokio::spawn(async move {
+            store_login_grant(
+                &a,
+                &t,
+                &u,
+                "client-1",
+                "login-access",
+                "login-refresh",
+                3600,
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(!store.is_finished(), "login must wait for the shared lock");
+        assert!(!token_path.exists());
+        drop(holder);
+        let expires_at = store.await.unwrap().unwrap();
+        assert!(expires_at > now_ms());
+        assert_eq!(fs::read_to_string(&token_path).unwrap(), "login-access");
+        assert_eq!(fs::metadata(&auth_path).unwrap().mode() & 0o777, 0o600);
+        assert_eq!(fs::metadata(&token_path).unwrap().mode() & 0o777, 0o600);
+        // The node's own renewer accepts what login wrote.
+        let outcome = renew_once(&auth_path, &token_path, &url, &test_client())
+            .await
+            .unwrap();
+        assert_eq!(outcome, RenewOutcome::Fresh);
+        assert_eq!(fake.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

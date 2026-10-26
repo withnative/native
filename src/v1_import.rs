@@ -12,8 +12,10 @@ use uuid::Uuid;
 
 mod app_state;
 mod history;
+mod member_context;
 mod messaging;
 mod state;
+mod surface_bindings;
 mod table_coverage;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -36,6 +38,8 @@ pub struct Options {
 }
 #[derive(Default, Serialize)]
 pub struct Report {
+    #[serde(flatten)]
+    pub build: cutover::ImportBuild,
     pub refusal_breakdown: Vec<refusal_breakdown::RefusalCount>,
     /// Counted-only source outcomes, separate from blocking refusals/review.
     pub counted_breakdown: Vec<refusal_breakdown::RefusalCount>,
@@ -809,7 +813,7 @@ async fn import_record_row(
     let started = Instant::now();
     // Snapshot provenance, not a fabricated v1 event or native creator/editor pin.
     let creator:Option<String>=sqlx::query_scalar("SELECT actor FROM content_events WHERE record_id=? AND type='record.created' ORDER BY seq LIMIT 1").bind(&record.id).fetch_optional(&mut *source).await?.flatten();
-    let editor:Option<String>=sqlx::query_scalar("SELECT actor FROM content_events WHERE record_id=? AND (type IN ('record.created','record.updated') OR (type='receipt.committed.v1' AND json_type(payload,'$.body') IS NOT NULL) OR (type='unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL)) ORDER BY seq DESC LIMIT 1").bind(&record.id).fetch_optional(&mut *source).await?.flatten();
+    let editor:Option<String>=sqlx::query_scalar("SELECT actor FROM content_events WHERE record_id=? AND (type IN ('record.created','record.updated') OR (type='receipt.committed.v1' AND json_type(payload,'$.body') IS NOT NULL) OR (type='unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL) OR (type='message.revision.recorded.v1' AND json_type(payload,'$.body') IS NOT NULL)) ORDER BY seq DESC LIMIT 1").bind(&record.id).fetch_optional(&mut *source).await?.flatten();
     let mut provenance = k::LegacyEvent {
         source: None,
         id: receipt(&format!("{origin}:snapshot:{}", record.id)),
@@ -819,6 +823,24 @@ async fn import_record_row(
         run_key: None,
         payload: json!({"source_origin":origin,"record_id":record.id,"creator":creator,"created_at":record.created_at,"last_editor":editor,"updated_at":record.updated_at,"persistence":record.persistence,"maturity":record.maturity,"last_activity_at":record.last_activity_at,"original_owner":record.owner_id,"verified_owner_accounts":record.owner_id.as_ref().and_then(|id|owner_accounts.get(id)),"owner_assumed":report.assumed_owners.contains(&record.id),"original_home":record.home_id,"policy_anchor":record.policy_anchor_id,"derived_home":derived(&record.id),"archive_observed_at":archive_observed_at,"v1_type":record.v1_type,"v1_kind":record.kind,"lifecycle":record.lifecycle,"summary":record.summary}),
     };
+    // Preserve the current typed-time projection even without --history.
+    // Empty is authoritative too: old typed history must not resurrect a
+    // value that an untyped current write or unset already removed on v1.
+    if report
+        .table_coverage
+        .imported
+        .iter()
+        .any(|name| name == "facet_times")
+    {
+        let times: Vec<String> = sqlx::query_scalar("SELECT json_object('key',t.key,'kind',t.kind,'all_day',t.all_day,'start_date',t.start_date,'end_date',t.end_date,'start_ms',t.start_ms,'end_ms',t.end_ms,'tz',t.tz,'tzdb_version',t.tzdb_version,'value',f.value) FROM facet_times t JOIN facet_values f ON f.record_id=t.record_id AND f.key=t.key WHERE t.record_id=? ORDER BY t.key")
+            .bind(&record.id).fetch_all(&mut *source).await?;
+        provenance.payload["facet_times"] = serde_json::Value::Array(
+            times
+                .into_iter()
+                .map(|row| serde_json::from_str(&row))
+                .collect::<std::result::Result<_, _>>()?,
+        );
+    }
     if let Some(owner_override) = report
         .owner_overrides
         .iter()
@@ -1311,12 +1333,28 @@ pub struct ImportedPlacement {
     pub home_id: Option<String>,
     pub kernel_home_id: String,
 }
+// The prepared header is the canonical witness for this exact envelope kind.
+// Looking through the raw retained stream decodes unrelated source revisions.
+pub(crate) const SNAPSHOT_PROVENANCE_SQL: &str = "SELECT e.payload FROM main.kernel_legacy_sql_events h JOIN main.content_events e ON e.seq=h.seq WHERE h.record_id=? AND h.source_stream='snapshot_provenance' ORDER BY h.seq DESC LIMIT 1";
+
 pub async fn placement_as(
     db: &Db,
     principal: &str,
     record: &str,
 ) -> crate::Result<Option<ImportedPlacement>> {
     let mut tx = db.write_pool().begin().await?;
+    let result = placement_on(&mut tx, principal, record).await?;
+    tx.rollback().await?;
+    Ok(result)
+}
+
+/// Placement and its View checks in the caller's existing live snapshot.
+pub(crate) async fn placement_on(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+    record: &str,
+) -> crate::Result<Option<ImportedPlacement>> {
+    k::legacy_history::require_sql_frontier_on(tx).await?;
     let Some(home): Option<String> =
         sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
             .bind(record)
@@ -1325,32 +1363,37 @@ pub async fn placement_as(
     else {
         return Ok(None);
     };
-    if !k::kernel_effective_capability_on(&mut tx, principal, record)
+    if !k::kernel_effective_capability_on(&mut *tx, principal, record)
         .await?
         .allows(crate::authorization::Capability::View)
     {
         return Ok(None);
     }
-    let provenance: Option<String> = sqlx::query_scalar("SELECT payload FROM content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1")
-        .bind(record).fetch_optional(&mut *tx).await?;
+    let provenance: Option<String> = sqlx::query_scalar(SNAPSHOT_PROVENANCE_SQL)
+        .bind(record)
+        .fetch_optional(&mut *tx)
+        .await?;
     let original: Option<serde_json::Value> =
         provenance.map(|v| serde_json::from_str(&v)).transpose()?;
-    let mut mapped: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
+    let mut mapped: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM main.content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1")
         .bind(&home).fetch_optional(&mut *tx).await?;
     let root_record: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id='native:root')")
             .fetch_one(&mut *tx)
             .await?;
     if home == KERNEL_ROOT_ID && mapped.is_none() {
-        let root_imported: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events WHERE record_id=? AND type='kernel.import_home_policy.v1')").bind(KERNEL_ROOT_ID).fetch_one(&mut *tx).await?;
+        let root_imported: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE record_id=? AND type='kernel.import_home_policy.v1')").bind(KERNEL_ROOT_ID).fetch_one(&mut *tx).await?;
         if root_imported || root_record {
             mapped = Some(V1_ROOT.into());
         }
     }
-    let moved: Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.logical_home_id') FROM content_events WHERE record_id=? AND type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') ORDER BY seq DESC LIMIT 1")
+    let moved: Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.logical_home_id') FROM main.content_events WHERE record_id=? AND type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') ORDER BY seq DESC LIMIT 1")
         .bind(record).fetch_optional(&mut *tx).await?.flatten();
+    let direct_home = k::messaging::logical_direct_home_on(tx, record).await?;
     let candidate = if moved.is_some() {
         moved
+    } else if direct_home.is_some() {
+        direct_home.clone()
     } else if home == derived(record)
         && original
             .as_ref()
@@ -1374,9 +1417,13 @@ pub async fn placement_as(
         } else {
             candidate.as_str()
         };
-        let visible = k::kernel_effective_capability_on(&mut tx, principal, target)
-            .await?
-            .allows(crate::authorization::Capability::View);
+        // This public filing sentinel does not disclose or grant View on the
+        // separate private policy home. Other home IDs still need live View.
+        let visible = (candidate == "native:unfiled"
+            && direct_home.as_deref() == Some("native:unfiled"))
+            || k::kernel_effective_capability_on(&mut *tx, principal, target)
+                .await?
+                .allows(crate::authorization::Capability::View);
         visible.then_some(candidate)
     } else {
         None
@@ -1401,9 +1448,11 @@ pub async fn snapshot_provenance_as(
     {
         return Ok(None);
     }
-    let payload: Option<String> = sqlx::query_scalar(
-        "SELECT payload FROM content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1")
-        .bind(record).fetch_optional(&mut *tx).await?;
+    k::legacy_history::require_sql_frontier_on(&mut tx).await?;
+    let payload: Option<String> = sqlx::query_scalar(SNAPSHOT_PROVENANCE_SQL)
+        .bind(record)
+        .fetch_optional(&mut *tx)
+        .await?;
     payload
         .map(|p| {
             let value: serde_json::Value = serde_json::from_str(&p)?;
@@ -1430,21 +1479,30 @@ pub async fn legacy_record_provenance_as(
     record: &str,
 ) -> crate::Result<Option<LegacyRecordProvenance>> {
     let mut tx = db.write_pool().begin().await?;
+    legacy_record_provenance_on(&mut tx, principal, record).await
+}
+pub(crate) async fn legacy_record_provenance_on(
+    tx: &mut sqlx::SqliteConnection,
+    principal: &str,
+    record: &str,
+) -> crate::Result<Option<LegacyRecordProvenance>> {
+    k::legacy_history::require_sql_frontier_on(tx).await?;
     // Provenance needs visibility, not a hydrated body/fields read.
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records WHERE id=?)")
         .bind(record)
         .fetch_one(&mut *tx)
         .await?;
     if !exists
-        || !k::kernel_effective_capability_on(&mut tx, principal, record)
+        || !k::kernel_effective_capability_on(tx, principal, record)
             .await?
             .allows(crate::authorization::Capability::View)
     {
         return Ok(None);
     }
-    let payload: Option<String> = sqlx::query_scalar(
-        "SELECT payload FROM content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1")
-        .bind(record).fetch_optional(&mut *tx).await?;
+    let payload: Option<String> = sqlx::query_scalar(SNAPSHOT_PROVENANCE_SQL)
+        .bind(record)
+        .fetch_optional(&mut *tx)
+        .await?;
     let Some(payload) = payload else {
         return Ok(None);
     };
@@ -1452,7 +1510,7 @@ pub async fn legacy_record_provenance_as(
     let legacy = &value["legacy"]["payload"];
     // Match history_as's directory-attribution fence, in the same snapshot as
     // record visibility. A visible record must not recover withheld actors.
-    let root_visible = k::kernel_effective_capability_on(&mut tx, principal, KERNEL_ROOT_ID)
+    let root_visible = k::kernel_effective_capability_on(tx, principal, KERNEL_ROOT_ID)
         .await?
         .allows(crate::authorization::Capability::View);
     let actor = |key: &str| {
@@ -2364,6 +2422,8 @@ pub async fn run(options: Options) -> Result<Report> {
         let mut generic_checks = Vec::new();
         for link in links {
             let id=link.id.clone(); let from=link.source_id.clone(); let to=link.target_id.clone(); let predicate=link.relationship.clone();
+            // Reserved bindings are captured as sealed configuration, never as generic link authority.
+            if predicate==crate::surface_binding::SURFACE_BINDING_RELATIONSHIP { *report.skipped_links.entry("sealed_surface_binding_metadata".into()).or_default()+=1; report.links_by_relationship.entry(predicate).or_default().skipped+=1; continue; }
             if options.all && (!records.contains_key(&from) || !records.contains_key(&to)) {*report.skipped_links.entry("endpoint_missing_from_source".into()).or_default()+=1;report.links_by_relationship.entry(predicate.clone()).or_default().skipped+=1;continue;}
             if !records.contains_key(&from) && !records.contains_key(&to) {continue;}
             if !expected.contains_key(&from)||!expected.contains_key(&to) {*report.skipped_links.entry("endpoint_outside_imported_subset".into()).or_default()+=1;report.links_by_relationship.entry(predicate.clone()).or_default().skipped+=1;continue;}

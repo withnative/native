@@ -215,7 +215,10 @@ function operational(purpose, key) {
 
 function privateFixtureJwk(key) {
   const privateJwk = key.private_key.export({ format: "jwk" });
-  return { ...privateJwk, alg: key.jwk.alg, use: key.jwk.use, kid: key.jwk.kid };
+  // Node's JWK export property order is not stable across releases (24.x moved
+  // `kty` first), so the member order is fixed here to keep fixtures byte-stable.
+  const { crv, d, x, kty, ...rest } = privateJwk;
+  return { crv, d, x, kty, ...rest, alg: key.jwk.alg, use: key.jwk.use, kid: key.jwk.kid };
 }
 
 const installationRecord = {

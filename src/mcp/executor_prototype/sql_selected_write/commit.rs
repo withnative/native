@@ -669,6 +669,23 @@ pub(super) mod tests {
         let upgraded = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
             .await
             .unwrap();
+        // Keep the exact historical edge proof, then advance to the serving
+        // schema before comparing with fresh and exercising interchange.
+        assert_eq!(upgraded, crate::db::ENGINE_90_SHAPE_CONTRACT_SHA256);
+        for edge in crate::migrations::EngineMigrationRegistry::production()
+            .pending(90, crate::db::CURRENT_ENGINE_SCHEMA_VERSION)
+            .unwrap()
+        {
+            edge.preflight(&mut conn).await.unwrap();
+            edge.apply(&mut conn).await.unwrap();
+            sqlx::query(&format!("PRAGMA user_version={}", edge.to()))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        let upgraded = crate::db::schema_shape_contract_sha256_for_test(&mut conn)
+            .await
+            .unwrap();
         drop(conn);
         let fresh = crate::create_database(":memory:").await.unwrap();
         let mut conn = fresh.write_pool().acquire().await.unwrap();

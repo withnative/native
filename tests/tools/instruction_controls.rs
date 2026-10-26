@@ -137,7 +137,13 @@ async fn instruction_tools_register_with_closed_action_schemas() {
 async fn workspace_binding_is_atomic_with_the_exact_utf8_budget() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
-    create_document(&registry, &db, TOO_LARGE, &"é".repeat(16_385)).await;
+    create_document(
+        &registry,
+        &db,
+        TOO_LARGE,
+        &"é".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES / 2 + 1),
+    )
+    .await;
 
     let error = call_as(
         &registry,
@@ -354,7 +360,13 @@ async fn active_dangling_sources_fail_closed_and_block_control_mutations() {
 async fn future_member_programme_budget_is_enforced_without_pending_members() {
     let db = create_database(":memory:").await.unwrap();
     let registry = registry();
-    create_document(&registry, &db, FUTURE_OVERSIZE, &"é".repeat(16_385)).await;
+    create_document(
+        &registry,
+        &db,
+        FUTURE_OVERSIZE,
+        &"é".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES / 2 + 1),
+    )
+    .await;
     call_as(
         &registry,
         &db,

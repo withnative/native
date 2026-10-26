@@ -6,7 +6,7 @@
 //! proportional to the whole workspace log, paid serially once per anchored
 //! comment.
 //!
-//! The projector derives `records.body` from the event payload in exactly four
+//! The projector derives `records.body` from the event payload in exactly five
 //! places, and no other projection touches the column:
 //!
 //! - `record.created` inserts the row; the body is the payload's `body` value
@@ -18,7 +18,9 @@
 //!   `{"body": <payload.body>}` (`project_receipt_committed_aggregate`), so the
 //!   payload's top-level `body` always wins;
 //! - `unit.revision.recorded.v1` overwrites the body with
-//!   `payload.content.content` (`project_unit_revision_recorded`).
+//!   `payload.content.content` (`project_unit_revision_recorded`);
+//! - `message.revision.recorded.v1` overwrites a Message's body with
+//!   `payload.body` (`project_message_revision_recorded`).
 //!
 //! Values pass through the same coercion the projector applies: payload
 //! values bind through `push_json_arg` into a `TEXT` column, so null stays
@@ -51,8 +53,7 @@ use sqlx::{Row, Sqlite, SqliteConnection, Transaction};
 use crate::error::{Error, Result};
 
 /// Content event types whose projection writes `records.body`.
-const BODY_WRITING_TYPES: &str =
-    "'record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1'";
+const BODY_WRITING_TYPES: &str = "'record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1','message.revision.recorded.v1'";
 
 /// SQL twin of [`payload_carries_body`]: the predicate selecting events whose
 /// projection writes `records.body` with a payload value. The two must move
@@ -60,7 +61,7 @@ const BODY_WRITING_TYPES: &str =
 /// [`BODY_WRITING_TYPES`]. `json_type(...) IS NOT NULL` distinguishes an
 /// absent key from an explicit JSON `null`, so a `record.updated` that clears
 /// the body still counts as a writer here.
-pub(crate) const BODY_CARRYING_EVENT_SQL: &str = "(type IN ('record.created','record.updated','receipt.committed.v1') AND json_type(payload,'$.body') IS NOT NULL) OR (type = 'unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL)";
+pub(crate) const BODY_CARRYING_EVENT_SQL: &str = "(type IN ('record.created','record.updated','receipt.committed.v1','message.revision.recorded.v1') AND json_type(payload,'$.body') IS NOT NULL) OR (type = 'unit.revision.recorded.v1' AND json_type(payload,'$.content.content') IS NOT NULL)";
 
 /// Legacy contribution/history selection. This deliberately differs from
 /// payload-bearing projection provenance: a bodyless create counts, while
@@ -101,7 +102,10 @@ impl BodyRevisionSelection {
 /// Callers validating exact source text must retain their own type checks.
 pub(crate) fn event_body_value<'a>(event_type: &str, payload: &'a Value) -> Option<&'a Value> {
     match event_type {
-        "record.created" | "record.updated" | "receipt.committed.v1" => payload.get("body"),
+        "record.created"
+        | "record.updated"
+        | "receipt.committed.v1"
+        | "message.revision.recorded.v1" => payload.get("body"),
         "unit.revision.recorded.v1" => payload.get("content")?.get("content"),
         _ => None,
     }
@@ -327,7 +331,7 @@ pub(crate) fn projected_body(event_type: &str, payload: &Value) -> Option<Option
         "record.created" => Some(coerce_body(
             event_body_value(event_type, payload).unwrap_or(&Value::Null),
         )),
-        "record.updated" | "receipt.committed.v1" => {
+        "record.updated" | "receipt.committed.v1" | "message.revision.recorded.v1" => {
             event_body_value(event_type, payload).map(coerce_body)
         }
         "unit.revision.recorded.v1" => event_body_value(event_type, payload)

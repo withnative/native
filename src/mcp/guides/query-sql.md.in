@@ -40,7 +40,7 @@ basis or policy version is offered.
 The relation admits snapshots with at most 20,000 visible records. Above that,
 dependent queries return `result_too_large` before interpretation, including
 queries with a `record_id` predicate. Use `get_record` for a specific record
-(on a lean MCP surface, `call_executor` with `{"executor":"records_read","operation":"get_record","arguments":{"ids":[reference]}}`).
+(on a lean MCP surface, `records_read` advertises `get_record` directly).
 On SQLite and PostgreSQL, queries that do not use this relation remain
 available, and the caller SQL's two-second execution timer begins after
 lifecycle interpretation. PostgreSQL also applies a two-second timeout to
@@ -784,6 +784,24 @@ The front-door scanner rejects multiple statements and obvious writes, DDL, tran
 Never infer availability from dialect similarity. Use `engine_info.query_sql.available` for the active profile.
 
 
+## Deleted parents of replies
+
+`links` needs both ends visible, so once a Message is deleted the `reply_to`
+row of each live reply to it disappears and the reply reads as unthreaded. The
+logical `deleted_messages` view restores that one fact. It has one row per
+visible live Message whose `reply_to` target is a deleted Message:
+`message_id` (the deleted parent), `reply_id` (the live reply, join to
+`records.id`), `deleted_at` and `deleted_at_ms`. Show "This message was
+deleted" in place of the parent and keep the replies. It carries no body, name,
+author or audience. A row exists only if you could see the parent itself before
+it was deleted: seeing the reply is not enough, so a reply to a parent outside
+your authority gets no row. There is no row for a deleted Message that no
+visible reply points at, so a deleted message with no live replies stays absent.
+A reply with neither a `links` row nor a `deleted_messages` row has no disclosed
+parent information: its parent may be outside your page, or may be one you cannot
+see (deleted or not), and the two relations do not say which. This is the SQL
+counterpart of the `deleted_parents` stub in `manage_messages` `list_context`.
+
 ## Persona identity and message speakers
 
 `my_participants` lists only the caller's own active and retired personas.
@@ -794,3 +812,38 @@ its private profile; historical Messages show renames. `my_message_state`
 and `my_mentions.own_source` distinguish persona speech from the owner's human
 speech. See the messaging guide for registration, claim validation, receipts
 and interchange behavior.
+
+### Discover facet keys before joining values
+
+`facet_keys` (SQLite online and member serving) lists observed and declared
+facets. Start with `SELECT * FROM facet_keys WHERE type = 'WorkItem' AND
+(kind = 'task' OR kind IS NULL) AND scope_id IS NULL ORDER BY kind, key`.
+`kind IS NULL` covers every kind, including records with no kind; its count
+covers the entire type. Every observed key has a workspace-wide wildcard row,
+even when undeclared and carried only by kinded records. Bare type declarations
+also use these wildcard rows. A concrete kind row resolves
+that kind's overrides and inherits the type declaration. Observed kinds also
+inherit a bare type declaration even without their own declared shape.
+
+`scope_id IS NULL` gives workspace-wide counts and declarations. Other scope
+rows describe direct members of that visible collection, with resolved global
+and collection declarations; their counts cover only visible direct members.
+Scoped rows are declaration contexts, not a second inventory of undeclared
+keys. Counts include every distinct caller-visible record carrying the key in
+`facet_values`, including superseded and archived records. To count only
+current records, join the values directly:
+
+```sql
+SELECT f.key, count(DISTINCT f.record_id) AS record_count
+FROM facet_values f JOIN records r ON r.id = f.record_id
+WHERE r.type = 'WorkItem' AND r.kind = 'task' AND r.is_current = 1
+GROUP BY f.key ORDER BY f.key
+```
+
+Declarations without values have count zero. `declared` is 1
+for a resolved declaration, otherwise 0; `value_type`, `vocab_ref`, and
+`required` come from the winning declaration (`required` defaults to 0).
+Undeclared metadata is NULL. Spine and engine-reserved keys are excluded.
+Counts in wildcard, concrete-kind, workspace and scoped rows overlap: do not
+sum them. A member generation with incomplete schema refuses discovery.
+Turso and Postgres refuse this SQLite-only relation explicitly.

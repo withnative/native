@@ -1109,30 +1109,75 @@ pub struct RebuildDiffResult {
 }
 
 pub(crate) async fn read_all_events(conn: &mut SqliteConnection) -> Result<Vec<EventRow>> {
-    // `pub(crate)` for the test-only v2 kernel replay path
-    // (`crate::kernel::replay_all_projections`); no non-test caller.
     read_events_of_types(conn, &[]).await
 }
 
-/// Read only selected sealed lanes for additive projection recovery. Empty
-/// selects the full log for the existing conformance/replay caller.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn read_events_after_seq(
+    conn: &mut SqliteConnection,
+    after: i64,
+) -> Result<Vec<EventRow>> {
+    read_event_page_after_seq(conn, after, i64::MAX).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn read_event_page_after_seq(
+    conn: &mut SqliteConnection,
+    after: i64,
+    limit: i64,
+) -> Result<Vec<EventRow>> {
+    read_event_rows(conn, Some(after), limit, &[]).await
+}
+
+/// Read selected sealed lanes for additive recovery, retaining the paged reader's
+/// canonical envelope decoding. Empty selects the full log.
 pub(crate) async fn read_events_of_types(
     conn: &mut SqliteConnection,
     types: &[&str],
 ) -> Result<Vec<EventRow>> {
+    read_event_rows(conn, None, i64::MAX, types).await
+}
+
+async fn read_event_rows(
+    conn: &mut SqliteConnection,
+    after: Option<i64>,
+    limit: i64,
+    types: &[&str],
+) -> Result<Vec<EventRow>> {
+    // Keep the v1 conformance reader unbounded, including malformed sequence
+    // values which must be decoded/refused rather than hidden by a predicate.
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act,causal_envelope_version,causal_status FROM content_events"
+        "SELECT seq,id,record_id,type,payload,actor,run_key,parent_key,intent,created_at,act,causal_envelope_version,causal_status FROM content_events WHERE 1=1",
     );
+    if let Some(after) = after {
+        query.push(" AND seq > ").push_bind(after);
+    }
     if !types.is_empty() {
-        query.push(" WHERE type IN (");
+        query.push(" AND type IN (");
         let mut separated = query.separated(",");
         for kind in types {
             separated.push_bind(*kind);
         }
         separated.push_unseparated(")");
     }
-    query.push(" ORDER BY seq");
+    query.push(" ORDER BY seq LIMIT ").push_bind(limit);
     let rows = query.build().fetch_all(&mut *conn).await?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One indexed frontier query per page, rather than one SQL round trip per
+    // historical event. Preserve canonical parent ordering and envelope checks.
+    let parents: Vec<(String, String)> = if let Some(after) = after {
+        let upper: i64 = rows.last().unwrap().try_get("seq")?;
+        sqlx::query_as("SELECT f.event_id,f.parent_event_id FROM content_events e CROSS JOIN content_event_causal_frontier f ON f.event_id=e.id WHERE e.seq>? AND e.seq<=? ORDER BY f.event_id,f.parent_event_id")
+            .bind(after).bind(upper).fetch_all(&mut *conn).await?
+    } else {
+        sqlx::query_as("SELECT event_id,parent_event_id FROM content_event_causal_frontier ORDER BY event_id,parent_event_id").fetch_all(&mut *conn).await?
+    };
+    let mut frontiers = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (event, parent) in parents {
+        frontiers.entry(event).or_default().push(parent);
+    }
     // try_get, not get: these values are database-controlled, and the suite's
     // contract is a report + exit code, never a crash — a malformed log (e.g. a
     // TEXT `seq`) must surface as a reportable error, not a decode panic.
@@ -1146,13 +1191,7 @@ pub(crate) async fn read_events_of_types(
         }
         let event_id: String = r.try_get("id")?;
         let frontier = crate::events::CausalFrontierV1::new(
-            sqlx::query_scalar::<_, String>(
-                "SELECT parent_event_id FROM content_event_causal_frontier
-                  WHERE event_id=? ORDER BY parent_event_id",
-            )
-            .bind(&event_id)
-            .fetch_all(&mut *conn)
-            .await?,
+            frontiers.get(&event_id).cloned().unwrap_or_default(),
         )?;
         let causal_envelope = match r.try_get::<String, _>("causal_status")?.as_str() {
             "complete" => crate::events::CausalEnvelopeV1::complete(frontier),

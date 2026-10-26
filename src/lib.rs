@@ -135,6 +135,8 @@ pub mod mcp;
 pub mod member_copy_admission;
 pub mod member_copy_client;
 pub mod member_copy_driver;
+#[cfg(feature = "v2-kernel-probe")]
+pub mod member_copy_kernel_v2;
 pub mod member_copy_lifecycle;
 pub mod member_copy_producer;
 pub mod member_copy_registry;
@@ -150,6 +152,9 @@ pub mod mentions;
 pub mod message_expectation;
 pub mod meta;
 pub mod migrations;
+pub(crate) mod named_views;
+/// Shared local-CLI serving paths for the `mcp-stdio` and `native` binaries.
+pub mod native_cli;
 pub(crate) mod need_metrics;
 /// Live tabs M2 need subscriptions (task `61e11ad`, design `ee12faf` rev 3).
 pub mod need_subscriptions;

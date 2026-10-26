@@ -220,6 +220,44 @@ pub(crate) async fn existing_hosted_identity_in_snapshot(
     }))
 }
 
+/// Read-only catalog-to-portable lookup. These outcomes require operator
+/// review, never provisioning. Missing legacy aliases are allowed; conflicting
+/// aliases still fail the same validation as ordinary hosted reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostedAccountLookup {
+    Missing,
+    Ambiguous,
+    Found(HostedPortableIdentity),
+}
+
+pub async fn existing_hosted_identity_for_catalog_in_snapshot(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    email: &str,
+    catalog_user_id: &str,
+) -> Result<HostedAccountLookup> {
+    // Diagnose cardinality without guessing an identity. Resolution and all
+    // liveness/token/legacy-alias validation remain the existing authorities.
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM bindings e JOIN bindings a ON a.record_id=e.record_id
+         AND a.system='account' AND a.is_canonical=1
+         WHERE e.system='email' AND e.identifier=?",
+    )
+    .bind(email)
+    .fetch_one(&mut **tx)
+    .await?;
+    if count == 0 {
+        return Ok(HostedAccountLookup::Missing);
+    }
+    if count > 1 {
+        return Ok(HostedAccountLookup::Ambiguous);
+    }
+    let Some(identity) = existing_hosted_identity_in_snapshot(tx, email).await? else {
+        return Ok(HostedAccountLookup::Missing);
+    };
+    validate_existing_legacy_alias(tx, catalog_user_id, &identity.person_record_id).await?;
+    Ok(HostedAccountLookup::Found(identity))
+}
+
 /// Validate an existing hosted identity before custody is allowed to mint a
 /// first principal. Returning an existing principal lets the caller refuse an
 /// unmanaged continuity conflict without irreversibly creating new custody.

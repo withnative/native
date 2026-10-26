@@ -9,11 +9,11 @@ without a top-level action discriminator.
 
 ## Current operation census
 
-- **88 registered tools / 236 operations**.
-- **13 ordinary, 87 high-risk, and 136 specialized operations**.
-- **101 read-only and 135 mutating operations**.
-- **231 operations carry a non-disclosure obligation**.
-- All **135 mutating operations** carry an explicit no-write-on-deny obligation
+- **90 registered tools / 247 operations**.
+- **13 ordinary, 87 high-risk, and 147 specialized operations**.
+- **105 read-only and 142 mutating operations**.
+- **242 operations carry a non-disclosure obligation**.
+- All **142 mutating operations** carry an explicit no-write-on-deny obligation
   and named negative evidence.
 - **5 read operations** have justified `negative_evidence: not_applicable`:
   `ping.$tool`, `engine_info.$tool`, `quickstart.$tool`, `read_guide.$tool`, and
@@ -21,7 +21,8 @@ without a top-level action discriminator.
   each still has positive executable evidence.
 - Complete-coverage claim: **SQLite local**, exercised by
   `sqlite-reference-ci`. Postgres and Turso contract profiles do not inherit
-  this claim.
+  this claim. Named-view rows separately qualify hosted-v2 success and
+  ordinary-SQLite refusal; they do not claim local success.
 
 Each operation independently declares its production disposition, risk tier,
 fixture owner, expected threshold, read/mutation nature, non-disclosure and
@@ -86,3 +87,12 @@ negative evidence is `prepare_install_authorization_requires_view_and_scopes_ins
 in `tests/tools/alpha_tabs_prepare_install.rs`: it proves non-disclosing refusal
 without View and independent current-install pins for two accounts sharing a
 package. Preparation is read-only and grants no installation or adoption.
+
+The main-Native-only `read_hcp_audit.$tool` operation is owned by
+`hcp_audit_non_owner_reads_only_own_events_and_refuses_foreign_cursors` in
+`tests/tools/counter_guard.rs`. A non-owner reads only its caller-derived sealed
+state/read aggregates, even across interleaved account activity. Pagination uses
+opaque event identities from that same snapshot. Foreign, unknown and malformed
+cursors receive a uniform refusal; payloads cannot select another account. This
+JSON-only audit is unavailable offline, where a partial workspace history cannot
+establish a complete personal audit.

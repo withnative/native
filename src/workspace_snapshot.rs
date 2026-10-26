@@ -41,15 +41,26 @@ use crate::error::{Error, Result};
 use crate::query::QueryPrincipal;
 use crate::workspace_index::FilteredWorkspaceIndex;
 
-/// Tokens held per database handle. Eight entries bound memory the way the
-/// handle LRU does: entries are LRU-evicted past the count cap or past
-/// [`SNAPSHOT_MAX_BYTES`] total, so worst case per handle is one 32 MiB
-/// index plus 32 MiB of tokens. Typical test workspaces measure in KiB.
+/// V1 tokens held per database handle. Entries are LRU-evicted past this count
+/// or [`SNAPSHOT_MAX_BYTES`] total. V2 uses its own bounded handle budget below
+/// so member browsers and agents can retain pins together.
 pub const SNAPSHOT_MAX_TOKENS: usize = 8;
 /// Total estimated bytes across held tokens per handle. Matches
 /// [`crate::workspace_index::MAX_INDEX_BYTES`] deliberately: the token budget
 /// can never exceed one more refused-sized index.
 pub const SNAPSHOT_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// V2 shares a handle across members and agents. Retain eight maximum-sized
+/// pins (plus smaller pins up to the count bound), rather than making every
+/// new member evict the previous member. V1's existing budget is unchanged.
+#[cfg(feature = "v2-kernel-probe")]
+pub const SNAPSHOT_V2_MAX_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(feature = "v2-kernel-probe")]
+pub const SNAPSHOT_V2_MAX_TOKENS: usize = 16;
+/// Estimated retained v2 pin bytes across every database handle in this
+/// process. A single HQ handle keeps its existing 256 MiB/16-pin behavior;
+/// additional databases share this budget instead of multiplying it.
+#[cfg(feature = "v2-kernel-probe")]
+pub const SNAPSHOT_V2_PROCESS_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// How long a token stays pageable. Five minutes: long enough to page a large
 /// workspace over serial round trips, short enough that a stale pin cannot
 /// outlive the operator's patience. Expiry is an explicit restart, not drift.
@@ -74,7 +85,7 @@ pub const SNAPSHOT_MAX_CATCH_UP_GAP: i64 = 512;
 pub struct SnapshotRecord {
     pub id: String,
     #[serde(rename = "type")]
-    pub record_type: String,
+    pub record_type: Option<String>,
     pub kind: Option<String>,
     pub name: String,
     pub home_id: Option<String>,
@@ -130,7 +141,7 @@ impl SnapshotRecord {
     pub(crate) fn from_head(head: &crate::workspace_index::RecordHead) -> Self {
         Self {
             id: head.id.clone(),
-            record_type: head.record_type.clone(),
+            record_type: Some(head.record_type.clone()),
             kind: head.kind.clone(),
             name: head.name.clone(),
             home_id: head.home_id.clone(),
@@ -198,6 +209,8 @@ pub(crate) struct SnapshotEntry {
     relationship_seq: i64,
     unit_seq_max: i64,
     estimated_bytes: usize,
+    #[cfg(feature = "v2-kernel-probe")]
+    kernel_v2: bool,
     records: BTreeMap<String, SnapshotRecord>,
     facets: BTreeMap<String, SnapshotFacet>,
     links: BTreeMap<String, SnapshotLink>,
@@ -211,57 +224,28 @@ pub(crate) struct SnapshotEntry {
 /// HashMap buckets) is covered by the node/entry constants, which exceed
 /// typical allocator overhead per row on 64-bit targets. A measured test
 /// below pins the bound.
-fn estimate_entry_bytes(
+#[doc(hidden)]
+pub fn estimate_entry_bytes(
     principal_credential_len: usize,
     records: &BTreeMap<String, SnapshotRecord>,
     facets: &BTreeMap<String, SnapshotFacet>,
     links: &BTreeMap<String, SnapshotLink>,
     events: &[SnapshotEvent],
 ) -> usize {
-    const MAP_NODE_OVERHEAD: usize = 64;
     const STORE_ENTRY_OVERHEAD: usize = 512;
     let mut estimated_bytes = 1024 + STORE_ENTRY_OVERHEAD + principal_credential_len + 64;
-    for (id, record) in records {
-        estimated_bytes += std::mem::size_of::<SnapshotRecord>()
-            + std::mem::size_of::<String>()
-            + id.len() * 2
-            + record.record_type.len()
-            + record.kind.as_ref().map_or(0, String::len)
-            + record.name.len()
-            + record.home_id.as_ref().map_or(0, String::len)
-            + record.lifecycle.as_ref().map_or(0, String::len)
-            + record.persistence.len()
-            + record.maturity.as_ref().map_or(0, String::len)
-            + record.summary.as_ref().map_or(0, String::len)
-            + record.last_activity_at.as_ref().map_or(0, String::len)
-            + record.created_at.len()
-            + record.updated_at.len()
-            + record.deleted_at.as_ref().map_or(0, String::len)
-            + MAP_NODE_OVERHEAD;
-    }
-    for (id, facet) in facets {
-        estimated_bytes += std::mem::size_of::<SnapshotFacet>()
-            + std::mem::size_of::<String>()
-            + id.len() * 2
-            + facet.record_id.len()
-            + facet.key.len()
-            + facet.value.as_ref().map_or(0, String::len)
-            + facet.value_num.map_or(0, |_| 8)
-            + facet.vocab_ref.as_ref().map_or(0, String::len)
-            + facet.created_at.len()
-            + MAP_NODE_OVERHEAD;
-    }
-    for (id, link) in links {
-        estimated_bytes += std::mem::size_of::<SnapshotLink>()
-            + std::mem::size_of::<String>()
-            + id.len() * 2
-            + link.source_id.len()
-            + link.target_id.len()
-            + link.relationship.len()
-            + link.note.as_ref().map_or(0, String::len)
-            + link.created_at.len()
-            + MAP_NODE_OVERHEAD;
-    }
+    estimated_bytes += records
+        .values()
+        .map(SnapshotRecord::estimated_bytes)
+        .sum::<usize>();
+    estimated_bytes += facets
+        .values()
+        .map(SnapshotFacet::estimated_bytes)
+        .sum::<usize>();
+    estimated_bytes += links
+        .values()
+        .map(SnapshotLink::estimated_bytes)
+        .sum::<usize>();
     estimated_bytes += std::mem::size_of_val(events) + 64;
     for event in events {
         estimated_bytes += event.id.len()
@@ -273,12 +257,84 @@ fn estimate_entry_bytes(
     estimated_bytes
 }
 
+impl SnapshotRecord {
+    /// Same held representation estimate for both engines: inline struct,
+    /// actual strings, map key and node overhead. No JSON escape multiplier.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        const MAP_NODE_OVERHEAD: usize = 64;
+        std::mem::size_of::<SnapshotRecord>()
+            + std::mem::size_of::<String>()
+            + self.id.len() * 2
+            + self.record_type.as_ref().map_or(0, String::len)
+            + self.kind.as_ref().map_or(0, String::len)
+            + self.name.len()
+            + self.home_id.as_ref().map_or(0, String::len)
+            + self.lifecycle.as_ref().map_or(0, String::len)
+            + self.persistence.len()
+            + self.maturity.as_ref().map_or(0, String::len)
+            + self.summary.as_ref().map_or(0, String::len)
+            + self.last_activity_at.as_ref().map_or(0, String::len)
+            + self.created_at.len()
+            + self.updated_at.len()
+            + self.deleted_at.as_ref().map_or(0, String::len)
+            + MAP_NODE_OVERHEAD
+    }
+}
+impl SnapshotFacet {
+    /// Same held representation estimate for both engines: inline struct,
+    /// actual strings, map key and node overhead. No JSON escape multiplier.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        const MAP_NODE_OVERHEAD: usize = 64;
+        std::mem::size_of::<SnapshotFacet>()
+            + std::mem::size_of::<String>()
+            + self.id.len() * 2
+            + self.record_id.len()
+            + self.key.len()
+            + self.value.as_ref().map_or(0, String::len)
+            + self.value_num.map_or(0, |_| 8)
+            + self.vocab_ref.as_ref().map_or(0, String::len)
+            + self.created_at.len()
+            + MAP_NODE_OVERHEAD
+    }
+}
+impl SnapshotLink {
+    /// Same held representation estimate for both engines: inline struct,
+    /// actual strings, map key and node overhead. No JSON escape multiplier.
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        const MAP_NODE_OVERHEAD: usize = 64;
+        std::mem::size_of::<SnapshotLink>()
+            + std::mem::size_of::<String>()
+            + self.id.len() * 2
+            + self.source_id.len()
+            + self.target_id.len()
+            + self.relationship.len()
+            + self.note.as_ref().map_or(0, String::len)
+            + self.created_at.len()
+            + MAP_NODE_OVERHEAD
+    }
+}
+impl FilteredWorkspaceIndex {
+    fn snapshot_record(&self, head: &crate::workspace_index::RecordHead) -> SnapshotRecord {
+        #[allow(unused_mut)]
+        let mut row = SnapshotRecord::from_head(head);
+        #[cfg(feature = "v2-kernel-probe")]
+        if self
+            .native_untyped_records
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&head.id))
+        {
+            row.record_type = None;
+        }
+        row
+    }
+}
+
 impl SnapshotEntry {
     fn project(principal: &QueryPrincipal, filtered: &FilteredWorkspaceIndex) -> Self {
         let records: BTreeMap<String, SnapshotRecord> = filtered
             .records
             .iter()
-            .map(|(id, head)| (id.clone(), SnapshotRecord::from_head(head)))
+            .map(|(id, head)| (id.clone(), filtered.snapshot_record(head)))
             .collect();
         let facets: BTreeMap<String, SnapshotFacet> = filtered
             .facets
@@ -312,6 +368,8 @@ impl SnapshotEntry {
             relationship_seq: filtered.relationship_seq,
             unit_seq_max: filtered.unit_seq_max,
             estimated_bytes,
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_v2: filtered.native_untyped_records.is_some(),
             records,
             facets,
             links,
@@ -384,13 +442,136 @@ impl ExpiredPin {
     }
 }
 
+/// One process-wide admission gate for retained v2 pins. Weak handles never
+/// keep a database or its cache alive. All insertion takes this lock before
+/// any store lock; paging/expiry/removal only take a store lock, never this
+/// lock, so scanning other handles cannot invert the lock order.
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Debug)]
+struct V2SnapshotBudget {
+    max_bytes: usize,
+    stores: Vec<std::sync::Weak<std::sync::Mutex<SnapshotStore>>>,
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+impl V2SnapshotBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            stores: Vec::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        store: &std::sync::Arc<std::sync::Mutex<SnapshotStore>>,
+        token: String,
+        entry: SnapshotEntry,
+        retire: Option<&str>,
+    ) -> Result<bool> {
+        debug_assert!(entry.kernel_v2);
+        if entry.estimated_bytes > self.max_bytes || entry.estimated_bytes > SNAPSHOT_MAX_BYTES {
+            return Ok(false);
+        }
+        self.stores.retain(|store| store.strong_count() != 0);
+        let weak = std::sync::Arc::downgrade(store);
+        if !self.stores.iter().any(|known| known.ptr_eq(&weak)) {
+            self.stores.push(weak);
+        }
+        {
+            let mut guard = store
+                .lock()
+                .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
+            if !guard.insert(token.clone(), entry) {
+                return Ok(false);
+            }
+        }
+        loop {
+            let now = Instant::now();
+            let mut total = 0usize;
+            let mut oldest = None;
+            for handle in self.stores.iter().filter_map(std::sync::Weak::upgrade) {
+                // Only cache accounting/eviction may inspect a poisoned handle.
+                // Ordinary snapshot reads still refuse that handle as before.
+                let mut guard = handle.lock().unwrap_or_else(|error| error.into_inner());
+                guard.evict_expired(now);
+                for (key, pin) in guard.entries.iter().filter(|(_, pin)| pin.kernel_v2) {
+                    total = total.saturating_add(pin.estimated_bytes);
+                    if oldest
+                        .as_ref()
+                        .is_none_or(|(created, _, _)| pin.created_at < *created)
+                    {
+                        oldest = Some((pin.created_at, handle.clone(), key.clone()));
+                    }
+                }
+            }
+            if total <= self.max_bytes {
+                break;
+            }
+            let Some((_, victim, key)) = oldest else {
+                break;
+            };
+            victim
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&key);
+        }
+        let mut guard = store
+            .lock()
+            .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
+        // A concurrently prepared, older new pin can itself be the global
+        // oldest. Never return its already-evicted token or retire its old pin.
+        if !guard.entries.contains_key(&token) {
+            return Ok(false);
+        }
+        if let Some(retire) = retire {
+            guard.remove(retire);
+        }
+        Ok(true)
+    }
+}
+
 impl SnapshotStore {
+    /// Insert without holding a store guard. V2 admission always acquires the
+    /// process gate first; v1 keeps the existing independent handle budget.
+    fn insert_shared(
+        store: &std::sync::Arc<std::sync::Mutex<Self>>,
+        token: String,
+        entry: SnapshotEntry,
+        retire: Option<&str>,
+    ) -> Result<bool> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if entry.kernel_v2 {
+            static BUDGET: std::sync::OnceLock<std::sync::Mutex<V2SnapshotBudget>> =
+                std::sync::OnceLock::new();
+            return BUDGET
+                .get_or_init(|| {
+                    std::sync::Mutex::new(V2SnapshotBudget::new(SNAPSHOT_V2_PROCESS_MAX_BYTES))
+                })
+                .lock()
+                .map_err(|_| Error::engine("workspace snapshot budget is unavailable"))?
+                .insert(store, token, entry, retire);
+        }
+        let mut guard = store
+            .lock()
+            .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
+        if !guard.insert(token, entry) {
+            return Ok(false);
+        }
+        if let Some(retire) = retire {
+            guard.remove(retire);
+        }
+        Ok(true)
+    }
+
     /// Store a pin. Returns `false` (refusal) when the single entry already
     /// exceeds the byte budget: callers must surface unavailable rather than
-    /// a token that is already gone. Eviction otherwise protects the new
-    /// token — only older pins are candidates — and storage is verified
-    /// before returning `true`.
-    pub(crate) fn insert(&mut self, token: String, entry: SnapshotEntry) -> bool {
+    /// a token that is already gone. Per-handle eviction excludes the new
+    /// token and verifies storage before returning `true`. The process-wide
+    /// budget in `insert_shared` can still evict it when it is globally oldest
+    /// (including concurrent insertions); that path rechecks storage before
+    /// reporting success.
+    fn insert(&mut self, token: String, entry: SnapshotEntry) -> bool {
         if entry.estimated_bytes > SNAPSHOT_MAX_BYTES {
             return false;
         }
@@ -399,10 +580,17 @@ impl SnapshotStore {
         if let Some(old) = self.entries.remove(&token) {
             self.bytes = self.bytes.saturating_sub(old.estimated_bytes);
         }
+        let (max_bytes, max_tokens) = (SNAPSHOT_MAX_BYTES, SNAPSHOT_MAX_TOKENS);
+        #[cfg(feature = "v2-kernel-probe")]
+        let (max_bytes, max_tokens) = if entry.kernel_v2 {
+            (SNAPSHOT_V2_MAX_BYTES, SNAPSHOT_V2_MAX_TOKENS)
+        } else {
+            (max_bytes, max_tokens)
+        };
         let bytes = entry.estimated_bytes;
         self.entries.insert(token.clone(), entry);
         self.bytes += bytes;
-        while self.entries.len() > SNAPSHOT_MAX_TOKENS || self.bytes > SNAPSHOT_MAX_BYTES {
+        while self.entries.len() > max_tokens || self.bytes > max_bytes {
             let oldest = self
                 .entries
                 .iter()
@@ -599,6 +787,46 @@ fn mint_token() -> String {
 }
 
 impl crate::db::Db {
+    // Select only the physical adapter here; token ownership, budgets, paging,
+    // manifest validation and diffs below remain the shared v1 contract.
+    async fn snapshot_filtered_index(
+        &self,
+        principal: QueryPrincipal,
+    ) -> Result<Option<FilteredWorkspaceIndex>> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.snapshot_is_v2().await? {
+            return crate::mcp::kernel_v2::workspace_snapshot::filtered(self, principal).await;
+        }
+        self.filtered_workspace_index(principal).await
+    }
+    async fn snapshot_live_fences(&self) -> Result<(i64, i64, i64)> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.snapshot_is_v2().await? {
+            let mut connection = self.governed_pool().acquire().await?;
+            return crate::mcp::kernel_v2::workspace_snapshot::fences_on(&mut connection).await;
+        }
+        self.live_snapshot_fences().await
+    }
+    #[cfg(feature = "v2-kernel-probe")]
+    async fn snapshot_is_v2(&self) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+            .fetch_one(self.pool())
+            .await?
+            == crate::db::V2_APPLICATION_ID)
+    }
+
+    async fn snapshot_gap_exceeded(&self, after: i64, through: i64) -> Result<bool> {
+        if through < after {
+            return Ok(true);
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.snapshot_is_v2().await? {
+            return crate::mcp::kernel_v2::workspace_snapshot::gap_exceeded(self, after, through)
+                .await;
+        }
+        Ok(through - after > SNAPSHOT_MAX_CATCH_UP_GAP)
+    }
+
     /// Pin the caller's current filtered view under a new token.
     /// Returns `Ok(None)` when M2 holds nothing (generic unavailable) or when
     /// the pin itself is refused by the token budget: a returned token is
@@ -607,7 +835,7 @@ impl crate::db::Db {
         &self,
         principal: QueryPrincipal,
     ) -> Result<Option<SnapshotOpened>> {
-        let Some(filtered) = self.filtered_workspace_index(principal.clone()).await? else {
+        let Some(filtered) = self.snapshot_filtered_index(principal.clone()).await? else {
             return Ok(None);
         };
         let entry = SnapshotEntry::project(&principal, &filtered);
@@ -619,13 +847,8 @@ impl crate::db::Db {
         };
         let store = self.workspace_snapshots.clone();
         let token = opened.token.clone();
-        {
-            let mut guard = store
-                .lock()
-                .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
-            if !guard.insert(token, entry) {
-                return Ok(None);
-            }
+        if !SnapshotStore::insert_shared(&store, token, entry, None)? {
+            return Ok(None);
         }
         Ok(Some(opened))
     }
@@ -657,7 +880,7 @@ impl crate::db::Db {
             }
         };
         let (live_epoch, live_relationship, live_unit_seq_max) =
-            self.live_snapshot_fences().await?;
+            self.snapshot_live_fences().await?;
         if live_epoch != entry.authorization_epoch {
             return Ok(Err(SnapshotLookup::Restart {
                 reason: "authorization_epoch_moved",
@@ -797,7 +1020,7 @@ impl crate::db::Db {
                 // displayed under the old pin was revoked. Any fence move
                 // fails closed with its specific reason, never the safe one.
                 let (live_epoch, live_relationship, live_unit_seq_max) =
-                    self.live_snapshot_fences().await?;
+                    self.snapshot_live_fences().await?;
                 if live_epoch != pin.authorization_epoch {
                     return Ok(CatchUpOutcome::Restart {
                         reason: "authorization_epoch_moved",
@@ -818,14 +1041,14 @@ impl crate::db::Db {
                 });
             }
         };
-        let Some(filtered) = self.filtered_workspace_index(principal.clone()).await? else {
+        let Some(filtered) = self.snapshot_filtered_index(principal.clone()).await? else {
             // M2 holds nothing: over-cap refusal, absent index, or a fence
             // that raced the visibility read. An unavailable index alone keeps
             // the caller's pin (the governed tail stays safe), but fences that
             // moved under the pin mean revoked rows — that is a restart with
             // no old rows, never an incremental tail.
             let (live_epoch, live_relationship, live_unit_seq_max) =
-                self.live_snapshot_fences().await?;
+                self.snapshot_live_fences().await?;
             if live_epoch != old.authorization_epoch {
                 return Ok(CatchUpOutcome::Restart {
                     reason: "authorization_epoch_moved",
@@ -861,8 +1084,9 @@ impl crate::db::Db {
         let fence_moved = filtered.authorization_epoch != old.authorization_epoch
             || filtered.relationship_seq != old.relationship_seq
             || filtered.unit_seq_max != old.unit_seq_max;
-        if filtered.content_seq < old.content_seq
-            || filtered.content_seq - old.content_seq > SNAPSHOT_MAX_CATCH_UP_GAP
+        if self
+            .snapshot_gap_exceeded(old.content_seq, filtered.content_seq)
+            .await?
         {
             return Ok(CatchUpOutcome::Restart {
                 reason: "content_gap_outside_window",
@@ -924,18 +1148,14 @@ impl crate::db::Db {
                 });
             }
         }
-        {
-            let store = self.workspace_snapshots.clone();
-            let mut guard = store
-                .lock()
-                .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
-            // The old pin retires only after its replacement is stored: a
-            // refused replacement leaves the caller able to keep paging the
-            // old pin (or retry), never holding a dead new token.
-            if !guard.insert(delta.token.clone(), fresh) {
-                return Ok(CatchUpOutcome::Unavailable);
-            }
-            guard.remove(token);
+        // Retire the old pin only after admitting its live replacement.
+        if !SnapshotStore::insert_shared(
+            &self.workspace_snapshots,
+            delta.token.clone(),
+            fresh,
+            Some(token),
+        )? {
+            return Ok(CatchUpOutcome::Unavailable);
         }
         Ok(CatchUpOutcome::Delta(Box::new(delta)))
     }
@@ -1020,7 +1240,7 @@ fn resume_digest_hex(domain: &[u8], fields: &[Option<&str>]) -> String {
 pub(crate) fn record_resume_digest(row: &SnapshotRecord) -> String {
     record_resume_digest_fields(&[
         Some(row.id.as_str()),
-        Some(row.record_type.as_str()),
+        row.record_type.as_deref(),
         row.kind.as_deref(),
         Some(row.name.as_str()),
         row.home_id.as_deref(),
@@ -1274,7 +1494,7 @@ impl crate::db::Db {
                 return Ok(CatchUpOutcome::Restart { reason });
             }
         };
-        let Some(filtered) = self.filtered_workspace_index(principal.clone()).await? else {
+        let Some(filtered) = self.snapshot_filtered_index(principal.clone()).await? else {
             return Ok(CatchUpOutcome::Unavailable);
         };
         let mut delta = SnapshotDelta {
@@ -1303,7 +1523,7 @@ impl crate::db::Db {
             match filtered.records.get(id) {
                 None => delta.delete_record_ids.push(id.clone()),
                 Some(head) => {
-                    let row = SnapshotRecord::from_head(head);
+                    let row = filtered.snapshot_record(head);
                     if record_resume_digest(&row) != *digest {
                         delta.upsert_records.push(row);
                     }
@@ -1312,7 +1532,7 @@ impl crate::db::Db {
         }
         for (id, head) in &filtered.records {
             if !manifest_record_keys.contains(id) {
-                delta.upsert_records.push(SnapshotRecord::from_head(head));
+                delta.upsert_records.push(filtered.snapshot_record(head));
             }
         }
         let mut fresh_facets: std::collections::HashMap<
@@ -1406,7 +1626,7 @@ impl crate::db::Db {
         // A fence that moved while the answer was being built voids it: the
         // diff above may already describe a revoked world.
         let (live_epoch, live_relationship, live_unit_seq_max) =
-            self.live_snapshot_fences().await?;
+            self.snapshot_live_fences().await?;
         if let Some(reason) = resume_fence_race_reason(
             (
                 filtered.authorization_epoch,
@@ -1418,14 +1638,13 @@ impl crate::db::Db {
             return Ok(CatchUpOutcome::Restart { reason });
         }
         let fresh = SnapshotEntry::project(&principal, &filtered);
-        {
-            let store = self.workspace_snapshots.clone();
-            let mut guard = store
-                .lock()
-                .map_err(|_| Error::engine("workspace snapshot store is unavailable"))?;
-            if !guard.insert(delta.token.clone(), fresh) {
-                return Ok(CatchUpOutcome::Unavailable);
-            }
+        if !SnapshotStore::insert_shared(
+            &self.workspace_snapshots,
+            delta.token.clone(),
+            fresh,
+            None,
+        )? {
+            return Ok(CatchUpOutcome::Unavailable);
         }
         Ok(CatchUpOutcome::Delta(Box::new(delta)))
     }
@@ -2002,6 +2221,9 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::store::archive_record(&db, ALICE_ONLY_ID)
+            .await
+            .unwrap();
         let pinned = page_all_records(&db, alice(), &opened.token).await;
         assert_eq!(pinned, before);
         assert_eq!(pinned[ALICE_ONLY_ID].name, "Alice only");
@@ -2316,7 +2538,7 @@ mod tests {
             "rec-1".to_string(),
             SnapshotRecord {
                 id: "rec-1".to_string(),
-                record_type: "Document".to_string(),
+                record_type: Some("Document".to_string()),
                 kind: Some("note".to_string()),
                 name: "A name".to_string(),
                 home_id: Some("root".to_string()),
@@ -2402,6 +2624,8 @@ mod tests {
             relationship_seq: 0,
             unit_seq_max: 0,
             estimated_bytes: bytes,
+            #[cfg(feature = "v2-kernel-probe")]
+            kernel_v2: false,
             records: BTreeMap::new(),
             facets: BTreeMap::new(),
             links: BTreeMap::new(),
@@ -3263,7 +3487,7 @@ mod tests {
             seen["record-ascii"],
             record_resume_digest(&SnapshotRecord {
                 id: ascii[0].as_str().unwrap().into(),
-                record_type: ascii[1].as_str().unwrap().into(),
+                record_type: Some(ascii[1].as_str().unwrap().into()),
                 kind: ascii_opt(2),
                 name: ascii[3].as_str().unwrap().into(),
                 home_id: ascii_opt(4),
@@ -3726,7 +3950,7 @@ mod tests {
             .filter(|row| row.id == MESSAGE_ID)
             .collect();
         assert_eq!(restored.len(), 1, "excluded message returns as an upsert");
-        assert_eq!(restored[0].record_type, "Message");
+        assert_eq!(restored[0].record_type.as_deref(), Some("Message"));
         assert!(
             !delta.delete_record_ids.contains(&MESSAGE_ID.to_string()),
             "a visible omitted row is a repair, not a delete"
@@ -3813,5 +4037,410 @@ mod tests {
             "unlisted fresh facets upsert"
         );
         assert!(delta.delete_record_ids.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod kernel_budget_tests {
+    use super::*;
+    #[test]
+    fn three_members_and_agents_retain_real_large_pins_with_bounded_v2_budget() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(SnapshotStore::default()));
+        let summary = "x".repeat(5 * 1024 * 1024);
+        let mut held = Vec::new();
+        for slot in 0..12 {
+            let principal = QueryPrincipal::authenticated(format!("account:{}", slot % 3), true);
+            let record = SnapshotRecord {
+                id: "shared".into(),
+                record_type: Some("Document".into()),
+                kind: Some("note".into()),
+                name: "Shared fixture".into(),
+                home_id: None,
+                lifecycle: None,
+                persistence: "enduring".into(),
+                maturity: None,
+                summary: Some(summary.clone()),
+                last_activity_at: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                deleted_at: None,
+            };
+            let records = BTreeMap::from([("shared".into(), record)]);
+            let facets = BTreeMap::new();
+            let links = BTreeMap::new();
+            let events = Vec::new();
+            let estimated_bytes = estimate_entry_bytes(
+                principal.credential().len(),
+                &records,
+                &facets,
+                &links,
+                &events,
+            );
+            assert!(estimated_bytes < SNAPSHOT_MAX_BYTES);
+            let entry = SnapshotEntry {
+                principal_credential: principal.credential().into(),
+                principal_is_member: principal.is_member(),
+                principal_trusted_bypass: principal.trusted_local_bypass(),
+                created_at: Instant::now(),
+                content_seq: 0,
+                authorization_epoch: 0,
+                relationship_seq: 0,
+                unit_seq_max: 0,
+                estimated_bytes,
+                kernel_v2: true,
+                records,
+                facets,
+                links,
+                events,
+            };
+            let token = format!("pin-{slot}");
+            assert!(SnapshotStore::insert_shared(&store, token.clone(), entry, None).unwrap());
+            held.push(token);
+        }
+        let store = store.lock().unwrap();
+        assert!(store.bytes > SNAPSHOT_MAX_BYTES);
+        assert!(store.bytes <= SNAPSHOT_V2_MAX_BYTES);
+        for token in held {
+            assert!(store.entries.contains_key(&token));
+        }
+    }
+    fn budget_entry(bytes: usize, created_at: Instant) -> SnapshotEntry {
+        SnapshotEntry {
+            principal_credential: "account:owner".into(),
+            principal_is_member: true,
+            principal_trusted_bypass: false,
+            created_at,
+            content_seq: 7,
+            authorization_epoch: 9,
+            relationship_seq: 11,
+            unit_seq_max: 13,
+            estimated_bytes: bytes,
+            kernel_v2: true,
+            records: BTreeMap::new(),
+            facets: BTreeMap::new(),
+            links: BTreeMap::new(),
+            events: Vec::new(),
+        }
+    }
+    fn total_v2_bytes(stores: &[std::sync::Arc<std::sync::Mutex<SnapshotStore>>]) -> usize {
+        stores
+            .iter()
+            .map(|s| {
+                s.lock()
+                    .unwrap()
+                    .entries
+                    .values()
+                    .filter(|e| e.kernel_v2)
+                    .map(|e| e.estimated_bytes)
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+    #[tokio::test]
+    async fn process_v2_budget_evicted_db_pin_returns_token_expired_or_unknown() {
+        use crate::mcp::{Caller, EngineHandle};
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = crate::mcp::registry::ToolRegistry::new();
+        crate::mcp::register_builtin_tools(&mut registry).unwrap();
+        crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+        crate::mcp::kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+        let mut pins = Vec::new();
+        for name in ["first", "second"] {
+            let (db, _) = crate::kernel::create_v2_database(
+                dir.path().join(format!("{name}.db")).to_str().unwrap(),
+                "account",
+                "Owner",
+                "account:owner",
+            )
+            .await
+            .unwrap();
+            let opened = registry
+                .call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    Caller::authenticated("account:owner"),
+                    "get_workspace_snapshot",
+                    json!({"action":"open"}),
+                )
+                .await
+                .unwrap();
+            let token = opened["snapshot_token"].as_str().unwrap().to_owned();
+            let entry = db.workspace_snapshots.lock().unwrap().entries[&token].clone();
+            pins.push((db, token, entry));
+        }
+        // Exercise the real Db stores with a local small budget, without
+        // changing the process singleton or allocating hundreds of MiB.
+        let mut budget = V2SnapshotBudget::new(
+            pins.iter()
+                .map(|(_, _, e)| e.estimated_bytes)
+                .sum::<usize>()
+                - 1,
+        );
+        for (index, (db, token, entry)) in pins.iter().enumerate() {
+            let mut entry = entry.clone();
+            entry.created_at = Instant::now() - Duration::from_secs(2 - index as u64);
+            assert!(budget
+                .insert(&db.workspace_snapshots, token.clone(), entry, None)
+                .unwrap());
+        }
+        for (index, (db, token, _)) in pins.iter().enumerate() {
+            let page = registry
+                .call_engine(
+                    EngineHandle::KernelV2(db.clone()),
+                    Caller::authenticated("account:owner"),
+                    "get_workspace_snapshot",
+                    json!({"action":"page","snapshot_token":token,"section":"records"}),
+                )
+                .await
+                .unwrap();
+            if index == 0 {
+                assert_eq!(page["restart_required"], true);
+                assert_eq!(page["reason"], "token_expired_or_unknown");
+                assert!(page.get("rows").is_none());
+                assert!(!db
+                    .workspace_snapshots
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .contains_key(token));
+            } else {
+                assert_eq!(page["snapshot_token"], *token);
+                assert!(page["rows"].is_array());
+            }
+        }
+        for (db, _, _) in pins {
+            db.close().await;
+        }
+    }
+
+    #[test]
+    fn process_v2_budget_evicts_global_oldest_across_handles_and_keeps_expiry_private() {
+        use std::sync::{Arc, Mutex};
+        let stores: Vec<_> = (0..3)
+            .map(|_| Arc::new(Mutex::new(SnapshotStore::default())))
+            .collect();
+        let mut budget = V2SnapshotBudget::new(400);
+        let start = Instant::now() - Duration::from_secs(10);
+        // The same token string on two handles must remain independent.
+        for (slot, token, age) in [
+            (0, "same", 0),
+            (1, "same", 1),
+            (0, "second", 2),
+            (2, "new", 3),
+        ] {
+            assert!(budget
+                .insert(
+                    &stores[slot],
+                    token.into(),
+                    budget_entry(100, start + Duration::from_secs(age)),
+                    None
+                )
+                .unwrap());
+        }
+        // V1 retains its own existing budget and is not a global v2 victim.
+        let mut v1 = budget_entry(200, start);
+        v1.kernel_v2 = false;
+        assert!(SnapshotStore::insert_shared(&stores[0], "v1".into(), v1, None).unwrap());
+        // Reading does not turn oldest-pin eviction into LRU eviction.
+        let owner = QueryPrincipal::authenticated("account:owner", true);
+        assert!(stores[0].lock().unwrap().get_for(&owner, "same").is_ok());
+        assert!(budget
+            .insert(
+                &stores[1],
+                "newest".into(),
+                budget_entry(100, Instant::now()),
+                None
+            )
+            .unwrap());
+        assert_eq!(total_v2_bytes(&stores), 400);
+        let mut first = stores[0].lock().unwrap();
+        assert!(!first.entries.contains_key("same"));
+        assert!(first.entries.contains_key("v1"));
+        assert_eq!(first.bytes, 300);
+        assert!(first.get_for(&owner, "same").is_err());
+        let expired = first.expired_pin_for(&owner, "same").unwrap();
+        assert_eq!(expired.authorization_epoch, 9);
+        assert!(first
+            .expired_pin_for(&QueryPrincipal::authenticated("other", true), "same")
+            .is_none());
+        assert!(first
+            .expired_pin_for(
+                &QueryPrincipal::authenticated("account:owner", false),
+                "same"
+            )
+            .is_none());
+        drop(first);
+        assert!(stores[1].lock().unwrap().get_for(&owner, "same").is_ok());
+        assert_eq!(budget.stores.len(), 3);
+    }
+    #[test]
+    fn process_v2_budget_reclaims_dropped_handles_expiry_and_rotation_without_owning_handles() {
+        use std::sync::{Arc, Mutex};
+        let mut budget = V2SnapshotBudget::new(300);
+        let first = Arc::new(Mutex::new(SnapshotStore::default()));
+        let second = Arc::new(Mutex::new(SnapshotStore::default()));
+        assert!(budget
+            .insert(
+                &first,
+                "dropped".into(),
+                budget_entry(200, Instant::now()),
+                None
+            )
+            .unwrap());
+        assert_eq!(Arc::strong_count(&first), 1);
+        drop(first);
+        assert!(budget
+            .insert(
+                &second,
+                "old".into(),
+                budget_entry(200, Instant::now()),
+                None
+            )
+            .unwrap());
+        assert_eq!(budget.stores.len(), 1);
+        // Refusal cannot retire the old pin or admit a dead new token.
+        assert!(!budget
+            .insert(
+                &second,
+                "too-large".into(),
+                budget_entry(301, Instant::now()),
+                Some("old")
+            )
+            .unwrap());
+        assert!(second.lock().unwrap().entries.contains_key("old"));
+        second
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut("old")
+            .unwrap()
+            .created_at = Instant::now() - SNAPSHOT_TTL - Duration::from_secs(1);
+        let third = Arc::new(Mutex::new(SnapshotStore::default()));
+        assert!(budget
+            .insert(
+                &third,
+                "fresh".into(),
+                budget_entry(200, Instant::now()),
+                None
+            )
+            .unwrap());
+        assert!(second.lock().unwrap().entries.is_empty());
+        assert_eq!(second.lock().unwrap().bytes, 0);
+        assert!(budget
+            .insert(
+                &third,
+                "rotated".into(),
+                budget_entry(100, Instant::now()),
+                Some("fresh")
+            )
+            .unwrap());
+        assert_eq!(third.lock().unwrap().bytes, 100);
+        assert!(third.lock().unwrap().expired.contains_key("fresh"));
+        // Clones of a handle register only once.
+        assert!(budget
+            .insert(
+                &third.clone(),
+                "clone".into(),
+                budget_entry(100, Instant::now()),
+                None
+            )
+            .unwrap());
+        assert_eq!(budget.stores.len(), 2);
+    }
+    #[test]
+    fn process_v2_budget_never_returns_an_already_evicted_new_pin() {
+        use std::sync::{Arc, Mutex};
+        let mut budget = V2SnapshotBudget::new(100);
+        let a = Arc::new(Mutex::new(SnapshotStore::default()));
+        let b = Arc::new(Mutex::new(SnapshotStore::default()));
+        assert!(budget
+            .insert(&a, "held".into(), budget_entry(100, Instant::now()), None)
+            .unwrap());
+        assert!(!budget
+            .insert(
+                &b,
+                "queued-old".into(),
+                budget_entry(100, Instant::now() - Duration::from_secs(1)),
+                None
+            )
+            .unwrap());
+        assert!(b.lock().unwrap().entries.is_empty());
+        assert!(a.lock().unwrap().entries.contains_key("held"));
+    }
+    #[test]
+    fn process_v2_budget_serializes_concurrent_insertions_and_preserves_handle_count_cap() {
+        use std::sync::{Arc, Barrier, Mutex};
+        let budget = Arc::new(Mutex::new(V2SnapshotBudget::new(1000)));
+        let stores: Vec<_> = (0..8)
+            .map(|_| Arc::new(Mutex::new(SnapshotStore::default())))
+            .collect();
+        let barrier = Arc::new(Barrier::new(stores.len()));
+        let threads: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                let (store, budget, barrier) = (store.clone(), budget.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for slot in 0..5 {
+                        budget
+                            .lock()
+                            .unwrap()
+                            .insert(
+                                &store,
+                                format!("pin-{slot}"),
+                                budget_entry(100, Instant::now()),
+                                None,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(total_v2_bytes(&stores), 1000);
+        let mut budget = V2SnapshotBudget::new(10000);
+        let store = Arc::new(Mutex::new(SnapshotStore::default()));
+        for slot in 0..=SNAPSHOT_V2_MAX_TOKENS {
+            assert!(budget
+                .insert(
+                    &store,
+                    format!("pin-{slot}"),
+                    budget_entry(100, Instant::now()),
+                    None
+                )
+                .unwrap());
+        }
+        assert_eq!(store.lock().unwrap().entries.len(), SNAPSHOT_V2_MAX_TOKENS);
+        assert!(!store.lock().unwrap().entries.contains_key("pin-0"));
+    }
+    #[test]
+    fn process_v2_budget_counts_poisoned_handles_without_serving_them() {
+        use std::sync::{Arc, Mutex};
+        let a = Arc::new(Mutex::new(SnapshotStore::default()));
+        let b = Arc::new(Mutex::new(SnapshotStore::default()));
+        let mut budget = V2SnapshotBudget::new(300);
+        assert!(budget
+            .insert(&a, "old".into(), budget_entry(200, Instant::now()), None)
+            .unwrap());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = a.lock().unwrap();
+            panic!("poison snapshot handle");
+        });
+        assert!(budget
+            .insert(&b, "new".into(), budget_entry(200, Instant::now()), None)
+            .unwrap());
+        assert!(a.lock().unwrap_err().get_ref().entries.is_empty());
+        assert_eq!(b.lock().unwrap().bytes, 200);
+        assert!(budget
+            .insert(
+                &a,
+                "refused".into(),
+                budget_entry(100, Instant::now()),
+                None
+            )
+            .is_err());
     }
 }

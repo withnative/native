@@ -313,7 +313,7 @@ pub(super) fn verify_effect_gesture(
 /// effect-gesture token so a swapped value cannot ride a valid token.
 /// Shared with the hosted adapter through
 /// [`crate::awareness::effect_gesture_values_digest`].
-pub(super) fn invocation_values_digest(invocation: &ArtifactInvocation) -> String {
+pub(crate) fn invocation_values_digest(invocation: &ArtifactInvocation) -> String {
     crate::awareness::effect_gesture_values_digest(
         &serde_json::to_value(&invocation.values).unwrap_or(Value::Null),
     )
@@ -350,6 +350,20 @@ fn check_effect_gesture(caller: &Caller, invocation: &ArtifactInvocation) -> Ges
         &invocation_values_digest(invocation),
         guarded,
     )
+}
+
+/// KernelV2 uses the same hosted gesture binding and enforcement policy as
+/// the legacy intent lane, including the package/generation for guarded apps.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn kernel_v2_gesture_evidence(
+    caller: &Caller,
+    invocation: &ArtifactInvocation,
+) -> std::result::Result<Option<Value>, (&'static str, &'static str)> {
+    match check_effect_gesture(caller, invocation) {
+        GestureCheck::Refused { code, message } => Err((code, message)),
+        GestureCheck::Absent => Ok(None),
+        GestureCheck::Evidence(evidence) => Ok(Some(evidence)),
+    }
 }
 
 /// Whether a facet-write replay candidate carries the same guard authorization

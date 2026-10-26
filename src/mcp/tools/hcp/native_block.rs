@@ -30,6 +30,13 @@ use crate::provenance::Channel;
 /// The attestation operation of every write made through `mutatePreferences`.
 /// The tool is only registered on `/hcp`, so no `/mcp` write carries it.
 pub(super) const HCP_OPERATION: &str = "mutatePreferences";
+/// The attestation operation of a Layer 3 proposal: it stamps the same
+/// `hcp.*` facets on the record it creates, so they describe that write.
+pub(super) const PROPOSE_OPERATION: &str = "proposeContextItem";
+/// The attestation operation of a Layer 3 resolution. It writes no `hcp.*`
+/// facets (an acceptance cannot add any to the suggestion events it
+/// appends), so the client that resolved is not recorded.
+pub(super) const RESOLVE_OPERATION: &str = "resolveContextItem";
 
 /// Longest evidence text echoed in the block.
 const EVIDENCE_TEXT_MAX_CHARS: usize = 1000;
@@ -56,7 +63,20 @@ impl Writer {
     /// Written by `mutatePreferences`, so the `hcp.*` facets of the same call
     /// describe it.
     pub(super) fn is_hcp(&self) -> bool {
-        self.operation == HCP_OPERATION
+        self.operation == HCP_OPERATION || self.operation == PROPOSE_OPERATION
+    }
+
+    /// Made through `resolveContextItem`: an HCP client acted, but no
+    /// `hcp.*` facet says which.
+    pub(super) fn is_hcp_resolution(&self) -> bool {
+        self.operation == RESOLVE_OPERATION
+    }
+
+    /// An action whose immutable record can show which suggestion it
+    /// accepted: Native's own `resolve_suggestions`. (`resolveContextItem`
+    /// never resolves a suggestion: change proposals are resolved in Native.)
+    pub(super) fn resolves_suggestions(&self) -> bool {
+        self.operation.starts_with("resolve_suggestions")
     }
 
     /// The server observed the first-party web route, and the attested
@@ -83,7 +103,7 @@ pub(super) enum Basis {
 }
 
 impl Basis {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Direct => "direct",
             Self::Endorsed => "endorsed",
@@ -130,6 +150,20 @@ pub(super) struct Accepted {
     pub evidence: Option<Value>,
 }
 
+/// The action that moved a record to `maturity: decided` after its body was
+/// written: accepting a proposed record does not rewrite the body, so the
+/// writer of the body and the one who accepted it differ.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Decided {
+    pub writer: Writer,
+    /// When the deciding event was recorded.
+    pub at: Option<String>,
+    /// Native's immutable record of the action shows exactly one record
+    /// moved to `decided`, this one. Otherwise nobody's decision on this
+    /// record can be derived from it.
+    pub unique: bool,
+}
+
 /// Everything recorded about where the current value came from.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Origin {
@@ -141,6 +175,9 @@ pub(super) struct Origin {
     pub evidence: Option<Value>,
     /// Set when accepting a suggestion produced the body.
     pub accepted: Option<Accepted>,
+    /// Set when the record was accepted by a maturity change (a proposed
+    /// record, as opposed to a suggestion) after its body was written.
+    pub decided: Option<Decided>,
     pub attributions: Vec<Attribution>,
 }
 
@@ -209,6 +246,16 @@ pub(super) fn basis(origin: &Origin) -> Option<Basis> {
             if owner_wrote {
                 return Some(Basis::Direct);
             }
+            // The body was written by someone else and the owner then accepted
+            // the whole record (exactly that one, in the action's immutable
+            // record) through a person channel: they endorsed what it says.
+            if origin
+                .decided
+                .as_ref()
+                .is_some_and(|decided| decided.unique && decided.writer.is_owner_person())
+            {
+                return Some(Basis::Endorsed);
+            }
             origin.writer.as_ref().is_some_and(Writer::is_hcp)
                 && declares_person_instruction(origin.evidence.as_ref())
         }
@@ -247,7 +294,7 @@ pub(super) fn source_type(origin: &Origin, basis: Option<Basis>) -> &'static str
 /// Who wrote the value into Native: the actor of the body-producing action. On
 /// an acceptance that is whoever accepted, not the proposal's author. `None`
 /// when no valid attestation covers it, or the actor is hidden from this caller.
-fn recorded_by(origin: &Origin, person: &str) -> Option<Value> {
+pub(super) fn recorded_by(origin: &Origin, person: &str) -> Option<Value> {
     let writer = origin.writer.as_ref()?;
     let client = origin.client.as_deref();
     if !writer.by_owner {
@@ -269,7 +316,7 @@ fn recorded_by(origin: &Origin, person: &str) -> Option<Value> {
         (_, Some(client)) => client,
         (Channel::Webhook, None) => "external service",
         (Channel::Local, None) => "Native (local process)",
-        (_, None) if writer.is_hcp() => "unidentified HCP client",
+        (_, None) if writer.is_hcp() || writer.is_hcp_resolution() => "unidentified HCP client",
         (_, None) => "MCP client",
     };
     let mut actor = Map::new();
@@ -666,6 +713,72 @@ mod tests {
                 { "text": "said so", "role": "basis" },
                 { "text": "said so", "role": "counterevidence" },
             ])
+        );
+    }
+    fn decided(writer: Writer, unique: bool) -> Decided {
+        Decided {
+            writer,
+            at: None,
+            unique,
+        }
+    }
+
+    #[test]
+    fn the_owner_accepting_a_proposed_record_through_a_person_channel_endorses_it() {
+        // An agent wrote the body; the owner then accepted the whole record.
+        let accepted = Origin {
+            writer: Some(hcp()),
+            decided: Some(decided(web(), true)),
+            ..Origin::default()
+        };
+        assert_eq!(basis(&accepted), Some(Basis::Endorsed));
+    }
+
+    #[test]
+    fn nobody_else_accepting_a_proposed_record_asserts_anything() {
+        let by = |writer: Writer, unique: bool| Origin {
+            writer: Some(hcp()),
+            decided: Some(decided(writer, unique)),
+            ..Origin::default()
+        };
+        // An agent's acceptance says nothing about the person.
+        let agent = writer(RESOLVE_OPERATION, Channel::Mcp, "authenticated_principal");
+        assert_eq!(basis(&by(agent, true)), None);
+        // The action's record does not show exactly this one record accepted.
+        assert_eq!(basis(&by(web(), false)), None);
+        // A collaborator's web acceptance is theirs, not the owner's.
+        let mut collaborator = web();
+        collaborator.by_owner = false;
+        assert_eq!(basis(&by(collaborator, true)), None);
+    }
+
+    #[test]
+    fn writing_the_body_still_outranks_accepting_it() {
+        // The owner wrote it on the web: direct, whoever accepted it.
+        let origin = Origin {
+            writer: Some(web()),
+            decided: Some(decided(
+                writer(RESOLVE_OPERATION, Channel::Mcp, "authenticated_principal"),
+                true,
+            )),
+            ..Origin::default()
+        };
+        assert_eq!(basis(&origin), Some(Basis::Direct));
+    }
+
+    #[test]
+    fn a_resolving_agent_is_named_without_a_client() {
+        let origin = Origin {
+            writer: Some(writer(
+                RESOLVE_OPERATION,
+                Channel::Mcp,
+                "authenticated_principal",
+            )),
+            ..Origin::default()
+        };
+        assert_eq!(
+            recorded_by(&origin, "Richard"),
+            Some(json!({ "kind": "agent", "name": "unidentified HCP client" }))
         );
     }
 }

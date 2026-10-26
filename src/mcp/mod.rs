@@ -142,9 +142,10 @@ pub use registry::{
     membership_page_size_is_valid, register_membership_tool_schema, register_membership_tool_with,
     register_reach_connect_tool_with, register_reach_read_tool_with, register_reach_tool_schema,
     register_workspace_tool_schema, register_workspace_tool_with, validate_descriptor_projection,
-    AdvertisedTool, AppMetadata, Caller, EngineHandle, EngineKind, GovernedRequestOperation,
-    GovernedRequestStage, ToolRegistry, ToolSpec, TrustedAudience, COMPLETE_PROFILE_MAX_BYTES,
-    FOCUSED_PROFILE_MAX_BYTES, GOVERNED_REQUEST_PIPELINE,
+    visible_person_names, AdvertisedTool, AppMetadata, Caller, EngineHandle, EngineKind,
+    GovernedRequestOperation, GovernedRequestStage, McpServerIdentity, ToolRegistry, ToolSpec,
+    TrustedAudience, COMPLETE_PROFILE_MAX_BYTES, FOCUSED_PROFILE_MAX_BYTES,
+    GOVERNED_REQUEST_PIPELINE,
 };
 pub use render::Format;
 pub use snapshot::{

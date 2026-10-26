@@ -81,6 +81,73 @@ mod response_mode_tests {
         (db, registry)
     }
 
+    #[tokio::test]
+    async fn artifact_record_create_bypasses_duplicate_gate_on_mcp() {
+        let (db, registry) = setup().await;
+        let body = r#"export const nativeArtifact = { schema: "native.mdx.artifact.v2", inputs: {}, module_inputs: {}, capability_requests: [] }
+
+<Metric label="Current" value={1} />"#;
+        let artifact = registry
+            .call(
+                db.clone(),
+                Caller::local(),
+                "create_record",
+                json!({
+                    "type":"Document", "kind":"artifact", "name":"Fixture", "body":body,
+                    "facets":{"runtime":"native.mdx.v2"}, "reason":"fixture"
+                }),
+            )
+            .await
+            .unwrap();
+        let args = json!({"type":"WorkItem", "kind":"task", "name":"Repeated artifact task", "reason":"fixture"});
+        registry
+            .call(db.clone(), Caller::local(), "create_record", args.clone())
+            .await
+            .unwrap();
+        let plan = ArtifactCreatePlan {
+            artifact_id: artifact["id"].as_str().unwrap().to_owned(),
+            entry_id: "create_task".into(),
+            source_digest: hex::encode(Sha256::digest(body)),
+            source_event_id: artifact["source_event_id"].as_str().unwrap().to_owned(),
+            idempotency_key: "artifact-duplicate-bypass".into(),
+            intent_digest: "fixture".into(),
+            invocation_digest: "fixture".into(),
+            gesture: None,
+            destination_binding: None,
+            references: vec![],
+            gesture_evidence: None,
+        };
+        let outcome = create_record_from_artifact(
+            db.clone(),
+            Caller::local().with_channel(Channel::Mcp),
+            args,
+            plan,
+        )
+        .await
+        .unwrap();
+        match outcome {
+            ArtifactCreateOutcome::Created(receipt) => {
+                assert!(receipt.get("duplicate_gate").is_none())
+            }
+            _ => panic!("artifact record.create must remain ungated"),
+        }
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn in_process_creates_remain_ungated_with_an_mcp_caller() {
+        let (db, _) = setup().await;
+        let args = json!({"type":"Document", "kind":"note", "name":"Internal identity", "reason":"fixture"});
+        let caller = Caller::local().with_channel(Channel::Mcp);
+        let first = create_record(db.clone(), caller.clone(), args.clone())
+            .await
+            .unwrap();
+        let second = create_record(db.clone(), caller, args).await.unwrap();
+        assert_ne!(first["id"], second["id"]);
+        assert!(second.get("duplicate_gate").is_none());
+        db.close().await;
+    }
+
     fn assert_summary(result: &Value) {
         for key in [
             "id",
@@ -253,7 +320,7 @@ async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Re
         "body_digest",
         "lifecycle_interpretation",
     ];
-    const OPTIONAL_RECEIPTS: [&str; 12] = [
+    const OPTIONAL_RECEIPTS: [&str; 13] = [
         "previous_seq",
         "act",
         "body_receipt",
@@ -272,6 +339,7 @@ async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Re
         // `source_sha256`.
         "source_event_id",
         "similar_existing",
+        "duplicate_gate",
         // Post-commit advisor output (S1). Present only when non-empty, so
         // receipts without a firing advisor stay byte-identical.
         "advisories",
@@ -315,7 +383,7 @@ async fn summarize_write_receipt(db: &Db, result: Value, version_seq: i64) -> Re
 
 /// Deterministic write-response confirmation for a declared basis. It depends
 /// only on the request, so an idempotent replay reproduces it byte-for-byte.
-fn declared_basis_feedback(declared: Option<usize>) -> Option<Value> {
+pub(crate) fn declared_basis_feedback(declared: Option<usize>) -> Option<Value> {
     let count = declared?;
     let (status, message) = match count {
         0 => ("declared_none", "basis: declared as none".to_string()),
@@ -329,6 +397,13 @@ fn declared_basis_feedback(declared: Option<usize>) -> Option<Value> {
     }))
 }
 
+/// The per-run "has this run declared a basis" probe. Its predicate text must
+/// match the partial index `idx_content_events_basis_run` exactly for SQLite to
+/// use it; a test pins the plan.
+pub(crate) const RUN_BASIS_DECLARED_SQL: &str = "SELECT EXISTS(SELECT 1 FROM content_events \
+     WHERE run_key=? AND CASE WHEN json_valid(payload) \
+       THEN json_extract(payload,'$.basis') END IS NOT NULL)";
+
 /// The one quiet pointer shown on an agent channel when a write declares
 /// nothing. Suppressed once the run has declared at least once, read cheaply
 /// from that run's own committed events rather than tracked in new
@@ -338,13 +413,10 @@ async fn undeclared_basis_feedback(db: &Db, caller: &Caller) -> Result<Option<Va
         return Ok(None);
     }
     if let Some(run_key) = caller.run_key() {
-        let already: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM content_events \
-             WHERE run_key=? AND json_extract(payload,'$.basis') IS NOT NULL)",
-        )
-        .bind(run_key)
-        .fetch_one(db.write_pool())
-        .await?;
+        let already: bool = sqlx::query_scalar(RUN_BASIS_DECLARED_SQL)
+            .bind(run_key)
+            .fetch_one(db.write_pool())
+            .await?;
         if already {
             return Ok(None);
         }
@@ -2338,6 +2410,7 @@ pub(crate) async fn resolve_source_basis_in(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRecordArgs {
+    confirm: Option<bool>,
     #[serde(rename = "type")]
     record_type: String,
     /// Required (fbfaf25 §3.1). `String`, not `Option<String>` — serde's missing
@@ -2521,7 +2594,22 @@ async fn resolve_message_origin_in(
     }
 }
 
+/// In-process semantic creators (including HCP imports) own their identity
+/// decisions. Only the registered public singleton opts into the MCP gate.
 pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    create_record_with_duplicate_gate(db, caller, arguments, false).await
+}
+
+async fn create_record_public(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    create_record_with_duplicate_gate(db, caller, arguments, true).await
+}
+
+async fn create_record_with_duplicate_gate(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+    gate_duplicates: bool,
+) -> Result<Value> {
     create_record_inner(
         db,
         caller,
@@ -2530,6 +2618,7 @@ pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> R
         None,
         None,
         CreateRecordResponse {
+            gate_duplicates,
             mode: None,
             similar_notice: Some(&[]),
             keyed_item: None,
@@ -2545,7 +2634,9 @@ pub(super) async fn create_record(db: Db, caller: Caller, arguments: Value) -> R
 /// `create_many`'s singular dispatch. The batch's own reserved ids travel as
 /// the similar-records exclusion set so one item's notice can never name a
 /// sibling created by the same call, while a genuine match with a record
-/// outside the batch is still reported.
+/// outside the batch is still reported. The duplicate gate stays on: items
+/// commit separately and in order, so an item that duplicates an earlier
+/// sibling is refused like any other duplicate.
 pub(super) async fn create_record_verbose_excluding(
     db: Db,
     caller: Caller,
@@ -2561,6 +2652,7 @@ pub(super) async fn create_record_verbose_excluding(
         None,
         None,
         CreateRecordResponse {
+            gate_duplicates: true,
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(similar_exclusion),
             keyed_item,
@@ -2637,6 +2729,7 @@ pub(crate) async fn create_record_from_artifact(
         Some(plan.clone()),
         None,
         CreateRecordResponse {
+            gate_duplicates: false,
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(&[]),
             keyed_item: None,
@@ -2827,6 +2920,7 @@ pub(crate) async fn create_comment_from_artifact(
         None,
         Some(plan),
         CreateRecordResponse {
+            gate_duplicates: false,
             mode: Some(ResponseMode::Verbose),
             similar_notice: Some(&[]),
             keyed_item: None,
@@ -3900,6 +3994,7 @@ pub(crate) async fn send_message_record(
         None,
         None,
         CreateRecordResponse {
+            gate_duplicates: false,
             mode: Some(ResponseMode::Verbose),
             // Sending a Message is not a duplication site: the notice is
             // type-blind, so a Message could match unrelated Documents, and this
@@ -3912,6 +4007,9 @@ pub(crate) async fn send_message_record(
 }
 
 struct CreateRecordResponse<'a> {
+    /// The public singleton and `create_many` item dispatch gate; internal
+    /// graph and host-composed routes stay out.
+    gate_duplicates: bool,
     mode: Option<ResponseMode>,
     similar_notice: Option<&'a [String]>,
     keyed_item: Option<KeyedCreateItem<'a>>,
@@ -3983,6 +4081,7 @@ async fn create_record_inner_impl(
     // reverse) without turning the same idempotency key into a conflict.
     if let Some(arguments) = provenance_arguments.as_object_mut() {
         arguments.remove("response_mode");
+        arguments.remove("confirm");
     }
     let mut args: CreateRecordArgs = parse_args(TOOL, arguments)?;
     let response_mode = response.mode.unwrap_or(args.response_mode);
@@ -4355,6 +4454,10 @@ async fn create_record_inner_impl(
     let mut mention_ids = BTreeSet::new();
     let body_for_mentions = fields.get("body").and_then(Value::as_str).unwrap_or("");
     let mut origin_db_id: Option<String> = None;
+    // Principal mentions of people who are not addressed. Only a
+    // Collection-origin send may carry one; that is settled once the origin
+    // has resolved, below.
+    let mut unaddressed_mention_accounts: Vec<String> = Vec::new();
     for mention in args.mentions.iter().flatten() {
         if mention.mention_id.trim().is_empty() || !mention_ids.insert(mention.mention_id.as_str())
         {
@@ -4366,18 +4469,21 @@ async fn create_record_inner_impl(
         require_record_in(&mut tx, &caller, TOOL, &mention.target_id, Capability::View).await?;
         let (target_binding, recipient_account) = match mention.target_kind.as_str() {
             "principal" => {
-                if !args
+                let addressed = args
                     .addressed_to
                     .iter()
                     .flatten()
-                    .any(|id| id == &mention.target_id)
-                {
+                    .any(|id| id == &mention.target_id);
+                if !addressed && args.origin.is_none() {
                     return Err(Error::engine(
                         "create_record: principal mention target must already be addressed",
                     ));
                 }
                 let principal:String=sqlx::query_scalar("SELECT identifier FROM bindings WHERE record_id=? AND system='native-principal' AND is_canonical=1").bind(&mention.target_id).fetch_optional(&mut *tx).await?.ok_or_else(||Error::engine("create_record: mention target is invalid or unavailable"))?;
                 let account:String=sqlx::query_scalar("SELECT identifier FROM bindings WHERE record_id=? AND system='account' AND is_canonical=1").bind(&mention.target_id).fetch_optional(&mut *tx).await?.ok_or_else(||Error::engine("create_record: mention target is invalid or unavailable"))?;
+                if !addressed {
+                    unaddressed_mention_accounts.push(account.clone());
+                }
                 (principal, Some(account))
             }
             "record" => {
@@ -4966,6 +5072,44 @@ async fn create_record_inner_impl(
             ));
         }
     }
+    if !unaddressed_mention_accounts.is_empty() {
+        // A mention alerts a person; it never addresses them and never
+        // changes who can read the Message. So an unaddressed principal
+        // mention is only meaningful where the Message keeps the
+        // audience it inherits: a Collection origin. A direct context's
+        // readers are its exact participant set, so there the mention must
+        // already be an addressee.
+        match &resolved_origin {
+            Some((
+                crate::events::MessageOriginDeclaredPayload::Collection { collection_id },
+                _,
+            )) => {
+                for account in &unaddressed_mention_accounts {
+                    // The engine holds no catalog of third-party membership,
+                    // so a `members` grant is read at member footing. A guest
+                    // mentioned there is still not notified: delivery
+                    // revalidates view with the recipient's live footing.
+                    let sees = crate::authorization::effective_capability_on(
+                        &mut tx,
+                        crate::authorization::Principal::bound(account, true),
+                        collection_id,
+                    )
+                    .await
+                    .is_ok_and(|capability| capability.allows(Capability::View));
+                    if !sees {
+                        return Err(Error::engine(
+                            "manage_messages.send: a mentioned person who is not addressed must be able to see the Collection the Message is posted in; the mention is refused and access is unchanged",
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(Error::engine(
+                    "create_record: principal mention target must already be addressed",
+                ));
+            }
+        }
+    }
     if let Some((crate::events::MessageOriginDeclaredPayload::Direct { principals }, _)) =
         &resolved_origin
     {
@@ -5464,6 +5608,104 @@ async fn create_record_inner_impl(
     {
         fields.insert("basis".into(), basis);
     }
+    // Public singleton MCP calls only. Batch/internal dispatch opts out;
+    // artifact, send and comment routes own their gates. A kind with a
+    // complete declared identity tuple is judged on that tuple alone; the
+    // name check below only runs when no declared rule applies.
+    let duplicate_matches = if caller.channel() == Channel::Mcp
+        && response.gate_duplicates
+        && record_type != "Message"
+        && !is_comment
+        && artifact_plan.is_none()
+        && send_plan.is_none()
+        && comment_plan.is_none()
+    {
+        match super::similar::declared_identity_for_gate(
+            resolution.metadata.as_ref(),
+            &facets,
+            &fields,
+        ) {
+            Some(identity) => {
+                super::similar::declared_identity_matches_in(
+                    &mut tx,
+                    &caller,
+                    &record_type,
+                    &record_kind,
+                    &identity,
+                )
+                .await?
+            }
+            None => {
+                super::similar::strong_matches_in(
+                    &mut tx,
+                    &caller,
+                    &record_type,
+                    &record_kind,
+                    fields.get("name").and_then(Value::as_str).unwrap_or(""),
+                    args.links.as_deref().unwrap_or(&[]),
+                )
+                .await?
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let duplicate_gate = if duplicate_matches.is_empty() {
+        None
+    } else if args.confirm == Some(true) {
+        // Caller-visible confirmation evidence belongs only to this receipt.
+        // Content events may be read by other principals; keyed replay omits it.
+        Some(
+            json!({"confirmed_over": duplicate_matches.iter().map(|item| &item["id"]).collect::<Vec<_>>()}),
+        )
+    } else {
+        // Error rather than Ok: executor success accounting uses isError,
+        // and held replay must settle this as refused, never as a receipt.
+        // A declared-identity refusal names a rule, not a name guess, so the
+        // supersedes retry is wrong: the same tuple is refused again. Point
+        // at update or a deliberate confirm instead.
+        let declared = duplicate_matches
+            .iter()
+            .any(|item| item["why"] == "declared_identity");
+        let (message, next_calls) = if declared {
+            (
+                "Nothing was created. Update the existing record, or retry with confirm: true to deliberately create a successor.",
+                json!([
+                    {"executor":"records_write", "operation":"update_record",
+                        "arguments":{"record_id":duplicate_matches[0]["id"], "reason":args.reason},
+                        "instruction":"Inspect the existing content, then add the body_append, body_set, summary or facets changes you intend."},
+                    {"executor":"records_write", "operation":"create_record",
+                        "arguments_patch":{"confirm":true},
+                        "instruction":"The tuple already exists; retry the same arguments plus confirm: true to deliberately create a successor."}
+                ]),
+            )
+        } else {
+            (
+                "Nothing was created. Update the existing record, supersede it, or retry with confirm: true.",
+                json!([
+                    {"executor":"records_write", "operation":"update_record",
+                        "arguments":{"record_id":duplicate_matches[0]["id"], "reason":args.reason},
+                        "instruction":"Inspect the existing content, then add the body_append, body_set, summary or facets changes you intend."},
+                    {"executor":"records_write", "operation":"create_record",
+                        "arguments_patch":{"links":[{"relationship":"supersedes", "target_id":duplicate_matches[0]["id"]}]},
+                        "instruction":"Use the same arguments, appending this supersedes link to any requested links."},
+                    {"executor":"records_write", "operation":"create_record",
+                        "arguments_patch":{"confirm":true},
+                        "instruction":"Retry the same arguments plus confirm: true."}
+                ]),
+            )
+        };
+        let refusal = json!({
+            "code":"likely_duplicate", "applied":false, "outcome":"refused",
+            "message":message,
+            "candidates":duplicate_matches,
+            "identity_criterion":resolution.metadata.as_ref().map(|m| &m.identity.criterion),
+            "next_calls":next_calls
+        });
+        tx.rollback().await?;
+        return Err(Error::engine(refusal.to_string()));
+    };
+    crate::authorization_grant::certify_birth_on(&mut tx, &id).await?;
     let source_event = append_in(
         &db,
         &mut tx,
@@ -5699,11 +5941,14 @@ async fn create_record_inner_impl(
             .await?;
         }
         // Awareness stays audience-derived. A channel post has no addressed
-        // account, and `routine_arrival` is reserved for recipient_policy
-        // provenance the engine cannot author, so its defined outcome is no
-        // obligation candidate at all; an @-mention is the one thing that still
-        // proposes one, and mentions must be addressed, which makes such a
-        // Message an addressed send rather than a channel post.
+        // account, so its defined outcome is no obligation candidate at all.
+        // An @-mention is the one thing that still proposes one, and it does
+        // so from the mention itself, not the audience: a channel post may
+        // mention a person who can see the Collection without addressing them,
+        // which alerts them and puts nothing on them. A DM or a thread reply
+        // additionally proposes `routine_arrival` candidates under each
+        // recipient's own arrival preference (see
+        // `append_routine_arrival_candidates_in`).
         if delivered {
             crate::awareness::apply_delivered_message_awareness_in(
                 &mut tx,
@@ -5753,6 +5998,7 @@ async fn create_record_inner_impl(
         )
         .await?;
     }
+    crate::authorization_grant::finish_birth_on(&mut tx, &id).await?;
     let after = required_violations_in(&mut tx, &schema_rows, &[&id]).await?;
     assert_required_not_worsened(TOOL, &before, &after)?;
     if let Some(draft) = action_draft {
@@ -5817,6 +6063,9 @@ async fn create_record_inner_impl(
     // substrates uniform — Postgres and Turso mint it from their shared read
     // shape — so the corpus can pin it on creation instead of looking away.
     let mut receipt = finish_create_receipt(result, html_body_write)?;
+    if let Some(gate) = duplicate_gate {
+        receipt["duplicate_gate"] = gate;
+    }
     if send_plan.is_some() {
         receipt["speaker_claim_status"] = json!(if receipt.get("speaker").is_some() {
             "recorded"
@@ -6169,7 +6418,8 @@ async fn compact_attested_create_in(
 /// tables, so a summary fold can skip it.
 const PINNED_SPINE_EVENT_TYPES: &str =
     "'record.created','record.updated','record.type_corrected.v1',\
-     'facet.set','facet.unset','receipt.committed.v1','unit.revision.recorded.v1'";
+     'facet.set','facet.unset','receipt.committed.v1','unit.revision.recorded.v1',\
+     'message.revision.recorded.v1'";
 
 /// One record's spine as of `horizon`, folded from that record's own events.
 struct PinnedSpine {
@@ -6299,7 +6549,12 @@ async fn fold_pinned_spine_in(
                     }
                 }
             }
-            ("receipt.committed.v1" | "unit.revision.recorded.v1", Some(_)) => {}
+            (
+                "receipt.committed.v1"
+                | "unit.revision.recorded.v1"
+                | "message.revision.recorded.v1",
+                Some(_),
+            ) => {}
             // A spine event before the record exists, or a second create.
             _ => return Ok(None),
         }
@@ -7662,6 +7917,128 @@ async fn attach_mentions_in(
     Ok(())
 }
 
+/// Per-request memo for link summaries. A batch `get_record` reads many
+/// records but needs the governed-lifecycle interpreter once; building it per
+/// record would repeat the schema and vocabulary reads for every row set.
+/// Built lazily, so a request whose records have no links does no schema work.
+#[derive(Default)]
+pub(crate) struct LinkSummaryContext {
+    interpreter: Option<crate::query::lifecycle::LifecycleInterpreter>,
+}
+
+/// Far ends of the link rows that survived visibility filtering and windowing.
+fn link_far_end_ids(record: &read::EnrichedRecord) -> Vec<String> {
+    let mut ids = record
+        .links_out
+        .iter()
+        .map(|link| link.target_id.clone())
+        .chain(record.links_in.iter().map(|link| link.source_id.clone()))
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Attach far-end summaries to a record's link windows.
+///
+/// Runs only after the caller-visibility filter has dropped every row whose far
+/// end the caller cannot see, and reads only for ids that survived it — so a
+/// hidden record's name, type, kind, lifecycle and succession are never loaded,
+/// let alone returned. Succession is the same live incoming-`supersedes`
+/// signal `superseded_by` uses (one batched statement, never a per-link
+/// query); like that disclosure it is true when the successor exists even if
+/// the caller cannot see it, and never names one.
+async fn attach_link_summaries_in_pools(
+    record_pool: &sqlx::SqlitePool,
+    auth_pool: &sqlx::SqlitePool,
+    caller: &Caller,
+    record: &mut read::EnrichedRecord,
+    ctx: &mut LinkSummaryContext,
+) -> Result<()> {
+    let ids = link_far_end_ids(record);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if ctx.interpreter.is_none() {
+        let rows = if caller.is_member_copy() {
+            crate::query::cascade::schema_config_rows_in_pool(auth_pool, None).await?
+        } else {
+            let principal = (!super::is_legacy_local(caller)).then(|| super::principal(caller));
+            crate::query::cascade::schema_config_rows_for_principal_in_pool(auth_pool, principal)
+                .await?
+        };
+        ctx.interpreter = Some(
+            crate::query::lifecycle::LifecycleInterpreter::load_from_pool(auth_pool, rows).await?,
+        );
+    }
+    let mut snapshot = record_pool.begin().await?;
+    let loaded = async {
+        let peers = read::load_link_peers(&mut *snapshot, &ids).await?;
+        let superseded = read::load_superseded_presence(&mut *snapshot, &ids).await?;
+        Ok::<_, Error>((peers, superseded))
+    }
+    .await;
+    snapshot.rollback().await?;
+    let (peers, superseded) = loaded?;
+    let interpreter = ctx.interpreter.as_ref().expect("interpreter just loaded");
+    read::attach_link_summaries(
+        &mut record.links_out,
+        |link| &link.target_id,
+        &peers,
+        &superseded,
+        interpreter,
+    );
+    read::attach_link_summaries(
+        &mut record.links_in,
+        |link| &link.source_id,
+        &peers,
+        &superseded,
+        interpreter,
+    );
+    Ok(())
+}
+
+/// Snapshot-scoped form of [`attach_link_summaries_in_pools`]: every read
+/// shares the caller's transaction.
+async fn attach_link_summaries_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    record: &mut read::EnrichedRecord,
+    ctx: &mut LinkSummaryContext,
+) -> Result<()> {
+    let ids = link_far_end_ids(record);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    if ctx.interpreter.is_none() {
+        let principal = (!caller.is_member_copy() && !super::is_legacy_local(caller))
+            .then(|| super::principal(caller));
+        let rows =
+            crate::query::cascade::schema_config_rows_for_principal_on(tx, principal).await?;
+        ctx.interpreter = Some(
+            crate::query::lifecycle::LifecycleInterpreter::load_from_connection(tx, rows).await?,
+        );
+    }
+    let peers = read::load_link_peers(&mut **tx, &ids).await?;
+    let superseded = read::load_superseded_presence(&mut **tx, &ids).await?;
+    let interpreter = ctx.interpreter.as_ref().expect("interpreter just loaded");
+    read::attach_link_summaries(
+        &mut record.links_out,
+        |link| &link.target_id,
+        &peers,
+        &superseded,
+        interpreter,
+    );
+    read::attach_link_summaries(
+        &mut record.links_in,
+        |link| &link.source_id,
+        &peers,
+        &superseded,
+        interpreter,
+    );
+    Ok(())
+}
+
 pub(super) async fn filter_enriched_record_with_auth(
     record_db: &Db,
     auth_db: &Db,
@@ -7673,6 +8050,7 @@ pub(super) async fn filter_enriched_record_with_auth(
     // single-record entry point free of a cache parameter its callers do not
     // have. The batch path below threads a shared one instead.
     let mut reported = crate::contribution::ReportedIdentityCache::new();
+    let mut link_ctx = LinkSummaryContext::default();
     filter_enriched_record_with_auth_in_pools(
         record_db.write_pool(),
         auth_db.write_pool(),
@@ -7680,6 +8058,7 @@ pub(super) async fn filter_enriched_record_with_auth(
         record,
         opts,
         &mut reported,
+        &mut link_ctx,
     )
     .await
 }
@@ -7691,6 +8070,7 @@ async fn filter_enriched_record_with_auth_in_pools(
     record: &mut read::EnrichedRecord,
     opts: read::EnrichOptions,
     reported: &mut crate::contribution::ReportedIdentityCache,
+    link_ctx: &mut LinkSummaryContext,
 ) -> Result<()> {
     let authored_home = record.record.home_id.clone();
     if caller.is_member_copy() {
@@ -7803,6 +8183,7 @@ async fn filter_enriched_record_with_auth_in_pools(
         .into_iter()
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
+        .map(read::EnrichedLink::from)
         .collect();
     let mut inbound = Vec::new();
     for link in all_links.links_in {
@@ -7815,7 +8196,11 @@ async fn filter_enriched_record_with_auth_in_pools(
         .into_iter()
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
+        .map(read::EnrichedLink::from)
         .collect();
+    if opts.link_summaries {
+        attach_link_summaries_in_pools(record_pool, auth_pool, caller, record, link_ctx).await?;
+    }
     // Succession names through the same visibility fold as links — with the
     // full ordered set reloaded first. The read path carries a capped window,
     // and truncating that window before filtering would let an invisible head
@@ -7881,6 +8266,7 @@ async fn filter_enriched_record_in(
     record: &mut read::EnrichedRecord,
     opts: read::EnrichOptions,
     reported: &mut crate::contribution::ReportedIdentityCache,
+    link_ctx: &mut LinkSummaryContext,
 ) -> Result<()> {
     let authored_home = record.record.home_id.clone();
     if caller.is_member_copy() {
@@ -7989,6 +8375,7 @@ async fn filter_enriched_record_in(
         .into_iter()
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
+        .map(read::EnrichedLink::from)
         .collect();
     let mut inbound = Vec::new();
     for link in all_links.links_in {
@@ -8001,7 +8388,11 @@ async fn filter_enriched_record_in(
         .into_iter()
         .skip(opts.links_offset as usize)
         .take(opts.links_limit as usize)
+        .map(read::EnrichedLink::from)
         .collect();
+    if opts.link_summaries {
+        attach_link_summaries_in_tx(tx, caller, record, link_ctx).await?;
+    }
     // Same succession rule as the pooled filter above: reload the full
     // ordered set, filter by visibility, then truncate — never the reverse.
     if record.superseded_by.is_some() {
@@ -8327,6 +8718,7 @@ async fn supplement_get_record_items(
             Some(
                 super::querying::SavedQueryInspection::Valid { .. }
                     | super::querying::SavedQueryInspection::GovernedSql { .. }
+                    | super::querying::SavedQueryInspection::GovernedSqlPinned { .. }
             )
         );
         item.as_object_mut()
@@ -8395,6 +8787,9 @@ async fn supplement_get_record_items(
                     }),
                 })
             }
+            Some(super::querying::SavedQueryInspection::GovernedSqlPinned { .. }) => Some(
+                json!({"status":"execution_error","version":"1.2","diagnostic":"view_profile_unsupported: use hosted pinned SQL"}),
+            ),
             Some(super::querying::SavedQueryInspection::GovernedSql { definition }) => {
                 Some(match source.execute_saved_sql(caller, &definition).await {
                     Ok(output) => json!({
@@ -8515,6 +8910,8 @@ async fn get_record_from_lens(
         children_offset: args.children_offset.unwrap_or(defaults.children_offset),
         links_limit: args.links_limit.unwrap_or(defaults.links_limit),
         links_offset: args.links_offset.unwrap_or(defaults.links_offset),
+        // `get_record` is the one read that renders the far end of each link.
+        link_summaries: true,
         include_suggestions: args.include_suggestions.unwrap_or(false),
         suggestions_limit: args.suggestions_limit.unwrap_or(defaults.suggestions_limit),
         suggestions_offset: args
@@ -8546,6 +8943,8 @@ async fn get_record_from_lens(
     // same run shares a single `agent_runs` read. A run page resolving many
     // acts through one `get_record` call therefore issues one lookup per run.
     let mut reported = crate::contribution::ReportedIdentityCache::new();
+    // Shared by both serving branches below; each branch uses it alone.
+    let mut link_ctx = LinkSummaryContext::default();
     let mut indexed_header_ids = crate::mcp::request_timing::m4_index_measurement_enabled()
         .then(std::collections::HashSet::new);
     // A member copy has no policy/event tables, so it takes the lens path
@@ -8576,8 +8975,15 @@ async fn get_record_from_lens(
                 let read::BatchGetItem::Found(record) = item else {
                     continue;
                 };
-                filter_enriched_record_in(&mut snapshot, caller, record, opts, &mut reported)
-                    .await?;
+                filter_enriched_record_in(
+                    &mut snapshot,
+                    caller,
+                    record,
+                    opts,
+                    &mut reported,
+                    &mut link_ctx,
+                )
+                .await?;
                 // Advisory freshness projection, live reads only: the same
                 // snapshot transaction keeps the authorization decision and
                 // the kernel state on one SQLite snapshot. Records without
@@ -8667,6 +9073,7 @@ async fn get_record_from_lens(
                 record,
                 opts,
                 &mut reported,
+                &mut link_ctx,
             )
             .await?;
         }
@@ -8857,6 +9264,20 @@ async fn annotate_display_references_in_pool(
     } else {
         batch_display_references_in_pool(pool, &ids).await?
     };
+    // A link's far end can be a tombstone the caller may still see. Its
+    // reference must be one the reader can follow, and prefix resolution
+    // excludes tombstones, so those far ends get the live-only lookup (one more
+    // batched statement, not a per-link query). A member copy ships references
+    // for live records only.
+    let link_ids = collect_link_other_ids(array);
+    let link_references = if link_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else if member {
+        member_display_references_in_pool(pool, &link_ids).await?
+    } else {
+        let borrowed: Vec<&str> = link_ids.iter().map(String::as_str).collect();
+        crate::mcp::record_ref::live_display_references_in_pool(pool, &borrowed).await?
+    };
     for item in array {
         if item.get("status").and_then(Value::as_str) != Some("found") {
             continue;
@@ -8864,8 +9285,36 @@ async fn annotate_display_references_in_pool(
         apply_record_path_annotations(item, &references)?;
         apply_enriched_record_path_annotations(item, &references)?;
         apply_superseded_by_reference_annotations(item, &references)?;
+        apply_link_other_reference_annotations(item, &link_references)?;
     }
     Ok(())
+}
+
+/// Far ends named by the link summaries of found records.
+fn collect_link_other_ids(items: &[Value]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for item in items {
+        if item.get("status").and_then(Value::as_str) != Some("found") {
+            continue;
+        }
+        for key in ["links_out", "links_in"] {
+            for link in item
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = link
+                    .get("other")
+                    .and_then(|other| other.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    ids.push(id.to_owned());
+                }
+            }
+        }
+    }
+    ids
 }
 
 fn collect_record_path_annotation_ids(items: &[Value]) -> Vec<String> {
@@ -9023,6 +9472,35 @@ fn apply_superseded_by_reference_annotations(
             .as_object_mut()
             .ok_or_else(|| Error::engine("superseded successor is not an object"))?
             .insert("display_reference".into(), json!(reference));
+    }
+    Ok(())
+}
+
+/// Stamp short references onto link far-end summaries in serialized
+/// `get_record` payloads. Like successors, a summary has a fixed shape, so the
+/// shared path annotator (which also writes `record_path`) is not used. Absent
+/// references stay absent.
+fn apply_link_other_reference_annotations(
+    item: &mut Value,
+    references: &std::collections::HashMap<String, Option<String>>,
+) -> Result<()> {
+    for key in ["links_out", "links_in"] {
+        let Some(links) = item.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for link in links {
+            let Some(other) = link.get_mut("other").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(reference) = other
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| references.get(id).cloned().flatten())
+            else {
+                continue;
+            };
+            other.insert("display_reference".into(), json!(reference));
+        }
     }
     Ok(())
 }
@@ -17170,7 +17648,7 @@ fn section_heading(heading: &str, shown: usize, total: i64) -> String {
 fn push_link_lines(
     out: &mut String,
     heading: &str,
-    links: &[crate::query::LinkRow],
+    links: &[read::EnrichedLink],
     total: i64,
     other_id: impl Fn(&crate::query::LinkRow) -> &str,
     names: &std::collections::HashMap<String, String>,
@@ -17181,7 +17659,7 @@ fn push_link_lines(
     }
     out.push_str(&section_heading(heading, links.len(), total));
     for link in links {
-        let other = other_id(link);
+        let other = other_id(&link.link);
         let name = names.get(other).map(String::as_str).unwrap_or("?");
         out.push_str(&format!(
             "- {arrow} {} — {name} (`{other}`)",
@@ -17457,6 +17935,7 @@ async fn render_record(db: Db, caller: Caller, arguments: Value) -> Result<Value
                         &mut record,
                         read::EnrichOptions::default(),
                         &mut reported,
+                        &mut LinkSummaryContext::default(),
                     )
                     .await?;
                     *record
@@ -17706,7 +18185,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
         .join(";");
     registry.register(
         ToolKind::CreateRecord,
-        "Create atomically. Compact default; response_mode=verbose gives full record. Requires spine type/open kind; preview_record_shape advises; create revalidates. Use manage_relationships.assert, not facets; assignment is assigned_to (WorkItem/task to Entity/person), not assignee. Artifacts: Document/artifact, source body, facets.runtime; see compositions guide. Messages require fixed audience. Comments require type Annotation, kind comment, nonblank body and exactly one outgoing part_of link. Roots default informational/open. A reply bears directly on the root comment; inherits context/null lifecycle. Targets require text_quote + canonical UTF-8 data_position. Replies stay targetless. Omit summary until resolution. Name what it rests on in sources; [] says none.",
+        "Atomic create. Compact receipt; response_mode=verbose for full. Require type/kind; preview_record_shape advises; create revalidates. Use manage_relationships.assert, not facets; assigned_to WorkItem/task to Entity/person, not assignee. Artifacts: Document/artifact, body, facets.runtime; compositions guide. Messages need fixed audience. Comments: type Annotation, kind comment, nonblank body, exactly one outgoing part_of link. Roots default informational/open. A reply bears directly on the root comment; inherits context/null lifecycle. Replies stay targetless. Targets: text_quote + canonical UTF-8 data_position. Omit summary until resolution. Declare sources; [] says none.",
         json!({
             "type": "object",
             "properties": {
@@ -17762,6 +18241,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
                     "items":{"type":"object","properties":{"mention_id":{"type":"string"},"target_kind":{"type":"string","enum":["principal","record"]},"target_id":{"type":"string"},"span_start":{"type":"integer","minimum":0},"span_end":{"type":"integer","minimum":1},"authored_label":{"type":"string"}},"required":["mention_id","target_kind","target_id","span_start","span_end","authored_label"],"additionalProperties":false}
                 },
                 "target": crate::mcp::tools::citations::target_schema(),
+                "confirm": { "type": "boolean", "description": "Create despite matches." },
                 "idempotency_key": { "type": "string", "description": "Retry-safety key: on ambiguous failure retry with the SAME key, never a fresh one. An identical retry returns the record already created; the same key with different content is rejected. No key: every call creates a new record." },
                 "access_policy": { "type": "string", "enum": ["account_only"], "description": "Optional privacy boundary: the single literal account_only installs an explicit caller-account-only Manage policy atomically with creation. Absent inherits the home policy as today." },
                 "response_mode": { "type": "string", "enum": ["summary", "verbose"], "default": "summary" }
@@ -17769,7 +18249,7 @@ pub fn register_lifecycle_tools(registry: &mut ToolRegistry) -> Result<()> {
             "required": ["type", "kind", "reason"],
             "additionalProperties": false
         }),
-        create_record,
+        create_record_public,
     )?;
     registry.register(
         ToolKind::GetRecord,
@@ -18541,6 +19021,71 @@ mod create_idempotency_tests {
         .unwrap()
         .unwrap();
         drop(settled);
+        db.close().await;
+    }
+
+    /// A full link window costs a bounded number of display-reference scans,
+    /// however many distinct seven-hex seeds its far ends spread across.
+    #[tokio::test]
+    async fn get_record_link_references_do_not_scan_once_per_link() {
+        let (db, registry) = fixture().await;
+        let call = |tool: &'static str, args: Value| {
+            let (db, registry) = (db.clone(), &registry);
+            async move {
+                registry
+                    .call(db, Caller::local(), tool, args)
+                    .await
+                    .unwrap()
+            }
+        };
+        let hub = call(
+            "create_record",
+            json!({"type":"Document","kind":"note","name":"hub","reason":"fixture"}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for index in 0..40 {
+            let peer = call(
+                "create_record",
+                json!({"type":"Document","kind":"note","name":format!("peer {index}"),"reason":"fixture"}),
+            )
+            .await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (source, target) = if index % 2 == 0 {
+                (&hub, &peer)
+            } else {
+                (&peer, &hub)
+            };
+            call(
+                "manage_links",
+                json!({"action":"add","source_id":source,"target_id":target,"relationship":"relates_to"}),
+            )
+            .await;
+        }
+
+        crate::mcp::record_ref::reset_prefix_row_query_count();
+        let payload = call("get_record", json!({"ids":[hub]})).await;
+        let record = &payload["records"][0];
+        let rows: Vec<&Value> = ["links_out", "links_in"]
+            .iter()
+            .flat_map(|key| record[*key].as_array().unwrap())
+            .collect();
+        assert_eq!(rows.len(), 40);
+        assert!(
+            rows.iter()
+                .all(|row| row["other"]["display_reference"].is_string()),
+            "{record:#}"
+        );
+        // One statement for the record's own references, one for the links'.
+        let scans = crate::mcp::record_ref::prefix_row_query_count();
+        assert!(
+            scans <= 2,
+            "40 distinct-seed links cost {scans} prefix scans"
+        );
         db.close().await;
     }
 

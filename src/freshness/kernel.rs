@@ -123,7 +123,10 @@ fn revision_ref_from_unit_event(event: &EventRow, content_sha256: String) -> Rev
 fn body_from_record_event(event_type: &str, payload: &str) -> Result<Vec<u8>> {
     if !matches!(
         event_type,
-        "record.created" | "record.updated" | "receipt.committed.v1"
+        "record.created"
+            | "record.updated"
+            | "receipt.committed.v1"
+            | "message.revision.recorded.v1"
     ) {
         return Err(Error::engine(
             "artefact body RevisionRef must identify a body-bearing record event",
@@ -235,7 +238,7 @@ pub(crate) async fn current_body_revision_on(
     }
     let row = sqlx::query(
         "SELECT id,seq,type,payload FROM content_events
-          WHERE record_id=? AND type IN ('record.created','record.updated','receipt.committed.v1')
+          WHERE record_id=? AND type IN ('record.created','record.updated','receipt.committed.v1','message.revision.recorded.v1')
             AND json_type(payload,'$.body') IS NOT NULL
           ORDER BY seq DESC LIMIT 1",
     )
@@ -488,6 +491,7 @@ pub async fn promote_idea(
         .requested_occurrence_id
         .clone()
         .unwrap_or(OccurrenceId::new(Uuid::new_v4().to_string())?);
+    crate::authorization_grant::certify_birth_on(&mut tx, unit_id.as_str()).await?;
     append_in(
         db,
         &mut tx,
@@ -531,6 +535,7 @@ pub async fn promote_idea(
         &mut act_alloc,
     )
     .await?;
+    crate::authorization_grant::finish_birth_on(&mut tx, unit_id.as_str()).await?;
     let content_sha256 = input.first_content.sha256();
     let revision_event = append_in(
         db,

@@ -58,6 +58,11 @@ pub struct MemberCopyDeviceConfig {
     pub origin_database_id: Option<String>,
     pub credential_file: PathBuf,
     pub copy_root: PathBuf,
+    /// N2 ownership handover for native revocation cleanup. Publication stays
+    /// with the collector; this owner holds its writer lock during the cutover.
+    #[cfg(feature = "v2-kernel-probe")]
+    #[serde(default)]
+    pub markdown_folder: Option<PathBuf>,
 }
 
 impl MemberCopyDeviceConfig {
@@ -97,6 +102,13 @@ impl MemberCopyDeviceConfig {
             ));
         }
         validate_absolute_unambiguous(&self.copy_root, "copy_root")?;
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(path) = &self.markdown_folder {
+            validate_absolute_unambiguous(path, "markdown_folder")?;
+            if path.starts_with(&self.copy_root) || self.copy_root.starts_with(path) {
+                return Err(Error::engine("member vault ownership refused"));
+            }
+        }
         Ok(())
     }
 }
@@ -162,6 +174,8 @@ enum Step {
 
 /// A download failure: a `Restart` re-request signal, or a typed refusal.
 enum DownloadError {
+    #[cfg(feature = "v2-kernel-probe")]
+    Revoked(crate::member_copy_lifecycle::RevokedCause),
     Restart,
     Refused(Error),
 }
@@ -172,6 +186,8 @@ pub struct MemberCopyDriver {
     transport: Arc<dyn MemberCopyTransport>,
     config: MemberCopyDeviceConfig,
     consumer: StandbyConsumerIdentity,
+    #[cfg(feature = "v2-kernel-probe")]
+    vault: Option<std::sync::Mutex<crate::markdown_vault::Publisher>>,
 }
 
 impl MemberCopyDriver {
@@ -193,12 +209,123 @@ impl MemberCopyDriver {
             consumer.clone(),
         )
         .await?;
-        Ok(Self {
+        #[allow(unused_mut)]
+        let mut driver = Self {
             serving,
             transport,
             config,
             consumer,
-        })
+            #[cfg(feature = "v2-kernel-probe")]
+            vault: None,
+        };
+        #[cfg(feature = "v2-kernel-probe")]
+        if let Some(path) = driver.config.markdown_folder.clone() {
+            driver.attach_markdown_vault(&path)?;
+        }
+        Ok(driver)
+    }
+
+    /// Attach the N2 publisher to this serialized member-copy owner. The
+    /// collector must hand over the writer lock before attachment. A pending
+    /// durable revocation is completed before returning, including on restart.
+    /// Native serving stays Locked; this adds deletion ownership only.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub fn attach_markdown_vault(&mut self, path: &Path) -> Result<()> {
+        validate_absolute_unambiguous(path, "markdown vault")?;
+        if self.vault.is_some()
+            || path.starts_with(&self.config.copy_root)
+            || self.config.copy_root.starts_with(path)
+        {
+            return Err(Error::engine("member vault ownership refused"));
+        }
+        let mut vault = crate::markdown_vault::Publisher::open(path)?;
+        if !vault.matches_member_copy(
+            self.serving.origin_database_id(),
+            self.serving.account_token().as_deref(),
+        ) {
+            return Err(Error::engine("member vault authenticated binding differs"));
+        }
+        if matches!(self.serving.lifecycle_status(), CopyStatus::Removed { .. }) {
+            // A scope purge never produces Removed. Authority/account loss
+            // while detached must cancel any older scope-only recovery target.
+            vault.mark_member_revoked()?;
+            vault.revoke_member()?;
+        }
+        self.vault = Some(std::sync::Mutex::new(vault));
+        Ok(())
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn mark_vault_revoked(&mut self) -> Result<()> {
+        if let Some(vault) = &mut self.vault {
+            vault
+                .get_mut()
+                .map_err(|_| Error::engine("member vault owner unavailable"))?
+                .mark_member_revoked()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    fn update_vault(&mut self, revoked: bool) -> Result<()> {
+        if let Some(vault) = &mut self.vault {
+            let vault = vault
+                .get_mut()
+                .map_err(|_| Error::engine("member vault owner unavailable"))?;
+            if revoked {
+                vault.revoke_member()?;
+            } else {
+                vault.unavailable("member copy locked")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume only a scope transition, only from the newly admitted immutable
+    /// copy. A revocation/account tombstone has no recovery target.
+    #[cfg(feature = "v2-kernel-probe")]
+    async fn publish_rebound_vault(&mut self) -> Result<()> {
+        let Some(scope) = self.serving.bound_scope_ref().map(str::to_owned) else {
+            return Ok(());
+        };
+        let pending = self
+            .vault
+            .as_mut()
+            .map(|vault| {
+                vault
+                    .get_mut()
+                    .map(|vault| vault.scope_rebind_pending(&scope))
+                    .map_err(|_| Error::engine("member vault owner unavailable"))
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if !pending {
+            return Ok(());
+        }
+        let db = self
+            .serving
+            .database()
+            .ok_or_else(|| Error::engine("member vault verified copy unavailable"))?;
+        let account = self
+            .serving
+            .account_token()
+            .ok_or_else(|| Error::engine("member vault account unavailable"))?;
+        let origin = self
+            .serving
+            .origin_database_id()
+            .ok_or_else(|| Error::engine("member vault origin unavailable"))?;
+        let mut source = crate::query::sql::member_vault_snapshot(&db, &account, origin).await?;
+        source.generation = self
+            .serving
+            .generation_id()
+            .ok_or_else(|| Error::engine("member vault generation unavailable"))?
+            .into();
+        self.vault
+            .as_mut()
+            .unwrap()
+            .get_mut()
+            .map_err(|_| Error::engine("member vault owner unavailable"))?
+            .publish_member_scope(&scope, &source)
     }
 
     pub fn serving(&self) -> &MemberCopyServing {
@@ -373,9 +500,20 @@ impl MemberCopyDriver {
     ) -> Result<Step> {
         match answer {
             MemberCopyAnswer::Revoked { cause } => {
-                self.serving
+                #[cfg(feature = "v2-kernel-probe")]
+                let vault_marked = self.mark_vault_revoked();
+                let removed = self
+                    .serving
                     .apply_reconnect(ReconnectAnswer::Revoked { cause })
-                    .await?;
+                    .await;
+                #[cfg(feature = "v2-kernel-probe")]
+                let vault_removed = self.update_vault(true);
+                removed?;
+                #[cfg(feature = "v2-kernel-probe")]
+                {
+                    vault_marked?;
+                    vault_removed?;
+                }
                 Ok(Step::Done(RefreshDisposition::Removed {
                     cause: cause.into(),
                 }))
@@ -384,6 +522,8 @@ impl MemberCopyDriver {
                 self.serving
                     .apply_reconnect(ReconnectAnswer::Locked)
                     .await?;
+                #[cfg(feature = "v2-kernel-probe")]
+                self.update_vault(false)?;
                 Ok(Step::Done(RefreshDisposition::Locked))
             }
             MemberCopyAnswer::Restart => Ok(Step::Restart),
@@ -430,6 +570,8 @@ impl MemberCopyDriver {
                         .serving
                         .adopt_current_metadata(&manifest_json, &context)
                         .await?;
+                    #[cfg(feature = "v2-kernel-probe")]
+                    self.publish_rebound_vault().await?;
                     return Ok(Step::Done(RefreshDisposition::MetadataRefreshed {
                         generation_id,
                         markers_changed,
@@ -481,7 +623,24 @@ impl MemberCopyDriver {
                 }
                 if let Some(bound) = self.serving.bound_scope_ref().map(str::to_owned) {
                     if bound != context.scope_ref() {
-                        self.serving.begin_scope_change_purge(&cut_at).await?;
+                        #[cfg(feature = "v2-kernel-probe")]
+                        let vault_marked = if let Some(vault) = &mut self.vault {
+                            vault
+                                .get_mut()
+                                .map_err(|_| Error::engine("member vault owner unavailable"))?
+                                .mark_member_scope_change(context.scope_ref())
+                        } else {
+                            Ok(())
+                        };
+                        let purged = self.serving.begin_scope_change_purge(&cut_at).await;
+                        #[cfg(feature = "v2-kernel-probe")]
+                        let vault_removed = self.update_vault(true);
+                        purged?;
+                        #[cfg(feature = "v2-kernel-probe")]
+                        {
+                            vault_marked?;
+                            vault_removed?;
+                        }
                     }
                 }
                 // Unavailable (e.g. a local refresh failure) cannot promote; move
@@ -492,6 +651,18 @@ impl MemberCopyDriver {
                             cut_at: cut_at.clone(),
                         })
                         .await?;
+                }
+                // A failed transition may have restarted without a durable
+                // copy binding. Retarget only an existing scope-only refusal,
+                // using this verified Replace response; never a revocation.
+                #[cfg(feature = "v2-kernel-probe")]
+                if let Some(vault) = &mut self.vault {
+                    let vault = vault
+                        .get_mut()
+                        .map_err(|_| Error::engine("member vault owner unavailable"))?;
+                    if vault.has_scope_rebind() {
+                        vault.mark_member_scope_change(context.scope_ref())?;
+                    }
                 }
                 self.serving.ground_origin(&context)?;
                 self.serving.bind_scope(&context)?;
@@ -601,7 +772,30 @@ impl MemberCopyDriver {
                 CopyStatus::Locked { .. } | CopyStatus::Removed { .. }
             );
         if needs_sign_in {
-            self.serving.sign_in(account, answer).await?;
+            #[cfg(feature = "v2-kernel-probe")]
+            let account_changed = self
+                .serving
+                .account_token()
+                .is_some_and(|old| old != account);
+            #[cfg(feature = "v2-kernel-probe")]
+            let vault_marked = if account_changed {
+                self.mark_vault_revoked()
+            } else {
+                Ok(())
+            };
+            let signed_in = self.serving.sign_in(account, answer).await;
+            #[cfg(feature = "v2-kernel-probe")]
+            let vault_removed = if account_changed {
+                self.update_vault(true)
+            } else {
+                Ok(())
+            };
+            signed_in?;
+            #[cfg(feature = "v2-kernel-probe")]
+            {
+                vault_marked?;
+                vault_removed?;
+            }
         } else if matches!(answer, ReconnectAnswer::Current) {
             self.serving.apply_reconnect(answer).await?;
         }
@@ -627,6 +821,22 @@ impl MemberCopyDriver {
                 self.remove_staging(&staged);
                 return Ok(Step::Restart);
             }
+            #[cfg(feature = "v2-kernel-probe")]
+            Err(DownloadError::Revoked(cause)) => {
+                let vault_marked = self.mark_vault_revoked();
+                self.remove_staging(&staged);
+                let removed = self
+                    .serving
+                    .apply_reconnect(ReconnectAnswer::Revoked { cause })
+                    .await;
+                let vault_removed = self.update_vault(true);
+                removed?;
+                vault_marked?;
+                vault_removed?;
+                return Ok(Step::Done(RefreshDisposition::Removed {
+                    cause: cause.into(),
+                }));
+            }
             Err(DownloadError::Refused(error)) => {
                 self.remove_staging(&staged);
                 let _ = self.serving.recover_after_failed_candidate().await;
@@ -644,9 +854,13 @@ impl MemberCopyDriver {
             .await;
         self.remove_staging(&staged);
         match admitted {
-            Ok(admitted) => Ok(Step::Done(RefreshDisposition::Admitted {
-                generation_id: admitted.generation_id,
-            })),
+            Ok(admitted) => {
+                #[cfg(feature = "v2-kernel-probe")]
+                self.publish_rebound_vault().await?;
+                Ok(Step::Done(RefreshDisposition::Admitted {
+                    generation_id: admitted.generation_id,
+                }))
+            }
             Err(AdmissionError::Removed { cause, .. }) => {
                 let _ = self.serving.recover_after_failed_candidate().await;
                 Ok(Step::Done(RefreshDisposition::Removed { cause }))
@@ -732,9 +946,12 @@ impl MemberCopyDriver {
                     )))
                 }
                 MemberCopyChunk::Refused(MemberCopyDownloadRefusal::Revoked { cause }) => {
+                    #[cfg(feature = "v2-kernel-probe")]
+                    return Err(DownloadError::Revoked(cause));
+                    #[cfg(not(feature = "v2-kernel-probe"))]
                     return Err(DownloadError::Refused(Error::engine(format!(
                         "member copy download revoked: {cause:?}"
-                    ))))
+                    ))));
                 }
                 MemberCopyChunk::Refused(MemberCopyDownloadRefusal::Locked) => {
                     return Err(DownloadError::Refused(Error::engine(
@@ -847,6 +1064,7 @@ mod tests {
         corrupt_offset: Mutex<Option<u64>>,
         override_sha: Mutex<Option<String>>,
         override_total: Mutex<Option<u64>>,
+        range_refusal: Mutex<Option<MemberCopyDownloadRefusal>>,
         last_request: Mutex<Option<MemberCopyRequest>>,
         block_requests: std::sync::atomic::AtomicBool,
         block_reads: std::sync::atomic::AtomicBool,
@@ -865,6 +1083,7 @@ mod tests {
                 corrupt_offset: Mutex::new(None),
                 override_sha: Mutex::new(None),
                 override_total: Mutex::new(None),
+                range_refusal: Mutex::new(None),
                 last_request: Mutex::new(None),
                 block_requests: std::sync::atomic::AtomicBool::new(false),
                 block_reads: std::sync::atomic::AtomicBool::new(false),
@@ -988,6 +1207,9 @@ mod tests {
                 if self.block_reads.load(Ordering::SeqCst) {
                     std::future::pending::<()>().await;
                 }
+                if let Some(refusal) = self.range_refusal.lock().unwrap().take() {
+                    return Ok(MemberCopyChunk::Refused(refusal));
+                }
                 let bytes = self
                     .bytes
                     .lock()
@@ -1105,6 +1327,8 @@ mod tests {
     fn config(root: &Path, origin: &str) -> MemberCopyDeviceConfig {
         write_credential(root, "test-bearer");
         MemberCopyDeviceConfig {
+            #[cfg(feature = "v2-kernel-probe")]
+            markdown_folder: None,
             contract: CONFIG_CONTRACT.to_owned(),
             version: PROTOCOL_VERSION,
             hosted_origin: "http://127.0.0.1:0".to_owned(),
@@ -1377,6 +1601,302 @@ mod tests {
         );
         assert_eq!(transport.requests(), 2);
         assert!(!driver.serving().is_serving());
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[tokio::test]
+    async fn native_member_vault_revocation_is_wired_to_driver_and_restart() {
+        for loss in ["revoked", "account", "scope"] {
+            let (db, origin) = world().await;
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("producer.db");
+            let copy = produce(&db, SCOPE_A, 1, &out).await;
+            let transport = Arc::new(MockTransport::new(crate::member_offline_fixtures::ACCT_B));
+            transport.push(replace_answer(&copy.manifest, false, "h"));
+            transport.serve("h", fs::read(&out).unwrap());
+            let config = config(dir.path(), &origin);
+            let vault_path = dir.path().join("vault");
+            let mut driver =
+                MemberCopyDriver::new(config.clone(), device_consumer(), transport.clone())
+                    .await
+                    .unwrap();
+            driver.refresh().await.unwrap();
+            let account = driver.serving.account_token().unwrap();
+            let mut publisher = crate::markdown_vault::Publisher::open(&vault_path).unwrap();
+            let mut source = crate::markdown_vault::SourceSnapshot {
+                origin: origin.clone(),
+                account,
+                ..Default::default()
+            };
+            source.records.insert(
+                "native:root".into(),
+                crate::markdown_vault::SourceRecord {
+                    id: "native:root".into(),
+                    record_type: "Collection".into(),
+                    kind: Some("folder".into()),
+                    name: Some("Synthetic workspace".into()),
+                    ..Default::default()
+                },
+            );
+            source.records.insert(
+                "00000000-0000-0000-0000-000000000001".into(),
+                crate::markdown_vault::SourceRecord {
+                    id: "00000000-0000-0000-0000-000000000001".into(),
+                    record_type: "Document".into(),
+                    kind: Some("note".into()),
+                    name: Some("Synthetic vault note".into()),
+                    body: Some("synthetic body".into()),
+                    ..Default::default()
+                },
+            );
+            publisher.cycle(&source).unwrap();
+            drop(publisher);
+            let foreign_path = dir.path().join("foreign-vault");
+            let mut foreign = crate::markdown_vault::Publisher::open(&foreign_path).unwrap();
+            let mut foreign_source = source.clone();
+            foreign_source.account = crate::member_offline_fixtures::ACCT_A.into();
+            foreign.cycle(&foreign_source).unwrap();
+            drop(foreign);
+            assert!(driver.attach_markdown_vault(&foreign_path).is_err());
+            let retained: serde_json::Value =
+                serde_json::from_slice(&fs::read(foreign_path.join(".native/state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(retained["visible"].as_array().unwrap().len(), 2);
+            driver.attach_markdown_vault(&vault_path).unwrap();
+            transport.push(MemberCopyAnswer::Locked);
+            assert_eq!(driver.refresh().await.unwrap(), RefreshDisposition::Locked);
+            let before: serde_json::Value =
+                serde_json::from_slice(&fs::read(vault_path.join(".native/state.json")).unwrap())
+                    .unwrap();
+            let owned: Vec<_> = before["files"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(path, entry)| {
+                    path.as_str() != ".native/STATUS.md"
+                        && !entry["contributors"].as_array().unwrap().is_empty()
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            assert!(!owned.is_empty());
+            for path in &owned {
+                assert!(vault_path.join(path).is_file());
+            }
+            if loss == "revoked" {
+                transport.push(MemberCopyAnswer::Revoked {
+                    cause: crate::member_copy_lifecycle::RevokedCause::MembershipEnded,
+                });
+            } else {
+                let next_path = dir.path().join("next.db");
+                let next = produce(&db, SCOPE_B, 1, &next_path).await;
+                if loss == "scope" {
+                    transport.push(replace_answer(&next.manifest, true, "incomplete"));
+                    transport.serve("incomplete", b"incomplete synthetic copy".to_vec());
+                    assert!(driver.refresh().await.is_err());
+                    let pending: serde_json::Value = serde_json::from_slice(
+                        &fs::read(vault_path.join(".native/state.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(pending["member_revoked"], true);
+                    for path in &owned {
+                        assert!(!vault_path.join(path).exists());
+                    }
+                    drop(driver);
+                    let mut retry_config = config.clone();
+                    retry_config.markdown_folder = Some(vault_path.clone());
+                    driver =
+                        MemberCopyDriver::new(retry_config, device_consumer(), transport.clone())
+                            .await
+                            .unwrap();
+                }
+                transport.push(replace_answer(&next.manifest, true, "next"));
+                transport.serve("next", fs::read(next_path).unwrap());
+                if loss == "account" {
+                    transport.set_account(crate::member_offline_fixtures::ACCT_A);
+                }
+            }
+            let disposition = driver.refresh().await.unwrap();
+            if loss == "scope" {
+                assert!(matches!(disposition, RefreshDisposition::Admitted { .. }));
+            } else {
+                assert!(matches!(disposition, RefreshDisposition::Removed { .. }));
+            }
+            assert_eq!(driver.serving.is_serving(), loss == "scope");
+            let state: serde_json::Value =
+                serde_json::from_slice(&fs::read(vault_path.join(".native/state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                state
+                    .get("member_revoked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                loss != "scope"
+            );
+            if loss != "scope" {
+                assert!(state["visible"].as_array().unwrap().is_empty());
+            } else {
+                assert!(!state["visible"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    state["successful_generation"],
+                    driver.serving.generation_id().unwrap()
+                );
+                assert!(
+                    state["successful_act"].is_null(),
+                    "member files contain no canonical act"
+                );
+                assert!(fs::read_to_string(vault_path.join(".native/STATUS.md"))
+                    .unwrap()
+                    .contains("not_held"));
+            }
+            if loss != "scope" {
+                assert!(state["files"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|entry| entry["contributors"].as_array().unwrap().is_empty()));
+            }
+            assert!(!fs::read_to_string(vault_path.join(".native/STATUS.md"))
+                .unwrap()
+                .contains("synthetic body"));
+            for path in &owned {
+                assert!(!vault_path.join(path).exists());
+            }
+            drop(driver);
+            let mut config = config;
+            config.markdown_folder = Some(vault_path);
+            let reopened = MemberCopyDriver::new(config, device_consumer(), transport)
+                .await
+                .unwrap();
+            assert_eq!(reopened.serving.is_serving(), loss == "scope");
+            db.close().await;
+        }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[tokio::test]
+    async fn native_member_vault_reattach_after_revocation_cancels_scope_recovery() {
+        use crate::member_copy_lifecycle::RevokedCause;
+        for cause in [
+            RevokedCause::MembershipEnded,
+            RevokedCause::RoleChanged,
+            RevokedCause::SessionRevoked,
+        ] {
+            let (db, origin) = world().await;
+            let dir = tempfile::tempdir().unwrap();
+            let first_path = dir.path().join("first.db");
+            let first = produce(&db, SCOPE_A, 1, &first_path).await;
+            let next_path = dir.path().join("next.db");
+            let next = produce(&db, SCOPE_B, 1, &next_path).await;
+            let transport = Arc::new(MockTransport::new(crate::member_offline_fixtures::ACCT_B));
+            transport.push(replace_answer(&first.manifest, false, "first"));
+            transport.serve("first", fs::read(first_path).unwrap());
+            let mut driver = MemberCopyDriver::new(
+                config(dir.path(), &origin),
+                device_consumer(),
+                transport.clone(),
+            )
+            .await
+            .unwrap();
+            driver.refresh().await.unwrap();
+            let source = crate::query::sql::member_vault_snapshot(
+                &driver.serving.database().unwrap(),
+                &driver.serving.account_token().unwrap(),
+                &origin,
+            )
+            .await
+            .unwrap();
+            let vault_path = dir.path().join("vault");
+            let mut publisher = crate::markdown_vault::Publisher::open(&vault_path).unwrap();
+            publisher.cycle(&source).unwrap();
+            drop(publisher);
+            driver.attach_markdown_vault(&vault_path).unwrap();
+            transport.push(replace_answer(&next.manifest, true, "incomplete"));
+            transport.serve("incomplete", b"incomplete synthetic copy".to_vec());
+            assert!(driver.refresh().await.is_err());
+            assert!(driver
+                .vault
+                .as_mut()
+                .unwrap()
+                .get_mut()
+                .unwrap()
+                .scope_rebind_pending(SCOPE_B));
+            // Detach the writer while scope recovery is pending. The real
+            // revocation must reach the copy lifecycle without touching vault.
+            drop(driver.vault.take());
+            transport.push(MemberCopyAnswer::Revoked { cause });
+            assert!(matches!(
+                driver.refresh().await.unwrap(),
+                RefreshDisposition::Removed { .. }
+            ));
+            let pending: serde_json::Value =
+                serde_json::from_slice(&fs::read(vault_path.join(".native/state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(pending["member_rebind_scope"], SCOPE_B);
+            driver.attach_markdown_vault(&vault_path).unwrap();
+            assert!(!driver
+                .vault
+                .as_mut()
+                .unwrap()
+                .get_mut()
+                .unwrap()
+                .has_scope_rebind());
+            transport.push(replace_answer(&next.manifest, true, "regrant"));
+            transport.serve("regrant", fs::read(next_path).unwrap());
+            assert!(matches!(
+                driver.refresh().await.unwrap(),
+                RefreshDisposition::Admitted { .. }
+            ));
+            let vault = driver.vault.as_mut().unwrap().get_mut().unwrap();
+            assert!(!vault.has_scope_rebind());
+            assert!(vault.cycle(&source).is_err());
+            let refused: serde_json::Value =
+                serde_json::from_slice(&fs::read(vault_path.join(".native/state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(refused["member_revoked"], true);
+            assert!(refused.get("member_rebind_scope").is_none());
+            assert!(refused["visible"].as_array().unwrap().is_empty());
+            drop(driver);
+            let mut reopened = crate::markdown_vault::Publisher::open(&vault_path).unwrap();
+            assert!(!reopened.has_scope_rebind());
+            assert!(reopened.cycle(&source).is_err());
+            db.close().await;
+        }
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    #[tokio::test]
+    async fn native_member_vault_range_revocation_purges_instead_of_recovering_old_copy() {
+        let (db, origin) = world().await;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("first.db");
+        let first = produce(&db, SCOPE_A, 1, &out).await;
+        let transport = Arc::new(MockTransport::new(crate::member_offline_fixtures::ACCT_B));
+        transport.push(replace_answer(&first.manifest, false, "first"));
+        transport.serve("first", fs::read(&out).unwrap());
+        let config = config(dir.path(), &origin);
+        let mut driver =
+            MemberCopyDriver::new(config.clone(), device_consumer(), transport.clone())
+                .await
+                .unwrap();
+        driver.refresh().await.unwrap();
+        let out2 = dir.path().join("second.db");
+        let next = produce(&db, SCOPE_A, 2, &out2).await;
+        transport.push(replace_answer(&next.manifest, false, "next"));
+        *transport.range_refusal.lock().unwrap() = Some(MemberCopyDownloadRefusal::Revoked {
+            cause: crate::member_copy_lifecycle::RevokedCause::MembershipEnded,
+        });
+        assert!(matches!(
+            driver.refresh().await.unwrap(),
+            RefreshDisposition::Removed { .. }
+        ));
+        assert!(!driver.serving.is_serving());
+        assert!(driver.serving.installed_generation_id().is_none());
+        drop(driver);
+        let reopened = MemberCopyDriver::new(config, device_consumer(), transport)
+            .await
+            .unwrap();
+        assert!(!reopened.serving.is_serving());
+        db.close().await;
     }
 
     /// `Revoked` preserves its cause as a `Removed` copy disposition; the old

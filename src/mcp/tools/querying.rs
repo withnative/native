@@ -404,7 +404,7 @@ fn parse_facet_op(
     Ok(op)
 }
 
-fn parse_facet_arg(
+pub(crate) fn parse_facet_arg(
     tool: &str,
     step_index: usize,
     facet_index: usize,
@@ -2689,10 +2689,25 @@ fn canonicalize_schema(value: Value, parent_key: Option<&str>) -> Value {
 
 #[derive(Debug)]
 pub(crate) enum SavedQueryInspection {
-    Valid { version: String, query: Value },
-    GovernedSql { definition: SavedSqlDefinition },
-    Invalid { diagnostic: String },
-    UnsupportedVersion { version: String, diagnostic: String },
+    Valid {
+        version: String,
+        query: Value,
+    },
+    GovernedSql {
+        definition: SavedSqlDefinition,
+    },
+    GovernedSqlPinned {
+        // Non-serving builds recognize the carrier and refuse its execution.
+        #[cfg_attr(not(feature = "v2-kernel-probe"), allow(dead_code))]
+        definition: crate::named_views::contract::SavedSqlV12,
+    },
+    Invalid {
+        diagnostic: String,
+    },
+    UnsupportedVersion {
+        version: String,
+        diagnostic: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -2978,6 +2993,20 @@ pub(crate) fn saved_governed_sql_write_issue(tool: &str, value: &Value) -> Optio
     if decoded.get("kind").and_then(Value::as_str) != Some("governed_sql") {
         return None;
     }
+    if decoded.get("v").and_then(Value::as_str) == Some("1.2") {
+        let pinned = serde_json::from_value::<crate::named_views::contract::SavedSqlV12>(decoded);
+        return match pinned {
+            Err(error) => Some(format!("{tool}: invalid pinned governed SQL: {error}")),
+            Ok(pinned) => match pinned.validate_current() {
+                Err(error) => Some(format!("{tool}: invalid pinned governed SQL: {error}")),
+                Ok(()) => saved_governed_sql_write_issue(
+                    tool,
+                    &serde_json::json!(serde_json::to_string(&pinned.static_shape())
+                        .expect("serializable SQL contract")),
+                ),
+            },
+        };
+    }
     if decoded.get("v").and_then(Value::as_str) != Some(SAVED_SQL_VERSION) {
         return None;
     }
@@ -3135,6 +3164,11 @@ fn validate_saved_sql_in(
     // query_sql from the serving pinned catalogue; a pinned definition can
     // never carry them. Dependency observation is alias-aware, so a
     // same-named CTE or literal never trips this.
+    if used_relations.contains("catalog_view_definitions") {
+        return Err(Error::engine(
+            "saved governed SQL cannot read 'catalog_view_definitions': caller-relative detail rows require standalone hosted ad-hoc query_sql",
+        ));
+    }
     if used_relations.contains("catalog_operations") {
         return Err(Error::engine(
             "saved governed SQL cannot read 'catalog_operations': serving catalogue rows resolve only in online executor ad-hoc query_sql",
@@ -3346,6 +3380,28 @@ fn inspect_saved_query_with(raw: Option<&str>, records_only: bool) -> SavedQuery
             version: legacy.v,
         };
     }
+    if decoded.get("v").and_then(Value::as_str) == Some("1.2")
+        && decoded.get("kind").and_then(Value::as_str) == Some("governed_sql")
+    {
+        let definition =
+            serde_json::from_value::<crate::named_views::contract::SavedSqlV12>(decoded);
+        return match definition {
+            Ok(definition) => match definition.validate_retained() {
+                Ok(()) if !records_only || definition.output.row_identity == ["id"] => {
+                    SavedQueryInspection::GovernedSqlPinned { definition }
+                }
+                Ok(()) => SavedQueryInspection::Invalid {
+                    diagnostic: "saved governed SQL Collection output must use id".into(),
+                },
+                Err(error) => SavedQueryInspection::Invalid {
+                    diagnostic: error.to_string(),
+                },
+            },
+            Err(error) => SavedQueryInspection::Invalid {
+                diagnostic: format!("invalid governed SQL v1.2: {error}"),
+            },
+        };
+    }
     if decoded.get("v").and_then(Value::as_str) == Some(SAVED_SQL_VERSION) {
         let definition: SavedSqlDefinition = match serde_json::from_value(decoded) {
             Ok(definition) => definition,
@@ -3477,7 +3533,9 @@ fn hydrate_has_query_filters_from_rows(
         };
         if matches!(
             inspection,
-            SavedQueryInspection::Valid { .. } | SavedQueryInspection::GovernedSql { .. }
+            SavedQueryInspection::Valid { .. }
+                | SavedQueryInspection::GovernedSql { .. }
+                | SavedQueryInspection::GovernedSqlPinned { .. }
         ) {
             capable.insert(id);
         }
@@ -3806,6 +3864,7 @@ async fn tree_siblings(
     exclude: &HashSet<String>,
     scope: Option<&HashSet<String>>,
     include_archived: bool,
+    exclude_predicate: Option<&str>,
 ) -> Result<Vec<Value>> {
     let home_ids: Vec<String> = {
         let mut seen = HashSet::new();
@@ -3840,6 +3899,9 @@ async fn tree_siblings(
     } else {
         ""
     };
+    let exclude_filter = exclude_predicate
+        .map(|predicate| format!("AND NOT ({predicate})"))
+        .unwrap_or_default();
     let sql = format!(
         "SELECT r.id, r.type, r.kind,
                 substr(r.name, 1, {name_chars}) AS name, r.home_id
@@ -3851,6 +3913,7 @@ async fn tree_siblings(
             {archived_filter}
             AND r.id NOT IN (SELECT value FROM json_each(?))
             {scope_filter}
+            {exclude_filter}
           ORDER BY r.name, r.id
           LIMIT ?"
     );
@@ -3907,16 +3970,28 @@ async fn tree_siblings(
 }
 
 pub(crate) async fn search(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+    search_excluding(db, caller, arguments, None).await
+}
+
+/// [`search`] that keeps records matching `exclude_predicate` out of the hits
+/// before any cap applies (see `FtsOptions::exclude_predicate`).
+pub(crate) async fn search_excluding(
+    db: Db,
+    caller: Caller,
+    arguments: Value,
+    exclude_predicate: Option<String>,
+) -> Result<Value> {
     const TOOL: &str = "search";
     let args: SearchArgs = parse_args(TOOL, arguments)?;
     let mut tx = db.write_pool().begin().await?;
-    let result = search_in(
+    let result = search_in_excluding(
         &mut tx,
         &caller,
         &args.query,
         args.scope.as_deref(),
         args.limit,
         args.include_archived.unwrap_or(false),
+        exclude_predicate,
     )
     .await;
     let cleanup = tx.rollback().await;
@@ -3946,6 +4021,21 @@ pub(crate) async fn search_in(
     limit: Option<i64>,
     include_archived: bool,
 ) -> Result<Value> {
+    search_in_excluding(tx, caller, query, scope, limit, include_archived, None).await
+}
+
+/// [`search_in`] with a trusted static predicate (see
+/// `FtsOptions::exclude_predicate`) that keeps matching records out of the
+/// hits before any cap applies.
+pub(crate) async fn search_in_excluding(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    caller: &Caller,
+    query: &str,
+    scope: Option<&str>,
+    limit: Option<i64>,
+    include_archived: bool,
+    exclude_predicate: Option<String>,
+) -> Result<Value> {
     const TOOL: &str = "search";
     if query.trim().is_empty() {
         return Err(Error::engine(format!("{TOOL}: 'query' must be non-empty")));
@@ -3958,6 +4048,7 @@ pub(crate) async fn search_in(
         limit: Some(limit),
         types: Vec::new(),
         member,
+        exclude_predicate,
     };
     let trusted_local_bypass = super::is_legacy_local(caller);
     let scope_set: Option<HashSet<String>> = match &opts.scope {
@@ -4038,6 +4129,8 @@ pub(crate) async fn search_in(
             limit: Some(NEAR_MISS_CAP),
             types: Vec::new(),
             member,
+            // The near misses are more candidates: held to the same exclusion.
+            exclude_predicate: opts.exclude_predicate.clone(),
         };
         let mut seen: HashSet<String> = hits.iter().map(|h| h.id.clone()).collect();
         let mut dedup = |mechanism_hits: Vec<SearchHit>| -> Vec<Value> {
@@ -4079,6 +4172,7 @@ pub(crate) async fn search_in(
             &seen,
             scope_set.as_ref(),
             opts.include_archived,
+            opts.exclude_predicate.as_deref(),
         )
         .await?;
         let any_near_miss = !(prefix.is_empty() && infix.is_empty() && siblings.is_empty());
@@ -4298,7 +4392,7 @@ pub(crate) async fn execute_saved_sql(
     output
 }
 
-fn finish_saved_sql(
+pub(crate) fn finish_saved_sql(
     definition: &SavedSqlDefinition,
     parameters: &[crate::query::sql_contract::QuerySqlParameter],
     origin: &str,
@@ -5549,6 +5643,7 @@ async fn scan(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
             // handler. The flag is derived rather than hardcoded so it cannot
             // silently disagree with the caller if scan is ever served.
             member: caller.is_member_copy(),
+            exclude_predicate: None,
         };
         let trusted_local_bypass = super::is_legacy_local(&caller);
         let count = fts::search_pool_count_with_policy_bypass(
@@ -6077,7 +6172,7 @@ mod governed_sql_tests {
             column_type: SavedSqlColumnType::Text,
             nullable: false,
         }];
-        let definition = SavedSqlDefinition {
+        let mut definition = SavedSqlDefinition {
             v: SAVED_SQL_VERSION.into(),
             kind: "governed_sql".into(),
             profile: SavedSqlProfile {
@@ -6108,6 +6203,16 @@ mod governed_sql_tests {
         let error =
             validate_saved_sql(&definition).expect_err("saved definitions cannot pin serving rows");
         assert!(error.to_string().contains("catalog_operations"), "{error}");
+        definition.sql =
+            "SELECT relation_name AS executor FROM catalog_view_definitions ORDER BY executor"
+                .into();
+        for validate in [validate_saved_sql, validate_stored_saved_sql] {
+            let error = validate(&definition).unwrap_err();
+            assert!(
+                error.to_string().contains("catalog_view_definitions"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -6628,8 +6733,8 @@ mod governed_sql_tests {
     #[test]
     fn unordered_limit_save_refusal_names_the_exact_default() {
         // E2: saving unordered top-level LIMIT still refuses everywhere, but
-        // names the default the ad-hoc path would apply. A nested-only
-        // unordered LIMIT refuses without it.
+        // names the default the ad-hoc path would apply. Nested levels
+        // name their own explicit ordering repairs.
         let sql = "SELECT name, id FROM records WHERE type = ?1 LIMIT 5";
         let raw = serde_json::to_string(&definition(sql, 10)).unwrap();
         let issue = saved_governed_sql_write_issue("test", &json!(raw))
@@ -6646,13 +6751,23 @@ mod governed_sql_tests {
             error.contains("the ad-hoc default would order by (name, id): add ORDER BY 1, 2"),
             "{error}"
         );
-        let nested = "SELECT * FROM (SELECT name, id FROM records LIMIT 1) s ORDER BY id";
+        let nested =
+            "SELECT * FROM (SELECT name, id FROM records WHERE type = ?1 LIMIT 1) s ORDER BY id";
         let nested_raw = serde_json::to_string(&definition(nested, 10)).unwrap();
         let nested_issue = saved_governed_sql_write_issue("test", &json!(nested_raw))
             .expect("nested unordered LIMIT save must refuse");
-        assert!(!nested_issue.contains("ad-hoc default"), "{nested_issue}");
-        // Top-level unordered over an unordered nest: the default would not
-        // cure it, so no repair suffix either.
+        assert!(
+            nested_issue.contains("in subquery s: add ORDER BY 1, 2"),
+            "{nested_issue}"
+        );
+        let nested_error = validate_saved_sql(&definition(nested, 10))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            nested_error.contains("in subquery s: add ORDER BY 1, 2"),
+            "{nested_error}"
+        );
+        // Mixed levels name both explicit fixes; execution still refuses.
         let combo =
             "SELECT * FROM (SELECT name, id FROM records WHERE type = ?1 LIMIT 1) s LIMIT 5";
         let combo_raw = serde_json::to_string(&definition(combo, 10)).unwrap();
@@ -6662,7 +6777,31 @@ mod governed_sql_tests {
             combo_issue.contains("LIMIT without ORDER BY"),
             "{combo_issue}"
         );
-        assert!(!combo_issue.contains("ad-hoc default"), "{combo_issue}");
+        assert!(
+            combo_issue.contains("in top level: add ORDER BY 1, 2"),
+            "{combo_issue}"
+        );
+        assert!(
+            combo_issue.contains("in subquery s: add ORDER BY 1, 2"),
+            "{combo_issue}"
+        );
+    }
+
+    #[test]
+    fn unordered_limit_save_keeps_e2_wording_for_unchecked_join_on() {
+        let sql = "SELECT r.id FROM records r JOIN links l ON l.id = (SELECT id FROM links LIMIT 1) LIMIT 5";
+        let mut saved = definition(sql, 10);
+        saved.parameters.clear();
+        let raw = serde_json::to_string(&saved).unwrap();
+        let issue = saved_governed_sql_write_issue("test", &json!(raw)).unwrap();
+        let error = validate_saved_sql(&saved).unwrap_err().to_string();
+        for refusal in [issue, error] {
+            assert!(
+                refusal.contains("the ad-hoc default would order by (id): add ORDER BY 1"),
+                "{refusal}"
+            );
+            assert!(!refusal.contains("in subquery"), "{refusal}");
+        }
     }
 
     #[test]
@@ -8495,6 +8634,73 @@ mod scan_scalability_tests {
             .iter()
             .map(|sample| sample["id"].as_str().expect("sample id").to_string())
             .collect()
+    }
+
+    /// The exclusion predicate must hold for the near-miss mechanisms a thin
+    /// search adds (name prefix, name infix, tree siblings) as well as for
+    /// the strict hits, or the excluded record comes back from whichever path
+    /// forgot it.
+    #[tokio::test]
+    async fn the_exclusion_predicate_holds_for_every_near_miss_mechanism() {
+        let db = create_database(":memory:").await.unwrap();
+        let folder = folder(&db, "Holding folder", None).await;
+        let hit = note(&db, "Zebrafinch strict", &folder).await;
+        let prefix = note(&db, "Zebrafinch prefix neighbour", &folder).await;
+        let infix = note(&db, "MyZebrafinchCamel", &folder).await;
+        // The strict hit has to carry the query term in its body or name.
+        sqlx::query("UPDATE records SET body = 'zebrafinch' WHERE id = ?")
+            .bind(&hit)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let caller = Caller::local();
+        let ids_in = |result: &Value, pointer: &str| -> Vec<String> {
+            result
+                .pointer(pointer)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|record| record["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let plain = search_excluding(
+            db.clone(),
+            caller.clone(),
+            json!({ "query": "zebrafinch" }),
+            None,
+        )
+        .await
+        .unwrap();
+        let near: Vec<String> = [
+            "/near_misses/name_prefix",
+            "/near_misses/name_infix",
+            "/near_misses/tree_siblings",
+        ]
+        .iter()
+        .flat_map(|pointer| ids_in(&plain, pointer))
+        .collect();
+        for id in [&prefix, &infix] {
+            assert!(
+                near.contains(id) || ids_in(&plain, "/hits").contains(id),
+                "fixture: {id} is reachable by some path: {plain}"
+            );
+        }
+        // Exclude each reachable record in turn: it appears nowhere.
+        for excluded in [&hit, &prefix, &infix] {
+            let result = search_excluding(
+                db.clone(),
+                caller.clone(),
+                json!({ "query": "zebrafinch" }),
+                Some(format!("r.id = '{excluded}'")),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !result.to_string().contains(excluded.as_str()),
+                "{excluded} was excluded but is in the result: {result}"
+            );
+        }
     }
 
     #[tokio::test]

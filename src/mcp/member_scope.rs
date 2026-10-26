@@ -155,6 +155,7 @@ pub const QUERY_SQL_SERVED_RELATIONS: &[&str] = &[
     "links",
     "facet_values",
     "facet_times",
+    "facet_keys",
     "bindings",
     "blobs",
     "vocabularies",
@@ -322,7 +323,8 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
             refused_write_actions: &["add", "remove"],
         },
         // §2.3(b) history (Richard's decision 1): refused, never partial.
-        K::GetHistory
+        K::ReadHcpAudit
+        | K::GetHistory
         | K::WhatsChanged
         | K::GetEventContext
         | K::GetRunActivity
@@ -352,6 +354,7 @@ pub(crate) const fn classify(kind: ToolKind) -> MemberScope {
         | K::ManageOnboarding
         | K::ManageChangeSummaries
         | K::ManageInterventions
+        | K::ManageNamedViews
         | K::ManageRendererBinding
         | K::ManageMdxModules
         | K::ManageArtifactInputs
@@ -422,8 +425,8 @@ mod tests {
             "ToolKind::ALL must not repeat a tool"
         );
         // The match has no wildcard arm, so a new ToolKind fails the build;
-        // this pins the current 88 and that no name repeats.
-        assert_eq!(ToolKind::ALL.len(), 90);
+        // this pins the current 92 and that no name repeats.
+        assert_eq!(ToolKind::ALL.len(), 92);
     }
 
     #[test]
@@ -457,6 +460,9 @@ mod tests {
         // exemption: it is Mutation, so it refuses as a write (§2.3(c))
         // before its history reason could apply.
         let unavailable = [
+            // Caller-private HCP audit needs the canonical sealed history;
+            // a member copy must refuse rather than claim a partial audit.
+            ToolKind::ReadHcpAudit,
             ToolKind::OutboxStatus,
             ToolKind::GetHistory,
             ToolKind::WhatsChanged,
@@ -473,6 +479,7 @@ mod tests {
             ToolKind::ResolveCitation,
             ToolKind::RenderSuggestionReview,
             ToolKind::ManageMessages,
+            ToolKind::ManageNamedViews,
             ToolKind::ManageParticipants,
             ToolKind::ReadCanvas,
             ToolKind::RenderArtifact,
@@ -499,7 +506,7 @@ mod tests {
             ToolKind::AuthorityActHead,
             ToolKind::AuthorityActDelta,
         ];
-        assert_eq!(unavailable.len(), 41);
+        assert_eq!(unavailable.len(), 43);
         for kind in unavailable {
             assert_eq!(
                 scope(kind),
@@ -808,6 +815,7 @@ mod tests {
                 "links",
                 "facet_values",
                 "facet_times",
+                "facet_keys",
                 "bindings",
                 "blobs",
                 "vocabularies",

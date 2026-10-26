@@ -26,6 +26,7 @@ use crate::node::hold;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::node) enum Halt {
     Empty,
+    EngineV2,
     Unreachable,
     ReadOnly,
     /// Hosted refused the node's credential (with this status, if it gave
@@ -106,6 +107,15 @@ impl WriteGate {
             let Some(entry) = self.journal.oldest_pending() else {
                 return Halt::Empty;
             };
+            if self.kernel_v2_upstream()
+                || if let Some(hooks) = hooks {
+                    !hooks.held_replay_allowed().await
+                } else {
+                    false
+                }
+            {
+                return Halt::EngineV2;
+            }
             if self.journal.hosted_pending_creator_of(&entry) {
                 return Halt::ReadOnly;
             }

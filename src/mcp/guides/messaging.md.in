@@ -58,18 +58,185 @@ threading repair is rejected because the reply context is part of what the
 message *is*: silently re-parenting it would rewrite conversation history
 under every reader who already saw the flat message.
 
+## Deleting your own message
+
+`manage_messages` `action:"delete"` with `message_id`, `idempotency_key` and
+`reason` withdraws one Message you authored. Only the author can delete: you
+need Edit on the Message, it must be owned by the Person bound to your
+account, and your credential must be the actor on its creation event, so another
+member who can edit the shared Collection cannot delete it,
+and a Message sent as a persona can be deleted only by its owner. A refusal is
+a plain error, never a silent no-op.
+
+Delete is the record tombstone, not erasure: the Message leaves every listing,
+reactions on it are refused, and its notification candidates are withdrawn, but
+its body stays in stored history. The same `idempotency_key` replays the first
+receipt; deleting an already-deleted Message under a new key is refused as
+already deleted (to its author; anyone else sees it as missing).
+
+A live reply may still point at a deleted parent. `list_context` keeps the
+reply and returns the parent in `deleted_parents` as a body-less stub
+(`id`, `deleted:true`, `body:null`, `created_at`, `deleted_at`) so a client can
+render "This message was deleted" in place. A deleted Message with no live
+replies appears nowhere. Stubs carry no name, author or audience, and appear
+only for a parent you could see before it was deleted; seeing the reply alone
+does not earn one.
+
+## Editing your own message
+
+`manage_messages` `action:"edit"` with `message_id`, `body`, `idempotency_key`
+and `reason` (and optionally `mentions`) replaces the text of one Message you
+authored. The authorship rule is exactly delete's: Edit on the Message and
+ownership by the Person bound to your account, backed by the credential that
+sent it (the actor recorded on the Message's creation event), so re-pointing an
+account at a Person does not hand over that Person's Messages. Another member
+who can edit
+the shared Collection cannot rewrite it, and a Message sent as a persona can be
+edited only by its owner. Refusals are plain errors.
+
+An edit is recorded as a `message.revision.recorded.v1` event on the same
+Message record; the generic `update_record` path still refuses to change a
+Message. The record's body becomes the new text and every earlier text stays in
+the history (`record.created` and each earlier revision). A client shows
+"(edited)" by counting those events in the `content_events` relation:
+`SELECT count(*), max(created_at_ms) FROM content_events WHERE record_id=? AND
+type='message.revision.recorded.v1'`. The receipt carries `edited_at` and
+`edit_count`.
+
+Nothing re-alerts: read state, awareness and notification candidates are
+untouched, and candidates carry no text so none can go stale. Structured
+mention spans index the body, so an edit re-establishes them. With `mentions`
+(same shape as send) the given set replaces the old one, but it may only name
+people the Message already mentioned: a new target would be a new alert, so it
+is refused and needs a new Message. Without `mentions`, existing mentions are relocated into the new text, so a
+typo fix ahead of an @mention does not lose it. In the order of their current
+spans, each mention's authored label is searched for after the previous match
+(from that match's start if the original spans overlapped, so overlapping
+mentions of different people both survive; otherwise from its end), and its span
+becomes the match's UTF-8 byte range. If a label appears more than once,
+matching is in order: the first acceptable occurrence after the previous match
+wins. An occurrence is acceptable only if it is not inside a fenced or inline
+code span or a URL (`http://` or `https://` up to whitespace), and it is bounded
+as the author wrote it: where the original mention stood against a non-word
+character or the edge of the body, so must the new one (Unicode letters, digits
+and `_` are word characters), so `Bob` never relocates into `Bobby`; and a label
+that followed an `@` must follow one again. Anything not found drops the
+mention. Targets never change and nobody is added. When an edit retires a
+mention, every outstanding mention candidate proposed for a dropped person is
+withdrawn (the person is the one the candidate's account was bound to when it
+was proposed, read from the audited binding ledger in act order, with the
+pre-cutover rows first).
+
+Refused: a deleted Message (named to its author, missing to anyone else), a
+blank body, a body identical to the current one, a Message whose audience was
+never declared, and a federated copy. The same `idempotency_key` replays the
+first receipt; the key on a different body is a conflict. Body size is bounded
+exactly as for send.
+
 ## Principal and record mentions
 
 `mentions` point at immutable prose from inside the same send.
 
 - `target_kind` is `principal` (a person) or `record` (any record).
-- A principal mention target must already be addressed in `addressed_to`.
+- A principal mention target must already be addressed in `addressed_to`,
+  with one exception: in a Collection-origin send you may mention a person
+  who can see that Collection without addressing them. The mention alerts
+  them; it adds no obligation, makes them no addressee, and does not narrow
+  who can read the post. A person who cannot see the Collection is refused.
+  Direct (DM) sends keep the addressed rule: a direct context's readers are
+  its exact participant set.
 - Each span is zero-based and half-open over UTF-8 bytes:
   `[span_start, span_end)` into `body`. Byte offsets, not character counts:
   both ends must be UTF-8 character boundaries and
   `body[span_start..span_end]` must equal `authored_label` byte-for-byte,
   including multibyte text. `span_end` must be greater than `span_start`, and
   `mention_id` values must be non-empty and unique within the send.
+
+## Reading messages: inbox, direct contexts, conversations
+
+`manage_messages.list_inbox` is the viewer-relative read for "my messages".
+`view: "browse"` lists every Message the viewer can see, **including the
+viewer's own sent Messages** (their `attention.unread` is false); `needs_me`
+and `all_new` leave sent Messages out because they carry no obligation and are
+never unread. Pages come from one pinned `snapshot`; continue with
+`after: next_after`. Today the snapshot covers every visible Message (at most
+10,000, otherwise the call refuses), so prefer `view: "needs_me"` or a
+`conversation_id` when you only need a slice.
+
+Since `native.message-inbox.v3` each item also carries `sender`,
+`participants`, `participant_count`, `reply_to_id` and `conversation`. They
+are resolved for the returned page when you fetch it, under your access at
+that moment, not frozen into the snapshot: a person or reply target you lose
+sight of between pages disappears from the later pages.
+
+- `sender` and each `participants[]` entry are `{person_id, name, viewer,
+  state:"person"}`. Use `viewer: true` to find your own slot; your own slot
+  has `name: null` if you cannot read your own Person record. A sender you
+  cannot see is the opaque `{person_id: null, name: null, viewer: false,
+  state: "hidden"}`. Account ids are never shown.
+- `participants` lists a direct context's participants **you can see**,
+  yourself first, then by Person id, at most 8. A member you cannot see has
+  no slot and is not counted: `participant_count` is the number you can see
+  (before the 8 cap), so group size is not disclosed beyond that. A legacy
+  Message (no declared origin) has no stored members, so it lists its sender
+  and `addressed_to` audience under the same rules. A note to self lists just
+  you. It is empty for a Collection Message.
+- `reply_to_id` is the Message this replies to, or `null` when there is none
+  or you cannot see it.
+- `conversation` is `{type, key?}`. A `collection` Message has
+  `key: "collection:<id>"` only when you can see that Collection, otherwise
+  just `{type: "collection"}`. A `direct` Message has **no key** yet: group
+  direct Messages by the participants you can see for now. A stable direct
+  conversation id (opaque and persisted) is planned as its own change. A
+  `legacy` Message has `{type: "legacy"}`. Your own Message authored in Unfiled (origin collection `native:unfiled`)
+  with no addressee is `{type: "self"}` (a note to self).
+
+Hosted and Desktop (kernel v2) answer with the same schema and the same
+identity rules. Desktop items no longer carry the raw `origin` or
+`communication_origin` fields, which listed every participant.
+
+**`scope: "direct"`** limits `list_inbox` to your own direct contexts: Messages
+whose declared direct origin names you (under any principal you have held,
+including retained aliases), plus legacy Messages (no declared origin) in
+Unfiled that you sent or were addressed in, plus your **notes to self**: your
+own Messages (owned by your Person, never merely sent by a principal that
+now resolves to you) authored in Unfiled (origin collection `native:unfiled`)
+with no `addressed_to`, whose Collection origin would otherwise exclude them (`conversation: {type: "self"}`, `participants` = you,
+`participant_count: 1`). Someone else's unaddressed Messages are never
+included, and neither are channel posts.
+Hosted selects them before any visibility or hydration work. Notes to self
+come from a keyed read of your own Messages in Unfiled, so other people's
+notes and your own channel posts do not scale it. Legacy Messages are found
+from your own sender and `addressed_to` audience rows, so that part costs
+O(your own sent and addressed Messages), not a constant: it grows with your
+traffic, never with other people's activity. On Desktop (kernel
+v2) selection is one scan of the stored message states (no kernel index yet),
+so it is O(messages in the workspace) with a small cost per row; the
+expensive per-message work still runs only for your DMs.
+
+Visibility is applied before the cap. It keeps at most 2000 **readable**
+candidates, newest first; unreadable or deleted Messages never use up the cap.
+The response carries `scope`, `candidate_cap` and `truncated`; `truncated:
+true` means more readable direct Messages exist than were kept. Which
+Messages a view contains is decided when the snapshot is built; every page,
+on every view, is hydrated when you fetch it, so a Message edited between
+pages shows its current content. A cursor is bound to its scope. `scope`
+cannot be combined with `conversation_id`, and a caller with no current member
+identity gets an error, not an empty list.
+`preview_chars` (1 to 1000) cuts each `body` and sets `body_truncated`; it
+defaults to 360 with `scope: "direct"` and is off (full body) otherwise.
+
+`manage_memberships.list` with `include_person: true` adds `person_name` to
+each member and shows `person_id` only for People you can see; a member whose
+Person you cannot see has `person_id: null` and `person_name: null`. It is
+served on hosted databases, not on a Desktop local node (which has no
+membership catalogue).
+
+`manage_messages.list_my_conversations` is **not** a direct-message list. It
+counts only Collection conversations that classified, readable Messages
+belong to, scanning all Messages with no paging, so a direct context never
+appears in it. Use `list_inbox` and group by `conversation.key` for direct
+contexts.
 
 ## Private read preferences
 
@@ -88,6 +255,29 @@ legacy awareness-derived unread. Archive and own human-authored Messages remain
 read, while persona-spoken Messages use the ordinary unread rule. Other
 preference actions preserve the override. These are caller-private writes and
 reads: they do not change shared message content or another viewer's state.
+
+## Arrival notifications
+
+A direct-context Message notifies each other participant, and a reply notifies
+the thread's participants (the root's author plus everyone who has replied),
+with a `routine_arrival` notification candidate. The sender is never notified,
+and a recipient who already holds a mention or obligation candidate for the
+Message keeps just that one. Muting any Message of a thread, or of the exact
+direct participant set, silences later arrivals in that conversation.
+
+`manage_messages.get_notification_preference` reads the caller's own arrival
+preference; `manage_messages.set_notification_preference` sets `arrival`, with
+`idempotency_key` and `reason`:
+
+- `"all"` (default): DMs and thread replies notify.
+- `"dms_and_mentions"`: only Messages sent in a direct context (DMs) notify,
+  and that includes a reply inside a DM. Replies in a channel thread do not.
+- `"off"`: no DM or thread-reply arrivals.
+
+The preference governs these arrivals only. Mentions, Messages that put an
+expectation on you, reminders you set and policy interventions always notify,
+whatever the preference. It is checked when the candidate is created and again
+when delivery harvests it, so a change also withholds arrivals already waiting.
 
 ## Complete examples
 
@@ -149,8 +339,11 @@ A Collection channel post and a reply to it. `✓` is three UTF-8 bytes, so in
 - **Mention span mismatch.** Offsets past the body end, ends that split a
   multibyte character, or a slice that differs from `authored_label` are
   refused. Count bytes, not characters, and copy the slice exactly.
-- **Unaddressed principal mention.** A principal mention whose target is not
-  in `addressed_to` is refused. Address them or drop the mention.
+- **Unaddressed principal mention.** In a direct send, a principal mention
+  whose target is not in `addressed_to` is refused: address them or drop the
+  mention. In a Collection-origin send it is allowed only for a person who can
+  see that Collection; otherwise it is refused, and granting them access is a
+  separate, deliberate step.
 - **Flat send sent by mistake.** The message cannot be re-parented. Send a new
   reply with a creation-time `reply_to` link; the flat message remains as
   authored history.

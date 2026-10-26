@@ -13,6 +13,10 @@ qualification remains a separate release concern.
 
 ## Release-pinned acquisition
 
+The 0.1.1 commands below describe the prepared Mac-capable candidate. They
+are not executable public delivery instructions until that exact wrapper and
+platform version are qualified and published. Public 0.1.0 selects Linux only.
+
 The supported laptop path is the `@withnative/standby` npm package at an
 exact version. Its platform-specific optional dependency contains a prebuilt
 `mcp-stdio`, plus a `native.standby-artifact.v1` manifest with the full
@@ -23,13 +27,13 @@ binary into an immutable versioned generation under
 not compile the repository.
 
 ```sh
-npx --package @withnative/standby@0.1.0 native-standby install
-npx --package @withnative/standby@0.1.0 native-standby configure \
+npx --package @withnative/standby@0.1.1 native-standby install
+npx --package @withnative/standby@0.1.1 native-standby configure \
   --replica-root "$HOME/.local/share/native-local" \
   --hosted-route ROUTE_DATABASE_ID \
   --origin-database-id ndb_DATABASE_ID \
   --mcp-config "$HOME/.config/mcp/config.json"
-npx --package @withnative/standby@0.1.0 native-standby verify --json
+npx --package @withnative/standby@0.1.1 native-standby verify --json
 ```
 
 The generated `native-local` entry launches the stable absolute path with
@@ -1241,3 +1245,249 @@ the audit is left to the operator.
   and freshness from agents.
 - Relying on tool discovery or filesystem mode alone: exact dispatch and an
   already-open writable connection remain bypasses.
+
+## Kernel v2 generations (HQ cutover N1)
+
+The standby artifact workflow includes `v2-kernel-probe`; local builds must
+name that feature too. Such a node can follow either engine. The authenticated
+hosted head identifies the engine; changing from v1 to v2 requests a fresh FULL
+snapshot through the existing nonoverlapping refresh controller and cooldown.
+It never applies a v2 delta to a v1 generation. A build without
+`v2-kernel-probe` still recognizes the v2 head for journal safety, but pauses
+refresh before any FULL request and discloses
+`engine v2 requires v2-kernel-probe build`. This applies to cold and warm nodes.
+At the switch, the newest verified v1 generation is durably pinned outside the
+normal current-plus-two retention budget until explicit operator release.
+Automatic hot fallback from v2 to v1 is refused.
+
+V2 uses `native.standby-snapshot-manifest.kernel-v2.v1`, the NKV2 file marker,
+immutable genesis identity, content/meta sequence heads, act head, blob count,
+and the compiled owned schema digest and projection inventory. Imported HQ
+keeps the unambiguous source origin recorded in its retained v1 snapshot
+provenance; a native v2 workspace derives its origin from its genesis UUID.
+The v1 frontier is empty in a v2 manifest and has no v2 continuity meaning.
+Catalog engine and file marker must agree. Both reader and refresh writer refuse
+an incompatible marker or owned schema; read opens never stamp, repair or migrate.
+
+`native.standby-kernel-v2-delta.v1` is a separate canonical document over whole
+acts, transported through the existing authenticated, route/origin-pinned MCP
+and chunked HTTP paths. It carries content/meta event tails, their causal
+frontiers and only the immutable CAS rows missing from the node's verified
+base. The node supplies sorted SHA-256 keys (at most 65,536; an 8 MiB bounded
+HTTP start request), never old blob bytes. This covers unbound additions and
+bytes used outside attachment-bound events. The receiver checksums only newly
+ingested rows. Blob-only deltas are supported without folding when event heads
+are unchanged. Oversize new-blob/event transfers use the
+existing disclosed FULL fallback and unchanged nonoverlapping six-hour FULL
+cooldown; N1 does not bypass or shorten that cooldown. A verified base with
+more than 65,536 blobs requests FULL with a disclosed
+`kernel_v2_blob_inventory_limit` reason instead of stopping the follower.
+
+The receiver checks available space for two database sizes plus the 256 MiB
+delta spool before copying the current database into private staging. If the
+reserve is unavailable, it defers with `insufficient_disk`; it does not ask
+hosted for a delta or FULL capture, or spend the six-hour FULL cooldown. A
+subsequent FULL attempt from an installed v2 base also checks a three-database
+reserve plus spool before any hosted capture. Operators can restore headroom
+and retry; the verified serving generation remains available meanwhile.
+
+The receiver copies the current database into private staging and opens a writer
+only on that scratch file. It checks destination schema, contiguous acts and
+sequences, then commits events, causal rows, act head and incremental kernel
+projection updates in one scratch transaction. It runs the same replay projectors
+on only the new meta events followed by the new content events, and refreshes
+search rows for affected records. FULL/repair replay still rebuilds all
+projections, reading content in bounded pages. The hosted delta carries a
+projection digest over every logical projection table discovered in
+`sqlite_master`, excluding only enumerated canonical authority/blob tables
+and FTS shadow storage, plus the hosted MCP adapter's durable write receipt
+ledger and `kernel_legacy_sql_progress`. The latter is a derived scan cursor:
+explicit preparation can advance it outside the event fold, so its position is
+not content-equivalence evidence. Legacy SQL header rows in
+`kernel_legacy_sql_events` remain covered, together with app custody, installs,
+package sources, consent revocations, install outcomes and actions. Schema and
+readiness validation and the existing SQL completeness guard still apply to
+the cursor; excluding it does not bypass those guards.
+The receipt ledger is lazily created with exact compiled DDL and carries no
+read projection; v2 shape validation admits it without treating it as event
+history. The node computes that same digest after the fold and
+requests FULL with `kernel_v2_projection_divergence` if it differs. This is a
+full scan on hosted cut and scratch verification, so its wall time still scales
+with projection bytes; it does not read canonical event history or blob bytes.
+It verifies the resulting coordinates and bytes and
+uses normal generation admission, fsync, durable directory publication and atomic
+pointer replacement. Existing readers keep their leased prior file throughout;
+no replay transaction writes or locks a serving v2 database. Aborted staging work
+is never a serving candidate. Derived manifests disclose `materialization: delta`
+while their files remain immutable, hash-verified checkpoints.
+
+Delta folding scales with the new events; copying, the full projection digest
+and byte/integrity verification still scale with database or projection size.
+The closed replay output is moved into staging and then into publication on
+the same filesystem, eliminating two redundant database-sized copies. Budget
+**about three additional database sizes of transient disk** for FULL and two
+for a delta, including staging, the private writer's WAL and publication work,
+on top of the current generation, two retained priors and the pinned v1
+rollback generation. Allow further space for growth and a bounded 256 MiB
+delta spool. Interrupted `kernel-replay-*` directories and
+`kernel-delta-*`/`kernel-manifest-*` files are removed on controller startup
+under its attempt lock; they never become serving candidates.
+
+Qualification sample (20 October 2026, shared host, dev workspace O0 / dependency
+O1): a fresh `v1_import --all --history` from main `e80c486908a3747b0ba89fb6f2124a4a487fad5d`,
+merged into the N1 branch, ran on a private snapshot COPY. It emitted
+308,335 content events, 8 meta events, 11,681 records and 1,092 blobs
+(82,684,130 encoded blob bytes), including 208 app-custody rows and
+123,228 legacy SQL headers. Import took 5,147.7 seconds and
+returned exit 0 with `capture_complete=true`, zero mismatches, no refusals and
+no review entries. Reviewed source accounting explicitly counted 50 deleted
+records and one v1-invisible record.
+
+The schema-derived dump covers all 53 included logical projection tables
+and 455,320 base rows. The admitted base matched hosted. After a chunked loopback
+delta added ten records and one unbound 4 KiB blob, every included table
+matched between incremental and hosted, incremental and independent FULL,
+and hosted before and after FULL. That FULL repair took
+2,421.3 seconds and peaked at 671,736 KiB RSS. The full projection
+digest scan took 5.386 seconds; hosted cut and scratch verification each run
+one complete scan. The derived SQL scan cursor is excluded as explained above.
+
+The delta took **54.007 seconds end to end**, with 245,644 KiB peak RSS.
+Its allocated disk rose from 9,105,215,488 to 12,319,277,056 bytes:
+3,214,061,568 transient bytes, about one admitted database size
+(3,210,690,560 bytes). Process logical read/write I/O was
+50,076,139,443 / 6,802,524,222 bytes; storage-accounted read/write I/O was
+0 / 6,339,174,400 bytes, with reads benefiting from page cache. The measured
+tree contained the raw source copy, hosted database and one admitted base;
+it did not model two retained priors or pinned v1. Initial FULL capture and
+admission used 9,632,083,968 additional allocated bytes, about three database
+sizes. Retain every generation required by the runbook, plus the conservative
+two-database-plus-spool delta reserve or three-database-plus-spool FULL reserve.
+The observed delta peak is not a safe capacity floor. These loopback dev
+measurements are not a freshness SLA. The temporary copies were deleted
+after comparison.
+
+### Disposable VM cache/pressure rehearsal (20 October 2026)
+
+[Sanitized counts and timings](https://github.com/withnative/native-ce/blob/9a01a15d184054da464aa9a93e43e4edc8b7db4d/docs/standby-v2-vm-qualification-2026-10-20.json)
+record a separate release-profile rehearsal on this VM. A fresh private v1
+snapshot **copy** was imported with `--all --history` at merged N1 `2a410a331`
+(4,195.2 seconds; capture complete; zero mismatches, refusals or review entries),
+then explicitly prepared and exercised at `6607aa3cf` after merging main.
+The base had 308,335 content events, 8 meta events, 11,681 records, 1,092 blobs
+and 54 logical projection tables / 455,320 rows. The admitted file was
+3,210,711,040 bytes; its full projection digest took 4.256 seconds.
+
+A disposable loopback source process used the real owner head/delta exporters,
+spool and ranged transport. A separate harness process ran the production
+refresh controller and daemon, publishing immutable generations in `/tmp`.
+This is a transport/controller rehearsal, not a full hosted authentication
+deployment or a measurement of the installed VM node. The source and current
+copy were fsynced and given file-specific `posix_fadvise(DONTNEED)` for cold
+runs; system-wide caches were untouched. Each direct delta added ten synthetic
+records and one unbound 4 KiB blob. The daemon added another ten records after
+its first publication to force a second update.
+
+| Condition | Delta through atomic publication | Peak RSS, MiB |
+| --- | ---: | ---: |
+| Warm, unconstrained private scope | 46.83 s | 201.7 |
+| File-evicted, unconstrained private scope | 50.37 s | 193.6 |
+| File-evicted, memory-high 4 GiB / maximum 8 GiB | 67.86 s | 216.0 |
+
+RSS is the whole process run through the subsequent offline-read check; the
+controller's high-water marks immediately after delta publication were
+153.3 / 153.4 / 154.9 MiB, and the separate source process used
+110.0 / 109.9 / 115.1 MiB. File cache is additional: the constrained scope hit
+its 4 GiB high watermark and recorded 28,695 high-pressure events, with no OOM.
+The 125 GiB VM still had substantial globally available memory; this was a
+deliberately constrained private cache budget while other builds/agents ran,
+not a claim that the whole VM was memory-starved. The co-located source also
+shares this budget; a remote source would not consume the node's local cache.
+
+Controller logical reads were about 45.2 GB per direct delta. Its
+storage-accounted reads rose from 0 warm, to 3.21 GB cold, to 14.73 GB under
+pressure. These counters exclude the separate source's I/O. Peak additional
+allocated disk was about **5.77 GB (1.8 admitted database sizes)**, including
+open, unlinked SQLite temporary files in the owned process tree. The earlier
+tree-only sample did not count those files. FULL admission used 9.58 GB
+additional disk. Keep the conservative two-database-plus-spool delta reserve
+and three-database-plus-spool FULL reserve, plus retained generations/growth.
+
+With the normal 60-second tick and unchanged persisted rest, the constrained
+daemon published at 75.15 and 237.80 seconds: **162.65 seconds between
+publications**. Reported frontier ages at publication were 75.15 and 102.74
+seconds; the prior copy reached about 237.80 seconds old before replacement.
+No updates overlapped. This two-update observation is not a cadence or
+freshness SLA. Unchanged authenticated heads can confirm freshness without a
+new file; the measured workload kept changes pending.
+
+During a hosted outage, no new hosted changes reach the copy. Its age keeps
+increasing from the last successful authenticated confirmation. Against the
+300-second RPO, the observed pre-replacement age would have only about
+62 seconds remaining before `beyond_rpo`; immediately after the second
+publication it would have about 197 seconds. Inspect actual status instead of
+assuming a one-minute-old copy. The live node's configuration and age were
+neither inspected nor changed.
+
+The unconstrained cold result is below the older 54-second development-profile
+sample; those different profiles do not establish a cache-only speedup.
+The constrained result suggests preserving file-cache headroom before a storage
+redesign. Reflink was unsupported on this test filesystem. A possible later
+optimization is an indexed, all-column comparison for the immutable prefix in
+place of `EXCEPT`'s temporary B-tree; it must retain the complete prefix proof
+and mutation/refusal tests. No cooldown or verification rule changed here.
+
+**Read qualification gap:** deltas published successfully, but the HQ-sized
+ordinary standby `get_record` probe refused with JSON-RPC `-32603` / SQLite
+code 9 (`interrupted`). The installed release binary reproduced it; small
+fixtures pass. Composed read staging has a two-second deadline. This rehearsal
+does not qualify ordinary HQ-sized outage MCP reads or identify the commit
+that introduced the scale limitation. Do not bypass its authorization or
+deadline checks to claim qualification. The vault's separate unbounded internal
+collector result is recorded in [N2 delivery qualification](https://github.com/withnative/native-ce/blob/9a01a15d184054da464aa9a93e43e4edc8b7db4d/docs/v2-continuity-n2-n3.md).
+All private snapshot/generation/vault copies and disposable package homes were
+deleted after retaining the sanitized evidence.
+
+One attempt lock covers copy through publication; concurrent requests are skipped/coalesced with `refresh_in_progress`
+or the normal accepted/coalesced response. After an attempt the node rests for
+at least 60 seconds and at least the preceding update's wall time, persisted
+across restarts. `kernel_v2_replay_cooldown` is disclosed while waiting; manual
+requests cannot bypass this delta rest. FULL capture cooldown semantics are
+unchanged. A deliberate deep audit also uses scratch.
+
+Run v2 probes locally with `RUST_MIN_STACK=67108864`, including
+`kernel_v2_switch_fetches_fresh_generation_and_retains_v1_for_rollback`.
+
+Outage reads use KernelV2 with physically read-only pools and the same serving
+bundle, leases, status and age/RPO disclosures as v1. Bootstrap suppresses run
+persistence; an echoed key establishes no new canonical run. These source
+changes do not install or qualify a live node or establish a freshness SLA.
+
+Holding v1 journal envelopes is disabled after a validated v2 upstream head.
+An actively served v2 copy also disables holding during an outage. The engine
+observation persists across restarts, and hold validation/drain consult only
+that monitor flag. They issue no compatibility head probes; v1 retains its
+existing confirm-down check and drain behavior. Existing pending entries remain on disk, unsent, for
+explicit resolution or rollback. `node_status.holding` reports
+`kernel_v2_upstream_drain_first`. Drain pending writes before the hosted engine
+switch; N1 does not convert or replay journal entries into v2.
+
+
+### Explicit v2-to-v1 operator recovery
+
+If hosted rolls back to v1, the node refuses the v1 snapshot and stays on its
+last v2 copy. Status reports the failed engine transition and the copy's actual
+age; it does not declare the v2 copy synchronized with v1. After independently
+confirming the hosted v1 rollback, stop the reader and refresh controller using
+the installation runbook. With the installed release-stamped binary, run:
+
+```sh
+mcp-stdio --standby-release-v1-pin <standby-config.json> --switch-back
+```
+
+This verifies the retained v1 generation, atomically selects it, then releases
+the pin; restart the reader/controller afterwards. Startup and orphan handoff
+respect the selected engine, so retained v2 files cannot undo this explicit
+rollback. It never deletes a generation
+or replays a v1 journal into v2. To release retention protection without changing
+the selected engine after the rollback window ends, omit `--switch-back`.

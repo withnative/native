@@ -1,0 +1,63 @@
+{
+  "provenance": {
+    "source": "experiments/alpha-tab-proof-packages/roadmap-base-descriptor.json",
+    "source_sha256": "951413ce28daeca7bbe1c2ad3a49b832cb60859d0a93990996caa9451f863dcc",
+    "purpose": "Public declaration-only SQL parity fixture; contains no workspace data or bundle source."
+  },
+  "declaration": {
+    "needs": [
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.tasks",
+        "label": "Your 200 most recently active tasks that belong to an epic: status, area, epic, counts, summary",
+        "sql": "WITH shared_records AS MATERIALIZED (SELECT id, type, kind, name, lifecycle, summary, home_id, created_at, last_activity_at, deleted_at FROM records), shared_links AS MATERIALIZED (SELECT source_id, target_id, relationship FROM links), shared_areas AS MATERIALIZED (SELECT record_id, value FROM facet_values WHERE key = 'area') SELECT r.id, r.name, r.lifecycle, r.summary, (SELECT f.value FROM shared_areas f WHERE f.record_id = r.id) AS area, (SELECT e.id FROM shared_links l JOIN shared_records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = 'part_of' AND e.kind = 'epic' ORDER BY e.id LIMIT 1) AS epic_id, (SELECT e.name FROM shared_links l JOIN shared_records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = 'part_of' AND e.kind = 'epic' ORDER BY e.id LIMIT 1) AS epic_name, (SELECT COUNT(*) FROM shared_links l JOIN shared_records c ON c.id = l.source_id WHERE l.target_id = r.id AND l.relationship = 'part_of' AND c.kind = 'comment') AS comments, r.created_at, r.last_activity_at FROM shared_records r WHERE r.type = 'WorkItem' AND r.kind = 'task' AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM shared_links p JOIN shared_records e ON e.id = p.target_id WHERE p.source_id = r.id AND p.relationship = 'part_of' AND e.kind = 'epic') ORDER BY r.last_activity_at DESC, r.id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.epics",
+        "label": "Epics with their folder and task counts",
+        "sql": "WITH shared_records AS MATERIALIZED (SELECT id, type, kind, name, lifecycle, summary, home_id, created_at, last_activity_at, deleted_at FROM records), shared_links AS MATERIALIZED (SELECT source_id, target_id, relationship FROM links) SELECT e.id, e.name, e.lifecycle, (SELECT h.name FROM shared_records h WHERE h.id = e.home_id) AS folder, (SELECT COUNT(*) FROM shared_links l JOIN shared_records t ON t.id = l.source_id WHERE l.target_id = e.id AND l.relationship = 'part_of' AND t.kind = 'task' AND t.deleted_at IS NULL) AS tasks, (SELECT COUNT(*) FROM shared_links l JOIN shared_records t ON t.id = l.source_id WHERE l.target_id = e.id AND l.relationship = 'part_of' AND t.kind = 'task' AND t.deleted_at IS NULL AND t.lifecycle IN ('completed', 'closed')) AS done, e.created_at, e.last_activity_at FROM shared_records e WHERE e.type = 'WorkItem' AND e.kind = 'epic' AND e.deleted_at IS NULL ORDER BY e.last_activity_at DESC, e.id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.decisions",
+        "label": "Your 200 most recently active decisions with summary and link counts",
+        "sql": "WITH shared_records AS MATERIALIZED (SELECT id, type, kind, name, lifecycle, summary, home_id, created_at, last_activity_at, deleted_at FROM records), shared_links AS MATERIALIZED (SELECT source_id, target_id, relationship FROM links) SELECT r.id, r.name, r.lifecycle, r.summary, (SELECT COUNT(*) FROM shared_links l JOIN shared_records t ON t.id = l.source_id WHERE l.target_id = r.id AND l.relationship = 'implements' AND t.kind = 'task') AS implemented_by, (SELECT COUNT(*) FROM shared_links l WHERE l.source_id = r.id OR l.target_id = r.id) AS link_count, r.created_at, r.last_activity_at FROM shared_records r WHERE r.type = 'Resolution' AND r.kind = 'decision' AND r.deleted_at IS NULL ORDER BY r.last_activity_at DESC, r.id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.dependencies",
+        "label": "Which of those tasks depend on which other tasks",
+        "sql": "WITH shared_records AS MATERIALIZED (SELECT id, type, kind, name, lifecycle, summary, home_id, created_at, last_activity_at, deleted_at FROM records), shared_links AS MATERIALIZED (SELECT source_id, target_id, relationship FROM links) SELECT l.source_id, l.target_id, t.name AS target_name FROM shared_links l JOIN shared_records t ON t.id = l.target_id WHERE l.relationship = 'depends_on' AND t.deleted_at IS NULL AND l.source_id IN (SELECT r.id FROM shared_records r WHERE r.type = 'WorkItem' AND r.kind = 'task' AND r.deleted_at IS NULL AND EXISTS (SELECT 1 FROM shared_links p JOIN shared_records e ON e.id = p.target_id WHERE p.source_id = r.id AND p.relationship = 'part_of' AND e.kind = 'epic') ORDER BY r.last_activity_at DESC, r.id LIMIT 200) ORDER BY l.source_id, l.target_id LIMIT 200"
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.record_body",
+        "label": "Complete selected record source and identity; NULL originals remain read-only",
+        "sql": "SELECT id, name, type, kind, body, length(body) AS body_length, 'full' AS body_source FROM records WHERE id = ?1 AND ((type = 'WorkItem' AND kind IN ('task', 'epic')) OR (type = 'Resolution' AND kind = 'decision')) AND deleted_at IS NULL ORDER BY id LIMIT 1",
+        "params": [
+          {
+            "name": "record_id",
+            "type": "text",
+            "max_len": 128,
+            "required": true
+          }
+        ]
+      },
+      {
+        "need": "sql.snapshot.v1",
+        "key": "base.title_targets",
+        "label": "Up to 200 task, epic or decision IDs eligible for title edits; exact input binding still required",
+        "sql": "SELECT r.id FROM records r WHERE r.deleted_at IS NULL AND ((r.type = 'WorkItem' AND r.kind = 'epic') OR (r.type = 'Resolution' AND r.kind = 'decision') OR (r.type = 'WorkItem' AND r.kind = 'task' AND EXISTS (SELECT 1 FROM links l JOIN records e ON e.id = l.target_id WHERE l.source_id = r.id AND l.relationship = 'part_of' AND e.kind = 'epic'))) ORDER BY r.last_activity_at DESC, r.id LIMIT 200"
+      }
+    ],
+    "effects": [
+      {
+        "effect": "records.title-set.v1",
+        "target": {
+          "need": "base.title_targets"
+        }
+      }
+    ]
+  }
+}

@@ -29,6 +29,17 @@ pub(super) enum Health {
     RevisionUnsupported,
 }
 impl Health {
+    /// The word `node_status` reports for this health.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Unreachable => "unreachable",
+            Self::AuthRefused => "auth_refused",
+            Self::ProtocolFailed => "protocol_failed",
+            Self::RevisionUnsupported => "revision_unsupported",
+        }
+    }
+
     /// Hosted counts as down only when it is actually unreachable. A
     /// reachable hosted that answers malformedly (`ProtocolFailed`), refuses
     /// credentials (`AuthRefused`) or authors an unreadable revision
@@ -92,6 +103,8 @@ impl Floor {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Persisted {
+    #[serde(default)]
+    kernel_v2: bool,
     binding: Binding,
     floor: Floor,
     discovery: BTreeMap<String, Discovery>,
@@ -101,6 +114,9 @@ struct State {
     health: Health,
     persistence_failed: bool,
     health_epoch: u64,
+    /// A probe (or a failed forward) has settled `health` at least once. Before
+    /// that, `Reachable` is only the optimistic starting value.
+    checked: bool,
     /// Sticky revision-compatibility flag, separate from connectivity.
     /// Set when a validated probe shows hosted authoring an unreadable
     /// interchange revision; retained through later outages and cleared
@@ -155,6 +171,7 @@ impl StateFile {
                 state
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Persisted {
+                kernel_v2: false,
                 binding,
                 floor: Floor::default(),
                 discovery: BTreeMap::new(),
@@ -281,8 +298,20 @@ pub(super) fn start_standby(config: &NodeConfig) -> Result<Option<NodeStandby>> 
         }
         return Ok(None);
     }
+    #[cfg(test)]
+    if let Some(identity) = TEST_CONSUMER_IDENTITY.lock().unwrap().clone() {
+        return start_standby_with_identity(config, identity);
+    }
     start_standby_with_identity(config, observe_installed_consumer_identity()?)
 }
+
+/// Test seam: a local build is stamped `dev` and cannot serve a standby
+/// generation, so a test that runs the whole `serve` path names the consumer
+/// identity to use. Only `serve` with a standby config consults it.
+#[cfg(test)]
+pub(crate) static TEST_CONSUMER_IDENTITY: std::sync::Mutex<
+    Option<crate::standby_snapshot::ObservedInstalledConsumerIdentity>,
+> = std::sync::Mutex::new(None);
 
 fn start_standby_with_identity(
     config: &NodeConfig,
@@ -374,6 +403,21 @@ fn start_standby_with_identity(
 }
 
 impl Failover {
+    /// How the node last found hosted, for `node_status`: the connectivity
+    /// health (reachable / unreachable / auth_refused / protocol_failed /
+    /// revision_unsupported) and the sticky interchange-revision flag. Last
+    /// observed, not a fresh probe.
+    pub(super) async fn hosted_summary(&self) -> Value {
+        let state = self.state.lock().await;
+        json!({
+            "health": state.health.as_str(),
+            // False until the first probe (or failed forward) has settled it:
+            // `reachable` before that is only the starting assumption.
+            "checked": state.checked,
+            "revision_unsupported": state.revision_unsupported,
+        })
+    }
+
     pub(super) fn new(
         upstream: Arc<Upstream>,
         dispatcher: StandbyDispatcher,
@@ -425,6 +469,7 @@ impl Failover {
                 health: Health::Reachable,
                 persistence_failed: false,
                 health_epoch: 0,
+                checked: false,
                 revision_unsupported: false,
             }),
             file,
@@ -436,6 +481,9 @@ impl Failover {
         })
     }
     pub(super) fn with_gate(mut self, gate: Option<Arc<WriteGate>>) -> Self {
+        if let Some(gate) = &gate {
+            gate.set_kernel_v2_upstream(self.state.get_mut().persisted.kernel_v2);
+        }
         self.gate = gate;
         self
     }
@@ -523,8 +571,21 @@ impl Failover {
         }
         .await;
         let mut state = self.state.lock().await;
+        state.checked = true;
+        let local_kernel_v2 = self.dispatcher.serving_kernel_v2();
+        if local_kernel_v2 && !state.persisted.kernel_v2 {
+            state.persisted.kernel_v2 = true;
+            if let Some(gate) = &self.gate {
+                gate.set_kernel_v2_upstream(true);
+            }
+            self.persist(&mut state);
+        }
         match result {
             Ok(head) => {
+                state.persisted.kernel_v2 = head.head().is_kernel_v2() || local_kernel_v2;
+                if let Some(gate) = &self.gate {
+                    gate.set_kernel_v2_upstream(state.persisted.kernel_v2);
+                }
                 if state.health_epoch == epoch {
                     if state.health != Health::Reachable {
                         self.hint_refresh(RefreshCause::NetworkRecovery);
@@ -813,6 +874,7 @@ impl Failover {
             let mut state = self.state.lock().await;
             state.health = failure;
             state.health_epoch += 1;
+            state.checked = true;
         }
         let read = target.as_ref().is_some_and(|(e, o, _)| {
             e != "bootstrap" && self.local_row(e, o).is_some_and(|r| r["access"] == "read")
@@ -1001,6 +1063,21 @@ impl Failover {
 }
 
 impl gate::Outage for Failover {
+    fn held_replay_allowed(&self) -> gate::Ready<'_, bool> {
+        Box::pin(async {
+            if self.dispatcher.serving_kernel_v2() {
+                let mut state = self.state.lock().await;
+                state.persisted.kernel_v2 = true;
+                if let Some(gate) = &self.gate {
+                    gate.set_kernel_v2_upstream(true);
+                }
+                self.persist(&mut state);
+                return false;
+            }
+            !self.state.lock().await.persisted.kernel_v2
+        })
+    }
+
     fn known_unreachable(&self) -> gate::Ready<'_, bool> {
         Box::pin(async { self.state.lock().await.health == Health::Unreachable })
     }

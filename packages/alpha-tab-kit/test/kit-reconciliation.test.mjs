@@ -17,10 +17,15 @@ const bound={effect:'records.body-set.v1',max_body_bytes:100,target:{need:sql.ke
 const errors=p=>p.findings.filter(f=>f.severity==='error');
 const refusal='body feature plans require a separately qualified Cookie host executor; runInstall refuses before source writes';
 
-test('all eight main269 default/chunked/icon/removal plans remain exact independent oracles',()=>{
+test('all eight main269 plans differ only by intentional source confirmation',()=>{
   assert.equal(oracles.main,'269dbff08890a36ef660945970665bac601627c0');
   // The oracles are the raw-body routes of main 269; the default is now gzip+base64, so pin utf8.
-  for(const v of oracles.legacy) assert.deepEqual(planInstall({...v.input,bodyEncoding:'utf8'}),v.plan,v.name);
+  for(const v of oracles.legacy) {
+    const actual=planInstall({...v.input,bodyEncoding:'utf8'});
+    assert.equal(actual.steps[0].arguments.confirm,true,v.name);
+    delete actual.steps[0].arguments.confirm;
+    assert.deepEqual(actual,v.plan,v.name);
+  }
 });
 
 test('all three qualified root feature plans retain every byte except fresh UUID field',()=>{

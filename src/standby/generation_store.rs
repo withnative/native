@@ -13,7 +13,12 @@ use crate::standby_snapshot::{
 };
 
 mod consumer_rebind;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+mod kernel_delta;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) use kernel_delta::{is_kernel_disk_refusal, kernel_disk_budget, INSUFFICIENT_DISK};
 mod maintenance;
+mod v1_pin;
 mod verification_status;
 pub use consumer_rebind::ConsumerRebind;
 
@@ -301,6 +306,11 @@ impl GenerationStore {
             {
                 generations.retain(|generation| {
                     generation.id != current.id
+                        // Engine switches require an explicitly published pointer.
+                        // In particular, do not undo an operator's v1 rollback
+                        // by rediscovering retained v2 files as durable orphans.
+                        && generation.manifest.kernel_v2.is_some()
+                            == current.manifest.kernel_v2.is_some()
                         && compare_generation_newest_first(generation, &current)
                             == std::cmp::Ordering::Less
                 });
@@ -370,11 +380,7 @@ impl GenerationStore {
             }
             match compare_generation_newest_first(&generation, &previous) {
                 std::cmp::Ordering::Less => {
-                    if !generation
-                        .manifest
-                        .frontier
-                        .is_componentwise_non_regressing_from(&previous.manifest.frontier)?
-                    {
+                    if !generation.manifest.frontier_follows(&previous.manifest)? {
                         return Err(Error::engine(
                             "standby durable successor regresses accepted state",
                         ));
@@ -388,11 +394,7 @@ impl GenerationStore {
                     // Fully prove that the desired generation preserves this
                     // candidate too, then finish its pinned readiness. The
                     // actual serving floor below still forbids hot downgrades.
-                    if !previous
-                        .manifest
-                        .frontier
-                        .is_componentwise_non_regressing_from(&generation.manifest.frontier)?
-                    {
+                    if !previous.manifest.frontier_follows(&generation.manifest)? {
                         return Err(Error::engine(
                             "standby moving acceptance diverges from candidate",
                         ));
@@ -411,10 +413,7 @@ impl GenerationStore {
                 .await?;
             if previous.manifest != predecessor.generation.manifest
                 || previous.id == generation.id
-                || !generation
-                    .manifest
-                    .frontier
-                    .is_componentwise_non_regressing_from(&previous.manifest.frontier)?
+                || !generation.manifest.frontier_follows(&previous.manifest)?
                 || chrono::DateTime::parse_from_rfc3339(&generation.manifest.captured_at)
                     .map_err(|_| Error::engine("invalid standby capture time"))?
                     < chrono::DateTime::parse_from_rfc3339(&previous.manifest.captured_at)
@@ -505,6 +504,38 @@ impl GenerationStore {
             #[cfg(test)]
             verification_pause: Default::default(),
         })
+    }
+
+    /// Read-only: would [`GenerationStore::open`] accept the directories that
+    /// already exist under `root`? Applies the same path and directory rules,
+    /// in the same order, without creating or changing anything. Levels that do
+    /// not exist are skipped (`open` creates them 0700) and the rest are still
+    /// checked, so a partial tree is judged as `open` would judge it.
+    /// `Ok(false)` means nothing exists there yet.
+    /// `native setup` asks this before it writes any config.
+    pub fn check_existing_root(root: &Path) -> Result<bool> {
+        require_unambiguous_store_path(root)?;
+        let accepted = root.join("accepted");
+        let mut found = false;
+        for directory in [
+            root.to_path_buf(),
+            accepted.clone(),
+            accepted.join("staging"),
+            accepted.join("generations"),
+            accepted.join("leases"),
+            accepted.join("heads"),
+        ] {
+            // A missing level is one `open` would create 0700; the levels
+            // below it may still exist and be wrong, so keep going.
+            match fs::symlink_metadata(&directory) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            check_private_directory(&directory)?;
+            found = true;
+        }
+        Ok(found)
     }
 
     pub fn staging_dir(&self) -> PathBuf {
@@ -804,6 +835,9 @@ impl GenerationStore {
                 continue;
             }
             if let Some(current) = &current {
+                if candidate.manifest.kernel_v2.is_some() != current.manifest.kernel_v2.is_some() {
+                    continue;
+                }
                 if compare_generation_newest_first(candidate, current) != std::cmp::Ordering::Less {
                     break;
                 }
@@ -819,10 +853,7 @@ impl GenerationStore {
                 }
             };
             if let Some(current) = &current {
-                if !candidate
-                    .manifest
-                    .frontier
-                    .is_componentwise_non_regressing_from(&current.manifest.frontier)?
+                if !candidate.manifest.frontier_follows(&current.manifest)?
                     || verify_database_successor(&current.snapshot_path, &candidate.snapshot_path)
                         .await
                         .is_err()
@@ -927,6 +958,23 @@ impl GenerationStore {
         snapshot: &Path,
         manifest_path: &Path,
         observed: &ObservedInstalledConsumerIdentity,
+        transition: F,
+    ) -> Result<InstalledGeneration>
+    where
+        F: FnMut(PublishTransition) -> Result<()>,
+    {
+        self.install_staged_with_hook_mode(snapshot, manifest_path, observed, false, transition)
+            .await
+    }
+
+    // Only the private, closed scratch-delta witness may transfer ownership.
+    // FULL/download callers always retain the copy-based admission path.
+    async fn install_staged_with_hook_mode<F>(
+        &self,
+        snapshot: &Path,
+        manifest_path: &Path,
+        observed: &ObservedInstalledConsumerIdentity,
+        take_snapshot: bool,
         mut transition: F,
     ) -> Result<InstalledGeneration>
     where
@@ -943,7 +991,12 @@ impl GenerationStore {
         set_mode(&publishing, 0o700)?;
         let owned_snapshot = publishing.join("snapshot.db");
         let owned_manifest = publishing.join("manifest.json");
-        copy_into_owned_file(snapshot, &owned_snapshot)?;
+        if take_snapshot {
+            fs::rename(snapshot, &owned_snapshot)?;
+            File::open(&owned_snapshot)?.sync_all()?;
+        } else {
+            copy_into_owned_file(snapshot, &owned_snapshot)?;
+        }
         copy_into_owned_file(manifest_path, &owned_manifest)?;
         File::open(&publishing)?.sync_all()?;
         File::open(&generations)?.sync_all()?;
@@ -979,9 +1032,20 @@ impl GenerationStore {
                 .as_ref()
                 .map(|head| head.head_act)
                 .or(current_manifest.head_act);
-            let replaceable = head
-                .as_ref()
-                .is_some_and(|head| head.advanced_in_place() || head.full_refresh_required)
+            let switching_to_v2 =
+                current_manifest.kernel_v2.is_none() && manifest.kernel_v2.is_some();
+            if switching_to_v2 {
+                self.pin_newest_v1(observed).await?;
+            }
+            if current_manifest.kernel_v2.is_some() && manifest.kernel_v2.is_none() {
+                return Err(Error::engine(
+                    "v2 to v1 generation rollback requires the explicit rollback procedure",
+                ));
+            }
+            let replaceable = switching_to_v2
+                || head
+                    .as_ref()
+                    .is_some_and(|head| head.advanced_in_place() || head.full_refresh_required)
                 || current_manifest.is_other_engine_revision();
             if replaceable {
                 // Without a known act there is no floor to hold the candidate
@@ -999,7 +1063,14 @@ impl GenerationStore {
                 // this build's full verification.
                 if manifest.hosted_route_database_id != current_manifest.hosted_route_database_id
                     || manifest.origin_database_id != current_manifest.origin_database_id
-                    || manifest.head_act.unwrap_or_default() < held_act
+                    || manifest
+                        .kernel_v2
+                        .as_ref()
+                        .zip(current_manifest.kernel_v2.as_ref())
+                        .is_some_and(|(next, prior)| {
+                            next.genesis_event_id != prior.genesis_event_id
+                        })
+                    || (!switching_to_v2 && manifest.head_act.unwrap_or_default() < held_act)
                 {
                     return Err(Error::engine(
                         "standby candidate fails act-order/continuity fence",
@@ -1017,9 +1088,7 @@ impl GenerationStore {
                 .await?;
                 if manifest.hosted_route_database_id != current_manifest.hosted_route_database_id
                     || manifest.origin_database_id != current_manifest.origin_database_id
-                    || !manifest
-                        .frontier
-                        .is_componentwise_non_regressing_from(&current_manifest.frontier)?
+                    || !manifest.frontier_follows(current_manifest)?
                 {
                     return Err(Error::engine(
                         "standby candidate fails scalar rollback/continuity fence",
@@ -1322,7 +1391,9 @@ impl GenerationStore {
             keep.insert(generation.id.clone());
         }
         for generation in ordered {
-            if keep.contains(&generation.id) {
+            if keep.contains(&generation.id)
+                || self.pinned_v1_generation().ok().flatten().as_deref() == Some(&generation.id)
+            {
                 continue;
             }
             let lease = match open_generation_lease(&self.root.join("leases"), &generation.id) {
@@ -1353,6 +1424,11 @@ impl GenerationStore {
     fn remove_published_generation(&self, id: &str) -> Result<()> {
         if !is_generation_id(id) {
             return Err(Error::engine("invalid standby generation id"));
+        }
+        if self.pinned_v1_generation()?.as_deref() == Some(id) {
+            return Err(Error::engine(
+                "v1 rollback generation is pinned; explicit operator release required",
+            ));
         }
         let generations = self.root.join("generations");
         let source = generations.join(id);
@@ -1783,6 +1859,11 @@ impl GenerationStore {
         &self,
         generation: &InstalledGeneration,
     ) -> Result<Option<crate::Db>> {
+        if generation.manifest.kernel_v2.is_some() {
+            return Err(Error::engine(
+                "v2 replay requires a scratch generation, never the serving file",
+            ));
+        }
         let mut head = self
             .generation_head(&generation.id)?
             .unwrap_or_else(|| GenerationHead::checkpoint(generation));
@@ -2084,6 +2165,21 @@ fn verify_snapshot_byte_identity(
     Ok(())
 }
 
+async fn validate_generation_shape(path: &Path, manifest: &StandbySnapshotManifest) -> Result<()> {
+    if manifest.kernel_v2.is_some() {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        {
+            super::kernel_v2::verify_path(path).await?;
+            return Ok(());
+        }
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        return Err(Error::engine(
+            "kernel-v2 generation requires v2-kernel-probe",
+        ));
+    }
+    crate::db::validate_current_engine_shape_immutable(path).await
+}
+
 async fn verify_snapshot_contents(
     path: &Path,
     manifest: &StandbySnapshotManifest,
@@ -2113,7 +2209,7 @@ async fn verify_snapshot_contents(
         let copy = scratch_dir.path().join("snapshot.db");
         verification_phase("advanced-consistent-copy", consistent_copy(path, &copy)).await?;
         verification_phase("engine-advanced-state", async {
-            crate::db::validate_current_engine_shape_immutable(&copy).await?;
+            validate_generation_shape(&copy, manifest).await?;
             validate_advanced_state(&copy, manifest).await
         })
         .await?;
@@ -2124,7 +2220,7 @@ async fn verify_snapshot_contents(
         })
         .await?;
         verification_phase("engine-manifest-state", async {
-            crate::db::validate_current_engine_shape_immutable(path).await?;
+            validate_generation_shape(path, manifest).await?;
             crate::standby_snapshot::validate_completed_export_manifest(path, manifest).await?;
             Ok(())
         })
@@ -2155,9 +2251,16 @@ async fn verify_snapshot_database(path: &Path) -> Result<()> {
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
                 .fetch_one(&mut raw)
                 .await?;
-        let embeddings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
             .fetch_one(&mut raw)
             .await?;
+        let embeddings: i64 = if marker == crate::db::V2_APPLICATION_ID {
+            0
+        } else {
+            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+                .fetch_one(&mut raw)
+                .await?
+        };
         raw.close().await?;
         if integrity != "ok" || foreign_key_violation != 0 || embeddings != 0 {
             return Err(Error::engine(
@@ -2212,6 +2315,33 @@ async fn verify_snapshot_contents_deep(
     scratch_parent: &Path,
     advanced: bool,
 ) -> Result<()> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if manifest.kernel_v2.is_some() {
+        verify_snapshot_contents(path, manifest, observed, scratch_parent, advanced).await?;
+        let scratch = tempfile::Builder::new()
+            .prefix(".audit-v2-")
+            .tempdir_in(scratch_parent)?;
+        let copy = scratch.path().join("audit.db");
+        consistent_copy(path, &copy).await?;
+        let db = crate::db::open_kernel_v2_head_writer(&copy).await?;
+        let result: Result<()> = async {
+            let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+                .fetch_one(db.pool())
+                .await?;
+            if integrity != "ok" {
+                return Err(Error::engine("kernel-v2 audit integrity failed"));
+            }
+            let before = crate::kernel::dump_all_kernel_tables(&db).await?;
+            crate::kernel::replay_all_projections(&db).await?;
+            if before != crate::kernel::dump_all_kernel_tables(&db).await? {
+                return Err(Error::engine("kernel-v2 audit projection replay differs"));
+            }
+            Ok(())
+        }
+        .await;
+        db.close().await;
+        return result;
+    }
     if advanced {
         verification_phase("advanced-manifest-consumer-identity", async {
             require_regular_no_symlink(path)?;
@@ -2231,7 +2361,7 @@ async fn verify_snapshot_contents_deep(
         let copy = scratch_dir.path().join("snapshot.db");
         verification_phase("advanced-consistent-copy", consistent_copy(path, &copy)).await?;
         verification_phase("engine-advanced-state", async {
-            crate::db::validate_current_engine_shape_immutable(&copy).await?;
+            validate_generation_shape(&copy, manifest).await?;
             validate_advanced_state(&copy, manifest).await
         })
         .await?;
@@ -2242,7 +2372,7 @@ async fn verify_snapshot_contents_deep(
         })
         .await?;
         verification_phase("engine-manifest-state", async {
-            crate::db::validate_current_engine_shape_immutable(path).await?;
+            validate_generation_shape(path, manifest).await?;
             crate::standby_snapshot::validate_completed_export_manifest(path, manifest).await?;
             Ok(())
         })
@@ -2277,9 +2407,16 @@ async fn verify_snapshot_database_deep(
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
                 .fetch_one(&mut raw)
                 .await?;
-        let embeddings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+        let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
             .fetch_one(&mut raw)
             .await?;
+        let embeddings: i64 = if marker == crate::db::V2_APPLICATION_ID {
+            0
+        } else {
+            sqlx::query_scalar("SELECT COUNT(*) FROM embeddings")
+                .fetch_one(&mut raw)
+                .await?
+        };
         raw.close().await?;
         if integrity != "ok" || foreign_key_violation != 0 || embeddings != 0 {
             return Err(Error::engine(
@@ -2387,6 +2524,10 @@ async fn consistent_copy(source: &Path, destination: &Path) -> Result<()> {
 /// An advanced copy keeps its checkpoint's identity and schema and never
 /// falls behind the checkpoint's act.
 async fn validate_advanced_state(path: &Path, manifest: &StandbySnapshotManifest) -> Result<()> {
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if manifest.kernel_v2.is_some() {
+        return super::kernel_v2::validate_manifest(path, manifest, true).await;
+    }
     let options = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)
@@ -2435,7 +2576,38 @@ async fn verify_database_successor_contents(current: &Path, candidate: &Path) ->
         .bind(candidate.to_string_lossy().as_ref())
         .execute(&mut conn)
         .await?;
-    for table in SEQUENCED_LOGS.iter().chain(UNSEQUENCED_APPEND_ONLY) {
+    let before: i64 = sqlx::query_scalar("PRAGMA main.application_id")
+        .fetch_one(&mut conn)
+        .await?;
+    let after: i64 = sqlx::query_scalar("PRAGMA candidate.application_id")
+        .fetch_one(&mut conn)
+        .await?;
+    if before != crate::db::V2_APPLICATION_ID && after == crate::db::V2_APPLICATION_ID {
+        // Authenticated FULL acquisition is the engine switch boundary. The
+        // manifest already binds route and imported source origin. Keep v1 on
+        // disk; the two engines' acts and row shapes are incomparable.
+        conn.close().await?;
+        return Ok(());
+    }
+    if before == crate::db::V2_APPLICATION_ID && after != before {
+        return Err(Error::engine("v2 generation cannot hot-fall back to v1"));
+    }
+    let v2_tables = [
+        "content_events",
+        "meta_events",
+        "kernel_blobs",
+        "content_event_causal_frontier",
+    ];
+    let tables: Vec<&str> = if before == crate::db::V2_APPLICATION_ID {
+        v2_tables.to_vec()
+    } else {
+        SEQUENCED_LOGS
+            .iter()
+            .chain(UNSEQUENCED_APPEND_ONLY)
+            .copied()
+            .collect()
+    };
+    for table in tables {
         let sql = format!(
             "SELECT EXISTS(SELECT * FROM main.{table} EXCEPT SELECT * FROM candidate.{table})"
         );
@@ -2451,7 +2623,11 @@ async fn verify_database_successor_contents(current: &Path, candidate: &Path) ->
             );
         }
     }
-    for table in UNFENCED_EXACT {
+    for table in if before == crate::db::V2_APPLICATION_ID {
+        &["act_cutover", "content_event_causal_cutover"][..]
+    } else {
+        UNFENCED_EXACT
+    } {
         for (left, right) in [("main", "candidate"), ("candidate", "main")] {
             let sql = format!(
                 "SELECT EXISTS(SELECT * FROM {left}.{table} EXCEPT SELECT * FROM {right}.{table})"
@@ -2668,6 +2844,13 @@ fn create_private_directory(path: &Path) -> Result<()> {
         fs::create_dir(path)?;
         set_mode(path, 0o700)?;
     }
+    check_private_directory(path)
+}
+
+/// What the store requires of a directory that already exists: a real
+/// directory (not a symlink) with no group or other access. Shared by
+/// [`create_private_directory`] and [`GenerationStore::check_existing_root`].
+fn check_private_directory(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(Error::engine("standby store path is not a directory"));
@@ -2832,6 +3015,39 @@ pub(crate) mod tests {
             engine_schema_version: crate::CURRENT_ENGINE_SCHEMA_VERSION,
             ddl_sha256: crate::schema::FROZEN_DDL_SHA256.into(),
         }
+    }
+
+    #[test]
+    fn check_existing_root_judges_a_partial_tree_as_open_does() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap().join("replica");
+        // A private accepted/, staging missing, and a group-readable
+        // generations/ below the gap: open would create staging, then refuse
+        // generations. The read-only check must not stop at the gap.
+        fs::create_dir_all(root.join("accepted/generations")).unwrap();
+        for private in [root.clone(), root.join("accepted")] {
+            fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::set_permissions(
+            root.join("accepted/generations"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(GenerationStore::check_existing_root(&root).is_err());
+        assert!(
+            !root.join("accepted/staging").exists(),
+            "the check creates nothing"
+        );
+        assert!(GenerationStore::open(&root, "route", None).is_err());
+        // Repaired, the same partial tree passes both.
+        fs::set_permissions(
+            root.join("accepted/generations"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        assert!(GenerationStore::check_existing_root(&root).unwrap());
+        assert!(GenerationStore::open(&root, "route", None).is_ok());
     }
 
     pub(crate) fn observed() -> ObservedInstalledConsumerIdentity {

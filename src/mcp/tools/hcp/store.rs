@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::provenance::Channel;
 
 use super::model::{Catalog, Definition, CATALOG_CONTRACT};
-use super::native_block::{self, Accepted, Attribution, Origin, Via, Writer};
+use super::native_block::{self, Accepted, Attribution, Decided, Origin, Via, Writer};
 use crate::mcp::registry::Caller;
 
 pub(super) const FACET_ROLE: &str = "hcp.role";
@@ -54,7 +54,7 @@ pub(super) const FACET_CLIENT: &str = "hcp.client";
 pub(super) const FACET_CORRELATION: &str = "hcp.correlation";
 pub(super) const FACET_CONFIDENCE: &str = "hcp.confidence";
 pub(super) const FACET_EVIDENCE: &str = "hcp.evidence";
-const CATALOG_ROLE: &str = "preference-catalog";
+pub(super) const CATALOG_ROLE: &str = "preference-catalog";
 
 /// Upper bound on the evidence object a client may attach to one value.
 pub(super) const MAX_EVIDENCE_BYTES: usize = 16 * 1024;
@@ -135,7 +135,7 @@ pub(super) struct Context {
     /// The person record behind the caller's account, and its name.
     pub person_id: Option<String>,
     pub person_name: Option<String>,
-    references: HashMap<String, Option<String>>,
+    pub(super) references: HashMap<String, Option<String>>,
 }
 
 impl Context {
@@ -172,6 +172,22 @@ impl Context {
 pub(super) struct BodyEvent {
     pub id: String,
     pub body: String,
+    /// When the event was recorded, for Layer 3 `acceptedBy.at`.
+    pub created_at: Option<String>,
+}
+
+/// A move to `maturity: decided`, and the body-setting event that was current
+/// when it was made.
+pub(super) struct Decision {
+    pub event_id: String,
+    pub at: Option<String>,
+    pub body_event_id: String,
+}
+
+/// What one walk of a record's history established.
+pub(super) struct HistoryView {
+    pub body: BodyEvent,
+    pub decision: Option<Decision>,
 }
 
 /// The confidence and `native` block of one active value.
@@ -235,7 +251,7 @@ fn guarded_body_set(
     args
 }
 
-fn cell<'v>(row: &'v Value, columns: &[String], name: &str) -> Option<&'v Value> {
+pub(super) fn cell<'v>(row: &'v Value, columns: &[String], name: &str) -> Option<&'v Value> {
     match row {
         Value::Object(map) => map.get(name),
         Value::Array(cells) => columns
@@ -246,14 +262,14 @@ fn cell<'v>(row: &'v Value, columns: &[String], name: &str) -> Option<&'v Value>
     }
 }
 
-fn text(row: &Value, columns: &[String], name: &str) -> String {
+pub(super) fn text(row: &Value, columns: &[String], name: &str) -> String {
     cell(row, columns, name)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
 }
 
-fn optional_text(row: &Value, columns: &[String], name: &str) -> Option<String> {
+pub(super) fn optional_text(row: &Value, columns: &[String], name: &str) -> Option<String> {
     cell(row, columns, name)
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -269,7 +285,32 @@ fn number(row: &Value, columns: &[String], name: &str) -> Option<f64> {
 
 /// Marks a future as a write to Native, so the store knows when a later error
 /// leaves it unknown whether the change landed.
-trait Committed<T>: std::future::Future<Output = Result<T>> + Sized {
+pub(super) trait Committed<T>: std::future::Future<Output = Result<T>> + Sized {
+    /// Like [`Self::committed`], for writes whose every failure must be read
+    /// as "may have committed" unless it is certified, **by its variant**, to
+    /// have been raised before anything was written: a guard `Conflict`, or the
+    /// deployment's read-only fence. An `Engine` error is not enough, because
+    /// Native raises one for a refusal and also for a failure after the commit
+    /// (the compact receipt's display-reference lookup, for example), and
+    /// nothing structural tells those apart.
+    fn committed_strict(self, store: &Store<'_>) -> impl std::future::Future<Output = Result<T>> {
+        async move {
+            store.in_flight.store(true, Ordering::SeqCst);
+            let result = self.await;
+            match &result {
+                Ok(_) => {
+                    store.committed.fetch_add(1, Ordering::SeqCst);
+                    store.in_flight.store(false, Ordering::SeqCst);
+                }
+                Err(Error::Conflict(_) | Error::DeploymentReadOnly(_)) => {
+                    store.in_flight.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {}
+            }
+            result
+        }
+    }
+
     fn committed(self, store: &Store<'_>) -> impl std::future::Future<Output = Result<T>> {
         async move {
             store.in_flight.store(true, Ordering::SeqCst);
@@ -323,14 +364,18 @@ impl<'a> Store<'a> {
         }
     }
 
-    fn reason(&self, what: &str) -> String {
+    pub(super) fn reason(&self, what: &str) -> String {
         format!(
             "HCP {what} via client {} (correlation {})",
             self.client, self.correlation_id
         )
     }
 
-    async fn query(&self, sql: &str, parameters: Vec<Value>) -> Result<(Vec<String>, Vec<Value>)> {
+    pub(super) async fn query(
+        &self,
+        sql: &str,
+        parameters: Vec<Value>,
+    ) -> Result<(Vec<String>, Vec<Value>)> {
         let result = Box::pin(super::super::querying::query_sql(
             self.db.clone(),
             self.caller.clone(),
@@ -697,7 +742,7 @@ impl<'a> Store<'a> {
             .is_empty())
     }
 
-    fn record_id(created: &Value) -> Result<String> {
+    pub(super) fn record_id(created: &Value) -> Result<String> {
         created
             .get("id")
             .and_then(Value::as_str)
@@ -1049,11 +1094,13 @@ impl<'a> Store<'a> {
         }))
     }
 
-    /// Attribution annotations that speak about exactly this revision of the
-    /// value, about this person, still standing.
-    async fn attributions_for(
+    /// The same lookup for an arbitrary record body (Layer 3 reuses the
+    /// slice-3 derivation for any `Resolution/*` record, not just
+    /// preferences). HCP facets never apply here: no client or evidence.
+    async fn attributions_for_body(
         &self,
-        record: &PrefRecord,
+        id: &str,
+        body: &str,
         context: &Context,
         body_event_id: &str,
     ) -> Result<Vec<Attribution>> {
@@ -1063,7 +1110,7 @@ impl<'a> Store<'a> {
         let read = Box::pin(super::super::attribution::read_attributions(
             self.db.clone(),
             self.caller.clone(),
-            json!({ "bearer_id": record.id, "limit": ATTRIBUTION_WINDOW }),
+            json!({ "bearer_id": id, "limit": ATTRIBUTION_WINDOW }),
         ))
         .await;
         let result = match read {
@@ -1072,7 +1119,7 @@ impl<'a> Store<'a> {
             Err(Error::Engine(_)) => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let digest = sha256_hex(&record.body);
+        let digest = sha256_hex(body);
         let mut found = Vec::new();
         for claim in result["attributions"].as_array().into_iter().flatten() {
             let target = &claim["target"];
@@ -1129,28 +1176,110 @@ impl<'a> Store<'a> {
     /// (the body moved between loading it and looking here), so provenance
     /// is never reported for a different value.
     async fn origin_of(&self, record: &PrefRecord, context: &Context) -> Result<Option<Origin>> {
+        self.origin_of_body(
+            &record.id,
+            &record.body,
+            record
+                .client
+                .clone()
+                .map(|client| (client, record.evidence.clone())),
+            context,
+        )
+        .await
+    }
+
+    /// Where the current body of an arbitrary record came from (Layer 3).
+    /// `hcp` carries the record's `hcp.client`/`hcp.evidence` facets when it
+    /// has them (preferences, exactly as Layer 1 passes them); otherwise
+    /// `None` and no HCP evidence applies.
+    /// Returns the origin with the body-producing event's time, or `None`
+    /// when the body moved under the read, exactly like [`Self::origin_of`].
+    pub(super) async fn origin_for(
+        &self,
+        id: &str,
+        body: &str,
+        hcp: Option<(String, Option<String>)>,
+        context: &Context,
+    ) -> Result<Option<(Origin, Option<String>)>> {
+        self.origin_of_body_at(id, body, hcp, context).await
+    }
+
+    async fn origin_of_body(
+        &self,
+        id: &str,
+        body: &str,
+        hcp: Option<(String, Option<String>)>,
+        context: &Context,
+    ) -> Result<Option<Origin>> {
+        self.origin_of_body_at(id, body, hcp, context)
+            .await
+            .map(|result| result.map(|(origin, _)| origin))
+    }
+
+    async fn origin_of_body_at(
+        &self,
+        id: &str,
+        body: &str,
+        hcp: Option<(String, Option<String>)>,
+        context: &Context,
+    ) -> Result<Option<(Origin, Option<String>)>> {
         let mut origin = Origin::default();
-        let Some(body_event) = self.latest_body_event(&record.id).await? else {
-            return Ok(Some(origin));
+        // One snapshot of the history answers every question below, so what is
+        // said about the body and about its acceptance can never come from two
+        // different moments.
+        let Some(view) = self.history_view(id).await? else {
+            return Ok(Some((origin, None)));
         };
-        if body_event.body != record.body {
+        let body_event = view.body;
+        if body_event.body != body {
             return Ok(None);
         }
+        super::pause("origin_after_history_read").await;
         origin.writer = self.writer_of_event(&body_event.id).await?;
         match &origin.writer {
             Some(writer) if writer.is_hcp() => {
-                origin.client = record.client.clone();
-                origin.evidence = parse_evidence(record.evidence.as_ref());
+                if let Some((client, evidence)) = hcp {
+                    origin.client = Some(client);
+                    origin.evidence = parse_evidence(evidence.as_ref());
+                }
             }
             Some(writer) => {
                 origin.accepted = self.accepted_producer(&body_event, writer).await?;
             }
             None => {}
         }
+        if origin.accepted.is_none() {
+            // A decision endorses the body that was current when it was made. It
+            // counts only if that is the body being described.
+            if let Some(decision) = view
+                .decision
+                .filter(|decision| decision.body_event_id == body_event.id)
+            {
+                origin.decided = self.decided_by(decision).await?;
+            }
+        }
         origin.attributions = self
-            .attributions_for(record, context, &body_event.id)
+            .attributions_for_body(id, body, context, &body_event.id)
             .await?;
-        Ok(Some(origin))
+        Ok(Some((origin, body_event.created_at)))
+    }
+
+    /// Who recorded one history event, under slice-3 disclosure: `None` when
+    /// no valid attestation covers it or Native hides the actor from this
+    /// caller. `person` names the account holder.
+    pub(super) async fn actor_for_event(
+        &self,
+        event_id: &str,
+        person: &str,
+    ) -> Result<Option<Value>> {
+        let Some(writer) = self.writer_of_event(event_id).await? else {
+            return Ok(None);
+        };
+        let origin = Origin {
+            writer: Some(writer),
+            ..Origin::default()
+        };
+        Ok(native_block::recorded_by(&origin, person))
     }
 
     /// What accepting suggestions did to produce the body, when a
@@ -1168,7 +1297,7 @@ impl<'a> Store<'a> {
         body_event: &BodyEvent,
         body_writer: &Writer,
     ) -> Result<Option<Accepted>> {
-        if !body_writer.operation.starts_with("resolve_suggestions") {
+        if !body_writer.resolves_suggestions() {
             return Ok(None);
         }
         let outputs = sqlx::query(
@@ -1238,6 +1367,131 @@ impl<'a> Store<'a> {
                 None
             },
         }))
+    }
+
+    /// Who made `decision`, from the attestation of that event: `None` when no
+    /// valid attestation covers it.
+    async fn decided_by(&self, decision: Decision) -> Result<Option<Decided>> {
+        let Decision { event_id, at, .. } = decision;
+        let Some(writer) = self.writer_of_event(&event_id).await? else {
+            return Ok(None);
+        };
+        let outputs = sqlx::query(
+            "SELECT e.id AS id, e.payload AS payload \
+               FROM provenance_action_outputs o \
+               JOIN content_events e ON e.id = o.output_event_id \
+              WHERE o.action_attestation_id = ?1 AND o.output_domain = 'content' \
+                AND e.type = 'record.updated'",
+        )
+        .bind(&writer.attestation_id)
+        .fetch_all(self.db.write_pool())
+        .await?;
+        let moved: Vec<String> = outputs
+            .iter()
+            .filter(|output| {
+                output
+                    .try_get::<Option<String>, _>("payload")
+                    .ok()
+                    .flatten()
+                    .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+                    .is_some_and(|payload| payload["maturity"] == "decided")
+            })
+            .filter_map(|output| output.try_get::<String, _>("id").ok())
+            .collect();
+        let unique = moved.len() == 1 && moved[0] == event_id;
+        Ok(Some(Decided { writer, at, unique }))
+    }
+
+    /// The latest body of `id` and, when the record's newest maturity change
+    /// moved it to `decided`, that decision and the body-setting event that was
+    /// current when it was made, all read from **one** authorised walk of the
+    /// history (newest first, so what is appended meanwhile is never seen and
+    /// cannot mix two moments). `None` when the record has no body event.
+    async fn history_view(&self, id: &str) -> Result<Option<HistoryView>> {
+        let mut latest_body: Option<BodyEvent> = None;
+        // The newest maturity change, once met; `Some(None)` when it is not a
+        // decision (so nothing was decided that still stands).
+        let mut maturity: Option<Option<(String, Option<String>, i64)>> = None;
+        let mut body_at_decision: Option<String> = None;
+        let mut cursor: Option<i64> = None;
+        'pages: loop {
+            let mut args = json!({
+                "record_id": id, "order": "newest_first", "limit": 100, "detail": "full"
+            });
+            if let Some(cursor) = cursor {
+                args["after_local_seq"] = json!(cursor);
+            }
+            let page = Box::pin(super::super::history::get_history(
+                self.db.clone(),
+                self.caller.clone(),
+                args,
+            ))
+            .await?;
+            for event in page["events"].as_array().into_iter().flatten() {
+                let Some(seq) = event["local_seq"].as_i64() else {
+                    continue;
+                };
+                let kind = event["type"].as_str();
+                let payload = &event["payload"];
+                if maturity.is_none()
+                    && kind == Some("record.updated")
+                    && payload.get("maturity").is_some()
+                {
+                    maturity = Some((payload["maturity"].as_str() == Some("decided")).then(|| {
+                        (
+                            event["id"].as_str().unwrap_or_default().to_string(),
+                            event["created_at"].as_str().map(str::to_string),
+                            seq,
+                        )
+                    }));
+                }
+                let sets_body = matches!(kind, Some("record.created" | "record.updated"))
+                    && payload.get("body").is_some();
+                if sets_body {
+                    if latest_body.is_none() {
+                        latest_body = Some(BodyEvent {
+                            id: event["id"].as_str().unwrap_or_default().to_string(),
+                            body: payload["body"].as_str().unwrap_or_default().to_string(),
+                            created_at: event["created_at"].as_str().map(str::to_string),
+                        });
+                    }
+                    if let Some(Some((_, _, decided_seq))) = &maturity {
+                        if body_at_decision.is_none() && seq < *decided_seq {
+                            body_at_decision =
+                                Some(event["id"].as_str().unwrap_or_default().to_string());
+                        }
+                    }
+                }
+                // Done once the latest body is known and either the newest
+                // maturity change is not a decision or the body it was made on
+                // is known.
+                let settled = match &maturity {
+                    Some(None) => true,
+                    Some(Some(_)) => body_at_decision.is_some(),
+                    None => false,
+                };
+                if latest_body.is_some() && settled {
+                    break 'pages;
+                }
+            }
+            match page["next_after_local_seq"].as_i64() {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let Some(body) = latest_body else {
+            return Ok(None);
+        };
+        let decision = match (maturity, body_at_decision) {
+            (Some(Some((event_id, at, _))), Some(body_event_id)) => Some(Decision {
+                event_id,
+                at,
+                body_event_id,
+            }),
+            // No decision, or one whose body cannot be established.
+            _ => None,
+        };
+        Ok(Some(HistoryView { body, decision }))
     }
 
     /// The `native` block of a definition, which lives in the catalog record.
@@ -1395,6 +1649,7 @@ impl<'a> Store<'a> {
                     .as_str()
                     .unwrap_or_default()
                     .to_string(),
+                created_at: event["created_at"].as_str().map(str::to_string),
             })
         })
         .await

@@ -59,6 +59,8 @@ mod inbox_snapshot_batching;
 mod interpretive_claims;
 #[path = "records/interventions.rs"]
 mod interventions;
+#[path = "records/link_summaries.rs"]
+mod link_summaries;
 #[path = "records/member_destinations.rs"]
 mod member_destinations;
 #[path = "records/mentions.rs"]
@@ -71,12 +73,16 @@ mod message_first_conversations;
 mod message_origins;
 #[path = "records/multiplayer_axis.rs"]
 mod multiplayer_axis;
+#[path = "records/obligation_withdrawal.rs"]
+mod obligation_withdrawal;
 #[path = "records/outcome_impact.rs"]
 mod outcome_impact;
 #[path = "records/read_log_capture.rs"]
 mod read_log_capture;
 #[path = "records/render.rs"]
 mod render;
+#[path = "records/routine_arrival.rs"]
+mod routine_arrival;
 #[path = "records/search_semantics.rs"]
 mod search_semantics;
 #[path = "records/superseded_by.rs"]

@@ -62,6 +62,177 @@ pub struct ChildSummary {
     pub archived: bool,
 }
 
+/// Compact lifecycle of the record at the far end of a link. It is a pure
+/// projection of the governed [`LifecycleInterpretation`](super::lifecycle::LifecycleInterpretation)
+/// the record itself reports, so the two can never disagree; the axis and
+/// vocabulary identity are dropped to keep a 200-row link window small.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkedLifecycle {
+    /// `governed` or `unclassified`; a record with no lifecycle carries no
+    /// `LinkedLifecycle` at all.
+    pub status: &'static str,
+    /// The canonical value when governed, the stored token when unclassified.
+    pub value: String,
+    /// `open`, `terminal_positive` or `terminal_negative`; governed only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminality: Option<String>,
+}
+
+impl LinkedLifecycle {
+    pub fn from_interpretation(
+        interpretation: &super::lifecycle::LifecycleInterpretation,
+    ) -> Option<Self> {
+        use super::lifecycle::LifecycleInterpretation;
+        match interpretation {
+            LifecycleInterpretation::Governed(governed) => Some(Self {
+                status: "governed",
+                value: governed.value.canonical.clone(),
+                terminality: Some(governed.terminality.clone()),
+            }),
+            LifecycleInterpretation::Unclassified(unclassified) => Some(Self {
+                status: "unclassified",
+                value: unclassified.raw.clone(),
+                terminality: None,
+            }),
+            LifecycleInterpretation::Absent(_) => None,
+        }
+    }
+}
+
+/// What a link row says about the record at its other end (the target of a
+/// `links_out` row, the source of a `links_in` row): enough to decide whether
+/// to open it, never its body or summary.
+///
+/// Only the visibility-filtering layer builds these, and only for rows whose
+/// far end the caller can already see — a link to an invisible record is
+/// dropped from the window before this is consulted, so nothing here can
+/// disclose a hidden record's name, type, kind, lifecycle or supersession.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkedRecordSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<LinkedLifecycle>,
+    /// True iff a live record names this one in an incoming `supersedes` link
+    /// — the same signal `superseded_by` discloses on the record itself, and
+    /// like it counts a successor the caller cannot see (without naming it).
+    /// Absent, never `false`, otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_reference: Option<String>,
+}
+
+/// One row of a `links_out` / `links_in` window: the bare relation row, with
+/// the far-end record's [`LinkedRecordSummary`] added beside it when the
+/// serving path attached one. The relation fields serialize exactly as the
+/// bare [`LinkRow`] always has.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrichedLink {
+    #[serde(flatten)]
+    pub link: LinkRow,
+    /// Absent (not null) when the serving path attaches no summaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other: Option<LinkedRecordSummary>,
+}
+
+impl From<LinkRow> for EnrichedLink {
+    fn from(link: LinkRow) -> Self {
+        Self { link, other: None }
+    }
+}
+
+impl std::ops::Deref for EnrichedLink {
+    type Target = LinkRow;
+    fn deref(&self) -> &LinkRow {
+        &self.link
+    }
+}
+
+/// The columns of a far-end record that a [`LinkedRecordSummary`] needs.
+pub(crate) struct LinkPeerRow {
+    pub name: String,
+    pub record_type: String,
+    pub kind: Option<String>,
+    pub lifecycle: Option<String>,
+    pub home_id: Option<String>,
+}
+
+/// Far-end records for a whole link window in one statement. Callers pass only
+/// ids the caller is already authorized to see; this reader makes no
+/// authorization decision. Soft-deleted records are returned like any other:
+/// the link survives them, and whether it is shown is the visibility layer's
+/// call, not this reader's.
+pub(crate) async fn load_link_peers<'e, E>(
+    executor: E,
+    ids: &[String],
+) -> Result<HashMap<String, LinkPeerRow>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(ids)?;
+    let rows = sqlx::query(
+        "SELECT id, type, kind, name, lifecycle, home_id FROM records
+          WHERE id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(ids_json)
+    .fetch_all(executor)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("id")?,
+                LinkPeerRow {
+                    name: row.try_get("name")?,
+                    record_type: row.try_get("type")?,
+                    kind: row.try_get("kind")?,
+                    lifecycle: row.try_get("lifecycle")?,
+                    home_id: row.try_get("home_id")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Attach summaries to an already visibility-filtered, already windowed link
+/// list. `far_end` picks the other end of a row. A row whose far end is not in
+/// `peers` is left bare rather than guessed at.
+pub(crate) fn attach_link_summaries(
+    links: &mut [EnrichedLink],
+    far_end: impl Fn(&LinkRow) -> &str,
+    peers: &HashMap<String, LinkPeerRow>,
+    superseded: &HashSet<String>,
+    interpreter: &super::lifecycle::LifecycleInterpreter,
+) {
+    for entry in links {
+        let id = far_end(&entry.link).to_owned();
+        let Some(peer) = peers.get(&id) else {
+            continue;
+        };
+        let interpretation = interpreter.interpret(
+            &peer.record_type,
+            peer.kind.as_deref(),
+            peer.home_id.as_deref(),
+            peer.lifecycle.as_deref(),
+        );
+        entry.other = Some(LinkedRecordSummary {
+            superseded: superseded.contains(&id),
+            name: peer.name.clone(),
+            record_type: peer.record_type.clone(),
+            kind: peer.kind.clone(),
+            lifecycle: LinkedLifecycle::from_interpretation(&interpretation),
+            display_reference: None,
+            id,
+        });
+    }
+}
+
 /// A comment window carries the authored utterance and thread state directly;
 /// clients must not issue one full-record read per row merely to render a
 /// thread. `summary` is reserved for a resolved root's resolution prose.
@@ -111,6 +282,10 @@ pub struct EnrichOptions {
     pub children_offset: i64,
     pub links_limit: i64,
     pub links_offset: i64,
+    /// Ask the visibility-filtering layer to attach a [`LinkedRecordSummary`]
+    /// to each link row it keeps. Off by default: only `get_record` renders
+    /// them, and every other filtered read would pay for rows it discards.
+    pub link_summaries: bool,
     /// Include `kind:suggestion` summaries in the separate `suggestions`
     /// collection. Ordinary child paging remains unchanged, and the separate
     /// `suggestion_count` is always reported.
@@ -132,6 +307,7 @@ impl Default for EnrichOptions {
             children_offset: 0,
             links_limit: DEFAULT_ENRICH_LIMIT,
             links_offset: 0,
+            link_summaries: false,
             include_suggestions: false,
             suggestions_limit: DEFAULT_SUGGESTIONS_LIMIT,
             suggestions_offset: 0,
@@ -284,10 +460,10 @@ pub struct EnrichedRecord {
     pub kind_governance: Option<crate::meta::kind::KindResolution>,
     /// Open/pack facets (spine facets are columns on the record itself).
     pub facets: Vec<FacetValueRow>,
-    pub links_out: Vec<LinkRow>,
+    pub links_out: Vec<EnrichedLink>,
     /// Total outbound links, whether or not `links_out` is a window onto them.
     pub links_out_count: i64,
-    pub links_in: Vec<LinkRow>,
+    pub links_in: Vec<EnrichedLink>,
     /// Total inbound links, whether or not `links_in` is a window onto them.
     pub links_in_count: i64,
     /// Outgoing body mentions, aggregated by authored reference and resolved
@@ -448,6 +624,36 @@ where
         grouped.entry(target).or_default().push(successor);
     }
     Ok(grouped)
+}
+
+/// Which of `ids` have at least one live incoming `supersedes` link — presence
+/// only, for callers that need the flag and not the successors. Same predicate
+/// as [`load_superseded_by_batch`] (a live source record), but one `EXISTS`
+/// probe per id returning only the matching ids, so a record with many
+/// successors costs the same as one with a single successor.
+pub(crate) async fn load_superseded_presence<'e, E>(
+    executor: E,
+    ids: &[String],
+) -> Result<HashSet<String>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let ids_json = serde_json::to_string(ids)?;
+    let rows = sqlx::query(
+        "SELECT j.value AS id FROM json_each(?) j
+          WHERE EXISTS (SELECT 1 FROM links l JOIN records s ON s.id = l.source_id
+                         WHERE l.target_id = j.value AND l.relationship = 'supersedes'
+                           AND s.deleted_at IS NULL)",
+    )
+    .bind(ids_json)
+    .fetch_all(executor)
+    .await?;
+    rows.iter()
+        .map(|row| Ok(row.try_get("id")?))
+        .collect::<Result<HashSet<String>>>()
 }
 
 /// Truncate an ordered successor list to the named disclosure window. This
@@ -1113,7 +1319,7 @@ async fn get_record_with_lens_inner(
     .fetch_all(db)
     .await?
     .iter()
-    .map(link_from_row)
+    .map(|row| link_from_row(row).map(EnrichedLink::from))
     .collect::<Result<Vec<_>>>()?;
 
     let links_in_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE target_id = ?")
@@ -1131,7 +1337,7 @@ async fn get_record_with_lens_inner(
     .fetch_all(db)
     .await?
     .iter()
-    .map(link_from_row)
+    .map(|row| link_from_row(row).map(EnrichedLink::from))
     .collect::<Result<Vec<_>>>()?;
 
     // Disclosure, not a window: the full ordered successor list feeds the
@@ -2407,7 +2613,7 @@ async fn get_record_live_in(
     .fetch_all(&mut **tx)
     .await?
     .iter()
-    .map(link_from_row)
+    .map(|row| link_from_row(row).map(EnrichedLink::from))
     .collect::<Result<Vec<_>>>()?;
     let links_in_count = sqlx::query_scalar("SELECT COUNT(*) FROM links WHERE target_id = ?")
         .bind(id)
@@ -2424,7 +2630,7 @@ async fn get_record_live_in(
     .fetch_all(&mut **tx)
     .await?
     .iter()
-    .map(link_from_row)
+    .map(|row| link_from_row(row).map(EnrichedLink::from))
     .collect::<Result<Vec<_>>>()?;
 
     // Same disclosure as the pool-backed path above, over this transaction's

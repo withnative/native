@@ -864,23 +864,32 @@ fn check_owned(metadata: &fs::Metadata, mode: u32) -> Result<()> {
     Ok(())
 }
 
-async fn bind_socket(config: &NodeConfig) -> Result<(UnixListener, SocketGuard)> {
-    validate_credential_path(&config.socket_directory, "node socket directory")?;
-    match fs::symlink_metadata(&config.socket_directory) {
+/// What the node demands of its socket directory when it already exists: a
+/// real (non-symlinked) directory owned by this user with mode exactly 0700.
+/// `Ok(false)` means it does not exist yet. `native setup` asks the same
+/// question before it hands the directory to the node.
+pub(crate) fn check_socket_directory(directory: &Path) -> Result<bool> {
+    validate_credential_path(directory, "node socket directory")?;
+    match fs::symlink_metadata(directory) {
         Ok(metadata) => {
             if !metadata.is_dir() {
                 return Err(Error::engine("node socket directory is not a directory"));
             }
             check_owned(&metadata, 0o700)?;
+            Ok(true)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&config.socket_directory)?;
-            fs::set_permissions(&config.socket_directory, fs::Permissions::from_mode(0o700))?;
-        }
-        Err(error) => return Err(error.into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn bind_socket(config: &NodeConfig) -> Result<(UnixListener, SocketGuard)> {
+    if !check_socket_directory(&config.socket_directory)? {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&config.socket_directory)?;
+        fs::set_permissions(&config.socket_directory, fs::Permissions::from_mode(0o700))?;
     }
     let lock_path = config.socket_directory.join("node.lock");
     let lock = OpenOptions::new()
@@ -998,6 +1007,9 @@ async fn route_message(
                 let filter = status_filter(message.pointer("/params/arguments"));
                 let mut status = gate.status(&filter);
                 status["account_id"] = json!(upstream.config.account_id);
+                if let Some(router) = router {
+                    status["hosted"] = router.hosted_summary().await;
+                }
                 return node_status_reply(
                     message.get("id"),
                     status,
@@ -1114,6 +1126,7 @@ fn status_filter(arguments: Option<&Value>) -> journal::StatusFilter {
             .and_then(|a| a.get("limit"))
             .and_then(Value::as_u64)
             .map_or(100, |n| n.min(500) as usize),
+        newest_first: text("order").as_deref() == Some("newest_first"),
     }
 }
 
@@ -1524,6 +1537,12 @@ pub async fn serve(config: NodeConfig) -> Result<()> {
 }
 
 /// Byte-only stdio shim, with a write half-close at stdin EOF and reply drain.
+/// The user id a node socket's peer must have: this process's own. Shared with
+/// `native status`, which makes the same check before it talks to a node.
+pub(crate) fn current_uid() -> u32 {
+    owner_uid()
+}
+
 pub async fn connect<R, W>(socket: &Path, mut input: R, mut output: W) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1555,6 +1574,14 @@ where
         }
     }
     Ok(())
+}
+
+/// See [`failover::TEST_CONSUMER_IDENTITY`].
+#[cfg(test)]
+pub(crate) fn set_test_consumer_identity(
+    identity: Option<crate::standby_snapshot::ObservedInstalledConsumerIdentity>,
+) {
+    *failover::TEST_CONSUMER_IDENTITY.lock().unwrap() = identity;
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {

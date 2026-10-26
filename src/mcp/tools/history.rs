@@ -557,6 +557,11 @@ fn changed_fields_for_payload(event_type: &str, payload: &Value) -> BTreeSet<Str
         fields.insert("type".into());
         return fields;
     }
+    // A Message edit changes exactly the body.
+    if event_type == "message.revision.recorded.v1" {
+        fields.insert("body".into());
+        return fields;
+    }
     if matches!(event_type, "facet.set" | "facet.unset") {
         if let Some(key) = payload.get("key").and_then(Value::as_str) {
             fields.insert(format!("facet:{key}"));
@@ -1143,6 +1148,7 @@ fn event_families_without_impact(event: &EventRow) -> Result<BTreeSet<String>> {
         "artifact.source_attested"
         | "unit.created.v1"
         | "unit.revision.recorded.v1"
+        | "message.revision.recorded.v1"
         | "occurrence.bound.v1" => {
             families.insert("updated".into());
         }
@@ -2101,6 +2107,7 @@ const TAB_CHANGE_FIELD_EVENT_TYPES: &[&str] = &[
     "record.created",
     "record.updated",
     "receipt.committed.v1",
+    "message.revision.recorded.v1",
     "record.type_corrected.v1",
     "facet.set",
     "facet.unset",
@@ -2361,7 +2368,10 @@ fn scalar_assignments(event_type: &str, payload: &Value) -> Vec<ScalarAssignment
 fn body_bytes(event_type: &str, payload: &Value) -> Option<u64> {
     if !matches!(
         event_type,
-        "record.created" | "record.updated" | "receipt.committed.v1"
+        "record.created"
+            | "record.updated"
+            | "receipt.committed.v1"
+            | "message.revision.recorded.v1"
     ) {
         return None;
     }
@@ -4564,5 +4574,27 @@ mod actor_filter_agreement_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod message_revision_tests {
+    use super::*;
+
+    #[test]
+    fn a_message_revision_is_a_body_change_with_a_body_size() {
+        let payload = json!({"format":"native.message-revision.v1","body":"héllo","mentions":[]});
+        assert_eq!(
+            body_bytes("message.revision.recorded.v1", &payload),
+            Some(6)
+        );
+        assert_eq!(
+            changed_fields_for_payload("message.revision.recorded.v1", &payload),
+            BTreeSet::from(["body".to_string()])
+        );
+        assert_eq!(
+            metadata_changed_fields("message.revision.recorded.v1", &payload),
+            vec!["body".to_string()]
+        );
     }
 }

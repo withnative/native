@@ -9,11 +9,11 @@ pub(super) use actions::{
     project_started as project_action_started, ACTION_RECORDED, ACTION_STARTED,
 };
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) use actions::{finish_app_action_in, start_app_action_in};
+pub(crate) use actions::{finish_app_action_in, start_app_action_in, start_declared_app_action_in};
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use hosted::{
-    admit_app_on, adopt_as, bundle_source_on, launch_source_on, prepare_source_as, preview_as,
-    AdoptRequest, AppSourceAdmission,
+    admit_app_on, admit_install_on, adopt_as, bundle_source_on, launch_source_on,
+    prepare_source_as, preview_as, AdoptRequest, AppSourceAdmission,
 };
 pub(super) use hosted::{project_adopted, recover_adopted_outcome, ADOPTED};
 
@@ -103,13 +103,37 @@ struct Source {
 }
 
 async fn source_on(conn: &mut SqliteConnection, request: &InstallRequest) -> Result<Source> {
+    if !declarations::source_supported(&request.declaration) {
+        return Err(Error::engine(NOT_YET_AVAILABLE));
+    }
     let declaration_digest =
         crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(&request.declaration)?;
     let row:Option<(String,String,i64)>=sqlx::query_as("SELECT pin_json,source_body,event_seq FROM kernel_app_package_sources WHERE package=? AND version=? AND digest=? AND artifact_id=? AND source_revision=? AND declaration_digest=?")
         .bind(&request.package).bind(&request.version).bind(&request.digest).bind(&request.artifact_id)
-        .bind(&request.source_revision).bind(&declaration_digest).fetch_optional(conn).await?;
+        .bind(&request.source_revision).bind(&declaration_digest).fetch_optional(&mut *conn).await?;
+    let row = if row.is_some() {
+        row
+    } else {
+        retained_sources_on(conn, Some(&request.artifact_id))
+            .await?
+            .into_iter()
+            .find(|(pin, _, _)| {
+                pin["package"] == request.package
+                    && pin["version"] == request.version
+                    && pin["digest"] == request.digest
+                    && pin["source_revision"] == request.source_revision
+                    && pin["declaration_digest"] == declaration_digest
+            })
+            .map(|(pin, body, seq)| (pin.to_string(), body, seq))
+    };
     let Some((raw, body, event_seq)) = row else {
-        return Err(Error::engine("manage_alpha_tabs: unsupported_on_v2"));
+        return Err(Error::engine(
+            if declarations::declarative(&request.declaration).is_ok() {
+                NOT_YET_AVAILABLE
+            } else {
+                "manage_alpha_tabs: unsupported_on_v2"
+            },
+        ));
     };
     let pin: Value = serde_json::from_str(&raw)?;
     let declaration: Value = serde_json::from_str(string(&pin, "consented_declaration")?)?;

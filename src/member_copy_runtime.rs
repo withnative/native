@@ -379,6 +379,8 @@ mod tests {
     fn config(root: &Path, origin: &str, token: &str) -> MemberCopyDeviceConfig {
         write_credential(root, token);
         MemberCopyDeviceConfig {
+            #[cfg(feature = "v2-kernel-probe")]
+            markdown_folder: None,
             contract: "native.member-copy-device.v1".to_owned(),
             version: 1,
             hosted_origin: "http://127.0.0.1:0".to_owned(),

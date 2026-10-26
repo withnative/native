@@ -13,7 +13,7 @@ fn text(value: &str) -> Value {
 fn integer(value: i64) -> Value {
     json!({"type":"integer","value":value.to_string()})
 }
-async fn section(
+pub(super) async fn section(
     db: &Db,
     actor: &str,
     predicate: &str,
@@ -51,11 +51,20 @@ fn ordinary(alias: &str) -> String {
 }
 
 pub(super) async fn artifact_kinds(db: &Db, actor: &str) -> Result<[Vec<String>; 2]> {
-    let mut tx = db.pool().begin().await?;
-    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
-    let vocabularies = kernel::v1_state::rows_on(&mut tx, "vocabularies").await?;
+    let actor_owned = actor.to_owned();
+    sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move { artifact_kinds_on(conn, &actor_owned).await })
+    })
+    .await
+}
+async fn artifact_kinds_on(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+) -> Result<[Vec<String>; 2]> {
+    kernel::app_installs::admit_dispatched_on(tx, actor).await?;
+    let vocabularies = kernel::v1_state::rows_on(tx, "vocabularies").await?;
     let vocabulary = vocabularies.iter().find(|v| v["name"] == "kind:Annotation");
-    let values = kernel::v1_state::rows_on(&mut tx, "vocabulary_values").await?;
+    let values = kernel::v1_state::rows_on(tx, "vocabulary_values").await?;
     let mut result = [Vec::new(), Vec::new()];
     for (index, family) in [
         crate::generated::kinds::CoreKind::AnnotationSuggestion,
@@ -92,6 +101,77 @@ pub(super) async fn artifact_kinds(db: &Db, actor: &str) -> Result<[Vec<String>;
     Ok(result)
 }
 
+/// Counts use the same staged visible relations as the individual windows.
+/// DISTINCT preserves the old EXISTS semantics when link lanes overlap.
+pub(super) async fn artifact_counts(
+    db: &Db,
+    actor: &str,
+    ids: &[String],
+    kinds: &[Vec<String>; 2],
+) -> Result<std::collections::BTreeMap<String, [i64; 2]>> {
+    let mut result = std::collections::BTreeMap::<String, [i64; 2]>::new();
+    let ids = serde_json::to_string(ids)?;
+    for (index, kinds) in kinds.iter().enumerate() {
+        let tokens = serde_json::to_string(kinds)?;
+        for row in rows(db,actor,"SELECT l.target_id,count(DISTINCT r.id) AS n FROM links l JOIN records r ON r.id=l.source_id WHERE l.relationship='part_of' AND l.target_id IN (SELECT value FROM json_each(?1)) AND r.type='Annotation' AND r.kind IN (SELECT value FROM json_each(?2)) GROUP BY l.target_id", vec![text(&ids),text(&tokens)]).await? {
+            result.entry(row["target_id"].as_str().expect("target id").to_owned()).or_default()[index] = row["n"].as_i64().expect("count");
+        }
+    }
+    Ok(result)
+}
+
+/// Child counts and pages for Get's closed batch share its staged relations.
+/// Root aliases retain the existing combined-root path in `enrich`.
+pub(super) async fn child_sections(
+    db: &Db,
+    actor: &str,
+    ids: &[String],
+    opts: &crate::query::read::EnrichOptions,
+) -> Result<std::collections::BTreeMap<String, (Value, Value)>> {
+    let ids: Vec<_> = ids
+        .iter()
+        .filter(|id| ![crate::events::KERNEL_ROOT_ID, "native:root"].contains(&id.as_str()))
+        .collect();
+    let mut sections = std::collections::BTreeMap::new();
+    if ids.is_empty() {
+        return Ok(sections);
+    }
+    let parameters = vec![text(&serde_json::to_string(&ids)?)];
+    for row in rows(db,actor,&format!("SELECT r.home_id,count(*) AS n FROM records r WHERE r.home_id IN (SELECT value FROM json_each(?1)) AND {} GROUP BY r.home_id",ordinary("r")),parameters.clone()).await? {
+        sections.insert(row["home_id"].as_str().expect("parent").to_owned(), (row["n"].clone(), json!([])));
+    }
+    if opts.children_limit > 0 {
+        let mut parameters = parameters;
+        parameters.extend([
+            integer(opts.children_offset),
+            integer(opts.children_offset.saturating_add(opts.children_limit)),
+        ]);
+        let page = rows(db,actor,&format!("WITH eligible AS (SELECT r.home_id,r.id,r.type,r.kind,r.name,r.archived,row_number() OVER (PARTITION BY r.home_id ORDER BY r.name,r.id) AS ordinal FROM records r WHERE r.home_id IN (SELECT value FROM json_each(?1)) AND {}) SELECT home_id,id,type,kind,name,archived FROM eligible WHERE ordinal>?2 AND ordinal<=?3 ORDER BY home_id,ordinal",ordinary("r")),parameters).await?;
+        for mut row in page {
+            let home = row
+                .as_object_mut()
+                .expect("child")
+                .remove("home_id")
+                .expect("parent");
+            row["archived"] = json!(row["archived"].as_i64() == Some(1));
+            sections
+                .get_mut(home.as_str().expect("parent"))
+                .expect("counted child")
+                .1
+                .as_array_mut()
+                .expect("children")
+                .push(row);
+        }
+    }
+    for id in ids {
+        sections
+            .entry(id.to_owned())
+            .or_insert_with(|| (json!(0), json!([])));
+    }
+    Ok(sections)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn enrich(
     db: &Db,
     actor: &str,
@@ -99,6 +179,8 @@ pub(super) async fn enrich(
     opts: &crate::query::read::EnrichOptions,
     artifact_kinds: &[Vec<String>; 2],
     history: bool,
+    artifact_counts: &[i64; 2],
+    child_section: Option<&(Value, Value)>,
     value: &mut Value,
 ) -> Result<()> {
     let (child_predicate, child_params) =
@@ -113,16 +195,20 @@ pub(super) async fn enrich(
                 vec![text(id)],
             )
         };
-    let (count, children) = section(
-        db,
-        actor,
-        &child_predicate,
-        child_params,
-        "r.name,r.id",
-        opts.children_limit,
-        opts.children_offset,
-    )
-    .await?;
+    let (count, children) = if let Some(section) = child_section {
+        section.clone()
+    } else {
+        section(
+            db,
+            actor,
+            &child_predicate,
+            child_params,
+            "r.name,r.id",
+            opts.children_limit,
+            opts.children_offset,
+        )
+        .await?
+    };
     value["child_count"] = count;
     value["children"] = children;
     for (index, (kind, enabled, limit, offset)) in [
@@ -142,6 +228,10 @@ pub(super) async fn enrich(
     .into_iter()
     .enumerate()
     {
+        if !enabled {
+            value[format!("{kind}_count")] = json!(artifact_counts[index]);
+            continue;
+        }
         let tokens = serde_json::to_string(&artifact_kinds[index])?;
         let (count, page) = section(db, actor,
             "r.type='Annotation' AND r.kind IN (SELECT value FROM json_each(?1)) AND EXISTS(SELECT 1 FROM links l WHERE l.source_id=r.id AND l.relationship='part_of' AND l.target_id=?2)",
@@ -151,7 +241,9 @@ pub(super) async fn enrich(
             value[format!("{kind}s")] = page;
         }
     }
-    value["ancestors"] = json!(ancestors(db, actor, id).await?.0);
+    let (ancestors, path_visible) = ancestors(db, actor, id).await?;
+    value["ancestors"] = json!(ancestors);
+    value["containment_path_visible"] = json!(path_visible);
     if history {
         let history_id = if value["kernel_v2"]["virtual_root"] == true {
             crate::events::KERNEL_ROOT_ID
@@ -200,6 +292,7 @@ enum Step {
         updated_since: Option<String>,
         last_activity_since: Option<String>,
         include_archived: Option<bool>,
+        facets: Option<Vec<Value>>,
     },
     Traverse {
         target: String,
@@ -261,7 +354,7 @@ pub(super) async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Va
             " AND NOT (r.type='Annotation' AND r.kind IS {placeholder})"
         ));
     }
-    for step in args.steps {
+    for (step_index, step) in args.steps.into_iter().enumerate() {
         let mut clauses = vec![hidden_clause.clone()];
         match step {
             Step::Filter {
@@ -276,6 +369,7 @@ pub(super) async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Va
                 updated_since,
                 last_activity_since,
                 include_archived,
+                facets,
             } => {
                 if let Some(previous) = &previous {
                     clauses.push(format!("r.id IN ({previous})"));
@@ -332,6 +426,45 @@ pub(super) async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Va
                         ));
                     }
                 }
+                // Reuse v1 validation and predicates, over the SQL lane's
+                // caller-filtered facet relation. Unlike v1 member slices,
+                // this relation includes its typed value_num projection.
+                let facets = facets
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, facet)| {
+                        crate::mcp::tools::querying::parse_facet_arg(
+                            "query_record",
+                            step_index,
+                            index,
+                            facet,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let (facet_clauses, facet_binds) =
+                    crate::query::pipeline::facet_filter_sql(&facets, false)?;
+                let mut facet_binds = facet_binds.into_iter();
+                for clause in facet_clauses {
+                    // Only compiler-generated SQL is renumbered here; authored
+                    // strings never enter the fragment and cannot contain SQL.
+                    let mut numbered = String::new();
+                    for ch in clause.chars() {
+                        if ch == '?' {
+                            numbered.push_str(&bind(
+                                &mut parameters,
+                                text(&facet_binds.next().expect("facet SQL binding")),
+                            ));
+                        } else {
+                            numbered.push(ch);
+                        }
+                    }
+                    clauses.push(numbered);
+                }
+                debug_assert!(facet_binds.next().is_none());
                 if !include_archived.unwrap_or(false) {
                     clauses.push("r.archived=0".into());
                 }
@@ -377,30 +510,37 @@ pub(super) async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Va
         ));
     }
     let selected = previous.expect("nonempty pipeline");
-    let total = rows(
-        db,
-        actor,
-        &format!("SELECT count(*) AS n FROM (SELECT r.id FROM records r WHERE r.id IN ({selected})) eligible"),
-        parameters.clone(),
-    )
-    .await?[0]["n"]
-        .as_u64()
-        .unwrap_or(0) as usize;
+    let count_sql = format!("SELECT count(*) AS n FROM (SELECT r.id FROM records r WHERE r.id IN ({selected})) eligible");
     let page = parameters.len() + 1;
-    parameters.extend([integer(limit), integer(offset)]);
-    let ids=rows(db,actor,&format!("SELECT r.id FROM records r WHERE r.id IN ({selected}) ORDER BY {order} LIMIT ?{page} OFFSET ?{}",page+1),parameters).await?;
+    let page_sql = format!("SELECT r.id FROM records r WHERE r.id IN ({selected}) ORDER BY {order} LIMIT ?{page} OFFSET ?{}",page+1);
+    let (total, ids) = sql::with_query_read_session(db, actor, &[&count_sql, &page_sql], async {
+        let total = rows(db, actor, &count_sql, parameters.clone()).await?[0]["n"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+        parameters.extend([integer(limit), integer(offset)]);
+        let ids = rows(db, actor, &page_sql, parameters).await?;
+        Ok((total, ids))
+    })
+    .await?;
     let ids: Vec<String> = ids
         .iter()
         .filter_map(|row| row["id"].as_str().map(str::to_owned))
         .collect();
-    let mut records = Vec::with_capacity(ids.len());
-    // Keep body hydration window-bounded, and use get's exact Message origin,
-    // lifecycle, owner and logical home rendering. No pre-page record reads.
-    for id in ids {
-        if let Some(record) = kernel::read_record_as(db, actor, &id).await? {
-            records.push(record_value(db, actor, &record).await?);
-        }
-    }
+    // One pinned hydration snapshot for the returned window. Selection is
+    // still separately governed, and every selected id is re-authorized here.
+    let actor_owned = actor.to_owned();
+    let records = sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move {
+            let mut records = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(record) = kernel::read_record_on(conn, &actor_owned, &id).await? {
+                    records.push(record_value_on(conn, &actor_owned, &record).await?);
+                }
+            }
+            Ok(records)
+        })
+    })
+    .await?;
     let returned = records.len();
     Ok(
         json!({"shape":"records","records":records,"total":total,"returned":returned,"offset":offset,"has_more":(offset as usize).saturating_add(returned)<total}),
@@ -414,9 +554,15 @@ pub(super) async fn root(db: &Db, actor: &str, id: &str) -> Result<Option<Value>
     if ![crate::events::KERNEL_ROOT_ID, "native:root"].contains(&id) {
         return Ok(None);
     }
-    let mut tx = db.pool().begin().await?;
-    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
-    if !kernel::kernel_effective_capability_on(&mut tx, actor, crate::events::KERNEL_ROOT_ID)
+    let actor_owned = actor.to_owned();
+    let id = id.to_owned();
+    sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move { root_on(conn, &actor_owned, &id).await })
+    })
+    .await
+}
+async fn root_on(tx: &mut sqlx::SqliteConnection, actor: &str, id: &str) -> Result<Option<Value>> {
+    if !kernel::kernel_effective_capability_on(tx, actor, crate::events::KERNEL_ROOT_ID)
         .await?
         .allows(crate::authorization::Capability::View)
     {
@@ -427,9 +573,8 @@ pub(super) async fn root(db: &Db, actor: &str, id: &str) -> Result<Option<Value>
             .bind(crate::events::KERNEL_ROOT_ID)
             .fetch_one(&mut *tx)
             .await?;
-    let (seq,created,updated):(i64,String,String)=sqlx::query_as("SELECT max(seq),min(created_at),max(created_at) FROM content_events WHERE record_id IN (?,?)").bind(crate::events::KERNEL_ROOT_ID).bind(kernel::workspace_metadata::RECORD_ID).fetch_one(&mut *tx).await?;
-    tx.rollback().await?;
-    let metadata = kernel::workspace_metadata::read(db).await?;
+    let (seq,created,updated):(i64,String,String)=sqlx::query_as("SELECT max(seq),min(created_at),max(created_at) FROM main.content_events WHERE record_id IN (?,?)").bind(crate::events::KERNEL_ROOT_ID).bind(kernel::workspace_metadata::RECORD_ID).fetch_one(&mut *tx).await?;
+    let metadata = kernel::workspace_metadata::read_on(tx).await?;
     Ok(Some(
         json!({"id":id,"status":"found","type":"Collection","kind":"folder","name":metadata.as_ref().map(|m|m.name.as_str()).unwrap_or("Native workspace"),"summary":metadata.and_then(|m|m.summary),"body":null,"body_digest":crate::mcp::tools::lifecycle::body_digest(None),"home_id":null,"owner_id":owner,"persistence":"enduring","maturity":null,"archived":false,"created_at":created,"updated_at":updated,"last_activity_at":updated,"record_version":format!("rec:{seq}"),"version":format!("rec:{seq}"),"kernel_v2":{"virtual_root":true},"ancestors":[]}),
     ))
@@ -453,6 +598,24 @@ struct Structure {
     exclude_types: Vec<String>,
 }
 pub(super) async fn get_structure(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    sql::with_read_session(
+        db,
+        actor,
+        &[
+            ("records", "id"),
+            ("records", "type"),
+            ("records", "kind"),
+            ("records", "name"),
+            ("records", "home_id"),
+            ("records", "persistence"),
+            ("records", "last_activity_at"),
+            ("records", "archived"),
+        ],
+        get_structure_in_session(db, actor, args),
+    )
+    .await
+}
+async fn get_structure_in_session(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let args: Structure = parse("get_structure", args)?;
     let depth = args.max_depth.unwrap_or(3);
     let width = args
@@ -572,11 +735,82 @@ pub(super) async fn get_structure(db: &Db, actor: &str, args: Value) -> Result<V
     )
 }
 
+// Ancestors expose only labels and placement. Hydrating a parent's body,
+// lifecycle, claims and clock for every child is both unnecessary and costly.
+async fn ancestor_descriptor_on(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+    id: &str,
+) -> Result<Option<Value>> {
+    type Labels = std::sync::Mutex<std::collections::BTreeMap<String, Option<Value>>>;
+    kernel::app_installs::admit_dispatched_on(tx, actor).await?;
+    let key = kernel::read_cache::key_on(tx, actor, "ancestor_descriptors").await?;
+    let labels = kernel::read_cache::get::<Labels>(&key).unwrap_or_default();
+    let cached = labels
+        .lock()
+        .expect("ancestor cache poisoned")
+        .get(id)
+        .cloned();
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+    let value = if let Some(record) = kernel::read_record_on(tx, actor, id).await? {
+        let primary: Option<String> =
+            sqlx::query_scalar("SELECT primary_type FROM kernel_records WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let (typ, kind) = v1_type_and_kind(
+            record.family.as_deref(),
+            record.pin.as_ref().map(|p| p.version),
+            primary.as_deref(),
+            record.kind.as_deref(),
+            &record.fields,
+        );
+        let home = crate::v1_import::placement_on(tx, actor, id)
+            .await?
+            .and_then(|p| p.home_id);
+        Some(
+            json!({"id":id,"type":typ,"kind":kind,"name":record.fields.get("title").or_else(||record.fields.get("name")),"home_id":home}),
+        )
+    } else if [crate::events::KERNEL_ROOT_ID, "native:root"].contains(&id)
+        && kernel::kernel_effective_capability_on(tx, actor, crate::events::KERNEL_ROOT_ID)
+            .await?
+            .allows(crate::authorization::Capability::View)
+    {
+        let metadata = kernel::workspace_metadata::read_on(tx).await?;
+        Some(
+            json!({"id":id,"type":"Collection","kind":"folder","name":metadata.as_ref().map(|m|m.name.as_str()).unwrap_or("Native workspace"),"home_id":null,"kernel_v2":{"virtual_root":true}}),
+        )
+    } else {
+        None
+    };
+    labels
+        .lock()
+        .expect("ancestor cache poisoned")
+        .insert(id.to_owned(), value.clone());
+    kernel::read_cache::put(key, labels);
+    Ok(value)
+}
+
 async fn ancestors(db: &Db, actor: &str, id: &str) -> Result<(Vec<Value>, bool)> {
+    let actor_owned = actor.to_owned();
+    let id = id.to_owned();
+    sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move { ancestors_on(conn, &actor_owned, &id).await })
+    })
+    .await
+}
+
+async fn ancestors_on(
+    tx: &mut sqlx::SqliteConnection,
+    actor: &str,
+    id: &str,
+) -> Result<(Vec<Value>, bool)> {
     let mut chain = Vec::new();
     let mut seen = std::collections::BTreeSet::from([id.to_string()]);
     let mut terminal_root = [crate::events::KERNEL_ROOT_ID, "native:root"].contains(&id);
-    let mut next = crate::v1_import::placement_as(db, actor, id)
+    let mut next = crate::v1_import::placement_on(tx, actor, id)
         .await?
         .and_then(|p| p.home_id);
     // A hidden/missing ancestor ends disclosure. Never bridge it with a raw id.
@@ -589,7 +823,7 @@ async fn ancestors(db: &Db, actor: &str, id: &str) -> Result<(Vec<Value>, bool)>
             chain.reverse();
             return Ok((chain, false));
         }
-        let Some(value) = descriptor(db, actor, &id).await? else {
+        let Some(value) = ancestor_descriptor_on(tx, actor, &id).await? else {
             chain.reverse();
             return Ok((chain, false));
         };
@@ -607,6 +841,9 @@ struct Collection {
     id: String,
 }
 pub(super) async fn open_collection(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    kernel::read_cache::with_capabilities(open_collection_read(db, actor, args)).await
+}
+async fn open_collection_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let args: Collection = parse("open_collection", args)?;
     let record = descriptor(db, actor, &args.id)
         .await?
@@ -655,7 +892,8 @@ async fn open_collection_input(db: &Db, actor: &str, id: &str, kind: &str) -> Re
                     let unpaged = query.get("limit").is_none() && query.get("offset").is_none();
                     (query, all_matching && unpaged)
                 }
-                SavedQueryInspection::GovernedSql { .. } => return Err(Error::engine(
+                SavedQueryInspection::GovernedSql { .. }
+                | SavedQueryInspection::GovernedSqlPinned { .. } => return Err(Error::engine(
                     "saved governed SQL artifact inputs require a native.relation-envelope.v1 port",
                 )),
                 SavedQueryInspection::Invalid { diagnostic }
@@ -666,6 +904,9 @@ async fn open_collection_input(db: &Db, actor: &str, id: &str, kind: &str) -> Re
         }
     };
     let schema = metadata_reads::schema(db, actor).await?;
+    // The captured schema is immutable for this resolution. Reuse the pure
+    // cascade only for exactly the same type, kind and context argument.
+    let mut shape_contexts = std::collections::BTreeMap::new();
     let mut records = Vec::new();
     let mut offset = 0;
     loop {
@@ -694,12 +935,19 @@ async fn open_collection_input(db: &Db, actor: &str, id: &str, kind: &str) -> Re
             let fields =
                 metadata_reads::facet_values(db, actor, record["id"].as_str().expect("member id"))
                     .await?;
-            let shapes = crate::query::cascade::facets_for_record_context(
-                &schema,
-                record["type"].as_str().unwrap_or_default(),
-                record["kind"].as_str(),
-                record["home_id"].as_str(),
+            let context = (
+                record["type"].as_str().unwrap_or_default().to_owned(),
+                record["kind"].as_str().map(str::to_owned),
+                record["home_id"].as_str().map(str::to_owned),
             );
+            let shapes = shape_contexts.entry(context.clone()).or_insert_with(|| {
+                crate::query::cascade::facets_for_record_context(
+                    &schema,
+                    &context.0,
+                    context.1.as_deref(),
+                    context.2.as_deref(),
+                )
+            });
             let mut facets = serde_json::Map::new();
             for (key, stored, _, _) in fields {
                 let declared = shapes.get(&key).and_then(|s| s["type"].as_str());
@@ -743,7 +991,7 @@ async fn open_collection_input(db: &Db, actor: &str, id: &str, kind: &str) -> Re
             .cmp(&b["name"].as_str().unwrap_or_default().to_lowercase())
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    let renderers=rows(db,actor,"SELECT r.id,r.name FROM records r WHERE EXISTS(SELECT 1 FROM links l WHERE l.source_id=r.id AND l.relationship='renders' AND l.target_id=?1) ORDER BY r.name,r.id",vec![text(id)]).await?;
+    let renderers=sql::with_renderer_read_session(db,actor,rows(db,actor,"SELECT r.id,r.name FROM records r WHERE EXISTS(SELECT 1 FROM links l WHERE l.source_id=r.id AND l.relationship='renders' AND l.target_id=?1) ORDER BY r.name,r.id",vec![text(id)])).await?;
     Ok(
         json!({"status":"opened","surface":"neutral_table","collection":{"id":id,"kind":kind},"input":{"version":"native.artifact-input.v1","records":records},"renderers":renderers}),
     )
@@ -797,22 +1045,7 @@ struct History {
     detail: Option<String>,
     include_import_receipts: Option<bool>,
 }
-pub(super) async fn history(db: &Db, actor: &str, args: Value) -> Result<Value> {
-    sql::with_read_session(
-        db,
-        actor,
-        &[
-            ("content_events", "local_seq"),
-            ("content_events", "record_id"),
-            ("content_events", "run_key"),
-            ("content_events", "parent_key"),
-        ],
-        history_in_session(db, actor, args),
-    )
-    .await
-}
-pub(super) async fn history_in_session(db: &Db, actor: &str, args: Value) -> Result<Value> {
-    let args: History = parse("get_history", args)?;
+fn validate_history(args: &History) -> Result<(i64, bool)> {
     let children = args.include_child_runs.unwrap_or(false);
     if children && args.for_run.is_none() {
         return Err(Error::engine(
@@ -843,6 +1076,43 @@ pub(super) async fn history_in_session(db: &Db, actor: &str, args: Value) -> Res
             "global import receipts; select one record",
         ));
     }
+    if args.after_local_seq.is_some_and(|cursor| cursor < 0) {
+        return Err(Error::engine("get_history: cursor must be nonnegative"));
+    }
+    Ok((limit, newest))
+}
+
+pub(super) async fn history(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    let request: History = parse("get_history", args.clone())?;
+    let (limit, newest) = validate_history(&request)?;
+    let reads = &[
+        ("content_events", "local_seq"),
+        ("content_events", "record_id"),
+        ("content_events", "run_key"),
+        ("content_events", "parent_key"),
+    ];
+    if request.record_id.is_none() && request.for_run.is_none() {
+        sql::with_history_read_session(
+            db,
+            actor,
+            reads,
+            sql::HistoryWindow {
+                after: request.after_local_seq,
+                newest,
+                limit: limit as usize,
+            },
+            history_in_session(db, actor, args),
+        )
+        .await
+    } else {
+        sql::with_read_session(db, actor, reads, history_in_session(db, actor, args)).await
+    }
+}
+
+pub(super) async fn history_in_session(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    let args: History = parse("get_history", args)?;
+    let (limit, newest) = validate_history(&args)?;
+    let children = args.include_child_runs.unwrap_or(false);
     if let Some(id) = args.record_id.as_deref() {
         descriptor(db, actor, id)
             .await?

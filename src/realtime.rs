@@ -79,8 +79,8 @@ async fn inbox_vector_on(pool: &SqlitePool) -> crate::Result<InboxInvalidationVe
             .await?,
         // Grant-only revision for the realtime authorization context. The
         // broad `authorization_revision.epoch` stays as the cache fence
-        // elsewhere; the stream hashes this governed counter instead, so
-        // ordinary creates/deletes/filings do not move it.
+        // elsewhere; subject counters govern v1 context comparison, while
+        // ordinary creates/deletes/filings need not move this wake-up.
         authorization: sqlx::query_scalar(
             "SELECT epoch FROM authorization_grant_revision WHERE id = 1",
         )
@@ -570,6 +570,47 @@ impl RealtimeHub {
         let high = self.inbox_invalidation_vector().await.ok()?.content;
         let published = *self.last_published_seq.lock().await;
         (high <= published).then_some(high)
+    }
+
+    /// Cheap per-viewer authority fence. All workspace inputs are read from
+    /// one snapshot; hosting membership is fenced independently by transport.
+    pub async fn authorization_subject_revisions(
+        &self,
+        account: &str,
+        is_member: bool,
+    ) -> crate::Result<Vec<(String, String, i64)>> {
+        // attach may stage a pool before router acceptance. Only the accepted
+        // handle can prove an unchanged viewer fence.
+        let db = self
+            .current_db()
+            .ok_or_else(|| crate::Error::engine("realtime database retired"))?;
+        let mut tx = db.pool().begin().await?;
+        let global: i64 = sqlx::query_scalar("SELECT revision FROM authorization_subject_revision WHERE subject_kind = 'global' AND subject_id = ''").fetch_one(&mut *tx).await?;
+        let own: i64 = sqlx::query_scalar("SELECT revision FROM authorization_subject_revision WHERE subject_kind = 'account' AND subject_id = ?").bind(account).fetch_optional(&mut *tx).await?.unwrap_or(0);
+        let mut rows = vec![
+            ("global".into(), "".into(), global),
+            ("account".into(), account.into(), own),
+        ];
+        if is_member {
+            let members: i64 = sqlx::query_scalar("SELECT revision FROM authorization_subject_revision WHERE subject_kind = 'members' AND subject_id = 'native:members'").fetch_optional(&mut *tx).await?.unwrap_or(0);
+            rows.push(("members".into(), "native:members".into(), members));
+        }
+        if rows.iter().any(|(_, _, revision)| *revision < 0) {
+            return Err(crate::Error::engine("invalid subject revision"));
+        }
+        tx.commit().await?;
+        if self.is_terminal()
+            || self
+                .current_db()
+                .is_none_or(|current| current.handle_id() != db.handle_id())
+        {
+            return Err(crate::Error::engine(
+                "realtime database changed during subject read",
+            ));
+        }
+
+        rows.sort();
+        Ok(rows)
     }
 
     /// Claim the one scheduler spawn for this database. The held layer calls

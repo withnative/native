@@ -2776,6 +2776,7 @@ async fn dispatch_with_request_port<
     capture: bool,
     public_origin: Option<&str>,
     bootstrap_exposure: Option<Value>,
+    hint_missing_records: bool,
     handler: &HandlerFn,
 ) -> Result<ToolCallOutcome> {
     crate::domain_transaction::request::execute_request(
@@ -2800,11 +2801,21 @@ async fn dispatch_with_request_port<
                 crate::mcp::record_ref::resolve_record_ids(&engine, &caller, name, arguments)
                     .await?;
             // Boxed: this dispatch future is already large.
-            let arguments = Box::pin(crate::position::admit_event_id_preconditions(
+            let mut arguments = Box::pin(crate::position::admit_event_id_preconditions(
                 &engine, &caller, name, arguments,
             ))
             .await?;
             crate::mcp::request_timing::pre_handler_complete();
+            // The handler consumes the arguments, so a refusal that names a
+            // record cannot be traced back to them afterwards. Remember only
+            // the id-keyed strings (in-memory, no database work); the hint
+            // lookup runs solely if the handler then refuses.
+            let remembered = if hint_missing_records {
+                crate::mcp::record_ref::record_id_arguments(&mut arguments, name)
+            } else {
+                Vec::new()
+            };
+            let hint_context = (!remembered.is_empty()).then(|| (engine.clone(), caller.clone()));
             // Handler-body write-pool acquisition count for the readonly-pool
             // migration (stage 1: instrument only). Test-only scope around the
             // handler alone — after reference resolution, before capture — so
@@ -2815,7 +2826,7 @@ async fn dispatch_with_request_port<
             // only the cheap request-local hosted timing wrapper, which is a
             // no-op when no hosted timing scope is installed.
             #[cfg(test)]
-            {
+            let outcome = {
                 let ((outcome, handler_write_acquisitions), handler_read_acquisitions) =
                     crate::mcp::request_timing::handler(
                         crate::db::with_read_pool_acquisition_counter(
@@ -2828,10 +2839,18 @@ async fn dispatch_with_request_port<
                 crate::db::publish_write_pool_acquisitions(handler_write_acquisitions);
                 crate::db::publish_read_pool_acquisitions(handler_read_acquisitions);
                 outcome
-            }
+            };
             #[cfg(not(test))]
-            {
-                crate::mcp::request_timing::handler(handler(engine, caller, arguments)).await
+            let outcome =
+                crate::mcp::request_timing::handler(handler(engine, caller, arguments)).await;
+            // A refusal that names a record which is not there gets a "did you
+            // mean" hint appended; every other outcome passes through as is.
+            match (outcome, hint_context) {
+                (Err(error), Some((engine, caller))) => Err(
+                    crate::mcp::record_ref::with_did_you_mean(&engine, &caller, error, &remembered)
+                        .await,
+                ),
+                (outcome, _) => outcome,
             }
         },
     )
@@ -3024,6 +3043,24 @@ pub struct ToolRegistry {
     /// agent to guess that the hosted short domain applies to their records.
     share_origin: Option<String>,
     app_bundle_delivery: Option<crate::mcp::tools::alpha_tabs::AppBundleDelivery>,
+    /// How this registry's endpoint identifies itself in `server/discover` and
+    /// `initialize`, when it is not the general Native surface. `None` — every
+    /// registry but the HCP v2 one — leaves both responses exactly as they were.
+    server_identity: Option<McpServerIdentity>,
+}
+
+/// Self-description a registry contributes to the MCP discovery responses
+/// (`server/discover`, and legacy `initialize`). Used by the HCP v2 endpoint to
+/// declare its MCP extension (HCP v2 §10.2) without the general Native
+/// endpoint declaring anything.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpServerIdentity {
+    /// Entries for `capabilities.extensions`, keyed by extension identifier.
+    pub extensions: serde_json::Map<String, Value>,
+    /// Replaces the Native `instructions` text in `server/discover`. The
+    /// default text tells a client to call a Bootstrap tool, which an endpoint
+    /// with its own registry does not have.
+    pub instructions: Option<String>,
 }
 
 /// Attach deployment-authoritative absolute addresses anywhere a read
@@ -3154,6 +3191,16 @@ impl ToolRegistry {
     /// Validation belongs to deployment configuration, not this shared seam.
     pub fn set_public_origin(&mut self, origin: Option<String>) {
         self.public_origin = origin;
+    }
+
+    /// Declare how this registry's endpoint identifies itself in MCP discovery.
+    pub fn set_server_identity(&mut self, identity: McpServerIdentity) {
+        self.server_identity = Some(identity);
+    }
+
+    /// The identity declared with [`Self::set_server_identity`], if any.
+    pub fn server_identity(&self) -> Option<&McpServerIdentity> {
+        self.server_identity.as_ref()
     }
 
     /// Set the already-validated short-link origin used on record projections.
@@ -3308,6 +3355,18 @@ impl ToolRegistry {
             // Bootstrap receives the same full shape through its bounded
             // tool-exposure component. The dedicated status tool already
             // returns the provider's full report directly.
+            "bootstrap"
+                if object
+                    .get("engine")
+                    .and_then(|v| v.get("name"))
+                    .and_then(Value::as_str)
+                    == Some("kernel-v2") =>
+            {
+                object.insert(
+                    "standby_context".into(),
+                    serde_json::to_value(provider.response_context()).expect("standby context"),
+                );
+            }
             "bootstrap" | "standby_status" => {}
             "engine_info" => {
                 object.insert(
@@ -4161,7 +4220,10 @@ impl ToolRegistry {
         .boxed();
         #[cfg(any(test, feature = "v2-kernel-probe"))]
         {
-            crate::kernel::hosted_identity::scope_request(call).boxed()
+            crate::kernel::read_cache::scope_request(crate::kernel::hosted_identity::scope_request(
+                call,
+            ))
+            .boxed()
         }
         #[cfg(not(any(test, feature = "v2-kernel-probe")))]
         {
@@ -4266,6 +4328,14 @@ impl ToolRegistry {
             if let Some(gate) = &self.member_copy {
                 gate.admit(tool.kind, name, &arguments)?;
             }
+            // "Did you mean" hints on missing-record refusals are a write-path
+            // aid (a mistyped link or source id). Read refusals stay bare, so
+            // a hosted read and the same read served from a member copy keep
+            // returning identical text: the member slice carries no policy
+            // tables to compute a hint from.
+            let hint_missing_records = self
+                .registered_operation_access(name, &arguments)
+                .is_ok_and(|access| access == OperationAccess::Mutation);
             let deployment_admission = if self.standby_read_only {
                 None
             } else if let Some(lease) = &persistence_lease {
@@ -4356,6 +4426,7 @@ impl ToolRegistry {
                                     false,
                                     self.public_origin(),
                                     bootstrap_exposure,
+                                    hint_missing_records,
                                     &handler.call,
                                 )
                                 .await
@@ -4371,6 +4442,7 @@ impl ToolRegistry {
                                     capture,
                                     self.public_origin(),
                                     bootstrap_exposure,
+                                    hint_missing_records,
                                     &handler.call,
                                 )
                                 .await
@@ -4464,11 +4536,12 @@ impl ToolRegistry {
                     let suppressed = SuppressedRequestLifecycle { backend: "kernel-v2-deployment-read-only" };
                     let lifecycle: &dyn crate::domain_transaction::request::RequestLifecyclePort =
                         if suppress_persistence { &suppressed } else { &port };
-                    let dispatched = dispatch_with_request_port(
+                    let mut dispatched = dispatch_with_request_port(
                         lifecycle, engine.clone(), caller, name, tool.kind,
                         tool.extractor, arguments, false, self.public_origin(),
-                        bootstrap_exposure, &handler.call,
+                        bootstrap_exposure, hint_missing_records, &handler.call,
                     ).await?;
+                    Box::pin(self.annotate_standby_status(name, &mut dispatched)).await;
                     Ok(dispatched)
                 }
                 #[cfg(feature = "turso-local")]
@@ -4496,6 +4569,7 @@ impl ToolRegistry {
                         capture,
                         self.public_origin(),
                         bootstrap_exposure,
+                        hint_missing_records,
                         &handler.call,
                     )
                     .await?;
@@ -4527,6 +4601,7 @@ impl ToolRegistry {
                             capture,
                             self.public_origin(),
                             bootstrap_exposure,
+                            hint_missing_records,
                             &handler.call,
                         )
                         .await?;
@@ -4548,6 +4623,7 @@ impl ToolRegistry {
                         capture,
                         self.public_origin(),
                         bootstrap_exposure,
+                        hint_missing_records,
                         &handler.call,
                     )
                     .await?;
@@ -4921,7 +4997,7 @@ mod record_url_annotation_tests {
 
 const MAX_MEMBERSHIP_PAGE_SIZE: u32 = 200;
 
-const MANAGE_MEMBERSHIPS_DESCRIPTION: &str = "Hosted database membership administration. Use action=list for the bounded roster; action=set_role for owner/member administration; action=remove for durable full offboarding that fences access, transfers ordinary record ownership, retains immutable Message authorship, and sweeps direct account grants.";
+const MANAGE_MEMBERSHIPS_DESCRIPTION: &str = "Hosted membership admin. list: bounded roster (include_person adds names); set_role: owner/member; remove: durable offboarding that fences access, transfers record ownership, retains Message authorship, sweeps direct grants.";
 
 fn manage_memberships_schema() -> Value {
     serde_json::json!({
@@ -4933,7 +5009,8 @@ fn manage_memberships_schema() -> Value {
                 "properties":{
                     "action":{"const":"list"},
                     "cursor":{"type":"string"},
-                    "limit":{"type":"integer","minimum":1,"maximum":MAX_MEMBERSHIP_PAGE_SIZE}
+                    "limit":{"type":"integer","minimum":1,"maximum":MAX_MEMBERSHIP_PAGE_SIZE},
+                    "include_person":{"type":"boolean"}
                 },
                 "additionalProperties":false
             },
@@ -4987,6 +5064,42 @@ fn manage_memberships_schema() -> Value {
             }
         ]
     })
+}
+
+/// Display names of the People among `person_ids` that `caller` can see, for
+/// `manage_memberships list` with `include_person`. A Person the caller cannot
+/// see is absent from the map, so the caller learns neither its name nor, from
+/// the roster, its id. Hosted SQLite engine.
+#[doc(hidden)]
+pub async fn visible_person_names(
+    db: &crate::db::Db,
+    caller: &Caller,
+    person_ids: &[String],
+) -> Result<std::collections::BTreeMap<String, String>> {
+    use sqlx::Row;
+    let mut names = std::collections::BTreeMap::new();
+    if person_ids.is_empty() {
+        return Ok(names);
+    }
+    let visible =
+        super::tools::visible_ids_in_pool(db.write_pool(), caller, person_ids.to_vec()).await?;
+    let ids: Vec<&String> = person_ids
+        .iter()
+        .filter(|id| visible.contains(*id))
+        .collect();
+    let ids_json = serde_json::to_string(&ids)?;
+    for row in sqlx::query(
+        "SELECT id,name FROM records
+          WHERE id IN (SELECT value FROM json_each(?)) AND type='Entity' AND kind='person'
+            AND deleted_at IS NULL",
+    )
+    .bind(ids_json)
+    .fetch_all(db.write_pool())
+    .await?
+    {
+        names.insert(row.try_get("id")?, row.try_get("name")?);
+    }
+    Ok(names)
 }
 
 /// Return whether a requested hosted membership page size is in range.

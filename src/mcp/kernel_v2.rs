@@ -1,9 +1,13 @@
 //! Probe-only ordinary MCP tools over the v2 kernel, without the v1 schema.
+mod account_config;
 mod activity;
 mod app_data;
 mod apps;
+pub(crate) mod artifacts;
 pub use app_data::NativeAppDataNeeds;
 mod attachments;
+mod bindings;
+mod canvas;
 mod changes;
 pub(crate) mod comments;
 pub(crate) mod coordination;
@@ -11,15 +15,22 @@ mod deletion;
 mod event_context;
 mod history_diff;
 pub mod identity_read;
+pub(crate) mod intents;
+mod interventions;
+mod member_configuration;
 mod messaging;
 mod metadata_reads;
+mod policy;
 mod read_surface;
 pub mod record_images;
 pub mod reference_read;
 mod shape;
+mod source_basis;
 pub(crate) mod sql;
 mod suggestions;
-mod writes;
+mod surface_bindings;
+pub(crate) mod workspace_snapshot;
+pub(crate) mod writes;
 pub(crate) use writes::render_links;
 
 use serde::Deserialize;
@@ -35,7 +46,7 @@ pub(crate) async fn principal(db: &Db, caller: &Caller) -> Result<String> {
         .await?
         .map(|(id, _, _)| id)
         .ok_or_else(|| Error::engine("kernel-v2: caller has no principal auth_binding"))?;
-    let mut snapshot = db.write_pool().begin().await?;
+    let mut snapshot = db.pool().begin().await?;
     let admitted = kernel::hosted_identity::admitted(&mut snapshot, &id).await?;
     snapshot.rollback().await?;
     if !admitted {
@@ -71,7 +82,10 @@ pub fn register_hosted_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()
 /// Install alternate handlers on the ordinary tool descriptors.
 pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
     apps::register(registry)?;
+    intents::register(registry)?;
     deletion::register(registry)?;
+    bindings::register(registry)?;
+    interventions::register(registry)?;
     macro_rules! register {
         ($name:literal, $handler:path) => {
             registry.register_engine_handler(
@@ -89,10 +103,15 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
                     // post-commit check that could hide committed success.
                     if matches!(
                         $name,
-                        "get_record"
+                        "render_artifact"
+                            | "read_canvas"
+                            | "get_record"
+                            | "query_record"
                             | "query_sql"
                             | "get_history"
                             | "search"
+                            | "read_attachment"
+                            | "manage_attachments"
                             | "get_structure"
                             | "open_collection"
                             | "resolve_facets"
@@ -116,6 +135,8 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
             )?;
         };
     }
+    register!("read_canvas", canvas::read);
+    register!("manage_canvas", canvas::manage);
     register!("manage_participants", messaging::participants);
     registry.register_engine_handler(
         "manage_messages",
@@ -182,15 +203,94 @@ pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
     register!("get_event_context", event_context::get);
     register!("render_record_version_diff", history_diff::render);
     register!("whats_changed", changes::whats_changed);
+    registry.register_engine_handler(
+        "get_workspace_snapshot",
+        EngineKind::KernelV2,
+        |engine, caller, arguments| async move {
+            let EngineHandle::KernelV2(db) = engine else {
+                unreachable!()
+            };
+            principal(&db, &caller).await?;
+            let result = crate::mcp::tools::workspace_snapshot::get_workspace_snapshot(
+                db.clone(),
+                caller.clone(),
+                arguments,
+            )
+            .await?;
+            if let Some(app) = caller.host_asserted_app() {
+                kernel::app_installs::admit_account_app_as(&db, caller.credential(), app).await?;
+            }
+            Ok(result)
+        },
+    )?;
     registry.extend_kernel_v2_arguments("get_history", json!({"include_import_receipts": {
         "type":"boolean", "default":false,
         "description":"KernelV2 migration detail: include attributed import receipts, omitted from ordinary history."
     }}))?;
     register!("search", search);
+    let artifact_delivery = registry.app_bundle_delivery();
+    registry.register_engine_handler(
+        "render_artifact",
+        EngineKind::KernelV2,
+        move |engine, caller, arguments| {
+            let delivery = artifact_delivery.clone();
+            async move {
+                let EngineHandle::KernelV2(db) = engine else {
+                    unreachable!()
+                };
+                let actor = principal(&db, &caller).await?;
+                let value = match artifacts::html_board::try_render(
+                    &db,
+                    &caller,
+                    &actor,
+                    &arguments,
+                    delivery.as_ref(),
+                )
+                .await?
+                {
+                    Some(value) => value,
+                    None => {
+                        artifacts::render_with_database(
+                            &db,
+                            &actor,
+                            caller.hosting_database(),
+                            arguments,
+                        )
+                        .await?
+                    }
+                };
+                if let Some(app) = caller.host_asserted_app() {
+                    kernel::app_installs::admit_account_app_as(&db, caller.credential(), app)
+                        .await?;
+                }
+                Ok(value)
+            }
+        },
+    )?;
     coordination::register(registry)?;
+    member_configuration::register(registry)?;
+    surface_bindings::register(registry)?;
     register!("query_sql", sql::query_sql);
+    policy::register(registry)?;
+    account_config::register(registry)?;
     writes::register(registry)?;
-    register!("resolve_suggestions", suggestions::resolve);
+    registry.register_engine_handler(
+        "resolve_suggestions",
+        EngineKind::KernelV2,
+        |engine, caller, args| async move {
+            let EngineHandle::KernelV2(db) = engine else {
+                unreachable!()
+            };
+            let actor = principal(&db, &caller).await?;
+            if let Some(result) =
+                crate::mcp::tools::hcp_v2::kernel_human::resolve(&db, &caller, &actor, &args)
+                    .await?
+            {
+                return Ok(result);
+            }
+            suggestions::resolve(&db, &actor, args).await
+        },
+    )?;
     Ok(())
 }
 
@@ -245,10 +345,21 @@ pub use crate::v2_standard::v1_compat::v1_type_and_kind;
 // Ordinary records keep their v1 field names. Unmapped v2 fields remain in
 // `fields`, rather than overwriting envelope keys or inventing v1 facets.
 async fn record_value(db: &Db, actor: &str, record: &kernel::KernelRecordView) -> Result<Value> {
-    let mut snapshot = db.write_pool().begin().await?;
-    kernel::app_installs::admit_dispatched_on(&mut snapshot, actor).await?;
+    let actor_owned = actor.to_owned();
+    let record = record.clone();
+    sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move { record_value_on(conn, &actor_owned, &record).await })
+    })
+    .await
+}
+async fn record_value_on(
+    snapshot: &mut sqlx::SqliteConnection,
+    actor: &str,
+    record: &kernel::KernelRecordView,
+) -> Result<Value> {
+    kernel::app_installs::admit_dispatched_on(snapshot, actor).await?;
     kernel::kernel_require(
-        &mut snapshot,
+        snapshot,
         actor,
         &record.id,
         crate::authorization::Capability::View,
@@ -270,19 +381,23 @@ async fn record_value(db: &Db, actor: &str, record: &kernel::KernelRecordView) -
     let created_at = sqlx::query_scalar::<_,String>("SELECT created_at FROM kernel_legacy_sql_events WHERE record_id=? AND source_stream='snapshot_provenance' AND seq<=? ORDER BY seq DESC LIMIT 1")
         .bind(&record.id).bind(record.revision).fetch_optional(&mut *snapshot).await?.unwrap_or(created_at);
     let field = |name: &str| record.fields.get(name).cloned().unwrap_or(Value::Null);
-    let updated_at: String =
-        sqlx::query_scalar("SELECT created_at FROM content_events WHERE seq=?")
-            .bind(record.revision)
-            .fetch_one(&mut *snapshot)
-            .await?;
+    let updated_at: String = sqlx::query_scalar(
+        "SELECT created_at FROM main.content_events WHERE record_id=? AND seq=?",
+    )
+    .bind(&record.id)
+    .bind(record.revision)
+    .fetch_one(&mut *snapshot)
+    .await?;
     let body = record
         .body
         .as_ref()
         .map(|body| json!(body))
         .unwrap_or_else(|| field("body"));
+    let mut owner = record.owner_id.clone();
     let communication_origin = if record_type == Some("Message") {
-        let origin = if let Some(state) = kernel::messaging::on(&mut snapshot, &record.id).await? {
-            Some(kernel::messaging::communication_origin(&mut snapshot, &state).await?)
+        owner = messaging::visible_person(snapshot, actor, owner.as_deref()).await?;
+        let origin = if let Some(state) = kernel::messaging::on(snapshot, &record.id).await? {
+            Some(kernel::messaging::communication_origin(snapshot, &state).await?)
         } else {
             None
         };
@@ -290,23 +405,40 @@ async fn record_value(db: &Db, actor: &str, record: &kernel::KernelRecordView) -
     } else {
         None
     };
-    snapshot.rollback().await?;
-    // Placement owns its own snapshot. Release this pool slot first so
-    // concurrent app reads cannot each wait for a second writer-pool slot.
-    let home_id = crate::v1_import::placement_as(db, actor, &record.id)
+    let placement_started = std::time::Instant::now();
+    let home_id = crate::v1_import::placement_on(snapshot, actor, &record.id)
         .await?
         .and_then(|p| p.home_id);
+    tracing::debug!(target:"native_ce::read_staging",phase="record_placement",elapsed_us=placement_started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
+    let lifecycle_interpretation = kernel::v1_state::lifecycle_on(
+        snapshot,
+        actor,
+        record_type.unwrap_or_default(),
+        kind,
+        &record.id,
+        record.fields.get("lifecycle").and_then(Value::as_str),
+    )
+    .await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="record_lifecycle",elapsed_us=started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
+    let historical_claims = kernel::v1_state::claims_on(snapshot, actor, &record.id).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="record_claims",elapsed_us=started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
+    let legacy_provenance =
+        crate::v1_import::legacy_record_provenance_on(snapshot, actor, &record.id).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="record_provenance",elapsed_us=started.elapsed().as_micros() as u64);
     Ok(json!({
         "communication_origin":communication_origin,
         "id": record.id, "type": record_type, "kind": kind,
         "name": record.fields.get("title").cloned().unwrap_or_else(|| field("name")), "body": body, "body_digest": super::tools::lifecycle::body_digest(body.as_str()), "summary": field("summary"),
         "lifecycle": field("lifecycle"), "archived": record.archived,
-        "lifecycle_interpretation":kernel::v1_state::lifecycle_as(db,actor,record_type.unwrap_or_default(),kind,&record.id,record.fields.get("lifecycle").and_then(Value::as_str)).await?,
-        "historical_claims":kernel::v1_state::claims_as(db,actor,&record.id).await?,
-        "home_id": home_id, "owner_id": record.owner_id,
+        "lifecycle_interpretation":lifecycle_interpretation,
+        "historical_claims":historical_claims,
+        "home_id": home_id, "owner_id": owner,
         "persistence": record.metadata.persistence, "maturity": record.metadata.maturity,
         "created_at": created_at, "updated_at": updated_at, "last_activity_at": record.metadata.last_activity_at,
-        "legacy_provenance": crate::v1_import::legacy_record_provenance_as(db, actor, &record.id).await?,
+        "legacy_provenance": legacy_provenance,
         "deleted_at": null,
         "fields": record.fields, "version": format!("rec:{}", record.revision), "record_version": format!("rec:{}", record.revision),
         "kernel_v2": {"family": record.family, "pin": record.pin, "interpreter": record.interpreter, "native_created_at":native_created_at}
@@ -334,7 +466,26 @@ struct GetArgs {
     include_history_summary: Option<bool>,
 }
 async fn get_record(db: &Db, actor: &str, args: Value) -> Result<Value> {
-    sql::with_read_session(
+    // V1 caps the batch at 100 and returns an error for a failed batch rather
+    // than a successful prefix (lifecycle.rs:get_record_from_lens). Preserve
+    // that shape, with an additional wall bound over staging AND hydration.
+    tokio::time::timeout(get_batch_deadline(), kernel::read_cache::with_capabilities(get_record_read(db, actor, args)))
+        .await.map_err(|_| Error::engine("get_record: batch deadline exceeded; no partial results returned; retry with fewer ids"))?
+}
+const GET_BATCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+tokio::task_local! { static GET_BATCH_DEADLINE_OVERRIDE: std::time::Duration; }
+fn get_batch_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(deadline) = GET_BATCH_DEADLINE_OVERRIDE.try_with(|d| *d) {
+        return deadline;
+    }
+    GET_BATCH_DEADLINE
+}
+async fn get_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    let plan = get_plan(args)?;
+    let ids = plan.args.ids.clone();
+    sql::with_part_of_read_session(
         db,
         actor,
         &[
@@ -349,11 +500,21 @@ async fn get_record(db: &Db, actor: &str, args: Value) -> Result<Value> {
             ("links", "target_id"),
             ("links", "relationship"),
         ],
-        get_record_in_session(db, actor, args),
+        &ids,
+        get_record_from_plan(db, actor, plan),
     )
     .await
 }
-async fn get_record_in_session(db: &Db, actor: &str, args: Value) -> Result<Value> {
+struct GetPlan {
+    args: GetArgs,
+    opts: crate::query::read::EnrichOptions,
+    links_limit: usize,
+    links_offset: usize,
+    include_comments: bool,
+    comments_limit: usize,
+    comments_offset: usize,
+}
+fn get_plan(args: Value) -> Result<GetPlan> {
     let args: GetArgs = parse("get_record", args)?;
     let defaults = crate::query::read::EnrichOptions::default();
     let opts = crate::query::read::EnrichOptions {
@@ -361,6 +522,7 @@ async fn get_record_in_session(db: &Db, actor: &str, args: Value) -> Result<Valu
         children_offset: args.children_offset.unwrap_or(0),
         links_limit: args.links_limit.unwrap_or(defaults.links_limit as usize) as i64,
         links_offset: args.links_offset.unwrap_or(0) as i64,
+        link_summaries: false,
         include_suggestions: args.include_suggestions.unwrap_or(false),
         suggestions_limit: args.suggestions_limit.unwrap_or(defaults.suggestions_limit),
         suggestions_offset: args.suggestions_offset.unwrap_or(0),
@@ -403,123 +565,212 @@ async fn get_record_in_session(db: &Db, actor: &str, args: Value) -> Result<Valu
             "get_record: comments_limit must be between 0 and 100 (page with comments_offset)",
         ));
     }
+    Ok(GetPlan {
+        args,
+        opts,
+        links_limit,
+        links_offset,
+        include_comments,
+        comments_limit,
+        comments_offset,
+    })
+}
+#[cfg(test)]
+async fn get_record_in_session(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    get_record_from_plan(db, actor, get_plan(args)?).await
+}
+async fn get_record_from_plan(db: &Db, actor: &str, plan: GetPlan) -> Result<Value> {
+    let plan = std::sync::Arc::new(plan);
+    let started = std::time::Instant::now();
     let artifact_kinds = read_surface::artifact_kinds(db, actor).await?;
-    let mut records = Vec::new();
-    for id in args.ids {
-        // Comments read through their bearer chain: visible exactly when
-        // their terminal bearer is, never by their own home.
-        if let Some(record) = kernel::read_record_as(db, actor, &id).await? {
-            let mut value = record_value(db, actor, &record).await?;
-            value["status"] = json!("found");
-            // v1 EnrichedRecord always includes facets. Keep its wire shape;
-            // observation timestamps/numeric indexes are kernel internals.
-            let mut tx = db.write_pool().begin().await?;
-            kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
-            kernel::kernel_require(
-                &mut tx,
-                actor,
-                &record.id,
-                crate::authorization::Capability::View,
-            )
-            .await?;
-            let rows: Vec<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
-                "SELECT key,value,vocab_ref,event_seq FROM kernel_facets WHERE record_id=? AND value IS NOT NULL AND key!='archived' ORDER BY key"
-            ).bind(&record.id).fetch_all(&mut *tx).await?;
-            value["facets"] = json!(rows
-                .into_iter()
-                .map(
-                    |(key, value, vocab_ref, event_seq)| crate::query::FacetValueRow {
-                        key,
-                        value: value.map(Value::String),
-                        vocab_ref,
-                        version: Some(
-                            native_artifact_runtime::artifact_intents::FacetVersion::Observation {
-                                event_seq
-                            }
-                            .encode()
-                        ),
-                    }
-                )
-                .collect::<Vec<_>>());
-            if value["type"] == "Message" {
-                if let Some(state) = kernel::messaging::on(&mut tx, &record.id).await? {
-                    if let Some(speaker) = &state.speaker {
-                        value["speaker"] = speaker.clone();
-                    }
-                    value["mentions"] = messaging::mentions_as(&mut tx, actor, &state).await?;
-                    value["mentions_count"] =
-                        json!(value["mentions"].as_array().map_or(0, Vec::len));
-                }
-            }
-            if value["type"] == "Document" && value["kind"] == "attachment" {
-                value["blob"] = serde_json::to_value(
-                    kernel::blobs::metadata_optional(&mut tx, actor, &record.id).await?,
-                )?;
-            }
-            tx.rollback().await?;
-            let links = kernel::generic_links::visible_link_rows_as(db, actor, &id).await?;
-            for (field, endpoint) in [("links_out", "source_id"), ("links_in", "target_id")] {
-                let direction: Vec<_> = links.iter().filter(|link| link[endpoint] == id).collect();
-                value[format!("{field}_count")] = json!(direction.len());
-                value[field] = json!(direction
-                    .into_iter()
-                    .skip(links_offset)
-                    .take(links_limit)
-                    .collect::<Vec<_>>());
-            }
-            // Direct thread children ride every row: the count always, the
-            // anchored summaries only with include_comments. A hidden record
-            // stays not_found above, so its comments never leak.
-            let enriched = comments::enrich(
-                db,
-                actor,
-                &record,
-                include_comments,
-                comments_limit,
-                comments_offset,
-            )
-            .await?;
-            value["comment_count"] = enriched["comment_count"].clone();
-            if let Some(comments) = enriched.get("comments") {
-                value["comments"] = comments.clone();
-            }
-            read_surface::enrich(
-                db,
-                actor,
-                &id,
-                &opts,
-                &artifact_kinds,
-                args.include_history_summary.unwrap_or(false),
-                &mut value,
-            )
-            .await?;
-            records.push(value);
-        } else if let Some(mut value) = read_surface::root(db, actor, &id).await? {
+    tracing::debug!(target:"native_ce::read_staging",phase="get_artifact_kinds",elapsed_us=started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
+    let artifact_counts =
+        read_surface::artifact_counts(db, actor, &plan.args.ids, &artifact_kinds).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="get_artifact_counts",elapsed_us=started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
+    let child_sections =
+        read_surface::child_sections(db, actor, &plan.args.ids, &plan.opts).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="get_child_sections",elapsed_us=started.elapsed().as_micros() as u64);
+    let history_summary = plan.args.include_history_summary.unwrap_or(false);
+    let actor_owned = actor.to_owned();
+    let ids = plan.args.ids.clone();
+    let started = std::time::Instant::now();
+    let links = sql::in_snapshot(db, actor, move |conn| {
+        Box::pin(async move {
+            kernel::generic_links::visible_link_rows_for_on(conn, &actor_owned, &ids).await
+        })
+    })
+    .await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="get_link_batch",elapsed_us=started.elapsed().as_micros() as u64);
+    let mut records = Vec::with_capacity(plan.args.ids.len());
+    // Partition the admitted batch once. Scanning every link again for each
+    // ID made a large Get quadratic even though its SQL reads were bounded.
+    let requested: std::collections::BTreeSet<_> =
+        plan.args.ids.iter().map(String::as_str).collect();
+    let mut by_record = std::collections::BTreeMap::<String, Vec<Value>>::new();
+    for link in links {
+        let source = link["source_id"].as_str();
+        let target = link["target_id"].as_str();
+        if let Some(source) = source.filter(|id| requested.contains(id)) {
+            by_record
+                .entry(source.to_owned())
+                .or_default()
+                .push(link.clone());
+        }
+        if let Some(target) = target.filter(|id| Some(*id) != source && requested.contains(id)) {
+            by_record
+                .entry(target.to_owned())
+                .or_default()
+                .push(link.clone());
+        }
+    }
+    let links = std::sync::Arc::new(by_record);
+    for id in &plan.args.ids {
+        let actor_owned = actor.to_owned();
+        let id_owned = id.clone();
+        let plan_ref = plan.clone();
+        let links_ref = links.clone();
+        // Connection-scoped hydration and composed SQL consume the same
+        // read snapshot; no pool transactions can observe a newer revision.
+        let hydrated = sql::in_snapshot(db, actor, move |conn| {
+            Box::pin(async move {
+                let links = links_ref.get(&id_owned).map(Vec::as_slice).unwrap_or(&[]);
+                hydrate_get_on(conn, &actor_owned, &id_owned, &plan_ref, links).await
+            })
+        })
+        .await?;
+        let mut value = if let Some(value) = hydrated {
+            value
+        } else if let Some(mut value) = read_surface::root(db, actor, id).await? {
             value["facets"] = json!([]);
             for field in ["links_out", "links_in"] {
                 value[field] = json!([]);
                 value[format!("{field}_count")] = json!(0);
             }
             value["comment_count"] = json!(0);
-            if include_comments {
+            if plan.include_comments {
                 value["comments"] = json!([]);
             }
-            read_surface::enrich(
-                db,
-                actor,
-                &id,
-                &opts,
-                &artifact_kinds,
-                args.include_history_summary.unwrap_or(false),
-                &mut value,
-            )
-            .await?;
-            records.push(value);
+            value
         } else {
-            records.push(json!({"id": id, "status": "not_found"}));
-        }
+            records.push(json!({"id":id,"status":"not_found"}));
+            continue;
+        };
+        read_surface::enrich(
+            db,
+            actor,
+            id,
+            &plan.opts,
+            &artifact_kinds,
+            history_summary,
+            artifact_counts.get(id).unwrap_or(&[0, 0]),
+            child_sections.get(id),
+            &mut value,
+        )
+        .await?;
+        records.push(value);
     }
     Ok(json!({"records": records}))
+}
+
+async fn hydrate_get_on(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    id: &str,
+    plan: &GetPlan,
+    links: &[Value],
+) -> Result<Option<Value>> {
+    let links_limit = plan.links_limit;
+    let links_offset = plan.links_offset;
+    let include_comments = plan.include_comments;
+    let comments_limit = plan.comments_limit;
+    let comments_offset = plan.comments_offset;
+    if let Some(record) = kernel::read_record_on(conn, actor, id).await? {
+        let value_started = std::time::Instant::now();
+        let mut value = record_value_on(conn, actor, &record).await?;
+        tracing::debug!(target:"native_ce::read_staging",phase="record_value",elapsed_us=value_started.elapsed().as_micros() as u64);
+        value["status"] = json!("found");
+        // v1 EnrichedRecord always includes facets. Keep its wire shape;
+        // observation timestamps/numeric indexes are kernel internals.
+        let tx = &mut *conn;
+        kernel::app_installs::admit_dispatched_on(&mut *tx, actor).await?;
+        kernel::kernel_require(
+            &mut *tx,
+            actor,
+            &record.id,
+            crate::authorization::Capability::View,
+        )
+        .await?;
+        let rows: Vec<(String, Option<String>, Option<String>, i64)> = sqlx::query_as(
+                "SELECT key,value,vocab_ref,event_seq FROM kernel_facets WHERE record_id=? AND value IS NOT NULL AND key!='archived' ORDER BY key"
+            ).bind(&record.id).fetch_all(&mut *tx).await?;
+        value["facets"] = json!(rows
+            .into_iter()
+            .map(
+                |(key, value, vocab_ref, event_seq)| crate::query::FacetValueRow {
+                    key,
+                    value: value.map(Value::String),
+                    vocab_ref,
+                    version: Some(
+                        native_artifact_runtime::artifact_intents::FacetVersion::Observation {
+                            event_seq
+                        }
+                        .encode()
+                    ),
+                }
+            )
+            .collect::<Vec<_>>());
+        if value["type"] == "Message" {
+            if let Some(state) = kernel::messaging::on(&mut *tx, &record.id).await? {
+                if let Some(speaker) = &state.speaker {
+                    value["speaker"] = speaker.clone();
+                }
+                value["mentions"] = messaging::mentions_as(&mut *tx, actor, &state).await?;
+                value["mentions_count"] = json!(value["mentions"].as_array().map_or(0, Vec::len));
+            }
+        }
+        if value["type"] == "Document" && value["kind"] == "attachment" {
+            value["blob"] = serde_json::to_value(
+                kernel::blobs::metadata_optional(&mut *tx, actor, &record.id).await?,
+            )?;
+        }
+        let links_started = std::time::Instant::now();
+        let links = links
+            .iter()
+            .filter(|link| link["source_id"] == id || link["target_id"] == id)
+            .cloned()
+            .collect::<Vec<_>>();
+        tracing::debug!(target:"native_ce::read_staging",phase="record_links",elapsed_us=links_started.elapsed().as_micros() as u64);
+        for (field, endpoint) in [("links_out", "source_id"), ("links_in", "target_id")] {
+            let direction: Vec<_> = links.iter().filter(|link| link[endpoint] == id).collect();
+            value[format!("{field}_count")] = json!(direction.len());
+            value[field] = json!(direction
+                .into_iter()
+                .skip(links_offset)
+                .take(links_limit)
+                .collect::<Vec<_>>());
+        }
+        // Direct thread children ride every row: the count always, the
+        // anchored summaries only with include_comments. A hidden record
+        // stays not_found above, so its comments never leak.
+        let enriched = comments::enrich_on(
+            conn,
+            actor,
+            &record,
+            include_comments,
+            comments_limit,
+            comments_offset,
+        )
+        .await?;
+        value["comment_count"] = enriched["comment_count"].clone();
+        if let Some(comments) = enriched.get("comments") {
+            value["comments"] = comments.clone();
+        }
+        Ok(Some(value))
+    } else {
+        Ok(None)
+    }
 }
 
 #[derive(Deserialize)]
@@ -547,6 +798,9 @@ struct Traverse {
 }
 
 async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    kernel::read_cache::with_capabilities(query_record_read(db, actor, args)).await
+}
+async fn query_record_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let extended = args.get("order").is_some()
         || args["steps"].as_array().is_some_and(|steps| {
             steps.len() == 2
@@ -647,20 +901,70 @@ async fn query_record(db: &Db, actor: &str, args: Value) -> Result<Value> {
         &counters,
     )
     .await?;
-    let mut records = Vec::with_capacity(page.records.len());
-    for record in &page.records {
-        let home = crate::v1_import::placement_as(db, actor, &record.id)
-            .await?
-            // Do not attach a newer placement to an older bounded-list hit.
-            .filter(|p| p.kernel_home_id == record.home_id)
-            .and_then(|p| p.home_id);
-        if record.primary_type.as_deref() == Some("Message") {
-            if let Some(message) = kernel::read_record_as(db, actor, &record.id).await? {
-                records.push(record_value(db, actor, &message).await?);
+    let placement_started = std::time::Instant::now();
+    let mut snapshot = db.pool().begin().await?;
+    kernel::app_installs::admit_dispatched_on(&mut snapshot, actor).await?;
+    let identity = kernel::read_cache::key_on(&mut snapshot, actor, "query_placement").await?;
+    let mut records = kernel::read_cache::in_pinned_snapshot(
+        identity,
+        kernel::read_cache::connection_id(&mut snapshot),
+        async {
+            let mut records = Vec::with_capacity(page.records.len());
+            for record in &page.records {
+                let home = crate::v1_import::placement_on(&mut snapshot, actor, &record.id)
+                    .await?
+                    // Do not attach a newer placement to an older bounded-list hit.
+                    .filter(|p| p.kernel_home_id == record.home_id)
+                    .and_then(|p| p.home_id);
+                if record.primary_type.as_deref() == Some("Message") {
+                    if let Some(message) =
+                        kernel::read_record_on(&mut snapshot, actor, &record.id).await?
+                    {
+                        records.push(record_value_on(&mut snapshot, actor, &message).await?);
+                    }
+                } else {
+                    records.push(bounded_value(record, home));
+                }
             }
-        } else {
-            records.push(bounded_value(record, home));
+            Ok::<_, Error>(records)
+        },
+    )
+    .await?;
+    snapshot.rollback().await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="query_placement",elapsed_us=placement_started.elapsed().as_micros() as u64);
+    // The built-in workbench hydrates inbox routing and author exclusion from
+    // this bounded list. These are governed Message metadata, not body reads.
+    // Finish placement first so the read snapshot never holds a pool slot
+    // while asking placement to acquire another one.
+    if page
+        .records
+        .iter()
+        .any(|r| r.primary_type.as_deref() == Some("Message"))
+    {
+        let mut tx = db.pool().begin().await?;
+        kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
+        for (record, value) in page.records.iter().zip(records.iter_mut()) {
+            if record.primary_type.as_deref() != Some("Message") {
+                continue;
+            }
+            kernel::kernel_require(
+                &mut tx,
+                actor,
+                &record.id,
+                crate::authorization::Capability::View,
+            )
+            .await?;
+            value["owner_id"] =
+                json!(messaging::visible_person(&mut tx, actor, record.owner_id.as_deref()).await?);
+            if let Some(state) = kernel::messaging::on(&mut tx, &record.id).await? {
+                value["communication_origin"] =
+                    kernel::messaging::communication_origin(&mut tx, &state).await?;
+                if let Some(created) = state.created_at {
+                    value["created_at"] = json!(created);
+                }
+            }
         }
+        tx.rollback().await?;
     }
     let returned = records.len();
     Ok(
@@ -699,6 +1003,9 @@ struct SearchArgs {
 /// shapes and kernel visibility. Optional filing scope intersects candidates;
 /// pass a filter to `query_record` to narrow.
 async fn search(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    kernel::read_cache::with_capabilities(search_read(db, actor, args)).await
+}
+async fn search_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let args: SearchArgs = parse("search", args)?;
     if args.query.trim().is_empty() {
         return Err(Error::engine(
@@ -714,6 +1021,7 @@ async fn search(db: &Db, actor: &str, args: Value) -> Result<Value> {
         return Err(Error::engine("search (kernel-v2): limit must be positive"));
     }
     let limit = limit.min(200);
+    let core_started = std::time::Instant::now();
     let (hits, truncated) = match scope_ids.as_deref() {
         Some(ids) => {
             kernel::search_v2::search_scoped_as(
@@ -737,17 +1045,28 @@ async fn search(db: &Db, actor: &str, args: Value) -> Result<Value> {
             .await?
         }
     };
+    tracing::debug!(target:"native_ce::read_staging",phase="search_core",elapsed_us=core_started.elapsed().as_micros() as u64);
     // Truncation (scan backstop) reads like a full page to the caller: the
     // guidance below says more may exist.
     let limit_reached = truncated || hits.len() as i64 == limit;
-    let mut rendered_hits = Vec::with_capacity(hits.len());
-    for hit in &hits {
-        let home_id = crate::v1_import::placement_as(db, actor, &hit.id)
-            .await?
-            .filter(|p| p.kernel_home_id == hit.home_id)
-            .and_then(|p| p.home_id);
-        rendered_hits.push(json!({"id":hit.id,"type":hit.record_type,"kind":hit.kind,"name":hit.name,"home_id":home_id,"score":hit.score,"snippet":hit.snippet}));
-    }
+    let placement_started = std::time::Instant::now();
+    let mut snapshot = db.pool().begin().await?;
+    kernel::app_installs::admit_dispatched_on(&mut snapshot, actor).await?;
+    let identity = kernel::read_cache::key_on(&mut snapshot, actor, "search_placement").await?;
+    let rendered = kernel::read_cache::in_pinned_snapshot(identity, kernel::read_cache::connection_id(&mut snapshot), async {
+        let mut rendered_hits = Vec::with_capacity(hits.len());
+        for hit in &hits {
+            let home_id = crate::v1_import::placement_on(&mut snapshot, actor, &hit.id)
+                .await?
+                .filter(|p| p.kernel_home_id == hit.home_id)
+                .and_then(|p| p.home_id);
+            rendered_hits.push(json!({"id":hit.id,"type":hit.record_type,"kind":hit.kind,"name":hit.name,"home_id":home_id,"score":hit.score,"snippet":hit.snippet}));
+        }
+        Ok::<_, Error>(rendered_hits)
+    }).await;
+    snapshot.rollback().await?;
+    let rendered_hits = rendered?;
+    tracing::debug!(target:"native_ce::read_staging",phase="search_placement",elapsed_us=placement_started.elapsed().as_micros() as u64);
     let mut payload = json!({
         "query": args.query, "scope": args.scope,
         "hits": rendered_hits,
@@ -774,6 +1093,9 @@ struct HistoryArgs {
     include_import_receipts: Option<bool>,
 }
 pub(crate) async fn get_history(db: &Db, actor: &str, args: Value) -> Result<Value> {
+    kernel::read_cache::with_capabilities(get_history_read(db, actor, args)).await
+}
+async fn get_history_read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     if args.get("record_id").is_none_or(Value::is_null)
         || args.get("for_run").is_some()
         || args.get("include_child_runs").is_some()
@@ -902,3 +1224,43 @@ fn history_values(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod policy_tests;
+
+/// Qualified hosted entry point; callers supply retained exact pins, never a
+/// mutable active-name lookup. Other serving profiles have no equivalent route.
+pub(crate) async fn query_pinned_saved_sql(
+    db: &Db,
+    actor: &str,
+    definition: &crate::named_views::contract::SavedSqlV12,
+) -> Result<Value> {
+    definition.validate_current()?;
+    let order = definition
+        .output
+        .order
+        .iter()
+        .map(|o| {
+            format!(
+                "\"{}\" {}",
+                o.column,
+                match o.direction {
+                    crate::mcp::tools::querying::SavedSqlDirection::Asc => "ASC",
+                    crate::mcp::tools::querying::SavedSqlDirection::Desc => "DESC",
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT * FROM ({}) AS saved_governed_projection ORDER BY {order} LIMIT {}",
+        definition.sql.trim().trim_end_matches(';'),
+        definition.bounds.rows.saturating_add(1)
+    );
+    sql::query_stored_saved_sql(
+        db,
+        actor,
+        json!({"sql":sql,"parameters":definition.parameters,"_named_view_pins":definition.roots()}),
+    )
+    .await
+}

@@ -92,7 +92,7 @@ printf '%s\n' \
 
 The second response should contain `result.structuredContent.engine` equal
 to `native-ce`. That minimal protocol probe selects the legacy compatibility
-surface explicitly; keep the default executor surface for the client setup
+surface explicitly; keep the default lean surface for the client setup
 above. Remove `/tmp/native-source.db` after the probe.
 
 ## Current limits

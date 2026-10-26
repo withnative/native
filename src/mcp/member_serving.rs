@@ -2418,6 +2418,100 @@ mod tests {
         member_db.close().await;
     }
 
+    /// Link far-end summaries on a member copy agree with the online read for
+    /// every record the member can see, and a link to a record outside the
+    /// member's slice names nothing — not its id, not its name, not its
+    /// succession.
+    #[tokio::test]
+    async fn member_link_summaries_match_online_and_name_no_hidden_record() {
+        use crate::mcp::{register_builtin_tools, register_surface_tools};
+        use crate::member_offline_fixtures::{link, two_caller, ACCT_B};
+
+        let world = two_caller::build().await;
+        link(
+            &world.db,
+            "zz-link-summary-visible",
+            two_caller::SHARED_CHILD,
+            two_caller::OLD_RECORD,
+            "mentions",
+        )
+        .await;
+        link(
+            &world.db,
+            "zz-link-summary-hidden",
+            two_caller::SHARED_CHILD,
+            two_caller::HIDDEN_PARENT,
+            "mentions",
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (member, lifecycle) = admit_member_copy_of(&dir, &world.db, ACCT_B, SCOPE).await;
+        let mut online = ToolRegistry::new();
+        register_builtin_tools(&mut online).unwrap();
+        register_surface_tools(&mut online).unwrap();
+        let mut offline = ToolRegistry::new();
+        register_builtin_tools(&mut offline).unwrap();
+        register_surface_tools(&mut offline).unwrap();
+        offline.set_member_copy_gate(lifecycle, SCOPE.into(), 1, Vec::new());
+        let args = json!({ "ids": [two_caller::SHARED_CHILD] });
+        let online_payload = online
+            .call(
+                world.db.clone(),
+                Caller::authenticated(ACCT_B),
+                "get_record",
+                args.clone(),
+            )
+            .await
+            .expect("online get_record");
+        let offline_payload = offline
+            .call(
+                member.clone(),
+                Caller::member_copy(ACCT_B),
+                "get_record",
+                args,
+            )
+            .await
+            .expect("member get_record");
+        assert_no_counter_fields(&offline_payload, "member link summaries");
+
+        let summary_for = |payload: &Value, target: &str| -> Option<Value> {
+            payload["records"][0]["links_out"]
+                .as_array()?
+                .iter()
+                .find(|link| link["target_id"] == json!(target))
+                .map(|link| link["other"].clone())
+        };
+        let online_other = summary_for(&online_payload, two_caller::OLD_RECORD)
+            .expect("online summarises the visible far end");
+        let offline_other = summary_for(&offline_payload, two_caller::OLD_RECORD)
+            .expect("member summarises the visible far end");
+        assert_eq!(online_other["id"], offline_other["id"]);
+        for field in ["name", "type", "kind", "lifecycle", "display_reference"] {
+            assert_eq!(
+                online_other.get(field),
+                offline_other.get(field),
+                "{field}: online {online_other} vs member {offline_other}"
+            );
+        }
+        // Online counts the hidden successor (R1 carve-out shared with
+        // `superseded_by`); the member copy ships no link from outside its
+        // slice, so it cannot — and never names it either way.
+        assert_eq!(online_other["superseded"], json!(true), "{online_other}");
+        assert!(offline_other.get("superseded").is_none(), "{offline_other}");
+
+        for payload in [&online_payload, &offline_payload] {
+            assert!(
+                summary_for(payload, two_caller::HIDDEN_PARENT).is_none(),
+                "a hidden far end is not in the window: {payload}"
+            );
+            let text = payload.to_string();
+            assert!(!text.contains(two_caller::NEWER_HIDDEN), "{text}");
+            assert!(!text.contains(two_caller::HIDDEN_PARENT), "{text}");
+        }
+        member.close().await;
+        world.db.close().await;
+    }
+
     #[tokio::test]
     async fn member_bears_shape_runs_and_is_false() {
         // Surrogate for the deferred unit-bearer case: a shape-bearing record
@@ -6003,6 +6097,7 @@ mod tests {
             "SELECT * FROM links ORDER BY id",
             "SELECT * FROM facet_values ORDER BY record_id, key, id",
             "SELECT * FROM facet_times ORDER BY record_id, key",
+            "SELECT * FROM facet_keys ORDER BY scope_id, type, kind, key",
             "SELECT * FROM bindings ORDER BY record_id, system, identifier",
             "SELECT * FROM vocabularies ORDER BY id",
             "SELECT * FROM vocabulary_values ORDER BY vocabulary_id, value",

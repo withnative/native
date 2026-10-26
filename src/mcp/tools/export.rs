@@ -99,6 +99,8 @@ async fn export_snapshot(
 }
 
 pub fn register_export_tool(registry: &mut ToolRegistry, source: SnapshotSourceRef) -> Result<()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    let kernel_source = source.clone();
     registry.register(
         ToolKind::ExportSnapshot,
         "Owner-only verified SQLite snapshot. Omit export_id to start; continue with its handle and offset until eof. A hosted first call may bind standby_consumer for per-page provenance; other exports omit it.",
@@ -141,6 +143,20 @@ pub fn register_export_tool(registry: &mut ToolRegistry, source: SnapshotSourceR
         move |db, caller, arguments| {
             let source = source.clone();
             async move { export_snapshot(db, caller, arguments, source).await }
+        },
+    )?;
+    #[cfg(feature = "v2-kernel-probe")]
+    registry.register_engine_handler(
+        "export_snapshot",
+        crate::mcp::registry::EngineKind::KernelV2,
+        move |engine, caller, args| {
+            let source = kernel_source.clone();
+            async move {
+                let crate::mcp::registry::EngineHandle::KernelV2(db) = engine else {
+                    unreachable!()
+                };
+                export_snapshot(db, caller, args, source).await
+            }
         },
     )?;
     Ok(())

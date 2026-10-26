@@ -52,7 +52,7 @@ The source is a constituent of the target whole. It is semantic composition, not
 
 The source was produced from the target and should retain that provenance.
 
-Use `manage_links` for atomic add/remove/list operations. Use `query_record` traversal for filtered multi-hop work; traversing a link never changes containment. On a lean MCP surface, `manage_links.list`, `get_record` and `query_record` are reached through `call_executor` with `{"executor":"records_read","operation":...,"arguments":...}`.
+Use `manage_links` for atomic add/remove/list operations. Use `query_record` traversal for filtered multi-hop work; traversing a link never changes containment. On a lean MCP surface, `manage_links.list` and `query_record` are reached through `call_executor` with `{"executor":"records_read","operation":...,"arguments":...}`; `get_record` is advertised directly.
 
 A record an incoming `supersedes` link points at discloses its successors on
 reads: `get_record`, `query_record`, `search`, `get_structure`,
@@ -62,6 +62,16 @@ reference; `total_count`: every live successor). The superseded record stays
 readable and otherwise unchanged — this is disclosure, not archival. A
 successor you cannot View is counted in `total_count` but never named in
 `items`.
+
+`get_record` link rows (`links_out`, `links_in`) also carry `other`, a compact
+summary of the record at the far end — the target for `links_out`, the source
+for `links_in` — so a link can be read without a second call: `id`, `name`,
+`type`, `kind`, `lifecycle` (`status`, `value`, `terminality`; absent when the
+record has none), `superseded` (present only when true) and
+`display_reference`. It carries no body or summary. A link whose far end you
+cannot View is not returned at all, as before. `superseded` follows the
+`superseded_by` rule above: a successor you cannot View still counts, and is
+never named. The row's own fields are unchanged.
 
 Use `manage_relationships` for governed semantic propositions whose support,
 contest, evidence, admission, provenance, and effective state must remain

@@ -64,6 +64,70 @@ pub fn method_and_name(message: &Value) -> (Option<&str>, Option<&str>) {
     protocol::method_and_name(message)
 }
 
+/// Shared pre-dispatch validation for a direct-dispatch `tools/call`: the
+/// envelope both eras require plus the modern metadata when `modern`. The
+/// caller must already have matched `tools/call` with a well-formed id (as
+/// [`method_and_name`] plus an id check do); notifications can therefore
+/// never reach this function. Returns the validated request id, or the exact
+/// response body and error code the generic path renders.
+pub fn validate_direct_call_envelope(
+    message: &Value,
+    modern: bool,
+) -> std::result::Result<Value, (Value, Option<i64>)> {
+    let outcome = if modern {
+        match protocol::validate_modern_envelope(message) {
+            Ok(envelope) => return Ok(envelope.id),
+            Err(outcome) => outcome,
+        }
+    } else {
+        match protocol::validate_legacy_envelope(message) {
+            Ok(_) => return Ok(protocol::request_id(message)),
+            Err(outcome) => outcome,
+        }
+    };
+    match HostedRpcOutcome::from(outcome).into_response() {
+        Some(response) => Err(response),
+        // Unreachable: the caller matched `tools/call` with a well-formed
+        // id, so neither envelope reports a notification.
+        None => Err((
+            protocol::error_response(
+                Value::Null,
+                protocol::INVALID_REQUEST,
+                "invalid request: notification without id",
+            ),
+            Some(protocol::INVALID_REQUEST),
+        )),
+    }
+}
+
+/// Thin wrapper over the shared client-capabilities check.
+pub fn validate_direct_client_capabilities(value: &Value) -> std::result::Result<(), String> {
+    protocol::validate_client_capabilities(value)
+}
+
+/// Thin wrapper over the shared client-info check.
+pub fn validate_direct_implementation(value: &Value) -> std::result::Result<(), String> {
+    protocol::validate_implementation(value)
+}
+
+/// Thin wrapper over the shared method-params check.
+pub fn validate_direct_method_params(
+    method: &str,
+    params: &serde_json::Map<String, Value>,
+) -> std::result::Result<(), String> {
+    protocol::validate_method_params(method, params)
+}
+
+/// Thin wrapper over the shared standby app-caller check: `native/app`
+/// metadata is only valid on the read-only owner standby.
+pub fn check_direct_standby_caller(
+    registry: &ToolRegistry,
+    caller: Caller,
+    meta: Option<&Value>,
+) -> std::result::Result<Caller, (i64, String)> {
+    protocol::standby_app_caller(registry, caller, meta)
+}
+
 pub fn requested_protocol_version(message: &Value) -> Option<&str> {
     protocol::requested_protocol_version(message)
 }
@@ -101,9 +165,27 @@ pub async fn handle_modern_message_with_persistence(
     message: Value,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> HostedRpcOutcome {
-    protocol::handle_modern_engine_message_with_persistence(
+    handle_modern_engine_message_with_persistence(
         registry,
         EngineHandle::Sqlite(db),
+        caller,
+        message,
+        persistence_lease,
+    )
+    .await
+}
+
+/// Engine-aware dispatch for hosted surfaces that select a workspace engine.
+pub async fn handle_modern_engine_message_with_persistence(
+    registry: Arc<ToolRegistry>,
+    engine: EngineHandle,
+    caller: Caller,
+    message: Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> HostedRpcOutcome {
+    protocol::handle_modern_engine_message_with_persistence(
+        registry,
+        engine,
         caller,
         message,
         persistence_lease,
@@ -120,9 +202,27 @@ pub async fn handle_legacy_message_with_persistence(
     message: Value,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> HostedRpcOutcome {
-    protocol::handle_legacy_engine_message_with_persistence(
+    handle_legacy_engine_message_with_persistence(
         registry,
         EngineHandle::Sqlite(db),
+        caller,
+        message,
+        persistence_lease,
+    )
+    .await
+}
+
+/// Initialize-era engine-aware dispatch.
+pub async fn handle_legacy_engine_message_with_persistence(
+    registry: Arc<ToolRegistry>,
+    engine: EngineHandle,
+    caller: Caller,
+    message: Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> HostedRpcOutcome {
+    protocol::handle_legacy_engine_message_with_persistence(
+        registry,
+        engine,
         caller,
         message,
         persistence_lease,

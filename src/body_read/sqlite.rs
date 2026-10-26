@@ -1465,7 +1465,7 @@ async fn policy_columns(
 
 async fn event(snapshot: &mut ReadSnapshot<'_>, id: &str) -> Result<String> {
     snapshot.budget.sql()?;
-    let metadata = sqlx::query("SELECT CASE WHEN octet_length(id)<=128 THEN id END AS id,type,octet_length(payload) AS bytes FROM content_events WHERE record_id=? AND type IN ('record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1') ORDER BY seq DESC LIMIT 129")
+    let metadata = sqlx::query("SELECT CASE WHEN octet_length(id)<=128 THEN id END AS id,type,octet_length(payload) AS bytes FROM content_events WHERE record_id=? AND type IN ('record.created','record.updated','receipt.committed.v1','unit.revision.recorded.v1','message.revision.recorded.v1') ORDER BY seq DESC LIMIT 129")
         .bind(id).fetch_all(&mut *snapshot.transaction).await.map_err(|e| snapshot.map_sql(e))?;
     let mut creation = None;
     for (index, row) in metadata.iter().enumerate() {

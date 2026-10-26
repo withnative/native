@@ -1283,9 +1283,9 @@ pub(crate) async fn render_record<E: DomainStatementExecutor>(
         bears_shape: false,
         kind_governance: None,
         facets,
-        links_out,
+        links_out: links_out.into_iter().map(Into::into).collect(),
         links_out_count,
-        links_in,
+        links_in: links_in.into_iter().map(Into::into).collect(),
         links_in_count,
         // Portable adapters do not serve the body-mention projection: the four
         // fields stay absent (never empty) outside the SQLite kernel, exactly

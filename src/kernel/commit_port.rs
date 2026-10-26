@@ -84,8 +84,19 @@ pub(super) async fn project_with_entry(
         attribution: folded.attribution,
     };
     // The recorded codec validates its own representation, without a domain cast.
-    (entry.state_codec)(&stored)?;
-    store_fold(conn, &decoded, &stored, event.local_seq).await
+    let view = (entry.state_codec)(&stored)?;
+    store_fold(conn, &decoded, &stored, event.local_seq).await?;
+    if let Some(project) = entry.link_read {
+        super::provider_link_reads::store_on(
+            conn,
+            &decoded.facts.aggregate_id,
+            event.local_seq,
+            &stored.pins,
+            project(view)?,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn store_fold(

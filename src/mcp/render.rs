@@ -4680,11 +4680,15 @@ fn render_lean_tool_surface(out: &mut String, exposure: &Value) {
             let direct = direct
                 .as_array()
                 .map(|operations| {
-                    operations
+                    let operations = operations
                         .iter()
                         .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                        .collect::<Vec<_>>();
+                    match operations.split_last() {
+                        Some((last, [])) => last.to_string(),
+                        Some((last, rest)) => format!("{} and {}", rest.join(", "), last),
+                        None => String::new(),
+                    }
                 })
                 .unwrap_or_default();
             let _ = writeln!(
@@ -6747,8 +6751,23 @@ fn render_get_record(value: &Value, include_response_disclosures: bool) -> Strin
                 "links_offset",
                 "links_limit",
             );
+            let arrow = if list_key == "links_out" {
+                "→"
+            } else {
+                "←"
+            };
             for link in links {
-                let _ = writeln!(out, "    {}", inline_json(link));
+                // A row that carries its far-end summary reads like a mention:
+                // title and short reference first. A row without one (an
+                // adapter that attaches none) keeps its exact JSON.
+                match render_link_line(link, arrow) {
+                    Some(line) => {
+                        let _ = writeln!(out, "    {line}");
+                    }
+                    None => {
+                        let _ = writeln!(out, "    {}", inline_json(link));
+                    }
+                }
             }
         }
         // Body mentions. Distinct from links on purpose: a mention is parser
@@ -6890,6 +6909,58 @@ fn render_mention_lines(entries: &[Value], list_key: &str) -> Vec<String> {
             render_mention_line(&combined, list_key)
         })
         .collect()
+}
+
+/// One `get_record` link line built from the far-end summary the server
+/// attached (`other`): relationship, title, short reference and full id, then
+/// what kind of record it is, its lifecycle and whether it has been superseded. Returns
+/// `None` when the row carries no summary, so the caller can fall back to the
+/// exact row rather than render a half-known line.
+///
+/// Absence stays absence: a record with no lifecycle says nothing about one,
+/// and a row without the `superseded` flag is not claimed live — the flag is
+/// only ever emitted when true.
+fn render_link_line(link: &Value, arrow: &str) -> Option<String> {
+    let other = link.get("other").filter(|other| other.is_object())?;
+    let relationship = display_inline(&string(link, "relationship")?);
+    let name = display_inline(&string(other, "name").unwrap_or_default());
+    // Short reference for reading, full id for copying: the raw row this
+    // replaces carried the full id and nothing else in the text does.
+    let id = display_inline(&string(other, "id").filter(|id| !id.is_empty())?);
+    let reference =
+        match string(other, "display_reference").filter(|reference| !reference.is_empty()) {
+            Some(reference) => format!("{} · {id}", display_inline(&reference)),
+            None => id,
+        };
+    let mut facts = Vec::new();
+    let record_type = display_inline(&string(other, "type").unwrap_or_default());
+    facts.push(
+        match string(other, "kind").filter(|kind| !kind.is_empty()) {
+            Some(kind) => format!("{record_type}/{}", display_inline(&kind)),
+            None => record_type,
+        },
+    );
+    if let Some(lifecycle) = other.get("lifecycle") {
+        let value = display_inline(&string(lifecycle, "value").unwrap_or_default());
+        facts.push(
+            if string(lifecycle, "status").as_deref() == Some("unclassified") {
+                format!("{value} (unclassified)")
+            } else {
+                value
+            },
+        );
+    }
+    if boolean(other, "superseded") == Some(true) {
+        facts.push("superseded".to_string());
+    }
+    let mut line = format!(
+        "{arrow} {relationship}  {name} ({reference}) — {}",
+        facts.join(" · ")
+    );
+    if let Some(note) = string(link, "note").filter(|note| !note.is_empty()) {
+        line.push_str(&format!(" — note: {}", display_inline(&note)));
+    }
+    Some(line)
 }
 
 /// One body-mention line. Outgoing entries carry a resolution state and name

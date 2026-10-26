@@ -543,6 +543,36 @@ impl PlanStore {
         Ok(())
     }
 
+    /// Release only a claim whose source handler was definitely never entered.
+    /// Callers must retain that proof; cancellation or uncertain dispatch must
+    /// keep the executing/indeterminate fence instead.
+    pub(super) async fn release_undispatched(
+        &self,
+        plan_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        let updated = match &self.backend {
+            PlanStoreBackend::Local(pool) => sqlx::query(
+                "UPDATE write_plans SET state='prepared', attempt_id=NULL, execution_owner=NULL,
+                 started_at_ms=NULL, updated_at_ms=?, source_dispatch_count=0
+                 WHERE plan_id=? AND attempt_id=? AND state='executing'",
+            ).bind(now_ms).bind(plan_id).bind(attempt_id).execute(pool).await?.rows_affected(),
+            PlanStoreBackend::Catalogue { catalog, db_id, .. } => sqlx::query(
+                "UPDATE executor_write_plans SET state='prepared', attempt_id=NULL, execution_owner=NULL,
+                 started_at_ms=NULL, updated_at_ms=?, source_dispatch_count=0
+                 WHERE plan_id=? AND db_id=? AND attempt_id=? AND state='executing'",
+            ).bind(now_ms).bind(plan_id).bind(db_id).bind(attempt_id)
+                .execute(catalog.executor_plan_pool()).await?.rows_affected(),
+        };
+        if updated != 1 {
+            return Err(Error::conflict(
+                "undispatched write plan lost its execution fence",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn mark_indeterminate(
         &self,
         plan_id: &str,
@@ -1934,11 +1964,46 @@ mod tests {
                 .count(),
             1
         );
+        assert!(first
+            .release_undispatched("wpl1:hosted", "wrong-attempt", 21)
+            .await
+            .is_err());
+        first
+            .release_undispatched("wpl1:hosted", &attempt_id, 22)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.load("wpl1:hosted", 23).await.unwrap().unwrap().state,
+            StoredState::Prepared
+        );
+        let dispatches: i64 = sqlx::query_scalar(
+            "SELECT source_dispatch_count FROM executor_write_plans WHERE plan_id='wpl1:hosted'",
+        )
+        .fetch_one(catalogue.executor_plan_pool())
+        .await
+        .unwrap();
+        assert_eq!(dispatches, 0);
+        assert!(first
+            .complete("wpl1:hosted", &attempt_id, &json!({"old":true}), 24)
+            .await
+            .is_err());
+        let ClaimOutcome::Claimed { attempt_id, .. } =
+            second.claim("wpl1:hosted", 25).await.unwrap()
+        else {
+            panic!("released claim must be reusable")
+        };
         first
             .complete("wpl1:hosted", &attempt_id, &json!({"shared":true}), 30)
             .await
             .unwrap();
 
+        assert!(
+            first
+                .release_undispatched("wpl1:hosted", &attempt_id, 31)
+                .await
+                .is_err(),
+            "completed effects must never be reset"
+        );
         catalogue.close().await;
         let restarted = TestHostedPlanCatalogue::reopen(catalogue_path).await;
         let store = PlanStore::open_for_catalogue(restarted.clone(), TEST_HOSTED_DB_ID, keys)

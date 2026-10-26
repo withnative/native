@@ -4222,19 +4222,29 @@ pub async fn portable_facets<H: ContractHarness>(harness: &H) -> Result<()> {
         json!({"action":"set","record_id":hidden,"key":"score","value":1,"as_of":"2026-08-05T00:00:00Z","reason":REASON}),
         json!({"action":"unset","record_id":hidden,"key":"score","as_of":"2026-08-05T00:00:00Z","reason":REASON}),
     ] {
+        let refusal = harness
+            .call(
+                &database,
+                TestCaller::member("acct:denied"),
+                "manage_facet_observations",
+                arguments,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        // A refused write may carry a SQLite-only "did you mean" suffix naming
+        // records the caller can see (these fixture ids share a prefix). The
+        // refusal itself must still be exactly the absent-record text, and the
+        // suffix must never name the hidden record or its title.
+        let (lead, hint) = refusal
+            .split_once(". Did you mean:")
+            .map_or((refusal.as_str(), ""), |(lead, hint)| (lead, hint));
         assert_eq!(
-            harness
-                .call(
-                    &database,
-                    TestCaller::member("acct:denied"),
-                    "manage_facet_observations",
-                    arguments,
-                )
-                .await
-                .unwrap_err()
-                .to_string(),
+            lead,
             format!("manage_facet_observations: record {hidden} does not exist")
         );
+        assert!(!hint.contains(hidden), "{refusal}");
+        assert!(!hint.contains("Hidden facet record"), "{refusal}");
     }
 
     let overflow = "fac70000-0000-4000-8000-000000000005";

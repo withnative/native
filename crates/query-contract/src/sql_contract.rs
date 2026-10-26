@@ -598,6 +598,20 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
             "assurance",
         ],
     },
+    // `links` needs both ends visible, so a live reply to a deleted parent
+    // loses its `reply_to` row and reads as unthreaded. This restores exactly
+    // that fact: one row per visible live reply whose `reply_to` target is a
+    // deleted Message - the same reach as the `list_context` `deleted_parents`
+    // stub. No body, name, author or audience.
+    QuerySqlRelationContract {
+        identity: "native.query-sql.deleted-messages",
+        name: "deleted_messages",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &["message_id", "reply_id", "deleted_at", "deleted_at_ms"],
+    },
     // Design D6 (task b2583dc): per-viewer message state and mentions. Both
     // hold only the caller's own private state and have no account column,
     // so no join or aggregate can reach another viewer's. Neither carries a
@@ -683,6 +697,25 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         ],
     },
     QuerySqlRelationContract {
+        identity: "native.query-sql.facet-keys",
+        name: "facet_keys",
+        semantic_version: LOGICAL_RELATION_VERSION,
+        caller_relative: true,
+        completeness: "complete",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "scope_id",
+            "type",
+            "kind",
+            "key",
+            "record_count",
+            "declared",
+            "value_type",
+            "vocab_ref",
+            "required",
+        ],
+    },
+    QuerySqlRelationContract {
         identity: "native.query-sql.facet-times",
         name: "facet_times",
         semantic_version: LOGICAL_RELATION_VERSION,
@@ -744,6 +777,27 @@ pub const LOGICAL_RELATIONS: &[QuerySqlRelationContract] = &[
         completeness: "complete",
         profiles: ALL_PROFILES,
         columns: &["relation_name", "column_name", "column_position"],
+    },
+    QuerySqlRelationContract {
+        identity: "native.query-sql.catalog-view-definitions",
+        name: "catalog_view_definitions",
+        semantic_version: 1,
+        caller_relative: true,
+        completeness: "best_effort",
+        profiles: SQLITE_PROFILE,
+        columns: &[
+            "relation_name",
+            "view_id",
+            "revision_id",
+            "definition_sha256",
+            "schema_sha256",
+            "origin",
+            "description",
+            "scope_json",
+            "source_pins_json",
+            "dependencies_json",
+            "columns_json",
+        ],
     },
     QuerySqlRelationContract {
         identity: "native.query-sql.catalog-operations",
@@ -928,6 +982,97 @@ pub fn join_detail_repair(detail: &str, repair: &str) -> String {
         Some(c) if c.is_ascii_punctuation() => format!("{detail}; {repair}"),
         _ => format!("{detail}. {repair}"),
     }
+}
+
+/// Candidate facet key for an already-refused records column. Callers must
+/// verify its existence in their caller-visible facet projection before advising.
+pub fn unknown_records_facet_key(statement: &str, detail: &str) -> Option<String> {
+    // Keep the existing column-repair parser unchanged, but never use its
+    // truncated ASCII prefix as evidence that a different facet exists.
+    if let Some((_, tail)) = detail.split_once("no such column") {
+        let tail = tail.trim_start_matches([':', ' ', '\t']);
+        let mut quoted = false;
+        let end = tail
+            .char_indices()
+            .find_map(|(index, c)| {
+                if c == '"' {
+                    quoted = !quoted;
+                }
+                (c.is_whitespace() && !quoted).then_some(index)
+            })
+            .unwrap_or(tail.len());
+        let complete = clean_column_parts(&tail[..end]);
+        if quoted || complete.is_none() || complete != unknown_column_in_detail(detail) {
+            return None;
+        }
+    }
+    let column = unknown_column_in_detail(detail)?;
+    let scope = statement_scope(statement);
+    let relations = resolve_column_scope(&column, &scope);
+    if !relations.contains(&"records") {
+        return None;
+    }
+    // An unresolved qualifier is not evidence that this is a records column.
+    if let Some((qualifier, _)) = column.rsplit_once('.') {
+        if !scope.iter().any(|(relation, alias)| {
+            relation.eq_ignore_ascii_case("records")
+                && (relation.eq_ignore_ascii_case(qualifier)
+                    || alias
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(qualifier)))
+        }) {
+            return None;
+        }
+    }
+    let key = column.rsplit('.').next()?;
+    if logical_columns("records", QuerySqlProfile::SqliteLocal)?
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(key))
+    {
+        return None;
+    }
+    Some(key.to_owned())
+}
+
+/// Advisory only: use after a caller-visible lookup confirms this facet key.
+pub fn records_facet_column_hint(statement: &str, detail: &str, key: &str) -> String {
+    let scope = statement_scope(statement);
+    let column = unknown_column_in_detail(detail).unwrap_or_default();
+    let qualifier = column.rsplit_once('.').map(|(qualifier, _)| qualifier);
+    let records = scope.iter().find(|(relation, alias)| {
+        relation == "records"
+            && qualifier.is_none_or(|q| {
+                relation.eq_ignore_ascii_case(q)
+                    || alias.as_deref().is_some_and(|a| a.eq_ignore_ascii_case(q))
+            })
+    });
+    let reference = records
+        .and_then(|(_, alias)| alias.as_deref())
+        .unwrap_or("records");
+    let tokens = scope_tokens(statement);
+    let reference = if tokens
+        .iter()
+        .any(|token| token.kind == ScopeKind::Quoted && token.text == reference)
+    {
+        format!("\"{}\"", reference.replace('"', "\"\""))
+    } else {
+        reference.to_owned()
+    };
+    // Reserve all identifiers, including CTE names and aliases outside the
+    // relation scan, so the suggested join cannot introduce an alias clash.
+    let mut facet_alias = "f".to_owned();
+    let mut suffix = 2;
+    while tokens.iter().any(|token| {
+        token
+            .text
+            .split('.')
+            .any(|part| part.eq_ignore_ascii_case(&facet_alias))
+    }) {
+        facet_alias = format!("f{suffix}");
+        suffix += 1;
+    }
+    let literal = key.replace('\'', "''");
+    format!("{key} is a facet, not a column: JOIN facet_values {facet_alias} ON {facet_alias}.record_id = {reference}.id AND {facet_alias}.key = '{literal}' and filter {facet_alias}.value ({facet_alias}.value_num for numbers).")
 }
 
 /// Repair remedy for an unknown column on known logical relation(s), shared
@@ -1418,6 +1563,7 @@ pub fn resolve_column_scope<'a>(
 /// agents otherwise guess. Descriptive only; the drift tests pin structure,
 /// not prose. No apostrophes: values render inside single-quoted SQL.
 const RELATION_COMMENTS: &[(&str, &str)] = &[
+    ("catalog_view_definitions", "best-effort visible named-view field meanings and exact pins - standalone hosted read-write v2 only - v1, node and member copies refuse view_profile_unsupported - omitted dynamic rows carry view_catalog_incomplete - prepare_named_views restores indexed discovery"),
     ("records", "one row per visible record - join links.source_id/target_id, facet_values.record_id and content_events.record_id to records.id - home_id is NULL when the home is not visible - archived is 0 or 1 and does not filter rows or certify currency"),
     ("record_lifecycle_interpretations", "caller-relative live lifecycle meaning for each visible record - join record_id to records.id - derived from the same query snapshot, with no public governance basis token"),
     ("content_events", "append-only history - join record_id to records.id - local_seq orders it - actor, run_key and parent_key are redacted by the get_history disclosure rule - channel_kind travels only where the actor is disclosed"),
@@ -1447,10 +1593,12 @@ const RELATION_COMMENTS: &[(&str, &str)] = &[
     ("messages_awaiting_reply", "single-column queue of message ids awaiting reply"),
     ("my_participants", "the caller's owner-private registered personas, including retired identities - profile edits cannot change ownership"),
     ("message_speakers", "immutable advisory speaker facts on visible Messages - names disclose the utterance identity, without access to the private persona profile - assurance is engine-selected"),
+    ("deleted_messages", "one row per visible live Message (reply_id, join to records.id) whose reply_to target is a deleted Message (message_id) - links hides a reply_to whose target is gone, so this is how a reader tells a deleted parent from one outside its window or authority - carries no body, name, author or audience, and nothing for a deleted Message no visible reply points at"),
     ("my_message_state", "the caller's own read state and preferences for each visible Message, private to the caller - join message_id to records.id - stage is unsurfaced, presented, opened or acknowledged - unread uses the caller's explicit mark_read/mark_unread preference when set, otherwise derives from opened or acknowledged stage - archived Messages and the caller's human-authored Messages are never unread - persona-spoken Messages use the ordinary unread rule even when owner_id is the caller"),
     ("my_mentions", "sources that mention the caller, private to the caller - join source_id to records.id - via principal is an addressed @-mention on a Message, via reference is a record reference that resolves to the caller - seen is NULL where Native does not track it - own_source requires human speech or an owned non-Message record"),
     ("comment_anchors", "passage anchors of visible comment roots on visible records' bodies - join annotation_id to records.id (the comment) and target_record_id to records.id (the bearer) - selectors is the stored JSON array (text_quote, data_position in UTF-8 bytes), and its quote discloses body text - source_event_seq is the stored content-events MAX at capture and source_sha256 the body digest the anchor was captured against, so a later live reopen proves the same recorded range while any later body write invalidates it - sqlite-local only, and the Docs and Spaces alpha tab links needs depend on it"),
     ("message_reactions", "exact latest additions per actor and legacy emoji partition on visible live Messages. reaction_id is the winning history event UUID, never a sequence. actor_record_id/name and executor_kind follow history disclosure. viewer is 0/1. metadata-only fold preserves duplicate emitted emoji rows. admission bounds are 20000 visible Messages, 100000 visible reaction events, 16 MiB metadata and 20000 winners, complete-or-error. saved receipts remain best_effort/non-replayable because binding, visibility and names are mutable"),
+    ("facet_keys", "facet discovery: scope_id NULL is workspace-wide, otherwise direct members of that visible collection, kind NULL means all kinds (including NULL), counts every distinct caller-visible record carrying the facet, including superseded and archived records, narrow via facet_values JOIN records and WHERE records.is_current = 1, declarations resolve pack/user and type/kind/scope overrides, declared keys include zero counts, value_type is the declared type, vocab_ref is the stored reference, required is 0/1 for declarations, NULL when undeclared, excludes spine and engine-reserved keys"),
     ("facet_times", "typed time facets (declared date, instant, zoned, when) on the timeline - join record_id to records.id - all_day rows use start_date/end_date, timed rows start_ms/end_ms, end exclusive"),
     ("body_task_items", "GFM task-list items in visible records' current bodies - byte offsets in body, document order by item_index - checked and quoted rows remain present, source event sequence is withheld"),
     ("catalog_relations", "this catalog - one row per declared relation, filter profiles for queryability"),
@@ -1565,10 +1713,28 @@ pub fn catalog_view_statements(if_not_exists: bool, collate_c_text: bool) -> Vec
 /// and `catalog_columns` (taught in the card header) carries the rest.
 const CARD_COLUMN_RELATIONS: &[&str] = &["records", "links", "content_events", "facet_values"];
 
+/// Relations that get a line on the served card. The rest are listed by
+/// `catalog_relations`, which the card points at: the served descriptor is paid
+/// for on every request, and most callers never touch the niche relations
+/// (`*_json_nodes`, messaging, runs, agent activity and so on). `CARD_NOTES`
+/// keeps a note for every relation so one can be promoted by listing it here.
+const CARD_LISTED_RELATIONS: &[&str] = &[
+    "records",
+    "record_lifecycle_interpretations",
+    "links",
+    "facet_values",
+    "facet_observations",
+    "content_events",
+    "catalog_relations",
+    "catalog_columns",
+    "catalog_operations",
+];
+
 /// Join-key notes for the `sql_read` catalog card, one per relation.
 /// Relation names render from `LOGICAL_RELATIONS` itself, so only this
 /// prose can drift; the card test pins both directions.
 const CARD_NOTES: &[(&str, &str)] = &[
+    ("catalog_view_definitions", "field meanings and exact pins - standalone hosted read-write v2 only - v1 and copies refuse view_profile_unsupported"),
     ("records", "home_id parent (hidden=NULL); links.source_id/target_id=id; successor_count live supersedes in, is_current 1 when 0"),
     ("record_lifecycle_interpretations", "governed/absent/unclassified; terminality open|terminal_positive|terminal_negative (governed only)"),
     ("content_events", "append-only; order local_seq"),
@@ -1599,14 +1765,16 @@ const CARD_NOTES: &[(&str, &str)] = &[
     ("messages_awaiting_reply", "IDs awaiting reply"),
     ("my_participants", "private personas"),
     ("message_speakers", "advisory"),
+    ("deleted_messages", "reply_id=records.id"),
     ("my_message_state", "private; persona speech unread"),
     ("my_mentions", "private; source_id=records.id; order mentioned_at_ms"),
     ("comment_anchors", "annotation_id,target_record_id=records.id; selectors JSON"),
+    ("facet_keys", "kind NULL covers all kinds; scope_id NULL covers workspace; discovery excludes spine/reserved keys"),
     ("facet_times", "all_day dates; timed millis; end exclusive"),
     ("body_task_items", "GFM tasks; item_index order; checked/in_quote"),
     ("catalog_relations", "filter by profiles"),
     ("catalog_columns", "order relation_name,column_position"),
-    ("catalog_operations", "serving executor catalogue; matches describe_operation pairs/digests; order executor,operation; advertised_directly=0 marks lean call_executor-only operations; online executor query_sql only (standby serves advertised reads; member/offline copies refuse)"),
+    ("catalog_operations", "executor catalogue; matches describe_operation pairs/digests; order executor,operation; advertised_directly=0 is call_executor-only; online executor query_sql only (standby serves advertised reads; member/offline copies refuse)"),
     ("message_reactions", "exact winners; message_id to records.id; actor/executor redacted; reaction_id event UUID"),
 ];
 
@@ -1642,16 +1810,17 @@ pub fn sql_read_catalog_card() -> String {
     let mut card = String::from(
         "Top-level LIMIT without ORDER BY adds assumed_order. \
          Saved SQL, nested/CTE LIMITs, OFFSET and FETCH require ORDER BY. \
-         Unique ties. record_id=records.id. Queryable relations: \
-         SELECT * FROM catalog_relations ORDER BY relation_name. \
-         Columns: SELECT * FROM catalog_columns ORDER BY relation_name,column_position. \
+         Unique ties. record_id=records.id. Columns: SELECT * FROM catalog_columns ORDER BY relation_name,column_position. \
          'Open'=lifecycle='open'; in_progress, blocked are distinct (Current work \
          below is all three): for not-done use terminality, and state the reading used. \
          Words in bodies: prefer search; body LIKE is a fallback. \
          Recipes (ancestor path, superseded-by): \
          guidance_read(operation=\"read_guide\", arguments={\"topic\":\"query-sql\"}).",
     );
-    for relation in LOGICAL_RELATIONS {
+    for relation in LOGICAL_RELATIONS
+        .iter()
+        .filter(|relation| CARD_LISTED_RELATIONS.contains(&relation.name))
+    {
         let note = CARD_NOTES
             .iter()
             .find(|(name, _)| *name == relation.name)
@@ -1666,6 +1835,10 @@ pub fn sql_read_catalog_card() -> String {
             card.push_str(&format!(" [only: {}]", relation.profiles.join(",")));
         }
     }
+    card.push_str(
+        "\nQueryable relations beyond these: \
+         SELECT * FROM catalog_relations ORDER BY relation_name",
+    );
     card.push_str(
         "\nValues: UTC-millis text/integer *_ms; bool 0/1; \
          binary text order; SQL NULL=JSON null. ?N contiguous from 1. \
@@ -1966,6 +2139,8 @@ pub const RESULT_FIELDS: &[&str] = &[
     "now_ms_ms",
     "time_dependent",
     "assumed_order",
+    "notices",
+    "view_provenance",
 ];
 
 /// `Some(hint)` exactly when a result was truncated, else `None`.
@@ -5586,6 +5761,46 @@ mod tests {
     }
 
     #[test]
+    fn records_facet_hint_candidates_exclude_columns_and_other_relations() {
+        for key in ["lifecycle", "persistence", "maturity", "archived", "name"] {
+            assert!(unknown_records_facet_key(
+                "SELECT * FROM records",
+                &format!("no such column: {key}")
+            )
+            .is_none());
+        }
+        for (sql, column) in [
+            (
+                "SELECT l.area FROM records r JOIN links l ON l.source_id=r.id",
+                "l.area",
+            ),
+            ("SELECT q.area FROM records r", "q.area"),
+        ] {
+            assert!(unknown_records_facet_key(sql, &format!("no such column: {column}")).is_none());
+        }
+        assert_eq!(
+            unknown_records_facet_key(
+                "SELECT r.area FROM records r",
+                "column r.area does not exist"
+            )
+            .as_deref(),
+            Some("area")
+        );
+    }
+
+    #[test]
+    fn records_facet_candidates_do_not_use_truncated_unicode_names() {
+        for column in ["réalm", "r.réalm", "\"réalm\"", "\"r éalm\""] {
+            let detail = format!("no such column: {column}");
+            assert!(
+                unknown_column_in_detail(&detail).is_some(),
+                "existing repair remains available"
+            );
+            assert!(unknown_records_facet_key("SELECT * FROM records r", &detail).is_none());
+        }
+    }
+
+    #[test]
     fn unknown_column_repair_lists_that_relations_columns() {
         use QuerySqlProfile::SqliteLocal;
         let repair =
@@ -5926,22 +6141,23 @@ mod tests {
         assert!(card.contains("assumed_order"));
         assert!(card.contains("Saved SQL, nested/CTE LIMITs, OFFSET and FETCH"));
         assert!(card.contains("require ORDER BY"));
-        assert!(card.contains("page by record_id, block_index, chunk_index"));
         assert!(card.contains("catalog_columns"));
         // The card renders in descriptor prose, never in a SQL batch,
         // so its notes may use semicolons freely.
         for relation in LOGICAL_RELATIONS {
-            // Match the line start so a name that prefixes another relation
-            // (schema_config, effective_relationships) cannot pass by accident.
-            assert!(
-                card.contains(&format!("\n{}:", relation.name))
-                    || card.contains(&format!("\n{}(", relation.name)),
-                "card omits {}",
-                relation.name
-            );
             assert!(
                 CARD_NOTES.iter().any(|(name, _)| *name == relation.name),
                 "no card note for {}",
+                relation.name
+            );
+            let listed = CARD_LISTED_RELATIONS.contains(&relation.name);
+            // Match the line start so a name that prefixes another relation
+            // cannot pass by accident.
+            let on_card = card.contains(&format!("\n{}:", relation.name))
+                || card.contains(&format!("\n{}(", relation.name));
+            assert_eq!(
+                on_card, listed,
+                "card listing of {} disagrees with CARD_LISTED_RELATIONS",
                 relation.name
             );
             // Core relations inline their full column list; every other
@@ -5961,14 +6177,17 @@ mod tests {
                 );
             }
         }
-        for name in CARD_COLUMN_RELATIONS {
+        for name in CARD_LISTED_RELATIONS {
             assert!(
                 LOGICAL_RELATIONS
                     .iter()
                     .any(|relation| relation.name == *name),
-                "card-column relation {name} is not a logical relation"
+                "listed card relation {name} is not a logical relation"
             );
         }
+        assert!(card.contains(
+            "Queryable relations beyond these: SELECT * FROM catalog_relations ORDER BY relation_name"
+        ));
         // A pinned non-core relation: columns reach the agent via `catalog_columns`,
         // not the card.
         assert!(!card.contains("schema_config_json_nodes(config_id,ordinal"));
@@ -5981,6 +6200,7 @@ mod tests {
             );
         }
         // Profile scope travels with the relation line.
+        assert!(card.contains("catalog_operations:"), "{card}");
         assert!(card.contains("[only: sqlite-local]"), "{card}");
         for (_, sql) in CARD_WORKED_STATEMENTS {
             assert!(card.contains(sql), "card omits a worked statement");

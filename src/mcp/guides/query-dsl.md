@@ -26,4 +26,4 @@ Without a count or aggregate terminal, results are records. `limit` defaults to 
 
 Optional `as_of` is exactly one of `{"content_seq":123}` with a non-negative sequence or `{"timestamp":"2026-08-03T12:00:00Z"}` with an RFC 3339 timestamp. It pins the content projection; current schema, vocabulary, and retained blob metadata remain live.
 
-Use `get_record` for a known full id or short record reference, `search` for free text, `scan` for cross-axis orientation, and `query_sql` when the needed relational expression is outside this grammar. On a lean MCP surface, call `query_record`, `get_record` and `scan` through `call_executor` with `{"executor":"records_read","operation":...,"arguments":...}`; the arguments are unchanged.
+Use `get_record` for a known full id or short record reference, `search` for free text, `scan` for cross-axis orientation, and `query_sql` when the needed relational expression is outside this grammar. On a lean MCP surface, call `query_record` and `scan` through `call_executor` with `{"executor":"records_read","operation":...,"arguments":...}`; the arguments are unchanged. `get_record` is advertised directly.

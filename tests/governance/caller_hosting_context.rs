@@ -71,22 +71,116 @@ fn rust_sources(repository_root: &Path, root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The production prefix of a source file: everything before the first
-/// `#[cfg(test)] mod` test module. In this tree every test module is the tail
-/// of its file, so this bounds production source. Only a `mod` item is treated
-/// as the boundary, so a `#[cfg(test)]` helper item does not truncate the scan.
-fn production_prefix(source: &str) -> &str {
-    const MARKER: &str = "#[cfg(test)]";
-    let mut search = 0;
-    while let Some(relative) = source[search..].find(MARKER) {
-        let index = search + relative;
-        let after = source[index + MARKER.len()..].trim_start();
-        if after.starts_with("mod ") || after.starts_with("pub mod ") {
-            return &source[..index];
+fn requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let Ok(terms) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                terms.iter().any(requires_test)
+            } else {
+                !terms.is_empty() && terms.iter().all(requires_test)
+            }
         }
-        search = index + MARKER.len();
+        _ => false,
     }
-    source
+}
+
+/// Production precedes the file's tail test modules. Only a module whose cfg
+/// requires `test` is a boundary; test helpers and cfgs that can also enable
+/// production (such as any(test, feature = "x")) must not truncate the scan.
+fn production_prefix(source: &str) -> &str {
+    // Parse once in whole-file context: attribute-looking text in comments or
+    // strings must never become an attribute by reparsing an isolated suffix.
+    // Unlike parse_file, parse_str does not strip a BOM or shebang and shift
+    // the spans away from the original source. Unsupported syntax stays in scope.
+    let Ok(file) = syn::parse_str::<syn::File>(source) else {
+        return source;
+    };
+    let mut boundary = source.len();
+    for item in file.items.iter().rev() {
+        let syn::Item::Mod(module) = item else {
+            break;
+        };
+        if !module.attrs.iter().any(|attribute| {
+            matches!(attribute.style, syn::AttrStyle::Outer)
+                && attribute.path().is_ident("cfg")
+                && attribute
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| requires_test(&meta))
+        }) {
+            break;
+        }
+        // Only the contiguous tail of top-level test-required modules is out
+        // of scope. The first attribute's original byte span preserves source
+        // text and diagnostic line numbers without searching raw substrings.
+        boundary = module.attrs[0].pound_token.span.byte_range().start;
+    }
+    source.get(..boundary).unwrap_or(source)
+}
+
+#[test]
+fn production_prefix_recognizes_only_test_required_module_boundaries() {
+    for attributes in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, feature = \"mcp-executor-prototype\"))]\n#[allow(dead_code)]",
+        "#[cfg(all(feature = \"x\", test))]",
+        "#[cfg(any(test, all(test, feature = \"x\")))]",
+    ] {
+        let source = format!("fn production() {{}}\n{attributes}\nmod tests {{}}\n");
+        assert_eq!(
+            production_prefix(&source),
+            "fn production() {}\n",
+            "{attributes}"
+        );
+    }
+    for source in [
+        "#[cfg(test)]\nfn helper() {}\nfn production() {}",
+        "#[cfg(any(test, feature = \"x\"))]\nmod production {}",
+        "#[cfg(not(test))]\nmod production {}",
+        "#[cfg(test)]\nmod tests {}\nfn production() {}",
+        "fn outer() { #[cfg(test)] mod tests {} }\nfn production() {}",
+        "#[cfg(feature = \"x\")]\nmod production {}",
+    ] {
+        assert_eq!(production_prefix(source), source);
+    }
+    let tail = "fn production() {}\n#[cfg(test)]\nmod first {}\n#[allow(dead_code)]\n#[cfg(all(test, feature = \"x\"))]\nmod second {}";
+    assert_eq!(production_prefix(tail), "fn production() {}\n");
+    let source = "#[cfg(test)]\nfn helper() {}\nfn production() {}\n#[cfg(test)]\nmod tests {}";
+    assert_eq!(
+        production_prefix(source),
+        "#[cfg(test)]\nfn helper() {}\nfn production() {}\n"
+    );
+}
+
+#[test]
+fn production_prefix_keeps_attribute_looking_comments_and_strings_in_scope() {
+    for source in [
+        "// #[cfg(all(test, feature = \"x\"))]\nmod production { fn caller() { Caller::authenticated(); } }",
+        "/* #[cfg(all(test, feature = \"x\"))] */\nmod production { fn caller() { Caller::authenticated(); } }",
+        r##"const TEXT: &str = r#"#[cfg(all(test, feature = "x"))]
+mod pretend {}"#;
+mod production { fn caller() { Caller::authenticated(); } }"##,
+        "// é: byte offsets must preserve Unicode too\nmod production { fn caller() { Caller::authenticated(); } }",
+    ] {
+        assert_eq!(production_prefix(source), source);
+        // A real tail test module must not change which production code is
+        // inspected, even when earlier text looks like a cfg attribute.
+        let with_tests = format!("{source}\n#[cfg(all(test, feature = \"x\"))]\nmod tests {{}}\n");
+        assert_eq!(production_prefix(&with_tests), format!("{source}\n"));
+        assert!(production_prefix(&with_tests).contains("Caller::authenticated("));
+    }
+    // An unsupported or malformed file stays entirely in scope.
+    for unsupported in [
+        "fn production( {\n#[cfg(test)]\nmod tests {}",
+        "#!/usr/bin/env rustx\nfn production() {}\n#[cfg(test)]\nmod tests {}",
+    ] {
+        assert_eq!(production_prefix(unsupported), unsupported);
+    }
 }
 
 #[test]

@@ -500,7 +500,8 @@ fn schema_config_nodes_saved_pins_and_unsupported_profiles() {
     let card = sql_contract::sql_read_catalog_card();
     assert!(card.len() <= 6144, "{} bytes", card.len());
     assert!(card.contains("Queryable relations"));
-    assert!(card.contains("config_id=schema_config.id"));
+    // Niche relations are discovered through catalog_relations, not the card.
+    assert!(!card.contains("schema_config_json_nodes"));
 }
 
 #[tokio::test]

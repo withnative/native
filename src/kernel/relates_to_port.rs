@@ -714,6 +714,38 @@ pub(crate) fn active_pair_from_state(json: &str) -> Result<Option<(String, Strin
     Ok(state.active().then_some((state.left, state.right)))
 }
 
+/// Batch view decoding validates each immutable retained interpreter/pin set
+/// once per read, while decoding every stored state through its exact codec.
+/// It never substitutes the currently selected provider or caches row state.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn active_states_from_states(states: &[String]) -> Result<Vec<provider::State>> {
+    let mut codecs: Vec<(InterpretationPins, &'static catalogue::Entry)> = Vec::new();
+    let mut pairs = Vec::new();
+    for json in states {
+        let stored: StoredState = serde_json::from_str(json)?;
+        let entry = if let Some((_, entry)) = codecs.iter().find(|(pins, _)| pins == &stored.pins) {
+            *entry
+        } else {
+            let entry = catalogue::lookup(&stored.pins)?;
+            codecs.push((stored.pins.clone(), entry));
+            entry
+        };
+        let state: provider::State = serde_json::from_value((entry.state_codec)(&stored)?)?;
+        if state.active() {
+            pairs.push(state);
+        }
+    }
+    Ok(pairs)
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) fn active_pairs_from_states(states: &[String]) -> Result<Vec<(String, String)>> {
+    Ok(active_states_from_states(states)?
+        .into_iter()
+        .map(|s| (s.left, s.right))
+        .collect())
+}
+
 pub(crate) async fn active_links_in(
     conn: &mut SqliteConnection,
     principal: &str,

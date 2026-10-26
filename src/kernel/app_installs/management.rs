@@ -48,6 +48,7 @@ async fn source_matches(
     conn: &mut SqliteConnection,
     row: &Value,
     declaration: &Value,
+    retained: Option<&[(Value, String, i64)]>,
 ) -> Result<bool> {
     let fields: Option<Vec<&str>> = [
         "package",
@@ -74,9 +75,28 @@ async fn source_matches(
     }
     let pin: Option<String> = sqlx::query_scalar("SELECT pin_json FROM kernel_app_package_sources WHERE package=? AND version=? AND digest=? AND artifact_id=? AND source_revision=? AND declaration_digest=?")
         .bind(fields[0]).bind(fields[1]).bind(fields[2]).bind(fields[3]).bind(fields[4]).bind(fields[5])
-        .fetch_optional(conn).await?;
-    let Some(pin) = pin else {
-        return Ok(false);
+        .fetch_optional(&mut *conn).await?;
+    let pin = if let Some(pin) = pin {
+        pin
+    } else {
+        let owned;
+        let retained = match retained {
+            Some(retained) => retained,
+            None => {
+                owned = retained_sources_on(conn, Some(fields[3])).await?;
+                &owned
+            }
+        };
+        let Some((pin, _, _)) = retained.iter().find(|(pin, _, _)| {
+            pin["package"] == fields[0]
+                && pin["version"] == fields[1]
+                && pin["digest"] == fields[2]
+                && pin["source_revision"] == fields[4]
+                && pin["declaration_digest"] == fields[5]
+        }) else {
+            return Ok(false);
+        };
+        pin.to_string()
     };
     let pin: Value = serde_json::from_str(&pin)?;
     let pinned_declaration: Value = serde_json::from_str(string(&pin, "consented_declaration")?)?;
@@ -87,6 +107,15 @@ pub(super) async fn entry_on(
     conn: &mut SqliteConnection,
     principal: &str,
     package: &str,
+) -> Result<Option<Value>> {
+    entry_with_retained_on(conn, principal, package, None).await
+}
+
+async fn entry_with_retained_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    package: &str,
+    retained: Option<&[(Value, String, i64)]>,
 ) -> Result<Option<Value>> {
     let stored: Option<(String, String, String, bool, Option<String>, i64)> = sqlx::query_as(
         "SELECT row_json,generation,status,executable,refusal,event_seq FROM kernel_app_installs WHERE principal=? AND package=?",
@@ -132,24 +161,39 @@ pub(super) async fn entry_on(
     .await?
     .unwrap_or(0);
     let source_valid = if target_reason.is_none() {
-        source_matches(conn, &row, &declaration).await?
+        source_matches(conn, &row, &declaration, retained).await?
     } else {
         false
     };
     let ready = target_reason.is_none()
         && status == "installed"
         && executable
-        && adoption == "shell_adopt.v1"
+        && verified_adoption(adoption)
         && refusal.is_none()
         && source_valid
         && row["consent_revocation_seq"].as_i64().unwrap_or(0) == epoch;
+    let readopt = source_valid
+        && refusal.as_deref() == Some(NOT_YET_AVAILABLE)
+        && declarations::declarative(&declaration).is_ok();
     let reason = target_reason.unwrap_or_else(|| {
         if ready {
             "launch_request_required"
+        } else if readopt {
+            "readopt_required_on_v2"
         } else if adoption == "caller_asserted" && source_valid {
             "digest_unverified"
         } else {
-            "unsupported_on_v2"
+            match refusal.as_deref() {
+                Some(NOT_YET_AVAILABLE)
+                    if verified_adoption(adoption)
+                        && declarations::declarative(&declaration).is_ok() =>
+                {
+                    RETAINED_SOURCE_UNVERIFIED
+                }
+                Some(NOT_YET_AVAILABLE) => NOT_YET_AVAILABLE,
+                Some(UNSUPPORTED_WITNESS) => UNSUPPORTED_WITNESS,
+                _ => "unsupported_on_v2",
+            }
         }
     });
     let mut launch_binding = json!({"digest_version":"alpha-tab-digest.v1","verdict":"refused","reason":reason,"receipt":null});
@@ -210,10 +254,14 @@ pub(crate) async fn list_as(
     .bind(principal)
     .fetch_all(&mut *tx)
     .await?;
+    // Derive certificates once inside this pinned, read-only list transaction.
+    // Only immutable retained source evidence is shared; each entry still
+    // checks this member's live visibility, consent and revocation state.
+    let retained = retained_sources_on(&mut tx, None).await?;
     let mut installs = Vec::new();
     let mut removed_hidden = 0;
     for package in packages {
-        let entry = entry_on(&mut tx, principal, &package)
+        let entry = entry_with_retained_on(&mut tx, principal, &package, Some(&retained))
             .await?
             .ok_or_else(|| invalid("install projection missing"))?;
         if !include_removed && entry["status"] == "removed" {
@@ -240,7 +288,7 @@ pub(crate) async fn list_as(
     let order = effective_order(&mut tx, principal).await?;
     let sources = if view == "full" {
         let mut sources = Vec::new();
-        for pin in frozen_sources_on(&mut tx, principal).await? {
+        for pin in frozen_sources_on(&mut tx, principal, Some(&retained)).await? {
             let declaration: Value = serde_json::from_str(string(&pin, "consented_declaration")?)?;
             sources.push(json!({"package":pin["package"],"version":pin["version"],"digest":pin["digest"],
                 "artifact_id":pin["artifact_id"],"source_revision":pin["source_revision"],

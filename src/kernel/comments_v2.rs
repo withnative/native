@@ -729,8 +729,8 @@ pub(crate) async fn derived_terminal_on(
 /// policy and owner floor. `homes` exposes valid homes as (id, view).
 /// The artifact's stored home/owner cannot widen or narrow this decision.
 pub(crate) fn sql_derived_visible(alias: &str, actor: &str, homes: &str) -> String {
-    let derived = super::sql_is_derived_artifact("current_record");
-    let terminal = super::sql_is_derived_artifact("terminal");
+    let derived = super::sql_is_derived_artifact_with_indexes("current_record", true);
+    let terminal = super::sql_is_derived_artifact_with_indexes("terminal", true);
     let depth = crate::authorization::MAX_DERIVED_BEARER_DEPTH;
     format!("EXISTS(WITH RECURSIVE chain(id,depth) AS (SELECT {alias}.id,0 UNION ALL SELECT l.target_id,c.depth+1 FROM chain c CROSS JOIN main.kernel_records current_record ON current_record.id=c.id JOIN main.kernel_generic_links l ON l.source_id=c.id AND l.relationship='part_of' AND l.active=1 WHERE c.depth<{depth} AND {derived} AND (SELECT count(*) FROM main.kernel_generic_links one WHERE one.source_id=c.id AND one.relationship='part_of' AND one.active=1)=1) SELECT 1 FROM chain c JOIN main.kernel_records terminal ON terminal.id=c.id JOIN ({homes}) terminal_home ON terminal_home.id=terminal.home_id WHERE NOT {terminal} AND (terminal_home.view OR terminal.owner_id={actor}) AND NOT EXISTS(SELECT 1 FROM chain path JOIN main.kernel_import_tombstones t ON t.record_id=path.id))")
 }
@@ -771,6 +771,7 @@ pub(crate) async fn create_comment_in(
     input: FieldInput<'_>,
     home_id: &str,
     bearer_id: &str,
+    basis: Option<serde_json::Value>,
 ) -> Result<String> {
     let home_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_roots WHERE root_id = ?)")
@@ -796,6 +797,8 @@ pub(crate) async fn create_comment_in(
         // member who can see the record can file the comment.
         false,
         None,
+        None,
+        basis,
     )
     .await
 }

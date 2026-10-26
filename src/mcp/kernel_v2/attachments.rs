@@ -20,6 +20,7 @@ enum ManageArgs {
 pub(super) async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let args: ReadArgs = parse("read_attachment", args)?;
     let mut tx = db.write_pool().begin().await?;
+    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     let meta = blobs::metadata(&mut tx, actor, &args.attachment_id).await?;
     let length = args.length.unwrap_or(64 * 1024);
     let offset = args.offset.unwrap_or(0);
@@ -67,6 +68,7 @@ pub(super) async fn read(db: &Db, actor: &str, args: Value) -> Result<Value> {
 pub(super) async fn manage(db: &Db, actor: &str, args: Value) -> Result<Value> {
     let args: ManageArgs = parse("manage_attachments", args)?;
     let mut tx = db.write_pool().begin().await?;
+    kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     match args {
         ManageArgs::Inspect { attachment_id } => {
             let meta = blobs::metadata(&mut tx, actor, &attachment_id).await?;

@@ -1,0 +1,142 @@
+[
+  {
+    "label": "agent.docs 0.8.2",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.docs",
+      "install_event": "pending-0.8.2",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMQphZ2VudC5kb2NzDXBlbmRpbmctMC44LjISaHR0cHM6Ly9zaGVsbC50ZXN0CAAAAAAAAAAECAAAAAB3NZQACAAAAAB3NZR4DnJldmlldy1yZWNlaXB0.re7wHVlhIuo6T1spNIb2NVDcOuaL2ZftSwOYdXkfFO4",
+    "payload_bytes": 165
+  },
+  {
+    "label": "agent.docs 0.9.0",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.docs",
+      "install_event": "pending-0.9.0",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMQphZ2VudC5kb2NzDXBlbmRpbmctMC45LjASaHR0cHM6Ly9zaGVsbC50ZXN0CAAAAAAAAAAECAAAAAB3NZQACAAAAAB3NZR4DnJldmlldy1yZWNlaXB0.RTnYpGqHPVqa8yW_4u97_YCPu73gAhPyF7Jg96cplts",
+    "payload_bytes": 165
+  },
+  {
+    "label": "agent.spaces 0.7.0",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.spaces",
+      "install_event": "pending-0.7.0",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMQxhZ2VudC5zcGFjZXMNcGVuZGluZy0wLjcuMBJodHRwczovL3NoZWxsLnRlc3QIAAAAAAAAAAQIAAAAAHc1lAAIAAAAAHc1lHgOcmV2aWV3LXJlY2VpcHQ.hCD54SP8Z5w4k0A49BVi-hcW9ebZkuHUcZVq9HCMveQ",
+    "payload_bytes": 167
+  },
+  {
+    "label": "agent.whiteboard 0.2.0",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.whiteboard",
+      "install_event": "pending-0.2.0",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMRBhZ2VudC53aGl0ZWJvYXJkDXBlbmRpbmctMC4yLjASaHR0cHM6Ly9zaGVsbC50ZXN0CAAAAAAAAAAECAAAAAB3NZQACAAAAAB3NZR4DnJldmlldy1yZWNlaXB0.EB-M32NLQP3hn49DRgYfzXVRVWnf8gcN8WH4iDeTDhw",
+    "payload_bytes": 171
+  },
+  {
+    "label": "agent.slack-workspace-v2 0.4.1",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.slack-workspace-v2",
+      "install_event": "pending-0.4.1",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMRhhZ2VudC5zbGFjay13b3Jrc3BhY2UtdjINcGVuZGluZy0wLjQuMRJodHRwczovL3NoZWxsLnRlc3QIAAAAAAAAAAQIAAAAAHc1lAAIAAAAAHc1lHgOcmV2aWV3LXJlY2VpcHQ.oyuFtBbm9fXMqM_OhC9ry_TZNGfYYR-8nCWF7r8S6gk",
+    "payload_bytes": 179
+  },
+  {
+    "label": "agent.slack-workspace-v2 0.5.7",
+    "fields": {
+      "principal": "preview-user",
+      "database": "preview-database",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "agent.slack-workspace-v2",
+      "install_event": "pending-0.5.7",
+      "parent_origin": "https://shell.test",
+      "adapter_revision": 4
+    },
+    "kid": "test-key-1",
+    "receipt": "review-receipt",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/Agp0ZXN0LWtleS0xDHByZXZpZXctdXNlchBwcmV2aWV3LWRhdGFiYXNlJDExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMRhhZ2VudC5zbGFjay13b3Jrc3BhY2UtdjINcGVuZGluZy0wLjUuNxJodHRwczovL3NoZWxsLnRlc3QIAAAAAAAAAAQIAAAAAHc1lAAIAAAAAHc1lHgOcmV2aWV3LXJlY2VpcHQ.6wfKE4RAoWdGidK2ZFEJKfV4BVpJAugk3WUSifUZ7L4",
+    "payload_bytes": 179
+  },
+  {
+    "label": "maximum ",
+    "fields": {
+      "principal": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+      "database": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "session": "11111111-1111-4111-8111-111111111111",
+      "package": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "install_event": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "parent_origin": "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "adapter_revision": 4
+    },
+    "kid": "kkkkkkkkkkkkkkkk",
+    "receipt": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+    "origin": "https://artifact.test",
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "issued": 2000000000,
+    "expires": 2000000120,
+    "url": "https://artifact.test/artifact-runtime/v1/app/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/AhBra2tra2tra2tra2tra2trQHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBAZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZCQxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTGAYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEuYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEuYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEuYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFAZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZYBodHRwczovL2FhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYS5iYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYggAAAAAAAAABAgAAAAAdzWUAAgAAAAAdzWUeEBycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJy.0lMVlFF3FTHtOumr4lt2wLSRLwI4yew3P8_6tMJDrBw",
+    "payload_bytes": 600
+  }
+]

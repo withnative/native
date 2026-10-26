@@ -2066,6 +2066,7 @@ mod neutral_fixture {
             decode,
             fold,
             state_codec: codec,
+            link_read: None,
         }
     }
     fn other_pins() -> InterpretationPins {
@@ -2239,4 +2240,80 @@ mod neutral_fixture {
         );
         tx.rollback().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn provider_link_read_projection_preparation_readiness_and_replay() {
+    let w = World::fresh().await;
+    let request = w.prepare("read-projection").await;
+    commit_provider_as(&w.db, &w.admin, &request).await.unwrap();
+    verify_v2_ready(&w.db).await.unwrap();
+    let expected = projection_dump::dump(&w.db).await.unwrap();
+    for table in [
+        "kernel_provider_link_meta",
+        "kernel_provider_link_heads",
+        "kernel_provider_link_rows",
+    ] {
+        assert!(expected
+            .tables
+            .iter()
+            .any(|t| t.name == table && t.rows > 0));
+    }
+    for index in [
+        "idx_kernel_provider_link_identity",
+        "idx_kernel_provider_state_heads",
+        "idx_kernel_provider_link_coverage",
+        "idx_kernel_event_birth",
+        "idx_kernel_read_type",
+        "idx_kernel_read_kind",
+    ] {
+        sqlx::query(&format!("DROP INDEX {index}"))
+            .execute(w.db.write_pool())
+            .await
+            .unwrap();
+        assert!(verify_v2_ready(&w.db).await.is_err(), "{index}");
+        prepare_v2_database(&w.db).await.unwrap();
+        assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    }
+    // These rows also feed the N1 delta digest; corrupting one must alter it.
+    sqlx::query("UPDATE kernel_provider_link_heads SET head=head+1")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert_ne!(
+        projection_dump::dump(&w.db).await.unwrap().sha256,
+        expected.sha256
+    );
+    assert!(verify_v2_ready(&w.db).await.is_err());
+    prepare_v2_database(&w.db).await.unwrap();
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    sqlx::query("DELETE FROM kernel_provider_link_rows WHERE ordinal=0")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(verify_v2_ready(&w.db).await.is_err());
+    prepare_v2_database(&w.db).await.unwrap();
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    sqlx::query("DELETE FROM kernel_provider_link_heads")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(verify_v2_ready(&w.db).await.is_err());
+    prepare_v2_database(&w.db).await.unwrap();
+    sqlx::query("UPDATE kernel_provider_link_meta SET version=0")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(verify_v2_ready(&w.db).await.is_err());
+    prepare_v2_database(&w.db).await.unwrap();
+    sqlx::query("DROP TABLE kernel_provider_link_rows")
+        .execute(w.db.write_pool())
+        .await
+        .unwrap();
+    assert!(verify_v2_ready(&w.db).await.is_err());
+    prepare_v2_database(&w.db).await.unwrap();
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    w.replay().await;
+    assert_eq!(projection_dump::dump(&w.db).await.unwrap(), expected);
+    w.db.close().await;
 }

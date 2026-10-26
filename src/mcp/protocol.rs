@@ -310,99 +310,109 @@ pub(crate) async fn handle_legacy_member_message(
     .await
 }
 
-async fn handle_modern_message_with_dispatch(
-    registry: Arc<ToolRegistry>,
-    dispatch: ProtocolToolDispatch,
-    message: Value,
-    persistence_lease: Option<DeploymentPersistenceLease>,
-) -> RpcOutcome {
+/// A modern message that passed envelope and metadata validation: the
+/// request id, the `tools/call`-routable method name, and the params object.
+/// Shared by the generic dispatcher and direct-dispatch transports so both
+/// reject malformed messages identically.
+pub(crate) struct ValidatedModernEnvelope<'a> {
+    pub(crate) id: Value,
+    pub(crate) method: &'a str,
+    pub(crate) params: &'a serde_json::Map<String, Value>,
+}
+
+/// Envelope and modern-metadata checks factored out of
+/// [`handle_modern_message_with_dispatch`]. On failure returns the exact
+/// outcome the generic path renders, so direct-dispatch transports reject
+/// identically.
+pub(crate) fn validate_modern_envelope(
+    message: &Value,
+) -> std::result::Result<ValidatedModernEnvelope<'_>, RpcOutcome> {
+    let err = |id: Value, code: i64, message: &str| RpcOutcome::error(id, code, message);
     let Some(object) = message.as_object() else {
-        return RpcOutcome::error(
+        return Err(err(
             Value::Null,
             INVALID_REQUEST,
             "invalid request: not a JSON object",
-        );
+        ));
     };
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return RpcOutcome::error(
+        return Err(err(
             Value::Null,
             INVALID_REQUEST,
             "invalid request: missing or invalid 'jsonrpc' version (expected \"2.0\")",
-        );
+        ));
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         if object.get("result").is_some() || object.get("error").is_some() {
-            return RpcOutcome::Notification;
+            return Err(RpcOutcome::Notification);
         }
-        return RpcOutcome::error(
-            request_id(&message),
+        return Err(err(
+            request_id(message),
             INVALID_REQUEST,
             "invalid request: no method",
-        );
+        ));
     };
-
     let id = match object.get("id") {
-        None => return RpcOutcome::Notification,
+        None => return Err(RpcOutcome::Notification),
         Some(id @ Value::String(_)) => id.clone(),
         Some(id @ Value::Number(n)) if n.is_i64() || n.is_u64() => id.clone(),
         Some(_) => {
-            return RpcOutcome::error(
+            return Err(err(
                 Value::Null,
                 INVALID_REQUEST,
                 "invalid request: 'id' must be a string or an integer",
-            )
+            ));
         }
     };
-
     let Some(params) = object.get("params").and_then(Value::as_object) else {
-        return RpcOutcome::error(
+        return Err(RpcOutcome::error(
             id,
             INVALID_PARAMS,
             "invalid params: modern MCP requests require object params",
-        );
+        ));
     };
     let Some(meta) = params.get("_meta").and_then(Value::as_object) else {
-        return RpcOutcome::error(
+        return Err(RpcOutcome::error(
             id,
             INVALID_PARAMS,
             "invalid params: modern MCP requests require object params._meta",
-        );
+        ));
     };
     let Some(version) = meta.get(PROTOCOL_VERSION_META).and_then(Value::as_str) else {
-        return RpcOutcome::error(
+        return Err(RpcOutcome::error(
             id,
             INVALID_PARAMS,
             "invalid params: params._meta requires a string protocol version",
-        );
+        ));
     };
     if version != PROTOCOL_VERSION {
-        return RpcOutcome::Response {
+        return Err(RpcOutcome::Response {
             body: unsupported_protocol_response(id, version),
             error_code: Some(UNSUPPORTED_PROTOCOL_VERSION),
-        };
+        });
     }
     let Some(client_capabilities) = meta.get(CLIENT_CAPABILITIES_META) else {
-        return RpcOutcome::error(
+        return Err(RpcOutcome::error(
             id,
             INVALID_PARAMS,
             "invalid params: params._meta requires object client capabilities",
-        );
+        ));
     };
     if let Err(message) = validate_client_capabilities(client_capabilities) {
-        return RpcOutcome::error(id, INVALID_PARAMS, &message);
+        return Err(RpcOutcome::error(id, INVALID_PARAMS, &message));
     }
     if let Some(client_info) = meta.get(CLIENT_INFO_META) {
         if let Err(message) = validate_implementation(client_info) {
-            return RpcOutcome::error(id, INVALID_PARAMS, &message);
+            return Err(RpcOutcome::error(id, INVALID_PARAMS, &message));
         }
     }
     if let Some(progress_token) = meta.get("progressToken") {
         if !progress_token.is_string() && !progress_token.is_number() {
-            return RpcOutcome::error(
+            return Err(RpcOutcome::error(
                 id,
                 INVALID_PARAMS,
                 "invalid params: params._meta.progressToken must be a string or number",
-            );
+            ));
         }
     }
     if meta
@@ -423,12 +433,25 @@ async fn handle_modern_message_with_dispatch(
             )
         })
     {
-        return RpcOutcome::error(
+        return Err(RpcOutcome::error(
             id,
             INVALID_PARAMS,
             "invalid params: params._meta logLevel is not a LoggingLevel",
-        );
+        ));
     }
+    Ok(ValidatedModernEnvelope { id, method, params })
+}
+
+async fn handle_modern_message_with_dispatch(
+    registry: Arc<ToolRegistry>,
+    dispatch: ProtocolToolDispatch,
+    message: Value,
+    persistence_lease: Option<DeploymentPersistenceLease>,
+) -> RpcOutcome {
+    let ValidatedModernEnvelope { id, method, params } = match validate_modern_envelope(&message) {
+        Ok(valid) => valid,
+        Err(outcome) => return outcome,
+    };
     if method == "tools/call" {
         if let Some(name) = params
             .get("name")
@@ -480,7 +503,7 @@ async fn handle_modern_message_with_dispatch(
     }
 
     let outcome = match method {
-        "server/discover" => Ok(discover_result()),
+        "server/discover" => Ok(discover_result_for(&registry)),
         "tools/list" => match &dispatch {
             ProtocolToolDispatch::Single { .. } | ProtocolToolDispatch::Refusing(_) => {
                 tools_list_result(&registry, &dispatch.exposure_policy(&registry))
@@ -591,30 +614,44 @@ pub(crate) async fn handle_legacy_lens_message(
     .await
 }
 
+/// The JSON-RPC 2.0 envelope head shared by the legacy dispatcher and
+/// direct-dispatch transports: the message is an object carrying
+/// `jsonrpc: "2.0"`. On failure returns the exact outcome the generic path
+/// renders.
+pub(crate) fn validate_legacy_envelope(
+    message: &Value,
+) -> std::result::Result<&serde_json::Map<String, Value>, RpcOutcome> {
+    // Envelope first (JSON-RPC 2.0): an object carrying `jsonrpc: "2.0"`.
+    // Anything else is answered -32600 with a null id — silently dropping
+    // valid-JSON-invalid-request input would leave a compliant caller waiting
+    // forever for a response that never comes.
+    let Some(object) = message.as_object() else {
+        return Err(RpcOutcome::error(
+            Value::Null,
+            INVALID_REQUEST,
+            "invalid request: not a JSON object",
+        ));
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err(RpcOutcome::error(
+            Value::Null,
+            INVALID_REQUEST,
+            "invalid request: missing or invalid 'jsonrpc' version (expected \"2.0\")",
+        ));
+    }
+    Ok(object)
+}
+
 async fn handle_legacy_message_with_dispatch(
     registry: Arc<ToolRegistry>,
     dispatch: ProtocolToolDispatch,
     message: Value,
     persistence_lease: Option<DeploymentPersistenceLease>,
 ) -> RpcOutcome {
-    // Envelope first (JSON-RPC 2.0): an object carrying `jsonrpc: "2.0"`.
-    // Anything else is answered -32600 with a null id — silently dropping
-    // valid-JSON-invalid-request input would leave a compliant caller waiting
-    // forever for a response that never comes.
-    let Some(object) = message.as_object() else {
-        return RpcOutcome::error(
-            Value::Null,
-            INVALID_REQUEST,
-            "invalid request: not a JSON object",
-        );
+    let object = match validate_legacy_envelope(&message) {
+        Ok(object) => object,
+        Err(outcome) => return outcome,
     };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return RpcOutcome::error(
-            Value::Null,
-            INVALID_REQUEST,
-            "invalid request: missing or invalid 'jsonrpc' version (expected \"2.0\")",
-        );
-    }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         // A response to a server-initiated request would arrive method-less
         // and is ignored per JSON-RPC (we initiate none); everything else
@@ -647,7 +684,7 @@ async fn handle_legacy_message_with_dispatch(
     };
 
     let outcome = match method {
-        "initialize" => Ok(legacy_initialize_result(&params)),
+        "initialize" => Ok(legacy_initialize_result_for(&registry, &params)),
         "ping" => Ok(json!({})),
         "tools/list" => match &dispatch {
             ProtocolToolDispatch::Single { .. } | ProtocolToolDispatch::Refusing(_) => {
@@ -702,6 +739,15 @@ async fn handle_legacy_message_with_dispatch(
         })),
         Err((code, message)) => RpcOutcome::error(id, code, &message),
     }
+}
+
+/// [`legacy_initialize_result`] plus the registry's declared MCP extensions.
+fn legacy_initialize_result_for(registry: &ToolRegistry, params: &Value) -> Value {
+    let mut result = legacy_initialize_result(params);
+    if let Some(identity) = registry.server_identity() {
+        result["capabilities"]["extensions"] = Value::Object(identity.extensions.clone());
+    }
+    result
 }
 
 fn legacy_initialize_result(params: &Value) -> Value {
@@ -1194,7 +1240,7 @@ async fn legacy_tools_call_result(
 /// ordinary app refusals before dispatch. Writable MCP has no such ingress.
 pub(crate) const STANDBY_APP_META: &str = "native/app";
 
-fn standby_app_caller(
+pub(crate) fn standby_app_caller(
     registry: &ToolRegistry,
     mut caller: Caller,
     meta: Option<&Value>,
@@ -1477,12 +1523,27 @@ fn result_meta() -> Value {
     })
 }
 
+/// [`discover_result`] with the registry's declared identity applied: its MCP
+/// extensions under `capabilities.extensions` (HCP v2 §10.2) and, when it has
+/// its own, its instructions in place of the Native bootstrap text. A registry
+/// with no identity gets the unchanged general response.
+fn discover_result_for(registry: &ToolRegistry) -> Value {
+    let mut result = discover_result();
+    if let Some(identity) = registry.server_identity() {
+        result["capabilities"]["extensions"] = Value::Object(identity.extensions.clone());
+        if let Some(instructions) = &identity.instructions {
+            result["instructions"] = Value::String(instructions.clone());
+        }
+    }
+    result
+}
+
 fn discover_result() -> Value {
     json!({
         "resultType": "complete",
         "supportedVersions": [PROTOCOL_VERSION],
         "capabilities": { "tools": {}, "resources": {} },
-        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface. Call read-only Bootstrap once per fresh host conversation; later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries. The host must determine that boundary: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account. After success retain the run key for every call and use set_intent when the aim materially changes. After transient transport/pool failure or HTTP 502/503/504, retry Bootstrap at most twice (1s, then 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, or instruction-readiness failures.",
+        "instructions": "Native's event-authoritative knowledge store. Use tools/list to discover the available tool surface. Call read-only Bootstrap once per fresh host conversation; later user turns, task/intent/artifact changes, or renewed Native use are not new bootstrap boundaries. The host must determine that boundary: Native has no trustworthy host-conversation identity and does not deduplicate by conversation/account. Skip Bootstrap only when your own instructions say the workspace is already described or Bootstrap is not needed. After success retain the run key for every call and use set_intent when the aim materially changes. After transient transport/pool failure or HTTP 502/503/504, retry Bootstrap at most twice (1s, then 2s; honor Retry-After up to 30s), then stop. Never retry auth, validation, or instruction-readiness failures.",
         "ttlMs": 0,
         "cacheScope": "private",
         "_meta": result_meta(),
@@ -1694,6 +1755,7 @@ mod tests {
             "use set_intent when the aim materially changes",
             "retry Bootstrap at most twice",
             "Never retry auth, validation, or instruction-readiness failures",
+            "Skip Bootstrap only when your own instructions say",
         ] {
             assert!(
                 instructions.contains(required),

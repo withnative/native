@@ -5,11 +5,19 @@ use std::path::PathBuf;
 async fn main() {
     if execute().await.is_err() {
         // Do not print engine errors: validators can quote private source values.
-        eprintln!("Import refused; inspect the JSON report if produced. Check paths, source schema, target identity and --resume.");
+        eprintln!("Import build {}; import refused; inspect the JSON report if produced. Check paths, source schema, target identity and --resume.",native_ce::FULL_GIT_SHA);
         std::process::exit(1);
     }
 }
 async fn execute() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv == ["--build-info"] {
+        println!(
+            "{}",
+            serde_json::json!({"importer_build_sha":native_ce::FULL_GIT_SHA})
+        );
+        return Ok(());
+    }
     let mut source = None;
     let mut target = None;
     let mut report = None;
@@ -20,7 +28,7 @@ async fn execute() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut history = false;
     let mut capture_only = false;
     let mut members_file = None;
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--source" => source = args.next().map(PathBuf::from),
@@ -88,7 +96,7 @@ async fn execute() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let result = match outcome {
         Ok(result) => result,
         Err(_) => {
-            report_file.write_all(br#"{"refusals":[{"reason":"import aborted during source/target validation or kernel admission; target may be partial; resume only with the same source"}]}"#)?;
+            report_file.write_all(&serde_json::to_vec(&serde_json::json!({"importer_build_sha":native_ce::FULL_GIT_SHA,"refusals":[{"reason":"import aborted during source/target validation or kernel admission; target may be partial; resume only with the same source"}]}))?)?;
             return Err("import aborted".into());
         }
     };
@@ -142,7 +150,7 @@ async fn execute() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!(
         "{}",
-        serde_json::json!({"history":result.history,"created":result.created,"unchanged":result.unchanged,"verified":result.verified,"refusals":result.refusals.len(),"review":result.review.len()})
+        serde_json::json!({"importer_build_sha":native_ce::FULL_GIT_SHA,"history":result.history,"created":result.created,"unchanged":result.unchanged,"verified":result.verified,"refusals":result.refusals.len(),"review":result.review.len()})
     );
     if !result.refusals.is_empty()
         || !result.review.is_empty()

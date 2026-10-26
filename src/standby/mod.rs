@@ -9,6 +9,11 @@ mod act_cut;
 mod act_delta;
 mod act_materialise;
 mod authority_probe;
+pub mod kernel_v2;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+mod kernel_v2_delta;
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) mod kernel_v2_tests;
 mod release_head;
 #[cfg(test)]
 pub(crate) use authority_probe::read_authority_act_head;
@@ -50,6 +55,7 @@ pub use generation_store::{
     InstalledGeneration, StandbyAuditOutcome, StandbyStartupOutcome, StandbyStartupReason,
     StatusOnlyStartup,
 };
+pub(crate) use refresh::CONFIG_CONTRACT as REFRESH_CONFIG_CONTRACT;
 pub use refresh::{
     current_attempt_detail, sanitize_retained_detail, start_background_refresh,
     start_background_refresh_with_store, BackgroundRefresh, DeltaFallbackClass,

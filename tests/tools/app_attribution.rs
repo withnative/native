@@ -504,3 +504,35 @@ async fn undo_selector_is_scoped_to_the_account_not_just_the_package() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn adopted_v1_store_app_can_query_records_as_its_user() {
+    let (db, registry) = fixture().await;
+    let install = adopted_v2(&registry, &db).await;
+    let args =
+        json!({"steps":[{"step":"filter","types":["Document"]}],"order":"name_asc","limit":500});
+    let direct = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE),
+        "query_record",
+        args.clone(),
+    )
+    .await
+    .unwrap();
+    let attributed = call_as(
+        &registry,
+        &db,
+        Caller::authenticated(ALICE).with_host_asserted_app(app(&install)),
+        "query_record",
+        args,
+    )
+    .await
+    .unwrap();
+    assert_eq!(attributed["records"], direct["records"]);
+    assert!(
+        attribution_rows(&db).await.is_empty(),
+        "reads do not create write attributions"
+    );
+    db.close().await;
+}

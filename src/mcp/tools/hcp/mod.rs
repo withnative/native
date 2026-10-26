@@ -1,6 +1,7 @@
-//! Hosted HCP preference tools (slices 1-2, Layer 1 + inference).
+//! Hosted HCP preference tools (slices 1-2, Layer 1 + inference) plus the
+//! slice-4a Layer 3 read tools `searchContext` and `traceContextItem`.
 //!
-//! These five tools reproduce ContextRouter's MCP contract at 0439d8f
+//! These seven tools reproduce ContextRouter's MCP contract at 0439d8f
 //! (conformance spec e5ae9ef) over Native records: `listPreferenceSlugs`,
 //! `searchPreferences`, `listPermissionGrants` and `mutatePreferences`
 //! (GLOBAL scope only), plus `smartSearchPreferences` over a Claude Haiku
@@ -29,8 +30,13 @@
 //! (`isError: true`). See `storage` notes in [`store`] for the record model.
 
 mod claude;
+mod context_item;
+mod context_search;
+mod context_trace;
+mod context_write;
+mod extensions;
 mod limits;
-mod locks;
+pub(crate) mod locks;
 mod model;
 mod native_block;
 mod setup;
@@ -56,15 +62,29 @@ pub const SEARCH_PREFERENCES: &str = "searchPreferences";
 pub const LIST_PERMISSION_GRANTS: &str = "listPermissionGrants";
 pub const MUTATE_PREFERENCES: &str = "mutatePreferences";
 pub const SMART_SEARCH_PREFERENCES: &str = "smartSearchPreferences";
+pub const SEARCH_CONTEXT: &str = "searchContext";
+pub const TRACE_CONTEXT_ITEM: &str = "traceContextItem";
+pub const PROPOSE_CONTEXT_ITEM: &str = "proposeContextItem";
+pub const RESOLVE_CONTEXT_ITEM: &str = "resolveContextItem";
 
-/// The tools slices 1-2 advertise, in `tools/list` order.
-pub const TOOL_NAMES: [&str; 5] = [
+/// The tools `/hcp` advertises, in `tools/list` order.
+pub const TOOL_NAMES: [&str; 9] = [
     LIST_PREFERENCE_SLUGS,
     SEARCH_PREFERENCES,
     LIST_PERMISSION_GRANTS,
     MUTATE_PREFERENCES,
     SMART_SEARCH_PREFERENCES,
+    SEARCH_CONTEXT,
+    TRACE_CONTEXT_ITEM,
+    PROPOSE_CONTEXT_ITEM,
+    RESOLVE_CONTEXT_ITEM,
 ];
+
+pub use extensions::{
+    hcp_v2_extension_descriptors, register_hcp_v2_extensions, EXTENSION_TOOL_NAMES,
+    NATIVE_PROPOSE_CONTEXT_ITEM, NATIVE_RESOLVE_CONTEXT_ITEM, NATIVE_SEARCH_CONTEXT,
+    NATIVE_TRACE_CONTEXT_ITEM,
+};
 
 const CATALOG_RETRIES: usize = 3;
 
@@ -172,6 +192,86 @@ fn input_schema(name: &str) -> Value {
             },
             "required": ["query"]
         }),
+        SEARCH_CONTEXT => json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string", "description": "Natural-language task to find context for; candidates come from lexical search over these words." },
+                "scope": {
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Only records under this folder or record." },
+                        "subject": { "type": "string", "description": "Only records linked to this entity." }
+                    }
+                },
+                "kinds": { "type": "array", "items": { "type": "string" }, "description": "Only records of these Native `Type/kind` values (for example `Resolution/decision`)." },
+                "include": {
+                    "type": "object",
+                    "properties": {
+                        "proposed": { "type": "boolean", "description": "Also return proposed items. Default false." },
+                        "superseded": { "type": "boolean", "description": "Also return superseded records. Default false." },
+                        "sources": { "type": "boolean", "description": "Also return status-less source records. Default true; false keeps only status-bearing items." }
+                    }
+                },
+                "limit": { "type": "number", "description": "How many items to return. Default 10, max 50." }
+            },
+            "required": ["task"]
+        }),
+        PROPOSE_CONTEXT_ITEM => json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "Native Type/kind of a new item, for example `Resolution/decision`, `Resolution/rule` or `Document/note` (the bare words decision, rule, note and fact are accepted). Required without `target`. A preference is proposed with mutatePreferences." },
+                "statement": { "type": "string", "description": "The proposed text. For a new item, its content (the first line becomes its title). With `target`, the full replacement text for the target's body." },
+                "value": { "description": "Not supported: a preference value is proposed with mutatePreferences." },
+                "subject": { "type": "string", "description": "New item only. Reference of the person it is about; linked in the same call." },
+                "appliesTo": { "type": "array", "items": { "type": "string" }, "description": "New item only. References of the projects, folders or records it applies to; linked in the same call." },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ref": { "type": "string", "description": "A record this rests on; linked as evidence in the same call." },
+                            "text": { "type": "string", "description": "A quotation or note, recorded on the proposal." }
+                        }
+                    }
+                },
+                "target": {
+                    "type": "object",
+                    "description": "Present = propose a change to an existing record instead of a new item.",
+                    "properties": {
+                        "ref": { "type": "string" },
+                        "expectedRevision": { "type": "string", "description": "The target's `revision` you read. The proposal is anchored to it and Native refuses to apply it if the target has changed by the time it is accepted." }
+                    },
+                    "required": ["ref", "expectedRevision"]
+                }
+            },
+            "required": ["statement"]
+        }),
+        RESOLVE_CONTEXT_ITEM => json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "description": "A new proposed item to accept, or an accepted item to supersede. (A change proposal is resolved in Native: accept and reject on one answer RESOLVE_IN_NATIVE.)" },
+                "action": { "type": "string", "enum": ["accept", "reject", "supersede"], "description": "reject is only ever answered RESOLVE_IN_NATIVE (a change proposal) or UNSUPPORTED_ACTION (a new item has no rejected state)." },
+                "expectedRevision": { "type": "string", "description": "Required for accept and supersede: the item's `revision` as you read it. A stale one gives STALE_REVISION and changes nothing." },
+                "replacement": {
+                    "type": "object",
+                    "description": "Supersede only. `{ ref }` of an existing item (propose it first; it may still be proposed). An inline statement is refused, and so is a revision on the replacement.",
+                    "properties": {
+                        "ref": { "type": "string" }
+                    }
+                },
+                "reason": { "type": "string", "description": "Why; recorded with the resolution." }
+            },
+            "required": ["ref", "action", "reason"]
+        }),
+        TRACE_CONTEXT_ITEM => json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "description": "Short reference or id of the record to trace." },
+                "include": { "type": "array", "items": { "type": "string", "enum": ["evidence", "history", "supersession"] }, "description": "Sections to return. Default all three." },
+                "historyLimit": { "type": "number", "description": "How many history entries to return. Default 20, max 100." }
+            },
+            "required": ["ref"]
+        }),
         _ => json!({
             "type": "object",
             "properties": {
@@ -214,8 +314,20 @@ fn description(name: &str) -> &'static str {
         SEARCH_PREFERENCES => "Retrieve stored preferences by literal slug prefix, category or description. Suggestions are returned only when includeSuggestions is true. Each preference may carry an optional `native` block: recordRef, url, revision (pass it back as expectedRevision), assertedBy with a basis (direct, endorsed, reported, or null when it is only an agent's inference), recordedBy and evidence.",
         LIST_PERMISSION_GRANTS => "List this client's permission grants. Native has no per-client grants: the list is empty and every client acts with the person's ordinary Native access.",
         SMART_SEARCH_PREFERENCES => "Match stored preferences against a natural-language query with model-assisted relevance. Returns matched definitions in relevance order with their active values (and suggestions only when includeSuggestions is true). Needs server-side model configuration. Preferences carry the same optional `native` block as searchPreferences.",
+        SEARCH_CONTEXT => "Find records relevant to a natural-language task: decisions, preferences and other readable records in one list, model-ranked with a lexical fallback. Candidates come only from authorised reads and never reach the model unread. Status-bearing items rank first; `include.sources: false` keeps only them.",
+        PROPOSE_CONTEXT_ITEM => "Propose a context item without making it current. With `target` ({ ref, expectedRevision }) it creates one Native suggestion on that record, anchored to the revision you read; Native refuses to apply it if the target has since changed. Without `target` it creates one new record of the given Type/kind at Native's `proposed` maturity, with its subject, appliesTo and evidence links written in the same call; searchContext reports it as `proposed`, never `accepted`, until it is resolved. Returns the proposal's ref. A preference is proposed with mutatePreferences.",
+        RESOLVE_CONTEXT_ITEM => "Accept a proposed new item, or supersede an accepted one, each as one atomic Native write; anything that could not be made atomic is refused and nothing is attempted. accept makes a proposed new item accepted (checked against expectedRevision); supersede marks an accepted item superseded by an existing replacement `{ ref }` and links the two in one write (the replacement may itself still be proposed, and is reported as it is; an inline replacement is refused). A change proposal (a suggestion on an existing record) is NOT resolved here: accept and reject answer RESOLVE_IN_NATIVE with the target record's url and change nothing, because the person resolves it in Native. Permission is Native's own: you can resolve what your access lets you edit, and the item records who accepted it (an agent's acceptance is recorded as the agent's, with no claim that the person said it). Outcomes: accepted, superseded, conflict (nothing changed; code STALE_REVISION carries the current revision), refused (nothing changed), unconfirmed (the write may have landed: re-read before retrying).",
+        TRACE_CONTEXT_ITEM => "Follow one context item through authorised reads: the item itself plus its evidence links, revision history and supersession. Unreadable records are refused without revealing that they exist.",
         _ => "Change one preference or definition per call. Values are JSON-encoded strings. SUGGEST_PREFERENCE records an inference for the person to review; SET_PREFERENCE revises the stored value in place. GLOBAL scope only. Optional expectedRevision (the `native.revision` last read) refuses a stale SET, DELETE of a value, UPDATE_DEFINITION or ARCHIVE_DEFINITION with STALE_REVISION and changes nothing; SUGGEST_PREFERENCE and DELETE of a suggestion refuse it (UNSUPPORTED_EXPECTED_REVISION). After an error that may follow a write, changed is null (OUTCOME_UNCERTAIN): re-read.",
     }
+}
+
+/// The tools that write; every other `/hcp` tool is read-only.
+fn is_mutator(name: &str) -> bool {
+    matches!(
+        name,
+        MUTATE_PREFERENCES | PROPOSE_CONTEXT_ITEM | RESOLVE_CONTEXT_ITEM
+    )
 }
 
 /// MCP descriptors for the advertised tools, with ContextRouter's annotations
@@ -224,7 +336,7 @@ pub fn hcp_tool_descriptors() -> Vec<Value> {
     TOOL_NAMES
         .iter()
         .map(|name| {
-            let mutator = *name == MUTATE_PREFERENCES;
+            let mutator = is_mutator(name);
             let mut annotations = json!({ "readOnlyHint": !mutator, "openWorldHint": false });
             if mutator {
                 annotations["idempotentHint"] = json!(false);
@@ -241,7 +353,8 @@ pub fn hcp_tool_descriptors() -> Vec<Value> {
 
 /// Register the HCP tools in their own registry. They are registered as
 /// extension tools: not shipped-tool kinds, no record-interaction logging. The
-/// four read tools are declared read-only; `mutatePreferences` is a mutation.
+/// read tools are declared read-only; `mutatePreferences`, `proposeContextItem`
+/// and `resolveContextItem` are mutations.
 pub fn register_hcp_tools(registry: &mut ToolRegistry) -> Result<()> {
     macro_rules! register {
         ($name:expr, $handler:expr) => {
@@ -260,13 +373,19 @@ pub fn register_hcp_tools(registry: &mut ToolRegistry) -> Result<()> {
     register!(LIST_PERMISSION_GRANTS, list_permission_grants);
     register!(MUTATE_PREFERENCES, mutate_preferences);
     register!(SMART_SEARCH_PREFERENCES, smart_search_preferences);
-    // The four read tools never write, so a frozen deployment keeps serving
+    register!(SEARCH_CONTEXT, context_search::search_context);
+    register!(TRACE_CONTEXT_ITEM, context_trace::trace_context_item);
+    register!(PROPOSE_CONTEXT_ITEM, context_write::propose_context_item);
+    register!(RESOLVE_CONTEXT_ITEM, context_write::resolve_context_item);
+    // The six read tools never write, so a frozen deployment keeps serving
     // them. Admission classifies by tool name (server-owned, not by arguments).
     for name in [
         LIST_PREFERENCE_SLUGS,
         SEARCH_PREFERENCES,
         LIST_PERMISSION_GRANTS,
         SMART_SEARCH_PREFERENCES,
+        SEARCH_CONTEXT,
+        TRACE_CONTEXT_ITEM,
     ] {
         registry.declare_read_only(name)?;
     }
@@ -323,12 +442,16 @@ pub async fn call_tool(
     };
     match result {
         Ok(mut body) => {
-            absolutize_record_urls(registry, &mut body);
+            absolutize_record_urls(&|path| registry.absolute_record_url(path), &mut body);
             frame(body)
         }
         Err(error) => failure_frame(name, &error),
     }
 }
+
+/// Turns a record's relative path into its absolute address, when the
+/// deployment has an origin to give it.
+type Absolute<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// `native.url` is built from the record's relative path; give it the
 /// deployment's origin, exactly as `/mcp` does for `record_url`. Without a
@@ -337,17 +460,17 @@ pub async fn call_tool(
 /// Only the known provenance paths are rewritten, and nothing under a `value`
 /// is ever visited: a stored value that happens to look like a `native` block
 /// is the person's data and stays byte for byte as stored.
-fn absolutize_record_urls(registry: &ToolRegistry, body: &mut Value) {
-    fn link(registry: &ToolRegistry, holder: &mut Value) {
+fn absolutize_record_urls(absolute: Absolute, body: &mut Value) {
+    fn link(absolute: Absolute, holder: &mut Value) {
         let Some(native) = holder.get_mut("native").and_then(Value::as_object_mut) else {
             return;
         };
-        let absolute = native
+        let resolved = native
             .get("url")
             .and_then(Value::as_str)
             .filter(|url| url.starts_with('/'))
-            .and_then(|path| registry.absolute_record_url(path));
-        if let Some(url) = absolute {
+            .and_then(absolute);
+        if let Some(url) = resolved {
             native.insert("url".into(), Value::String(url));
         }
     }
@@ -358,20 +481,76 @@ fn absolutize_record_urls(registry: &ToolRegistry, body: &mut Value) {
             .and_then(|list| list.get_mut("preferences"))
             .and_then(Value::as_array_mut)
         {
-            items.iter_mut().for_each(|item| link(registry, item));
+            items.iter_mut().for_each(|item| link(absolute, item));
         }
     }
     // smartSearchPreferences.
     for list in ["matchedActivePreferences", "matchedSuggestedPreferences"] {
         if let Some(items) = body.get_mut(list).and_then(Value::as_array_mut) {
-            items.iter_mut().for_each(|item| link(registry, item));
+            items.iter_mut().for_each(|item| link(absolute, item));
         }
     }
     // mutatePreferences.
     for holder in ["preference", "definition"] {
         if let Some(holder) = body.get_mut(holder) {
-            link(registry, holder);
+            link(absolute, holder);
         }
+    }
+    // resolveContextItem RESOLVE_IN_NATIVE: the target record's url, and the
+    // same path where the message names it.
+    if let Some(target) = body.get_mut("target").filter(|target| target.is_object()) {
+        let before = target
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        absolutize_url(absolute, target);
+        let after = target
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let (Some(before), Some(after)) = (before, after) {
+            if before != after {
+                if let Some(message) = body.get("error").and_then(Value::as_str) {
+                    let message = message.replace(&format!("`{before}`"), &format!("`{after}`"));
+                    body["error"] = Value::String(message);
+                }
+            }
+        }
+    }
+    // searchContext: `items` are ContextItems with relative `url`s.
+    if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items.iter_mut() {
+            absolutize_url(absolute, item);
+        }
+    }
+    // traceContextItem: `item` plus full items under `supersession`.
+    if let Some(item) = body.get_mut("item") {
+        absolutize_url(absolute, item);
+    }
+    if let Some(supersession) = body.get_mut("supersession") {
+        if let Some(items) = supersession
+            .get_mut("supersedes")
+            .and_then(Value::as_array_mut)
+        {
+            for item in items.iter_mut() {
+                absolutize_url(absolute, item);
+            }
+        }
+        if let Some(item) = supersession.get_mut("supersededBy") {
+            absolutize_url(absolute, item);
+        }
+    }
+}
+
+/// Give one ContextItem's relative `url` the deployment's origin.
+fn absolutize_url(absolute: Absolute, item: &mut Value) {
+    let resolved = item
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|url| url.starts_with('/'))
+        .and_then(absolute);
+    if let Some(url) = resolved {
+        item["url"] = Value::String(url);
     }
 }
 
@@ -380,16 +559,24 @@ fn absolutize_record_urls(registry: &ToolRegistry, body: &mut Value) {
 pub fn failure_frame(name: &str, error: &Error) -> Value {
     let (code, message) = transport_failure(error);
     let mut body = json!({ "success": false, "code": code, "error": message });
-    if name == MUTATE_PREFERENCES {
+    if is_mutator(name) {
         // A read-only fence refuses the call before it changes anything. A
         // draining fence says itself that the outcome of a write is unknown, and
         // any other failure that escapes a mutation may have followed a write:
         // `changed` is then unknown (`null`), never `false`.
-        body["changed"] = if matches!(error, Error::DeploymentReadOnly(_)) {
+        let refused_first = matches!(error, Error::DeploymentReadOnly(_));
+        body["changed"] = if refused_first {
             json!(false)
         } else {
             Value::Null
         };
+        if name == RESOLVE_CONTEXT_ITEM {
+            body["outcome"] = json!(if refused_first {
+                "refused"
+            } else {
+                "unconfirmed"
+            });
+        }
     }
     frame(body)
 }
@@ -585,6 +772,9 @@ async fn suggested_wires(
 
 /// The body every tool returns while the workspace has not enabled HCP.
 async fn refused_if_not_configured(db: &Db) -> Result<Option<Value>> {
+    if extensions::on_hcp_v2_host() {
+        return extensions::not_configured(db).await;
+    }
     Ok(setup::not_configured(db)
         .await?
         .map(|message| failure(setup::NOT_CONFIGURED, message)))
@@ -2228,6 +2418,10 @@ async fn delete_preference(store: &Store<'_>, arguments: &Value) -> Outcome {
 #[cfg(test)]
 mod acceptance_tests;
 #[cfg(test)]
+mod context_tests;
+#[cfg(test)]
+mod extension_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod provenance_tests;
@@ -2237,3 +2431,5 @@ mod review_tests;
 mod smart_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_tests;

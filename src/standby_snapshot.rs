@@ -202,7 +202,7 @@ pub struct StandbySnapshotEngineIdentity {
 /// also the deterministic integration-test seam and applies the same checks.
 #[derive(Clone, Debug)]
 pub struct ProducerBuildIdentity {
-    source_sha: String,
+    pub(crate) source_sha: String,
     ddl_sha256: String,
 }
 
@@ -276,12 +276,21 @@ pub struct StandbySnapshotManifest {
         skip_serializing_if = "StandbyGenerationMaterialization::is_snapshot"
     )]
     pub materialization: StandbyGenerationMaterialization,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_v2: Option<crate::standby::kernel_v2::KernelGeneration>,
     pub snapshot: StandbySnapshotBytes,
 }
 
 impl StandbySnapshotManifest {
+    /// Recognize only the declared contract/version; this does not validate
+    /// engine coordinates, identity, bytes or admit a generation.
+    pub(crate) fn has_supported_contract(&self) -> bool {
+        (self.contract == STANDBY_SNAPSHOT_MANIFEST_CONTRACT
+            || self.contract == crate::standby::kernel_v2::MANIFEST)
+            && self.version == 1
+    }
     pub fn validate(&self) -> Result<()> {
-        if self.contract != STANDBY_SNAPSHOT_MANIFEST_CONTRACT || self.version != 1 {
+        if !self.has_supported_contract() {
             return Err(Error::engine("unknown standby snapshot manifest contract"));
         }
         if self.hosted_route_database_id.trim().is_empty()
@@ -301,16 +310,36 @@ impl StandbySnapshotManifest {
                 "standby snapshot capture time follows completion",
             ));
         }
-        if self.engine.name != crate::ENGINE_NAME
-            || !lowercase_hex(&self.engine.source_sha, 40)
-            || self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
-            || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256
+        let kernel_v2 = self.kernel_v2.as_ref();
+        if let Some(kernel) = kernel_v2 {
+            kernel.validate()?;
+            if self.contract != crate::standby::kernel_v2::MANIFEST
+                || self.engine.name != crate::standby::kernel_v2::ENGINE
+                || !lowercase_hex(&self.engine.source_sha, 40)
+                || self.engine.schema_version != 0
+                || self.engine.ddl_sha256 != kernel.schema_sha256
+                || self.head_act != Some(kernel.head_act)
+                || self.frontier.coordinates() != [0; 12]
+            {
+                return Err(Error::engine(
+                    "kernel-v2 manifest engine/coordinates mismatch",
+                ));
+            }
+        } else if self.contract != STANDBY_SNAPSHOT_MANIFEST_CONTRACT {
+            return Err(Error::engine("v2 manifest requires kernel coordinates"));
+        }
+        if kernel_v2.is_none()
+            && (self.engine.name != crate::ENGINE_NAME
+                || !lowercase_hex(&self.engine.source_sha, 40)
+                || self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
+                || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256)
         {
             return Err(Error::engine("standby snapshot engine identity is invalid"));
         }
         self.consumer.validate_declaration()?;
-        if self.consumer.engine_schema_version != self.engine.schema_version
-            || self.consumer.ddl_sha256 != self.engine.ddl_sha256
+        if kernel_v2.is_none()
+            && (self.consumer.engine_schema_version != self.engine.schema_version
+                || self.consumer.ddl_sha256 != self.engine.ddl_sha256)
         {
             return Err(Error::engine(
                 "standby consumer is not exactly schema-compatible with the snapshot",
@@ -341,15 +370,16 @@ impl StandbySnapshotManifest {
     /// it by design. Such a generation cannot be served or compared with
     /// current rows, but it may still be replaced by a whole snapshot.
     pub fn is_other_engine_revision(&self) -> bool {
-        self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
-            || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256
+        self.kernel_v2.is_none()
+            && (self.engine.schema_version != crate::CURRENT_ENGINE_SCHEMA_VERSION
+                || self.engine.ddl_sha256 != crate::schema::FROZEN_DDL_SHA256)
     }
 
     /// What a replacement needs to trust about a manifest that
     /// [`Self::is_other_engine_revision`]: its contract, database identity
     /// and times, never its engine identity.
     pub fn validate_other_revision_for_replacement(&self) -> Result<()> {
-        if self.contract != STANDBY_SNAPSHOT_MANIFEST_CONTRACT || self.version != 1 {
+        if !self.has_supported_contract() {
             return Err(Error::engine("unknown standby snapshot manifest contract"));
         }
         if self.hosted_route_database_id.trim().is_empty()
@@ -373,6 +403,27 @@ impl StandbySnapshotManifest {
         Ok(())
     }
 
+    pub(crate) fn frontier_follows(&self, current: &Self) -> Result<bool> {
+        if self.hosted_route_database_id != current.hosted_route_database_id
+            || self.origin_database_id != current.origin_database_id
+        {
+            return Ok(false);
+        }
+        match (&current.kernel_v2, &self.kernel_v2) {
+            (None, Some(_)) => Ok(true),
+            (Some(_), None) => Ok(false),
+            (Some(a), Some(b)) => Ok(a.genesis_event_id == b.genesis_event_id
+                && a.schema_sha256 == b.schema_sha256
+                && b.head_act >= a.head_act
+                && b.content_event_seq >= a.content_event_seq
+                && b.meta_event_seq >= a.meta_event_seq
+                && b.blob_count >= a.blob_count),
+            (None, None) => self
+                .frontier
+                .is_componentwise_non_regressing_from(&current.frontier),
+        }
+    }
+
     /// Scalar precheck for promotion. A true result still requires deep
     /// database proof: prefix inclusion for unsequenced append-only domains,
     /// governed projection validation, and the applicable rules for unfenced
@@ -386,16 +437,14 @@ impl StandbySnapshotManifest {
         {
             return Ok(false);
         }
-        if !self
-            .frontier
-            .is_componentwise_non_regressing_from(&current.frontier)?
-        {
+        if !self.frontier_follows(current)? {
             return Ok(false);
         }
-        if self
-            .head_act
-            .zip(current.head_act)
-            .is_some_and(|(next, prior)| next < prior)
+        if self.kernel_v2.is_some() == current.kernel_v2.is_some()
+            && self
+                .head_act
+                .zip(current.head_act)
+                .is_some_and(|(next, prior)| next < prior)
         {
             return Ok(false);
         }
@@ -410,12 +459,18 @@ impl StandbySnapshotManifest {
 
 #[derive(Clone, Debug)]
 pub struct HostedStandbyManifestContext {
+    pub(crate) expected_kernel_v2: Option<bool>,
     pub hosted_route_database_id: String,
     pub consumer: StandbyConsumerIdentity,
-    producer: ProducerBuildIdentity,
+    pub(crate) producer: ProducerBuildIdentity,
 }
 
 impl HostedStandbyManifestContext {
+    pub fn with_expected_kernel_v2(mut self, expected: bool) -> Self {
+        self.expected_kernel_v2 = Some(expected);
+        self
+    }
+
     pub fn new(
         hosted_route_database_id: String,
         consumer: StandbyConsumerIdentity,
@@ -447,6 +502,7 @@ impl HostedStandbyManifestContext {
             ));
         }
         Ok(Self {
+            expected_kernel_v2: None,
             hosted_route_database_id,
             consumer,
             producer,
@@ -468,6 +524,30 @@ pub(crate) async fn manifest_from_completed_export(
         .read_only(true)
         .immutable(true);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
+        .fetch_one(&mut connection)
+        .await?;
+    if context
+        .expected_kernel_v2
+        .is_some_and(|v2| v2 != (marker == crate::db::V2_APPLICATION_ID))
+    {
+        return Err(Error::engine(
+            "standby export catalog engine and file marker disagree",
+        ));
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::standby::kernel_v2::is_v2(&mut connection).await? {
+        connection.close().await?;
+        return crate::standby::kernel_v2::manifest(
+            path,
+            size_bytes,
+            sha256,
+            captured_at,
+            snapshot_completed_at,
+            context,
+        )
+        .await;
+    }
     crate::db::refuse_v2_database(&mut connection).await?;
     let row = sqlx::query(
         "SELECT
@@ -522,6 +602,7 @@ pub(crate) async fn manifest_from_completed_export(
                 .try_get("storage_portability_policy_revision")?,
         },
         head_act: Some(row.try_get("head_act")?),
+        kernel_v2: None,
         materialization: StandbyGenerationMaterialization::Snapshot,
         snapshot: StandbySnapshotBytes {
             media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
@@ -548,6 +629,11 @@ pub(crate) async fn validate_completed_export_manifest(
         .create_if_missing(false)
         .read_only(true);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if manifest.kernel_v2.is_some() {
+        connection.close().await?;
+        return crate::standby::kernel_v2::validate_manifest(path, manifest, false).await;
+    }
     crate::db::refuse_v2_database(&mut connection).await?;
     let row = sqlx::query("SELECT
       (SELECT origin_db_id FROM database_identity WHERE singleton=1) origin_database_id,
@@ -630,6 +716,20 @@ pub(crate) async fn validate_standby_export_relations(path: &Path) -> Result<()>
         .read_only(true)
         .immutable(true);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    if crate::standby::kernel_v2::is_v2(&mut connection).await? {
+        crate::standby::kernel_v2::coordinates(&mut connection).await?;
+        let violation: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
+                .fetch_one(&mut connection)
+                .await?;
+        connection.close().await?;
+        return if violation == 0 {
+            Ok(())
+        } else {
+            Err(Error::engine("v2 export foreign-key validation failed"))
+        };
+    }
     crate::db::refuse_v2_database(&mut connection).await?;
     let violation: i64 =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)")
@@ -693,6 +793,7 @@ mod tests {
             },
             frontier: frontier(frontier_value),
             head_act: Some(frontier_value),
+            kernel_v2: None,
             materialization: StandbyGenerationMaterialization::Snapshot,
             snapshot: StandbySnapshotBytes {
                 media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),

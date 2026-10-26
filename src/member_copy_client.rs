@@ -456,6 +456,18 @@ fn parse_etag(headers: &HeaderMap) -> Result<String> {
 }
 
 fn revoked_cause(body: &[u8]) -> Result<RevokedCause> {
+    // The HTTP surface preserves its honest guest refusal. A member-copy
+    // device can never hold as a guest: an existing slice must be purged,
+    // rather than treating this authenticated refusal as an outage.
+    if serde_json::from_slice::<ErrorBody>(body)
+        .ok()
+        .is_some_and(|error| {
+            error.api == MEMBER_COPY_API && error.error_code == "guest_access_ended"
+        })
+    {
+        return Ok(RevokedCause::RoleChanged);
+    }
+
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Revoked {
@@ -692,6 +704,24 @@ mod tests {
             serde_json::from_slice::<OutcomeBody>(&bytes).is_err(),
             "a success body missing the api marker must reject"
         );
+    }
+
+    #[test]
+    fn guest_access_ended_is_a_member_copy_role_revocation_only_with_exact_api() {
+        assert_eq!(
+            revoked_cause(br#"{"api":"native.member-copy.v1","error_code":"guest_access_ended"}"#)
+                .unwrap(),
+            RevokedCause::RoleChanged
+        );
+        for body in [
+            br#"{"api":"other","error_code":"guest_access_ended"}"#.as_slice(),
+            br#"{"error_code":"guest_access_ended"}"#.as_slice(),
+            br#"{"api":"native.member-copy.v1","error_code":"other"}"#.as_slice(),
+            br#"{"api":"native.member-copy.v1","error_code":"guest_access_ended","extra":true}"#
+                .as_slice(),
+        ] {
+            assert!(revoked_cause(body).is_err());
+        }
     }
 
     /// Refusal bodies must carry the api marker and the kind/error_code that

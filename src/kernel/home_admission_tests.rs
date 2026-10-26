@@ -120,6 +120,8 @@ fn record_spec(id: &str, actor: &str) -> AppendSpec {
             pin: None,
             interpreter: None,
             fields: None,
+            origin: None,
+            basis: None,
         })
         .unwrap(),
         actor: Some(actor.into()),

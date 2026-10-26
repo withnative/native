@@ -9,7 +9,7 @@
 //!
 //! `authority_act_head` is the cheap probe: it returns the authority's
 //! replicated head coordinates so a client can decide whether a cut is needed.
-//! `authority_act_delta` is the exact cut: the client supplies `F1` only and the
+//! `authority_act_delta` is the exact cut: the client supplies `F1` and optional v2 base blob keys, and the
 //! authority returns the canonical delta from its own observed head `F2`. If
 //! the exact delta exceeds the bounded transport ceiling it refuses, so the
 //! caller can take the whole-snapshot fallback rather than receive a partial
@@ -33,10 +33,11 @@ struct EmptyArgs {}
 #[serde(deny_unknown_fields)]
 struct AuthorityActDeltaArgs {
     from_exclusive_act: i64,
+    blob_inventory: Option<Vec<String>>,
 }
 
 const AUTHORITY_ACT_HEAD_DESCRIPTION: &str = "Owner-only replicated authority act-head probe for local standby delta refresh. Returns the authority's replicated head coordinates (origin, head act, per-log and non-sequenced watermarks, cutovers, binding seeds and pins) without creating a snapshot. Hosted and HostOwner-only; absent on local/stdio.";
-const AUTHORITY_ACT_DELTA_DESCRIPTION: &str = "Owner-only exact canonical authority act-delta cut for local standby delta refresh. Supply only from_exclusive_act (F1); the authority cuts to the head it observes in the same read transaction (F2) and returns the canonical delta bytes with an outer digest. Refuses a cut above the bounded transport ceiling so the caller can fall back to a whole snapshot. Hosted and HostOwner-only; absent on local/stdio.";
+const AUTHORITY_ACT_DELTA_DESCRIPTION: &str = "Owner-only exact canonical authority act-delta cut for local standby delta refresh. Supply from_exclusive_act (F1); v2 also requires sorted SHA-256 blob_inventory from the verified base. The authority cuts to the head it observes in the same read transaction (F2) and returns the canonical delta bytes with an outer digest. Refuses a cut above the bounded transport ceiling so the caller can fall back to a whole snapshot. Hosted and HostOwner-only; absent on local/stdio.";
 
 fn authority_act_head_schema() -> Value {
     json!({
@@ -51,6 +52,7 @@ fn authority_act_delta_schema() -> Value {
         "type": "object",
         "required": ["from_exclusive_act"],
         "properties": {
+            "blob_inventory": {"type":"array","maxItems":65536,"items":{"type":"string","pattern":"^[0-9a-f]{64}$"},"description":"Sorted unique SHA-256 keys in the verified v2 base; required for v2 deltas after act zero."},
             "from_exclusive_act": {
                 "type": "integer",
                 "minimum": 0,
@@ -85,6 +87,7 @@ async fn authority_act_delta(
             caller,
             AuthorityActDeltaRequest {
                 from_exclusive_act: args.from_exclusive_act,
+                blob_inventory: args.blob_inventory,
             },
         )
         .await?;
@@ -96,6 +99,8 @@ pub fn register_authority_act_tools(
     registry: &mut ToolRegistry,
     source: AuthorityActSourceRef,
 ) -> Result<()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    let kernel_source = source.clone();
     let head_source = source.clone();
     registry.register(
         ToolKind::AuthorityActHead,
@@ -115,6 +120,27 @@ pub fn register_authority_act_tools(
             async move { authority_act_delta(db, caller, arguments, source).await }
         },
     )?;
+    #[cfg(feature = "v2-kernel-probe")]
+    for name in ["authority_act_head", "authority_act_delta"] {
+        let source = kernel_source.clone();
+        registry.register_engine_handler(
+            name,
+            crate::mcp::registry::EngineKind::KernelV2,
+            move |engine, caller, args| {
+                let source = source.clone();
+                async move {
+                    let crate::mcp::registry::EngineHandle::KernelV2(db) = engine else {
+                        unreachable!()
+                    };
+                    if name == "authority_act_head" {
+                        authority_act_head(db, caller, args, source).await
+                    } else {
+                        authority_act_delta(db, caller, args, source).await
+                    }
+                }
+            },
+        )?;
+    }
     Ok(())
 }
 

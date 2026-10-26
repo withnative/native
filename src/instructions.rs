@@ -11,7 +11,12 @@ use crate::portable_sql::{
     NormalizedRow, NormalizedValue, StatementKind, StatementTemplate,
 };
 
-pub const MAX_RESOLVED_INSTRUCTION_BYTES: usize = 32 * 1024;
+/// Raised from 32 KiB to 48 KiB on 21 Oct 2026. Native HQ's standing guidance
+/// stood 708 bytes inside the old bound, and exceeding it invalidates the whole
+/// stack, so one more paragraph would have put every session into repair. This
+/// is a stopgap that adds no context cost today; the compact bootstrap spec
+/// (90ba81b) replaces it with inlined and total-source ceilings.
+pub const MAX_RESOLVED_INSTRUCTION_BYTES: usize = 48 * 1024;
 /// Caller-relative control metadata has its own bound: the authored-body limit
 /// does not stop thousands of empty sources or obligations from bloating a
 /// bootstrap response. Count ceilings make resolution work bounded too; the
@@ -651,7 +656,7 @@ async fn resolve_for_account_in(
             pending_obligations,
             resolved_bytes,
             "instruction_budget_exceeded",
-            "The resolved instruction stack exceeds the 32 KiB UTF-8 budget. No partial instruction stack is authoritative.",
+            "The resolved instruction stack exceeds the 48 KiB UTF-8 budget. No partial instruction stack is authoritative.",
             None,
         ));
     }

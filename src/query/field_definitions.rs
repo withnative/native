@@ -1,4 +1,4 @@
-//! Pure, bounded field discovery for the future SQL population adapter.
+//! Pure, bounded field discovery shared with the SQL facet_keys adapter.
 //!
 //! Callers must supply only global/caller-visible schema rows and a consistent
 //! vocabulary snapshot. This module neither authorizes rows nor reads records.

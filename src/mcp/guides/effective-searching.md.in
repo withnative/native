@@ -18,7 +18,7 @@ Choose the door whose semantics faithfully match the question:
 4. Use `scan` when you do not yet know which axis contains the answer. Its optional `query` adds a lexical-text axis, while its address-valued `scope` bounds every axis beneath a known record. Its censuses and samples orient you; they are not complete matching sets. Refine through a more exact door once a useful axis appears.
 5. Use `query_sql` only when a caller-filtered relational join or aggregation cannot be represented faithfully by the higher-level query surface. Inspect the live schema first and keep results bounded.
 
-On a lean MCP surface (bootstrap reports `tool_exposure.projection: "lean"`), `records_read` advertises only `search` directly. Read with `sql_read` `query_sql` first, and reach `get_record`, `query_record`, `get_structure` and `scan` through `call_executor` with the same operation and arguments, for example `call_executor` with `{"executor":"records_read","operation":"get_record","arguments":{"ids":[reference]}}`.
+On a lean MCP surface (bootstrap reports `tool_exposure.projection: "lean"`), `records_read` advertises `search` and `get_record` directly. Read with `sql_read` `query_sql` first, and reach `query_record`, `get_structure` and `scan` through `call_executor` with the same operation and arguments, for example `call_executor` with `{"executor":"records_read","operation":"get_history","arguments":{"record_id":reference}}`.
 
 History and activity answer a different question from record content. When you need to know why something changed, what landed since a known point, or whether concurrent work altered the premise, use the relevant history or change surface rather than trying to infer a timeline from current values.
 

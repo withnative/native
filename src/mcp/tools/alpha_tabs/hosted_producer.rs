@@ -13,6 +13,42 @@ pub(super) const SOURCE_BYTES: i64 = 16 * 1024 * 1024;
 fn refused() -> Error {
     Error::engine("internal body producer refused")
 }
+
+/// Test-only record of why the most recent `preview` on this thread refused
+/// for a reason the caller can recognise. Every classified path still returns
+/// the same `refused()` error; the classification exists so a fixture can
+/// retry exactly the process-global lock contention it proved, and report any
+/// other refusal (including the original-deadline checks) with its reason
+/// instead of retrying it. No production behaviour depends on this.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewRefusal {
+    /// `preview_receipt_store().try_lock()` found the store held.
+    ReceiptStoreBusy,
+    /// `reserve_sample_launch` reported the sample store busy.
+    SampleStoreBusy,
+    /// The ingress handle changed or its original deadline passed.
+    IngressDeadlineOrHandle,
+}
+#[cfg(test)]
+thread_local! {
+    static LAST_PREVIEW_REFUSAL: std::cell::Cell<Option<PreviewRefusal>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn note_preview_refusal(reason: PreviewRefusal) {
+    LAST_PREVIEW_REFUSAL.with(|cell| cell.set(Some(reason)));
+}
+/// The classified reason for the last refused `preview` on this thread, if any.
+/// `preview` clears it on entry; read it immediately after an `Err`, with no
+/// await between (the classification is set in the final poll). The slot is
+/// per thread, which fits the current callers (default current-thread
+/// `#[tokio::test]` runtimes that read it immediately); a future multi-thread
+/// caller would need a task-local instead.
+#[cfg(test)]
+pub(crate) fn take_preview_refusal() -> Option<PreviewRefusal> {
+    LAST_PREVIEW_REFUSAL.with(|cell| cell.take())
+}
 fn conflict() -> Error {
     Error::engine("internal body install intent conflict")
 }
@@ -247,6 +283,8 @@ impl<'a> Ingress<'a> {
     }
     fn check(&self) -> Result<()> {
         if self.db.handle_id() != self.handle || Instant::now() >= self.deadline {
+            #[cfg(test)]
+            note_preview_refusal(PreviewRefusal::IngressDeadlineOrHandle);
             Err(refused())
         } else {
             Ok(())
@@ -618,6 +656,8 @@ pub async fn preview<'a>(
     g: &'a Ingress<'a>,
     delivery: &crate::artifact_html::LaunchDelivery,
 ) -> Result<Preview<'a>> {
+    #[cfg(test)]
+    let _ = take_preview_refusal();
     if g.request.action != "preview" {
         return Err(refused());
     }
@@ -684,7 +724,13 @@ pub async fn preview<'a>(
             g.caller.hosting_database(),
             &r.artifact_id,
         )
-        .map_err(publication_sample_error)?;
+        .map_err(|e| {
+            #[cfg(test)]
+            if matches!(e, crate::artifact_html::SampleFailure::Busy) {
+                note_preview_refusal(PreviewRefusal::SampleStoreBusy);
+            }
+            publication_sample_error(e)
+        })?;
     g.check()?;
     #[cfg(test)]
     preview_fault(g, PreviewFault::AfterSample, Some(&launch), None)?;
@@ -716,7 +762,15 @@ pub async fn preview<'a>(
     )?;
     let receipt_guard;
     {
-        let mut store = preview_receipt_store().try_lock().map_err(|_| refused())?;
+        let mut store = preview_receipt_store().try_lock().map_err(|_e| {
+            // Only a held lock is contention; a poisoned store is a genuine
+            // failure and stays unclassified.
+            #[cfg(test)]
+            if matches!(_e, std::sync::TryLockError::WouldBlock) {
+                note_preview_refusal(PreviewRefusal::ReceiptStoreBusy);
+            }
+            refused()
+        })?;
         g.check()?;
         store.retain(|_, (r, _, b)| {
             r.expires_at_secs > now && !b.as_ref().is_some_and(|b| b.publication.is_invalid())

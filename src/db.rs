@@ -165,7 +165,7 @@ impl RollupCache {
 
 /// Engine schema stored in each ejectable user database's file header.
 /// This is independent of the product's SemVer and the catalog schema.
-pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 90;
+pub const CURRENT_ENGINE_SCHEMA_VERSION: i64 = 93;
 /// The deliberately selected historical support baseline, once one exists.
 ///
 /// `None` is a product contract, not an implementation gap: development
@@ -433,14 +433,86 @@ pub(crate) const ENGINE_78_SHAPE_CONTRACT_SHA256: &str =
 /// SQLite file marker for the v2 owned-schema engine (ASCII `NKV2`).
 /// Independent of the v1 source-history application-id range.
 pub const V2_APPLICATION_ID: i64 = 0x4e4b_5632;
+/// Native kernel member-profile file (ASCII `NKM2`). A scoped current-state
+/// artifact is never a canonical workspace, even when its engine is kernel-v2.
+/// It requires independent member-profile admission before read-only opening.
+pub const V2_MEMBER_APPLICATION_ID: i64 = 0x4e4b_4d32;
 
 /// Refuse v2 before any v1 schema/identity access or mutation.
 pub async fn refuse_v2_database(connection: &mut SqliteConnection) -> Result<()> {
+    refuse_v2_database_marker(connection, false).await
+}
+
+async fn refuse_v2_database_marker(
+    connection: &mut SqliteConnection,
+    allow_canonical: bool,
+) -> Result<()> {
     let marker: i64 = sqlx::query_scalar("PRAGMA application_id")
         .fetch_one(connection)
         .await?;
-    if marker == V2_APPLICATION_ID {
+    if marker == V2_APPLICATION_ID && !allow_canonical {
         return Err(Error::engine("this is a v2 database; use a v2 engine path"));
+    }
+    if marker == V2_MEMBER_APPLICATION_ID {
+        return Err(Error::engine(
+            "this is a v2 database member profile; use member-profile admission",
+        ));
+    }
+    Ok(())
+}
+
+// A member profile must never negotiate WAL through a generic/raw writable
+// opener. Read SQLite's authoritative marker, including an existing WAL; a
+// header-byte shortcut could miss a marker that has not been checkpointed.
+async fn refuse_member_profile_before_write_pool(url: &str) -> Result<()> {
+    let options = read_only_connect_options(url)?.busy_timeout(Duration::from_millis(250));
+    // Preserve the raw opener's existing handling of missing/special paths;
+    // a new read-only open of a FIFO could otherwise block before that path.
+    let path = options.get_filename();
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    if !std::path::Path::new(&wal).try_exists()? {
+        // Closed, self-contained files need only the four-byte SQLite marker.
+        // In particular ordinary v1 opens do not create another SQLite worker
+        // or connection. An existing WAL always requires SQLite's live view.
+        use std::io::Read;
+        let mut file = std::fs::File::open(path)?;
+        let mut bytes = [0; 72];
+        match file.read_exact(&mut bytes) {
+            Ok(())
+                if &bytes[..16] == b"SQLite format 3\0"
+                    && i64::from(u32::from_be_bytes(bytes[68..72].try_into().unwrap()))
+                        == V2_MEMBER_APPLICATION_ID =>
+            {
+                return Err(Error::engine(
+                    "this is a v2 database member profile; use member-profile admission",
+                ));
+            }
+            Ok(()) => return Ok(()),
+            // Preserve the raw SQLite opener's existing empty/short-file path.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Allow brief WAL initialization/checkpoint contention, without the old
+    // five-second busy wait. Writable/serving paths must stay
+    // stable while opening: canonical replacement requires evict_and_drain;
+    // published member generation paths are immutable. This marker preflight
+    // is not member admission or protection against a local filesystem owner
+    // replacing files concurrently. Native member admission MUST separately fence
+    // the actually opened file's origin, account, principal and generation.
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    let marker = sqlx::query_scalar::<_, i64>("PRAGMA application_id")
+        .fetch_one(&mut connection)
+        .await;
+    connection.close().await?;
+    if marker? == V2_MEMBER_APPLICATION_ID {
+        return Err(Error::engine(
+            "this is a v2 database member profile; use member-profile admission",
+        ));
     }
     Ok(())
 }
@@ -453,6 +525,7 @@ pub enum DatabaseVersionState {
     Known(i64),
     UnversionedNonEmpty,
     KernelV2,
+    KernelV2Member,
     Future(i64),
     Missing,
     Unreadable(String),
@@ -520,6 +593,21 @@ pub(crate) const ENGINE_88_SHAPE_CONTRACT_SHA256: &str =
 pub(crate) const ENGINE_89_SHAPE_CONTRACT_SHA256: &str =
     "73d242e180f0f3d3830c25f4000188b5664d9b5448eec7d947686c53a04bd603";
 
+/// Released engine90 shape, measured from its committed DDL before engine91.
+pub(crate) const ENGINE_90_SHAPE_CONTRACT_SHA256: &str =
+    "9f8f78c31502e7ceab00efdc626a3d9b91cccc34cd66309a9d1535b76d1cb8ca";
+
+/// Engine91 (subject authorization revisions) measured from main's unmodified
+/// 395-statement production DDL (ddl 8bd902af...) before causal heads, built
+/// via `historical_ddl_for_test(91)`.
+pub(crate) const ENGINE_91_SHAPE_CONTRACT_SHA256: &str =
+    "126b267d37feb12674f155cd127aa92d140755b30f468e5bc3bcec773a82effb";
+
+/// Released engine92 shape (causal heads), measured from main's unmodified
+/// DDL (ddl 6c5d734c...) before engine93, built via `historical_ddl_for_test(92)`.
+pub(crate) const ENGINE_92_SHAPE_CONTRACT_SHA256: &str =
+    "952a7c5ceb230e938d5e02afabf7d83b3b3d208af1c46faad973d2aec1d87b18";
+
 /// The SQLite authority granted to an open [`Db`] handle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseOpenMode {
@@ -542,6 +630,10 @@ impl std::fmt::Display for DatabaseVersionState {
             Self::Empty => write!(f, "empty"),
             Self::Known(version) => write!(f, "schema {version}"),
             Self::KernelV2 => write!(f, "this is a v2 database; use a v2 engine path"),
+            Self::KernelV2Member => write!(
+                f,
+                "this is a v2 database member profile; use member-profile admission"
+            ),
             Self::UnversionedNonEmpty => write!(f, "unversioned non-empty"),
             Self::Future(version) => write!(f, "future schema {version}"),
             Self::Missing => write!(f, "missing"),
@@ -4162,20 +4254,24 @@ pub(crate) const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     "messages_awaiting_reply",
     "my_participants",
     "message_speakers",
+    "deleted_messages",
     "my_message_state",
     "my_mentions",
     "comment_anchors",
     "message_reactions",
     "facet_times",
+    "facet_keys",
     "body_task_items",
     "catalog_relations",
     "catalog_columns",
+    "catalog_view_definitions",
     "_query_sql_my_person",
     "_query_sql_run_principals",
     "_query_sql_disclosable_persons",
     "_query_sql_visible_records",
     "_query_sql_authorization_subjects",
     "_query_sql_lifecycle_interpretations",
+    "_query_sql_facet_keys",
     "_query_sql_principal",
     "_query_sql_activity_observations",
     "_query_sql_activity_capture",
@@ -4190,7 +4286,7 @@ pub(crate) const QUERY_SQL_TEMP_CONTRACT_OBJECTS: &[&str] = &[
     // (a table, not a view, so it closes the tables group).
     "catalog_operations",
 ];
-pub(crate) const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 12;
+pub(crate) const QUERY_SQL_TEMP_VIEW_COUNT: usize = QUERY_SQL_TEMP_CONTRACT_OBJECTS.len() - 13;
 
 #[cfg(test)]
 mod wal_journal_size_limit_tests {
@@ -4542,6 +4638,27 @@ async fn sanitize_released_write_connection(
     if connection.is_in_transaction() {
         return Ok(false);
     }
+    // A cancelled SQL need can leave SQLite's connection-local read fence
+    // enabled after its native write transaction rolls back. Restore it even
+    // if rollback already removed every TEMP contract object. Do not issue a
+    // setter when the fence is already off: enrolled ordinary connections
+    // deliberately forbid disabling it, and discarding clean connections
+    // would prevent read-only diagnostics after owner quarantine.
+    let query_only = match sqlx::query_scalar::<_, bool>("PRAGMA query_only")
+        .fetch_one(&mut *connection)
+        .await
+    {
+        Ok(query_only) => query_only,
+        Err(_) => return Ok(false),
+    };
+    if query_only
+        && sqlx::query("PRAGMA query_only=OFF")
+            .execute(&mut *connection)
+            .await
+            .is_err()
+    {
+        return Ok(false);
+    }
     let placeholders = vec!["?"; QUERY_SQL_TEMP_CONTRACT_OBJECTS.len()].join(", ");
     let sentinel = format!(
         "SELECT EXISTS (
@@ -4581,6 +4698,7 @@ fn released_temp_contract_teardown_script() -> &'static str {
         let tables = [
             "catalog_operations",
             "_query_sql_lifecycle_interpretations",
+            "_query_sql_facet_keys",
             "_query_sql_principal",
             "_query_sql_activity_observations",
             "_query_sql_activity_capture",
@@ -4600,6 +4718,87 @@ fn released_temp_contract_teardown_script() -> &'static str {
 #[cfg(test)]
 mod released_write_connection_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn release_removes_a_lone_view_definition_catalog_and_reuses_connection() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .after_release(|connection, _| Box::pin(sanitize_released_write_connection(connection)))
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let mut connection = pool.acquire().await.unwrap();
+            sqlx::query("CREATE TEMP TABLE IF NOT EXISTS reuse_marker(value TEXT); DELETE FROM reuse_marker; INSERT INTO reuse_marker VALUES('same connection'); CREATE TEMP VIEW catalog_view_definitions AS SELECT 'private definition' AS description")
+                .execute(&mut *connection).await.unwrap();
+            drop(connection);
+            let mut reused = pool.acquire().await.unwrap();
+            let marker: String = sqlx::query_scalar("SELECT value FROM temp.reuse_marker")
+                .fetch_one(&mut *reused)
+                .await
+                .unwrap();
+            assert_eq!(
+                marker, "same connection",
+                "discarding the connection is not cleanup/reuse"
+            );
+            let left: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM temp.sqlite_schema WHERE name='catalog_view_definitions'",
+            )
+            .fetch_one(&mut *reused)
+            .await
+            .unwrap();
+            assert_eq!(
+                left, 0,
+                "the catalog alone must trigger the release sentinel"
+            );
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn enrolled_read_guard_keeps_clean_connections_and_discards_fenced_ones() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        enrolled::install_read_guard(&mut connection).await.unwrap();
+        assert!(sqlx::query("PRAGMA query_only=OFF")
+            .execute(&mut connection)
+            .await
+            .is_err());
+        assert!(sanitize_released_write_connection(&mut connection)
+            .await
+            .unwrap());
+
+        sqlx::query("PRAGMA query_only=ON")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(!sanitize_released_write_connection(&mut connection)
+            .await
+            .unwrap());
+        let still_fenced: bool = sqlx::query_scalar("PRAGMA query_only")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert!(still_fenced, "cleanup must not widen enrolled authority");
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sql_read_fence_is_reset_after_transaction_cancellation_without_temp_contract() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("BEGIN; PRAGMA query_only=ON; ROLLBACK")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        assert!(sanitize_released_write_connection(&mut connection)
+            .await
+            .unwrap());
+        sqlx::query(
+            "CREATE TABLE writable_again(value TEXT); INSERT INTO writable_again VALUES('ok')",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn cancelled_custom_begin_is_quarantined_before_reload() {
@@ -4674,6 +4873,7 @@ mod released_write_connection_tests {
                 .await
                 .unwrap();
             for relation in [
+                "catalog_view_definitions",
                 "body_task_items",
                 "my_message_state",
                 "my_mentions",
@@ -4716,7 +4916,7 @@ mod released_write_connection_tests {
             let leftover: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                    SELECT 1 FROM temp.sqlite_schema
-                    WHERE name IN ('records', 'catalog_columns', '_query_sql_principal',
+                    WHERE name IN ('records', 'catalog_columns', 'catalog_view_definitions', '_query_sql_principal',
                                    'body_task_items', 'my_message_state', 'my_mentions',
                                    'record_lifecycle_interpretations', '_query_sql_lifecycle_interpretations'))",
             )
@@ -4757,18 +4957,14 @@ async fn open_read_pool(path: &str) -> Result<SqlitePool> {
 
 /// Default governed-SQL pool size (Tier 1.2).
 ///
-/// Why 3, and why not Postgres's 4: the Postgres governed pool bounds
-/// *backend sessions* on a server that multiplexes many databases; this pool
-/// bounds *SQLite connections* on one file, so the number answers to SQLite's
-/// costs, not Postgres's. Three is the smallest size at which one governed
-/// read holding its connection through per-row JSON encoding cannot serialize
-/// every other viewer (two slots remain); it stays strictly below the
-/// five-connection write pool so the governed tier is never the largest
-/// writer-side pool; and it caps the per-connection TEMP-contract memory — and
-/// rung 1.4's per-connection visible-set cache copies — at three. Tune with
-/// [`GOVERNED_SQL_POOL_SIZE_ENV`] after live measurement; saturation then
-/// surfaces as a bounded acquire wait, never as writer starvation.
-pub const DEFAULT_GOVERNED_SQL_POOL_SIZE: u32 = 3;
+/// Four admits the HQ cutover's four concurrent callers without making the
+/// fourth wait for a second staging wave. This remains strictly below the
+/// five-connection write pool and bounds TEMP-contract memory and any
+/// per-connection visible-set copies at four. SQLite connections have their
+/// own memory costs; this setting is independent of Postgres backend sessions.
+/// Tune with [`GOVERNED_SQL_POOL_SIZE_ENV`] after measuring the workload and
+/// memory budget; saturation surfaces as a bounded acquire wait.
+pub const DEFAULT_GOVERNED_SQL_POOL_SIZE: u32 = 4;
 
 /// Environment override for the governed-SQL pool size. Unset, unparseable, or
 /// zero values fall back to [`DEFAULT_GOVERNED_SQL_POOL_SIZE`]: a zero-slot
@@ -5040,6 +5236,28 @@ enum WorkspaceSchema {
     KernelV2,
 }
 
+// Recheck SQLite's authoritative marker on the connection actually opened:
+// a replacement or hot-journal rollback can invalidate the header preflight.
+async fn open_raw_write_pool(
+    url: &str,
+    create_if_missing: bool,
+    kind: WritePoolKind,
+    probes: Option<Arc<control_commit_test::PoolProbeRegistry>>,
+) -> Result<SqlitePool> {
+    let pool = open_pool_with_probes(url, create_if_missing, kind, probes).await?;
+    let admitted = async {
+        let mut connection = pool.acquire().await?;
+        // Raw opens intentionally accept canonical NKV2, never NKM2 profiles.
+        refuse_v2_database_marker(&mut connection, true).await
+    }
+    .await;
+    if let Err(error) = admitted {
+        close_pool_and_drain(&pool).await;
+        return Err(error);
+    }
+    Ok(pool)
+}
+
 async fn open_database_with_write_pool_kind(
     url: &str,
     kind: WritePoolKind,
@@ -5103,10 +5321,11 @@ async fn open_database_with_write_pool_kind(
             _tmp: Some(tmp),
         });
     }
+    refuse_member_profile_before_write_pool(url).await?;
     let pending_commit_probes = matches!(kind, WritePoolKind::Workspace)
         .then(|| Arc::new(control_commit_test::PoolProbeRegistry::default()));
     let write_pool =
-        open_pool_with_probes(url, create_if_missing, kind, pending_commit_probes.clone()).await?;
+        open_raw_write_pool(url, create_if_missing, kind, pending_commit_probes.clone()).await?;
     let (read_pool, governed_pool) =
         open_database_companion_pools(url, &write_pool, create_if_missing).await?;
     let execution_owner = match crate::managed_custody::execution_for_filename(
@@ -5185,9 +5404,9 @@ pub async fn open_database_at(path: &Path) -> Result<Db> {
 /// Open the authoritative SQLite pool for a hosted control plane.
 ///
 /// The opening and handoff are deliberately identical to the historical
-/// catalogue path: open the database through Native's write/read-pool
-/// configuration, retain the write pool, and await physical shutdown of the
-/// read-only observation pool before dropping the temporary [`Db`] handle.
+/// catalogue path: open the database through Native's pool configuration,
+/// retain the write pool, and await physical shutdown of both unused companion
+/// pools (observation and governed SQL) before dropping the temporary [`Db`].
 /// This pool owns its SQLite trace slot while a measured checkout is active;
 /// test tracing uses separate, dedicated pools and never shares this pool.
 #[doc(hidden)]
@@ -5205,6 +5424,7 @@ pub async fn open_host_control_plane_sqlite_pool(path: &Path) -> Result<SqlitePo
 async fn retain_host_control_plane_sqlite_pool(database: Db) -> SqlitePool {
     let write_pool = database.write_pool().clone();
     database.pool().close().await;
+    database.governed_pool().close().await;
     write_pool
 }
 
@@ -5296,6 +5516,9 @@ mod host_control_plane_pool_tests {
             .await
             .unwrap();
         let read_pool = database.pool().clone();
+        // Keep the unused companion alive to deterministically model a slow
+        // asynchronous drop after the temporary Db hands off its write pool.
+        let governed_pool = database.governed_pool().clone();
 
         let write_pool = retain_host_control_plane_sqlite_pool(database).await;
 
@@ -5311,6 +5534,27 @@ mod host_control_plane_pool_tests {
             .unwrap();
         transaction.commit().await.unwrap();
         write_pool.close().await;
+        // Candidate staging switches a quiescent catalog out of WAL before
+        // copying its single file. That requires every unused companion to
+        // have physically closed, not merely been scheduled for drop.
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(directory.path().join("catalog.db"));
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode=DELETE")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(mode, "delete");
+        connection.close().await.unwrap();
+        assert!(
+            governed_pool.is_closed(),
+            "unused governed pool remained open"
+        );
+        assert_eq!(
+            governed_pool.size(),
+            0,
+            "unused governed pool was not drained"
+        );
     }
 }
 
@@ -5370,6 +5614,7 @@ macro_rules! probe_database_body {
         match result {
             Err(err) => DatabaseVersionState::Unreadable(err.to_string()),
             Ok((V2_APPLICATION_ID, _, _)) => DatabaseVersionState::KernelV2,
+            Ok((V2_MEMBER_APPLICATION_ID, _, _)) => DatabaseVersionState::KernelV2Member,
             Ok((_, 0, 0)) => DatabaseVersionState::Empty,
             Ok((_, 0, _)) => DatabaseVersionState::UnversionedNonEmpty,
             Ok((_, version, _)) if version > current_version => {
@@ -5717,6 +5962,21 @@ pub(crate) async fn validate_engine_shape_on(
             schema_shape_contract_sha256(&actual_contract) == ENGINE_89_SHAPE_CONTRACT_SHA256
         );
     }
+    if version == 90 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_90_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 91 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_91_SHAPE_CONTRACT_SHA256
+        );
+    }
+    if version == 92 {
+        return Ok(
+            schema_shape_contract_sha256(&actual_contract) == ENGINE_92_SHAPE_CONTRACT_SHA256
+        );
+    }
     if version != CURRENT_ENGINE_SCHEMA_VERSION {
         return Err(Error::engine(format!(
             "no frozen engine structural shape is registered for schema {version}"
@@ -6049,7 +6309,9 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
             (DatabaseVersionState::Known(version), Some(baseline))
                 if (baseline..CURRENT_ENGINE_SCHEMA_VERSION).contains(version)
         );
-        let remedy = if state == DatabaseVersionState::KernelV2 {
+        let remedy = if state == DatabaseVersionState::KernelV2Member {
+            "a member profile is not a canonical workspace; use member-profile admission rather than migrating or resetting; v1 engine schema is"
+        } else if state == DatabaseVersionState::KernelV2 {
             "v1 serving cannot open v2 databases; select the v2 engine rather than migrating or resetting; v1 engine schema is"
         } else if migratable {
             "ordinary serving does not migrate; run `operator migrate-db` to bring it to engine schema"
@@ -6183,22 +6445,37 @@ pub async fn open_existing_database(url: &str) -> Result<Db> {
 /// (see [`open_standby_head_writer`]). Ordinary SQLite locking then gives every
 /// read either the state before a delta or the state after it.
 pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
+    open_standby_read_only_inner(url, false).await
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn open_kernel_v2_standby_read_only(url: &str) -> Result<Db> {
+    open_standby_read_only_inner(url, true).await
+}
+
+async fn open_standby_read_only_inner(url: &str, kernel_v2: bool) -> Result<Db> {
     if url == ":memory:" {
         return Err(crate::error::Error::engine(
             "standby read-only open requires an existing on-disk database",
         ));
     }
     let path = path_from_url(url);
-    let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
-    if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
-        return Err(crate::error::Error::engine(format!(
+    if kernel_v2 {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        crate::standby::kernel_v2::verify_path(path).await?;
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
+    } else {
+        let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
+        if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
+            return Err(crate::error::Error::engine(format!(
             "refusing standby read-only open of {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
             path.display()
         )));
+        }
+
+        validate_current_engine_shape_read_only(path).await?;
     }
-
-    validate_current_engine_shape_read_only(path).await?;
-
     let pending_commit_probes = None;
     let write_pool = open_standby_read_pool(url).await?;
     let read_pool = match open_standby_read_pool(url).await {
@@ -6258,6 +6535,9 @@ pub async fn open_existing_database_standby_read_only(url: &str) -> Result<Db> {
         live_session_key: Arc::new(OnceLock::new()),
         _tmp: None,
     };
+    if kernel_v2 {
+        return Ok(db);
+    }
     for (label, violations) in [
         (
             "authorization revision state",
@@ -6320,14 +6600,30 @@ fn standby_head_writer_busy_timeout() -> Duration {
 /// connections, never needs `-wal`/`-shm` sidecars it cannot create. One
 /// connection serves every tier; nothing is migrated, repaired or seeded.
 pub(crate) async fn open_standby_head_writer(path: &Path) -> Result<Db> {
-    let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
-    if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
-        return Err(crate::error::Error::engine(format!(
+    open_standby_head_writer_inner(path, false).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn open_kernel_v2_head_writer(path: &Path) -> Result<Db> {
+    open_standby_head_writer_inner(path, true).await
+}
+
+async fn open_standby_head_writer_inner(path: &Path, kernel_v2: bool) -> Result<Db> {
+    if kernel_v2 {
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        crate::standby::kernel_v2::verify_path(path).await?;
+        #[cfg(not(any(test, feature = "v2-kernel-probe")))]
+        return Err(Error::engine("kernel-v2 standby requires v2-kernel-probe"));
+    } else {
+        let state = probe_database(path, CURRENT_ENGINE_SCHEMA_VERSION).await;
+        if state != DatabaseVersionState::Known(CURRENT_ENGINE_SCHEMA_VERSION) {
+            return Err(crate::error::Error::engine(format!(
             "refusing standby head write to {}: {state}; expected engine schema {CURRENT_ENGINE_SCHEMA_VERSION}",
             path.display()
         )));
+        }
+        validate_current_engine_shape_read_only(path).await?;
     }
-    validate_current_engine_shape_read_only(path).await?;
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -7939,3 +8235,7 @@ mod pending_commit_pool_release_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "db/member_profile_tests.rs"]
+mod member_profile_tests;

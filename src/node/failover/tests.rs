@@ -1631,6 +1631,80 @@ async fn node_status_surfaces_report_bound_account_without_credentials() {
 }
 
 #[tokio::test]
+async fn node_status_reports_how_hosted_was_last_found() {
+    let fixture = Fixture::new().await;
+    for (health, revision, word) in [
+        (Health::Reachable, false, "reachable"),
+        (Health::Unreachable, false, "unreachable"),
+        (Health::AuthRefused, false, "auth_refused"),
+        (Health::ProtocolFailed, false, "protocol_failed"),
+        (Health::RevisionUnsupported, true, "revision_unsupported"),
+    ] {
+        {
+            let mut state = fixture.node.state.lock().await;
+            state.health = health;
+            state.revision_unsupported = revision;
+        }
+        let message = local_only(
+            json!({"jsonrpc":"2.0","id":92,"method":"tools/call","params":{"name":"node_status","arguments":{}}}),
+        );
+        let reply = route_message(
+            &fixture.node.upstream,
+            Some(&fixture.node),
+            fixture.node.gate.as_ref(),
+            &message.to_string(),
+            message.clone(),
+            Some(crate::mcp::PROTOCOL_VERSION),
+            &fixture.direct,
+            &anonymous_caller(),
+        )
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        let hosted = &reply["result"]["structuredContent"]["hosted"];
+        assert_eq!(hosted["health"], word, "{reply}");
+        assert_eq!(hosted["revision_unsupported"], revision, "{reply}");
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn node_status_says_hosted_is_not_checked_until_a_probe_has_settled_it() {
+    let fixture = Fixture::new().await;
+    let status = || async {
+        let message = local_only(
+            json!({"jsonrpc":"2.0","id":93,"method":"tools/call","params":{"name":"node_status","arguments":{}}}),
+        );
+        let reply = route_message(
+            &fixture.node.upstream,
+            Some(&fixture.node),
+            fixture.node.gate.as_ref(),
+            &message.to_string(),
+            message.clone(),
+            Some(crate::mcp::PROTOCOL_VERSION),
+            &fixture.direct,
+            &anonymous_caller(),
+        )
+        .await
+        .unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        reply["result"]["structuredContent"]["hosted"].clone()
+    };
+    fixture.node.state.lock().await.checked = false;
+    let before = status().await;
+    assert_eq!(before["health"], "reachable", "the starting assumption");
+    assert_eq!(before["checked"], false, "{before}");
+    fixture.node.probe().await;
+    let after = status().await;
+    assert_eq!(
+        (after["health"].as_str(), after["checked"].as_bool()),
+        (Some("reachable"), Some(true)),
+        "{after}"
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn the_queue_counts_its_sends_in_the_own_write_floor_and_survives_a_node_restart() {
     let fixture = Fixture::new().await;
     fixture
@@ -1926,4 +2000,69 @@ fn standby_without_a_copy_treats_default_and_off_as_off() {
         )))))
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn v1_hold_and_drain_use_monitor_flag_without_extra_head_probes() {
+    let fixture = Fixture::new().await;
+    fixture
+        .node
+        .refresh_catalogue(crate::mcp::PROTOCOL_VERSION, None)
+        .await;
+    fixture.node.probe().await;
+    // Any accidental fresh probe blackholes here. Reading the persisted flag
+    // must finish without issuing HTTP, even while hosted is blackholed.
+    fixture.fake.pause_probe.store(true, Ordering::Release);
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        gate::Outage::held_replay_allowed(&*fixture.node)
+    )
+    .await
+    .unwrap());
+    fixture.fake.pause_probe.store(false, Ordering::Release);
+    fixture.fake.status.store(502, Ordering::Release);
+    // The monitor has already established the outage before counting holds.
+    fixture.node.probe().await;
+    assert!(gate::Outage::known_unreachable(&*fixture.node).await);
+    fixture.fake.requests.lock().await.clear();
+    let probes = |requests: &[Value]| {
+        requests
+            .iter()
+            .filter(|r| target(r).is_some_and(|(_, op, _)| op == "authority_act_head"))
+            .count()
+    };
+    // One confirm-down per write; the second also confirms the failed
+    // backlog send before holding behind it. These are the existing v1 probes.
+    for expected in [1, 3] {
+        pending_info(&fixture.send(write()).await);
+        assert_eq!(
+            probes(&fixture.fake.requests.lock().await),
+            expected,
+            "only existing outage and failed-backlog confirmations"
+        );
+    }
+    fixture.fake.status.store(0, Ordering::Release);
+    fixture.fake.requests.lock().await.clear();
+    fixture.fake.pause_probe.store(true, Ordering::Release);
+    let gate = fixture.node.gate.as_ref().unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            gate.drain(
+                &fixture.node.upstream,
+                Some(&*fixture.node as &dyn gate::Outage),
+                None,
+                None
+            )
+        )
+        .await
+        .unwrap(),
+        gate::queue::Halt::Empty
+    );
+    assert_eq!(
+        probes(&fixture.fake.requests.lock().await),
+        0,
+        "no per-entry probe during drain"
+    );
+    fixture.finish().await;
 }

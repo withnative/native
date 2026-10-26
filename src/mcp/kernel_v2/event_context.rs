@@ -39,6 +39,9 @@ fn logical_payload(typ: &str, payload: &Value) -> Option<(String, Value)> {
             }
         }
     }
+    if let Some(basis) = payload.get("basis") {
+        fields["basis"] = basis.clone();
+    }
     match typ {
         "kernel.record_created.v1" | "kernel.record_created.v2" => {
             Some(("record.created".into(), fields))

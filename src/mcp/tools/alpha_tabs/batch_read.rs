@@ -36,7 +36,7 @@
 use super::*;
 
 /// Most items one batched read may carry.
-pub(super) const LIVE_READ_BATCH_MAX: usize = 16;
+pub(crate) const LIVE_READ_BATCH_MAX: usize = 16;
 
 /// One item of a batched `live_read`.
 #[derive(Debug, Deserialize)]
@@ -78,7 +78,7 @@ fn error_code(message: &str) -> String {
         .to_string()
 }
 
-fn item_result(need: &str, result: Result<Value>) -> Value {
+pub(crate) fn item_result(need: &str, result: Result<Value>) -> Value {
     match result {
         Ok(body) => json!({"need": need, "ok": body}),
         Err(error) => {

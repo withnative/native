@@ -8,6 +8,13 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+fn mcp_stdio_binary() -> &'static str {
+    // `cargo check --all-targets` does not inject executable paths; tests do.
+    #[allow(clippy::option_env_unwrap)]
+    option_env!("CARGO_BIN_EXE_mcp-stdio")
+        .expect("the mcp-stdio binary path must be supplied when this test runs")
+}
+
 struct StdioClient {
     child: Child,
     stdin: ChildStdin,
@@ -17,7 +24,7 @@ struct StdioClient {
 
 impl StdioClient {
     fn new(directory: &std::path::Path) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-stdio"));
+        let mut command = Command::new(mcp_stdio_binary());
         command
             .env_clear()
             .env("NATIVE_CE_MCP_SURFACE", "executor")

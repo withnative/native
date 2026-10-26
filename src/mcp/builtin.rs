@@ -202,6 +202,8 @@ pub fn register_standby_status_tool(
     registry: &mut ToolRegistry,
     provider: crate::standby::StandbyStatusProvider,
 ) -> Result<()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    let kernel_provider = provider.clone();
     registry.register(
         ToolKind::StandbyStatus,
         "Current local standby mode, generation provenance, freshness, compatibility, and refresh diagnostics.",
@@ -213,5 +215,18 @@ pub fn register_standby_status_tool(
                 Ok(serde_json::to_value(provider.status().await)?)
             }
         },
-    )
+    )?;
+    #[cfg(feature = "v2-kernel-probe")]
+    registry.register_engine_handler(
+        "standby_status",
+        super::registry::EngineKind::KernelV2,
+        move |_engine, _caller, arguments| {
+            let provider = kernel_provider.clone();
+            async move {
+                require_no_arguments(arguments)?;
+                Ok(serde_json::to_value(provider.status().await)?)
+            }
+        },
+    )?;
+    Ok(())
 }

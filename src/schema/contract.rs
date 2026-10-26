@@ -347,10 +347,11 @@ pub const ARCHIVED_FACET_KEY: &str = "archived";
 /// (new hard-shaped data lands as a new substrate primitive, not a new top-level
 /// type) and still conform; conformance requires presence, never absence, of
 /// tables.
-pub const REQUIRED_TABLES: [&str; 138] = [
+pub const REQUIRED_TABLES: [&str; 139] = [
     // Substrate primitives
     "content_events",
     "content_event_causal_frontier",
+    "content_event_heads",
     "content_event_causal_cutover",
     "content_event_sources",
     "content_event_claim_meta",
@@ -784,9 +785,18 @@ pub(crate) fn alpha_tab_installs_create_for_version(statement: &str, version: i6
 /// not record or imply support for any historical engine schema. A future
 /// support baseline must deliberately add its own fixture and fingerprint as
 /// part of the activation checklist in `docs/schema-migrations.md`.
-// Measured from 373 production statements, including engine90 SQL receipts.
-pub const FROZEN_DDL_SHA256: &str =
+// Engine91 adds conservative subject revisions to the engine90 DDL.
+pub const FROZEN_DDL_SHA256_PRE_91: &str =
     "87ba5084e86528d8c73a969da076dc314d842ad70d2e2ccab06d26ae97a9b21f";
+/// Engine91 before trigger-maintained causal heads and the basis index.
+pub const FROZEN_DDL_SHA256_PRE_92: &str =
+    "8bd902af56faad19351c133552205db6e968d4a08756e8f9af39871916faa42a";
+/// Engine92 before the partial unfiled-message owner index.
+pub const FROZEN_DDL_SHA256_PRE_93: &str =
+    "6c5d734cc76619d87feacf4f97d141e66c765127899b1bb4747cb01c0cef0f32";
+// Engine93 adds the partial unfiled-message owner index to the engine92 DDL.
+pub const FROZEN_DDL_SHA256: &str =
+    "4a818a9dd255d32f8f5c57fd49e9cfca7a2231d76a94f0bc7dbe24d192c00581";
 
 /// Engine89 before internal SQL batch receipts.
 pub const FROZEN_DDL_SHA256_PRE_90: &str =
@@ -918,6 +928,19 @@ pub const FROZEN_DDL_SHA256_PRE_66: &str =
 pub(crate) fn historical_ddl_for_test(version: i64) -> String {
     let mut statements = Vec::new();
     for statement in DDL_STATEMENTS {
+        if version < 93 && statement.contains("idx_records_unfiled_message_owner") {
+            continue;
+        }
+        if version < 92
+            && (statement.starts_with("CREATE TABLE content_event_heads")
+                || statement.starts_with("CREATE TRIGGER content_event_heads_")
+                || statement.starts_with("CREATE INDEX idx_content_events_basis_run"))
+        {
+            continue;
+        }
+        if version < 91 && statement.contains("authorization_subject_") {
+            continue;
+        }
         if version < 90
             && (statement.starts_with("CREATE TABLE sql_write_receipts")
                 || statement.starts_with("CREATE INDEX idx_sql_write_receipts")
@@ -1142,6 +1165,9 @@ mod tests {
                 historical(87),
                 historical(88),
                 historical(89),
+                historical(90),
+                historical(91),
+                historical(92),
             ],
             [
                 "b418f5ea746c5e791df9ec07041dbb4fdd3a5098b828de3dc3e983a456a9c755",
@@ -1196,6 +1222,9 @@ mod tests {
                 FROZEN_DDL_SHA256_PRE_88,
                 FROZEN_DDL_SHA256_PRE_89,
                 FROZEN_DDL_SHA256_PRE_90,
+                FROZEN_DDL_SHA256_PRE_91,
+                FROZEN_DDL_SHA256_PRE_92,
+                FROZEN_DDL_SHA256_PRE_93,
             ]
         );
     }

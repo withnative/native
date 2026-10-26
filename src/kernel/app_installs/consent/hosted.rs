@@ -71,6 +71,9 @@ struct HostedScope {
 }
 
 fn hosted_scope(caller: &Caller, pin: &InstallRequest, adopting: bool) -> Result<HostedScope> {
+    if !declarations::source_supported(&pin.declaration) {
+        return Err(Error::engine(NOT_YET_AVAILABLE));
+    }
     if caller.host_asserted_app().is_some() {
         return Err(Error::engine(
             "manage_alpha_tabs: app callers cannot consent",
@@ -87,6 +90,7 @@ fn hosted_scope(caller: &Caller, pin: &InstallRequest, adopting: bool) -> Result
     let account = caller.credential();
     let declaration_digest =
         crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(&pin.declaration)?;
+    let (needs, effects) = declarations::consent_names(&pin.declaration)?;
     if authority.account_id != account
         || authority.package != pin.package
         || authority.version != pin.version
@@ -94,8 +98,8 @@ fn hosted_scope(caller: &Caller, pin: &InstallRequest, adopting: bool) -> Result
         || authority.artifact_id != pin.artifact_id
         || authority.source_revision != pin.source_revision
         || authority.declaration_digest != declaration_digest
-        || !authority.needs.is_empty()
-        || !authority.effects.is_empty()
+        || authority.needs != needs
+        || authority.effects != effects
     {
         return Err(Error::engine(
             "manage_alpha_tabs: consent authority pin mismatch",
@@ -328,6 +332,7 @@ pub(crate) async fn adopt_as(
     }
     let account = scope.account.clone();
     let binding = preview_binding(&mut tx, principal, scope, generation.clone()).await?;
+    let (needs, effects) = declarations::consent_names(&request.pin.declaration)?;
     let confirm = AlphaTabAdoptConfirm {
         receipt_id: request.receipt_id.clone(),
         nonce: request.nonce.clone(),
@@ -338,8 +343,8 @@ pub(crate) async fn adopt_as(
         artifact_id: request.pin.artifact_id.clone(),
         source_revision: request.pin.source_revision.clone(),
         declaration_digest: string(&source.pin, "declaration_digest")?.into(),
-        needs: vec![],
-        effects: vec![],
+        needs,
+        effects,
         preview_session: request.preview_session.clone(),
         reason: request.pin.reason.clone(),
         expected_install_event_id: expected,
@@ -405,7 +410,7 @@ impl CurrentSource {
     fn require_executable(&self) -> Result<()> {
         if !self.executable
             || self.refusal.is_some()
-            || self.row["adoption"] != "shell_adopt.v1"
+            || !self.row["adoption"].as_str().is_some_and(verified_adoption)
             || self.row["consent_revocation_seq"].as_i64().unwrap_or(0) != self.epoch
         {
             return Err(Error::engine("native app consent is not executable"));
@@ -420,6 +425,7 @@ async fn current_source_on(
     package: &str,
     expected_generation: &str,
     expected_digest: Option<&str>,
+    retained_review: bool,
 ) -> Result<CurrentSource> {
     require_activated_on(conn).await?;
     let account = require_member(conn, principal, i64::MAX).await?;
@@ -435,6 +441,17 @@ async fn current_source_on(
     let row: Value = serde_json::from_str(&raw)?;
     if expected_digest.is_some_and(|digest| row["digest"] != digest) {
         return Err(Error::engine("native app source digest changed"));
+    }
+    if let Some(code @ (NOT_YET_AVAILABLE | UNSUPPORTED_WITNESS)) = refusal.as_deref() {
+        let declaration: Value = serde_json::from_str(string(&row, "consented_declaration")?)?;
+        if !retained_review
+            || code != NOT_YET_AVAILABLE
+            || declarations::declarative(&declaration).is_err()
+        {
+            return Err(Error::engine(code));
+        }
+        // Source admission below proves retained active/adopted v1 evidence.
+        // The executable gate still refuses until fresh member adoption.
     }
     let request = InstallRequest {
         package: package.into(),
@@ -477,17 +494,26 @@ pub(crate) async fn admit_app_on(
     principal: &str,
     claim: &crate::mcp::app_attribution::AppAttribution,
 ) -> Result<AppSourceAdmission> {
-    let current = current_source_on(
-        conn,
-        principal,
-        &claim.package,
-        &claim.install_event_id,
-        None,
-    )
-    .await?;
-    if current.request.version != claim.version {
+    let admitted =
+        admit_install_on(conn, principal, &claim.package, &claim.install_event_id).await?;
+    let declaration: Value = serde_json::from_str(string(&admitted.pin, "consented_declaration")?)?;
+    // Declarative grants never become general app-host authority.
+    if !contract_supported(&declaration) {
+        return Err(Error::engine(NOT_YET_AVAILABLE));
+    }
+    if admitted.version != claim.version {
         return Err(Error::engine("native app installation version changed"));
     }
+    Ok(admitted)
+}
+
+pub(crate) async fn admit_install_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    package: &str,
+    generation: &str,
+) -> Result<AppSourceAdmission> {
+    let current = current_source_on(conn, principal, package, generation, None, false).await?;
     current.require_executable()?;
     Ok(AppSourceAdmission {
         principal: principal.into(),
@@ -522,7 +548,8 @@ pub(crate) async fn launch_source_on(
         ));
     }
     require_hosted_account_on(conn, principal, caller).await?;
-    let current = current_source_on(conn, principal, package, expected_generation, None).await?;
+    let current =
+        current_source_on(conn, principal, package, expected_generation, None, false).await?;
     current.require_executable()?;
     Ok(AppSourceAdmission {
         principal: principal.into(),
@@ -564,8 +591,15 @@ pub(crate) async fn bundle_source_on(
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| Error::engine("database membership not found"))?;
-    let current =
-        current_source_on(conn, &principal, package, expected_generation, Some(digest)).await?;
+    let current = current_source_on(
+        conn,
+        &principal,
+        package,
+        expected_generation,
+        Some(digest),
+        preview_receipt.is_some(),
+    )
+    .await?;
     require_hosted_account_on(conn, &principal, caller).await?;
     if let Some(receipt_id) = preview_receipt {
         let scope = HostedScope {
@@ -614,6 +648,8 @@ pub(in crate::kernel::app_installs) async fn project_adopted(
     {
         return Err(invalid("invalid adopted outcome"));
     }
+    // Tightening verify_sources must remain compatible with historical
+    // retained-source adoption events: replay resolves their original pins.
     let source = source_on(conn, &p.request.pin).await?;
     let (generation, mut row) =
         current_install(conn, actor, &p.request.pin, event.local_seq).await?;
@@ -640,8 +676,8 @@ pub(in crate::kernel::app_installs) async fn project_adopted(
     row["event_id"] = json!(event.id);
     row["updated_at"] = json!(event.created_at);
     row["consent_revocation_seq"] = json!(p.revocation_seq);
-    sqlx::query("UPDATE kernel_app_installs SET row_json=?,generation=?,previous_generation=?,event_seq=?,executable=1,refusal=NULL WHERE principal=? AND package=?")
-        .bind(row.to_string()).bind(&event.id).bind(generation).bind(event.local_seq)
+    sqlx::query("UPDATE kernel_app_installs SET row_json=?,source_body=?,generation=?,previous_generation=?,event_seq=?,executable=1,refusal=NULL WHERE principal=? AND package=?")
+        .bind(row.to_string()).bind(&source.body).bind(&event.id).bind(generation).bind(event.local_seq)
         .bind(actor).bind(&p.request.pin.package).execute(conn).await?;
     Ok(())
 }
@@ -668,16 +704,13 @@ mod frozen_declaration_tests {
 
     #[test]
     fn snapshot_frozen_declarations_pass_hosted_preview_and_adopt_scope() {
-        // Exact declaration shape and canonical digest observed on all four
-        // frozen source pins in the archived HQ snapshot. No source bodies,
-        // account identities or installation evidence are copied here.
+        // Synthetic packages and never-seen versions exercise contract admission.
         const DECLARATION: &str = r#"{"contract":"native.app.v2","needs":[],"effects":[]}"#;
         const DIGEST: &str = "c88880b7ec70e0f66547d982b4ed627cd145e9646c61b6708a0cfe07e7a1bcaf";
         for (package, version) in [
-            ("agent.docs", "0.8.2"),
-            ("agent.docs", "0.9.0"),
-            ("agent.spaces", "0.7.0"),
-            ("agent.whiteboard", "0.2.0"),
+            ("agent.docs", "999.1.0"),
+            ("agent.slack-workspace-v2", "999.2.0"),
+            ("synthetic.unknown", "999.3.0"),
         ] {
             let declaration: Value = serde_json::from_str(DECLARATION).unwrap();
             crate::alpha_tab_sessions::validate_declaration_contract(&declaration).unwrap();

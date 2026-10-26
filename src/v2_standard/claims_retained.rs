@@ -18,6 +18,7 @@ pub(crate) const V1: Entry = Entry {
     decode,
     fold,
     state_codec: view,
+    link_read: None,
 };
 fn decode(payload: &Value) -> Result<Decoded> {
     let o: Outcome = serde_json::from_value(payload.clone())?;

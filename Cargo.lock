@@ -3115,6 +3115,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "base64 0.23.0",
+ "chacha20poly1305",
  "hex",
  "hmac",
  "html5ever",
@@ -3193,6 +3194,7 @@ dependencies = [
  "native-relationship-kernel",
  "percent-encoding",
  "pg_query",
+ "proc-macro2",
  "rand 0.9.5",
  "regex",
  "reqwest",

@@ -159,6 +159,41 @@ async fn visible(conn: &mut SqliteConnection, principal: &str, record: &str) -> 
             .allows(Capability::View))
 }
 
+/// v1 messaging.rs:2331/:2544 write only the caller's own mark links
+/// on that Annotation's single live Message bearer, after Message View,
+/// without requiring bearer Edit. Ordinary generic
+/// link APIs still check record_edit before appending, so gain no exemption.
+async fn own_relevance_write(conn: &mut SqliteConnection, event: &EventRow) -> Result<bool> {
+    let (target, rel, note) = match event.event_type.as_str() {
+        ADDED => {
+            let p = added_link(event)?;
+            (p.target_id, p.relationship, p.note)
+        }
+        REMOVED => {
+            let p: LinkRemoval = event_payload(event)?;
+            let Some(link) = by_id(conn, &p.link_id).await? else {
+                return Ok(false);
+            };
+            if link.source_id != event.record_id {
+                return Ok(false);
+            }
+            (link.target_id, link.relationship, link.note)
+        }
+        _ => return Ok(false),
+    };
+    if rel != "resolves" || note.as_deref() != Some("no_longer_relevant") {
+        return Ok(false);
+    }
+    let actor = event.actor.as_deref().unwrap_or("");
+    let owns:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r JOIN kernel_message_people p ON p.principal_id=r.owner_id WHERE r.id=? AND r.owner_id=? AND r.pin_family='native.v1.record' AND r.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_type' AND value_json='\"Annotation\"') AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_kind' AND value_json='\"no_longer_relevant\"') AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle WHERE record_id=r.id AND archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones WHERE record_id=r.id))")
+        .bind(&event.record_id).bind(actor).fetch_one(&mut *conn).await?;
+    let bearers = super::comments_v2::bearer_on(conn, &event.record_id).await?;
+    Ok(owns
+        && bearers.as_slice() == [target.as_str()]
+        && super::messaging::is_message(conn, &target).await?
+        && visible(conn, actor, &target).await?)
+}
+
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
     if !matches!(
         event.event_type.as_str(),
@@ -172,13 +207,15 @@ pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Resu
     ) {
         hq::require_import(conn, event.actor.as_deref().unwrap_or("")).await?;
     } else {
-        hq::record_edit(
-            conn,
-            event.actor.as_deref().unwrap_or(""),
-            &event.record_id,
-            None,
-        )
-        .await?;
+        if !own_relevance_write(conn, event).await? {
+            hq::record_edit(
+                conn,
+                event.actor.as_deref().unwrap_or(""),
+                &event.record_id,
+                None,
+            )
+            .await?;
+        }
         let target = if matches!(event.event_type.as_str(), REMOVED | NOTE) {
             let id = if event.event_type == REMOVED {
                 event_payload::<LinkRemoval>(event)?.link_id
@@ -313,12 +350,59 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
     refuse_active_collision(conn, &p).await?;
     let existing: Option<GenericLink> = sqlx::query_as("SELECT link_id,source_id,target_id,relationship,note,created_at,actor FROM kernel_generic_links WHERE link_id=?")
         .bind(&p.link_id).fetch_optional(&mut *conn).await?;
-    if existing.is_some() {
-        return Err(Error::conflict("link id already used"));
+    if let Some(existing) = existing {
+        // v1 messaging.rs:2407 reasserts an owner's live relevance link under
+        // a new command key. Keep its original creation time/identity, but
+        // record the latest assertion's sequence and visible history. Its
+        // actor remains on that event; the link's creation provenance stays.
+        // Every other repeated link id remains a conflict.
+        let own_mark: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_records r WHERE r.id=? AND r.owner_id=? AND r.pin_family='native.v1.record' AND r.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_type' AND value_json='\"Annotation\"') AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_kind' AND value_json='\"no_longer_relevant\"'))")
+            .bind(&p.source_id).bind(&event.actor).fetch_one(&mut *conn).await?;
+        let active: bool =
+            sqlx::query_scalar("SELECT active FROM kernel_generic_links WHERE link_id=?")
+                .bind(&p.link_id)
+                .fetch_one(&mut *conn)
+                .await?;
+        if event.event_type != ADDED
+            || !own_mark
+            || !active
+            || p.source_id != existing.source_id
+            || p.target_id != existing.target_id
+            || p.relationship != "resolves"
+            || existing.relationship != p.relationship
+            || p.note.as_deref() != Some("no_longer_relevant")
+            || existing.note != p.note
+        {
+            return Err(Error::conflict("link id already used"));
+        }
+        sqlx::query("UPDATE kernel_generic_links SET event_seq=? WHERE link_id=?")
+            .bind(event.local_seq)
+            .bind(&p.link_id)
+            .execute(conn)
+            .await?;
+        return Ok(());
     }
+    // Native creation completes the Annotation's bearer last. Evaluate again
+    // at that point, when recipient-relative evidence visibility is valid.
+    let completes_mark = p.relationship == "part_of"
+        && super::messaging::own_relevance_marks_on(
+            conn,
+            event.actor.as_deref().unwrap_or(""),
+            &p.target_id,
+        )
+        .await?
+        .iter()
+        .any(|(id, _)| id == &p.source_id);
+    let relevance_target = ((p.relationship == "resolves"
+        && p.note.as_deref() == Some("no_longer_relevant"))
+        || completes_mark)
+        .then(|| p.target_id.clone());
     sqlx::query("INSERT INTO kernel_generic_links(link_id,source_id,target_id,relationship,note,created_at,actor,active,event_seq,imported) VALUES(?,?,?,?,?,?,?,1,?,?)")
         .bind(p.link_id).bind(p.source_id).bind(p.target_id).bind(p.relationship).bind(p.note)
-        .bind(p.created_at).bind(p.actor).bind(event.local_seq).bind(event.event_type == IMPORTED).execute(conn).await?;
+        .bind(p.created_at).bind(p.actor).bind(event.local_seq).bind(event.event_type == IMPORTED).execute(&mut *conn).await?;
+    if let Some(message) = relevance_target {
+        super::notifications::relevance_on(conn, event, &message).await?;
+    }
     Ok(())
 }
 
@@ -411,6 +495,9 @@ pub async fn remove_generic_link_as(
     link_id: &str,
 ) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
+    // The explicit relevance executor owns the View-only exception. This
+    // ordinary API keeps its original source Edit admission.
+    hq::record_edit(&mut tx, principal, source, None).await?;
     let mut acts = crate::act::ActAllocation::new();
     append_in(
         db,
@@ -738,12 +825,10 @@ const ANCHORED_GENERIC_LINKS: &str = "SELECT * FROM kernel_generic_links WHERE s
 /// JSON, `?2` the principal; both are reused by the comment legs, so call
 /// sites keep their binds.
 fn visible_cte() -> String {
-    let homes = "SELECT json_extract(value,'$.id') AS id,json_extract(value,'$.view') AS view FROM json_each(?1)";
+    let homes = "SELECT id,view FROM _kernel_link_homes";
     format!(
-        "WITH visible AS NOT MATERIALIZED (SELECT r.id FROM kernel_records r WHERE (((NOT {derived}) AND EXISTS(SELECT 1 FROM ({homes}) h WHERE h.id=r.home_id AND (h.view OR r.owner_id=?2))) OR ({derived} AND {derived_visible})) AND {message_guard} AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones dead WHERE dead.record_id=r.id)) ",
-        derived = crate::kernel::sql_is_derived_artifact("r"),
-        derived_visible = crate::kernel::comments_v2::sql_derived_visible("r", "?2", homes),
-        message_guard = crate::kernel::messaging::sql_guard("r", "?2", homes),
+        "WITH _kernel_link_homes AS MATERIALIZED (SELECT json_extract(value,'$.id') AS id,json_extract(value,'$.view') AS view FROM json_each(?1)), visible AS NOT MATERIALIZED (SELECT r.id FROM kernel_records r WHERE {}) ",
+        super::sql_record_visible("r", "?2", homes, true)
     )
 }
 
@@ -773,8 +858,20 @@ pub(crate) async fn visible_link_rows_as(
     anchor: &str,
 ) -> Result<Vec<serde_json::Value>> {
     let mut tx = db.write_pool().begin().await?;
-    app_installs::admit_dispatched_on(&mut tx, principal).await?;
-    let scope = visible_home_anchors_as(&mut tx, principal).await?;
+    visible_link_rows_for_on(&mut tx, principal, &[anchor.to_owned()]).await
+}
+
+/// Batch the subject seeks, preserving the same endpoint visibility oracle.
+/// No result is cached outside the caller's read snapshot.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn visible_link_rows_for_on(
+    tx: &mut SqliteConnection,
+    principal: &str,
+    anchors: &[String],
+) -> Result<Vec<serde_json::Value>> {
+    app_installs::admit_dispatched_on(tx, principal).await?;
+    super::provider_link_reads::require_ready_on(tx).await?;
+    let scope = visible_home_anchors_as(tx, principal).await?;
     let homes: Vec<_> = scope
         .homes
         .into_iter()
@@ -782,21 +879,34 @@ pub(crate) async fn visible_link_rows_as(
         .map(|h| serde_json::json!({"id":h.home_id,"view":h.policy_view}))
         .collect();
     let homes = serde_json::to_string(&homes)?;
+    let anchors = serde_json::to_string(anchors)?;
     let cte = visible_cte();
-    let sql = visible_generic_links_sql();
+    let sql = visible_generic_links_sql()
+        .replace(
+            "source_id<>?3",
+            "source_id NOT IN (SELECT value FROM json_each(?3))",
+        )
+        .replace(
+            "source_id=?3",
+            "source_id IN (SELECT value FROM json_each(?3))",
+        )
+        .replace(
+            "target_id=?3",
+            "target_id IN (SELECT value FROM json_each(?3))",
+        );
     let links: Vec<GenericLink> = sqlx::query_as(&sql)
         .bind(&homes)
         .bind(principal)
-        .bind(anchor)
+        .bind(&anchors)
         .fetch_all(&mut *tx)
         .await?;
     let mut rows: Vec<_> = links.into_iter().map(|l| serde_json::json!({"id":l.link_id,"source_id":l.source_id,"target_id":l.target_id,"relationship":l.relationship,"note":l.note,"created_at":l.created_at})).collect();
     // Principal targets are not policy-bearing. Record targets still need View.
-    let sql = format!("{cte} SELECT l.source_id,l.target_id,l.relationship,e.created_at FROM (SELECT * FROM kernel_links WHERE source_id=?3 UNION ALL SELECT * FROM kernel_links WHERE target_id=?3 AND source_id<>?3) l JOIN visible s ON s.id=l.source_id LEFT JOIN visible t ON t.id=l.target_id LEFT JOIN kernel_principals p ON p.principal_id=l.target_id JOIN main.content_events e ON e.seq=l.created_seq WHERE t.id IS NOT NULL OR p.principal_id IS NOT NULL");
+    let sql = format!("{cte} SELECT l.source_id,l.target_id,l.relationship,e.created_at FROM (SELECT * FROM kernel_links WHERE source_id IN (SELECT value FROM json_each(?3)) UNION ALL SELECT * FROM kernel_links WHERE target_id IN (SELECT value FROM json_each(?3)) AND source_id NOT IN (SELECT value FROM json_each(?3))) l JOIN visible s ON s.id=l.source_id LEFT JOIN visible t ON t.id=l.target_id LEFT JOIN kernel_principals p ON p.principal_id=l.target_id JOIN main.content_events e INDEXED BY idx_kernel_event_birth ON e.seq=l.created_seq WHERE t.id IS NOT NULL OR p.principal_id IS NOT NULL");
     let legacy: Vec<(String, String, String, String)> = sqlx::query_as(&sql)
         .bind(&homes)
         .bind(principal)
-        .bind(anchor)
+        .bind(&anchors)
         .fetch_all(&mut *tx)
         .await?;
     for (source, target, rel, created) in legacy {
@@ -804,18 +914,17 @@ pub(crate) async fn visible_link_rows_as(
     }
     // Start from the subject index, not every provider state. The reverse
     // subject index bounds the all-endpoints visibility check per aggregate.
-    let sql = format!("{cte} SELECT p.state_json FROM kernel_provider_state p WHERE p.id IN (SELECT aggregate_id FROM kernel_provider_subjects WHERE subject_id=?3) AND p.provider_key='relates_to.v1' AND NOT EXISTS(SELECT 1 FROM kernel_provider_subjects s WHERE s.aggregate_id=p.id AND NOT EXISTS(SELECT 1 FROM visible v WHERE v.id=s.subject_id))");
-    let states: Vec<String> = sqlx::query_scalar(&sql)
+
+    let sql = format!("{cte} SELECT p.left_id,p.right_id FROM kernel_provider_link_heads p WHERE p.active=1 AND p.aggregate_id IN (SELECT aggregate_id FROM kernel_provider_subjects WHERE subject_id IN (SELECT value FROM json_each(?3))) AND NOT EXISTS(SELECT 1 FROM kernel_provider_subjects s WHERE s.aggregate_id=p.aggregate_id AND NOT EXISTS(SELECT 1 FROM visible v WHERE v.id=s.subject_id))");
+    let pairs: Vec<(String, String)> = sqlx::query_as(&sql)
         .bind(&homes)
         .bind(principal)
-        .bind(anchor)
+        .bind(&anchors)
         .fetch_all(&mut *tx)
         .await?;
-    for state in states {
-        if let Some((left, right)) = relates_to_port::active_pair_from_state(&state)? {
-            for (source, target) in [(&left, &right), (&right, &left)] {
-                rows.push(serde_json::json!({"id":null,"source_id":source,"target_id":target,"relationship":"relates_to","note":null,"created_at":null}));
-            }
+    for (left, right) in pairs {
+        for (source, target) in [(&left, &right), (&right, &left)] {
+            rows.push(serde_json::json!({"id":null,"source_id":source,"target_id":target,"relationship":"relates_to","note":null,"created_at":null}));
         }
     }
     // Prefer the generic identity/note/provenance when an older declared lane

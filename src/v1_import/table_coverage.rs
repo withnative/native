@@ -22,6 +22,7 @@ const IMPORTED: &[&str] = &[
     "control_events",
     "database_identity",
     "facet_observations",
+    "facet_times",
     "facet_values",
     "human_message_awareness",
     "instruction_bindings",
@@ -70,6 +71,11 @@ const INTENTIONALLY_DROPPED: &[&str] = &[
     "attribution_targets",
     "authorization_grant_revision",
     "authorization_revision",
+    // Derived viewer fences and transaction-only certification are not v2
+    // authority. The importer reconstructs access from policies and bindings.
+    "authorization_subject_birth_fence",
+    "authorization_subject_births",
+    "authorization_subject_revision",
     "awareness_command_intents",
     "awareness_event_evidence",
     "binding_audit",
@@ -79,6 +85,7 @@ const INTENTIONALLY_DROPPED: &[&str] = &[
     "content_event_causal_cutover",
     "content_event_causal_frontier",
     "content_event_claim_meta",
+    "content_event_heads",
     "content_event_reaction_meta",
     "content_event_sources",
     "control_event_applications",
@@ -109,7 +116,6 @@ const INTENTIONALLY_DROPPED: &[&str] = &[
     "engine_migration_drills",
     "external_observations",
     "facet_observation_json_nodes",
-    "facet_times",
     "facet_value_json_nodes",
     "freshness_command_results",
     "freshness_runtime_command_results",
@@ -189,4 +195,37 @@ pub(super) async fn check(source: &mut SqliteConnection) -> Result<TableCoverage
         }
     }
     Ok(coverage)
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn current_engine_tables_are_classified_and_unknown_tables_still_refuse() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let coverage = super::check(&mut conn).await.unwrap();
+        assert!(
+            coverage.unclassified.is_empty(),
+            "{:?}",
+            coverage.unclassified
+        );
+        for table in [
+            "authorization_subject_revision",
+            "authorization_subject_births",
+            "authorization_subject_birth_fence",
+        ] {
+            assert!(coverage
+                .intentionally_dropped
+                .iter()
+                .any(|name| name == table));
+        }
+        sqlx::query("CREATE TABLE unreviewed_import_state (id TEXT)")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::check(&mut conn).await.unwrap().unclassified,
+            ["unreviewed_import_state"]
+        );
+    }
 }

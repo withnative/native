@@ -18,20 +18,41 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use native_ce::db::DatabaseOpenMode;
-use native_ce::export::{ExportCoordinator, LocalSnapshotSource};
-use native_ce::identity::resolve_stdio_account_identity;
+#[cfg(any(test, feature = "turso-local", feature = "postgres"))]
+use native_ce::export::ExportCoordinator;
+#[cfg(test)]
+use native_ce::export::LocalSnapshotSource;
+#[cfg(test)]
+use native_ce::mcp::register_snapshot_tool;
 use native_ce::mcp::standby_stdio::{
-    resolve_standby_account_identity, standby_startup_status, StandbySessionConfig,
-    StandbyStdioSession,
+    standby_startup_status, StandbySessionConfig, StandbyStdioSession,
 };
+#[cfg(any(
+    test,
+    feature = "turso-local",
+    feature = "postgres",
+    feature = "v2-kernel-probe"
+))]
+use native_ce::mcp::ToolRegistry;
+#[cfg(test)]
+use native_ce::mcp::{register_builtin_tools, register_surface_tools};
+#[cfg(any(
+    feature = "turso-local",
+    feature = "postgres",
+    feature = "v2-kernel-probe"
+))]
+use native_ce::mcp::{Caller, StdioServer};
 use native_ce::mcp::{
-    register_allowlisted_experimental_tools, register_build_enabled_experimental_tools,
-    register_builtin_tools, register_snapshot_tool, register_surface_tools, Caller,
-    ExperimentalExecutors, ExposureProfile, McpSurfaceMode, StatusOnlyStdioServer, StdioServer,
-    ToolRegistry, EXPERIMENTAL_EXECUTORS_ENV,
+    ExperimentalExecutors, ExposureProfile, McpSurfaceMode, StatusOnlyStdioServer,
+    EXPERIMENTAL_EXECUTORS_ENV,
 };
-#[cfg(feature = "mcp-executor-prototype")]
-use native_ce::mcp::{ExecutorPrototypeStdioServer, ExecutorTelemetryContext};
+#[cfg(any(test, feature = "turso-local", feature = "postgres"))]
+use native_ce::native_cli::register_stdio_tools;
+#[cfg(test)]
+use native_ce::native_cli::{configured_profile, sqlite_owner_caller, sqlite_surface};
+use native_ce::native_cli::{
+    configured_profile_for_surface, configured_surface, read_only_surface, ENV_MCP_SURFACE,
+};
 #[cfg(feature = "postgres")]
 use native_ce::postgres::{register_postgres_tools, PostgresRuntimeConfig};
 use native_ce::standby::{
@@ -112,7 +133,6 @@ async fn run_kernel_v2(args: &[String]) -> ExitCode {
 
 const USAGE: &str =
     "usage: mcp-stdio [--account <token>] <path-to.db> | mcp-stdio --standby [--account <token>] <path-to-standby-config.json> | mcp-stdio --member-copy <path-to-member-copy-config.json> | mcp-stdio node serve --config <file> | mcp-stdio node connect --socket <path>   (or set exactly one applicable controller: NATIVE_CE_DB, NATIVE_CE_STANDBY_CONFIG, NATIVE_CE_MEMBER_COPY_CONFIG, NATIVE_CE_STORAGE_TARGET_CONFIG, NATIVE_CE_POSTGRES_CONFIG, NATIVE_CE_TURSO_LOCAL_CONFIG; Postgres and Turso-local are trusted-local and reject NATIVE_CE_ACCOUNT; member-copy derives its account from the authenticated owner binding and rejects --account/NATIVE_CE_ACCOUNT)";
-const ENV_MCP_SURFACE: &str = "NATIVE_CE_MCP_SURFACE";
 const ENV_STANDBY_REFRESH_CONFIG: &str = "NATIVE_CE_STANDBY_REFRESH_CONFIG";
 const ENV_MEMBER_COPY_CONFIG: &str = "NATIVE_CE_MEMBER_COPY_CONFIG";
 
@@ -195,53 +215,6 @@ fn standby_refresh_cause_label(cause: RefreshCause) -> &'static str {
         RefreshCause::Manual => "manual",
         RefreshCause::AfterAdmittedWrite => "after-admitted-write",
     }
-}
-
-fn configured_surface(raw: Option<String>) -> std::result::Result<McpSurfaceMode, String> {
-    raw.map(|value| {
-        value
-            .parse()
-            .map_err(|reason| format!("{ENV_MCP_SURFACE} is invalid ({reason})"))
-    })
-    .transpose()
-    .map(Option::unwrap_or_default)
-}
-
-fn configured_profile(raw: Option<String>) -> std::result::Result<ExposureProfile, String> {
-    raw.map(|value| {
-        value
-            .parse()
-            .map_err(|reason| format!("NATIVE_CE_MCP_TOOL_PROFILE is invalid ({reason}): {value}"))
-    })
-    .transpose()
-    .map(Option::unwrap_or_default)
-}
-
-fn configured_profile_for_surface(
-    surface: McpSurfaceMode,
-    raw: Option<String>,
-) -> std::result::Result<ExposureProfile, String> {
-    if surface == McpSurfaceMode::Legacy {
-        configured_profile(raw)
-    } else {
-        Ok(ExposureProfile::Complete)
-    }
-}
-
-fn register_stdio_tools(
-    registry: &mut ToolRegistry,
-    exports: &ExportCoordinator,
-    experimental: &ExperimentalExecutors,
-) -> native_ce::Result<()> {
-    register_builtin_tools(registry)?;
-    register_surface_tools(registry)?;
-    register_build_enabled_experimental_tools(registry)?;
-    register_allowlisted_experimental_tools(registry, experimental)?;
-    register_snapshot_tool(
-        registry,
-        Arc::new(LocalSnapshotSource::with_coordinator(exports.clone())),
-    )?;
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -388,37 +361,6 @@ fn member_copy_controller_conflict(
             || non_empty(turso_config))
 }
 
-/// The caller for the default SQLite stdio path. Whoever operates the local
-/// database file is its owner, so this carries the narrow local-owner marker
-/// (owner counter footing only); it is not `trusted_local`.
-fn sqlite_owner_caller(account: String) -> Caller {
-    Caller::local_owner(account).with_channel(native_ce::provenance::Channel::Mcp)
-}
-
-fn sqlite_surface(configured: McpSurfaceMode, open_mode: DatabaseOpenMode) -> McpSurfaceMode {
-    match open_mode {
-        DatabaseOpenMode::ReadWrite => configured,
-        // Standby keeps the configured surface. An Executor surface over a
-        // verified standby engine selects `new_standby_read_only`, which
-        // constructs no plan store or telemetry; an explicit Legacy surface
-        // serves the native surface unchanged. Lean narrows only the
-        // writable ordinary catalogue, so a standby keeps the executor
-        // standby projection.
-        DatabaseOpenMode::StandbyReadOnly => read_only_surface(configured),
-        // A member copy is a read-only local surface; keep the configured
-        // surface as standby does.
-        DatabaseOpenMode::MemberReadOnly => read_only_surface(configured),
-    }
-}
-
-/// Read-only local surfaces (standby, member copy) are unchanged by lean.
-fn read_only_surface(configured: McpSurfaceMode) -> McpSurfaceMode {
-    match configured {
-        McpSurfaceMode::Lean => McpSurfaceMode::Executor,
-        surface => surface,
-    }
-}
-
 fn validate_postgres_selection(
     args: &[String],
     db_env: Option<&str>,
@@ -515,6 +457,26 @@ async fn main_async() -> ExitCode {
     }
     if args
         .first()
+        .is_some_and(|a| a == "--standby-release-v1-pin")
+    {
+        let result = async {
+            if args.len() < 2 || args.len() > 3 || (args.len() == 3 && args[2] != "--switch-back") {
+                return Err(native_ce::Error::engine("usage: mcp-stdio --standby-release-v1-pin <standby-config.json> [--switch-back]"));
+            }
+            let runtime = StandbyRuntimeConfig::from_json(&std::fs::read(&args[1])?)?;
+            let store = GenerationStore::open(runtime.replica_root, runtime.hosted_route_database_id, Some(runtime.origin_database_id))?;
+            store.release_v1_pin(&observe_installed_consumer_identity()?, args.len() == 3).await
+        }.await;
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mcp-stdio: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args
+        .first()
         .is_some_and(|argument| argument == "--standby-identity")
     {
         if args.len() != 1 {
@@ -540,7 +502,7 @@ async fn main_async() -> ExitCode {
     #[cfg(not(feature = "mcp-executor-prototype"))]
     if surface.serves_executors() {
         eprintln!(
-            "mcp-stdio: executor MCP surface is not included in this build; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
+            "mcp-stdio: executor/lean MCP surface is not included in this build; controlled rollback requires {ENV_MCP_SURFACE}=legacy and a restart"
         );
         return ExitCode::FAILURE;
     }
@@ -726,140 +688,17 @@ async fn main_async() -> ExitCode {
         )
         .await;
     }
-    let open = async {
-        let db = match open_mode {
-            DatabaseOpenMode::StandbyReadOnly => {
-                native_ce::db::open_existing_database_standby_read_only(&path).await?
-            }
-            DatabaseOpenMode::ReadWrite if !std::path::Path::new(&path).exists() => {
-                native_ce::create_database(&path).await?
-            }
-            DatabaseOpenMode::ReadWrite => native_ce::open_existing_database(&path).await?,
-            DatabaseOpenMode::MemberReadOnly => {
-                native_ce::db::open_member_database_read_only(&path).await?
-            }
-        };
-        Ok::<_, native_ce::Error>(db)
-    };
-    let db = match open.await {
-        Ok(db) => db,
-        Err(err) => {
-            eprintln!("mcp-stdio: cannot open {path}: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Advisors S4: when NATIVE_ADVISORS_DIR is set, load installs and register
-    // the active advisors on this handle. Unset means today's empty registry.
-    native_ce::mcp::advisors::startup::apply_from_env(&db);
-
-    let account_result = match open_mode {
-        DatabaseOpenMode::ReadWrite => {
-            resolve_stdio_account_identity(&db, selected_account.as_deref()).await
-        }
-        DatabaseOpenMode::StandbyReadOnly => {
-            resolve_standby_account_identity(&db, selected_account.as_deref()).await
-        }
-        DatabaseOpenMode::MemberReadOnly => {
-            resolve_stdio_account_identity(&db, selected_account.as_deref()).await
-        }
-    };
-    let account = match account_result {
-        Ok(account) => account,
-        Err(err) => {
-            eprintln!("mcp-stdio: {err}");
-            db.close().await;
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let exports = ExportCoordinator::new();
-    let mut registry = ToolRegistry::new();
-    registry.set_standby_read_only(open_mode == DatabaseOpenMode::StandbyReadOnly);
-    registry.set_exposure_profile(profile);
-    if let Err(err) = register_stdio_tools(&mut registry, &exports, &experimental_executors) {
-        eprintln!("mcp-stdio: {err}");
-        return ExitCode::FAILURE;
-    }
-    if let Err(err) = registry.validate_profile_budgets() {
-        eprintln!("mcp-stdio: {err}");
-        return ExitCode::FAILURE;
-    }
-    let registry = Arc::new(registry);
-    let sql_commit = match std::env::var("NATIVE_CE_SQLITE_SQL_COMMIT").ok().as_deref() {
-        None | Some("0" | "false") => false,
-        Some("1" | "true") => true,
-        Some(_) => {
-            eprintln!("mcp-stdio: NATIVE_CE_SQLITE_SQL_COMMIT must be true/false or 1/0");
-            return ExitCode::FAILURE;
-        }
-    };
-    if sql_commit && (open_mode != DatabaseOpenMode::ReadWrite || surface == McpSurfaceMode::Legacy)
+    // The ordinary read-write SQLite path is shared with `native mcp --local`.
+    // Standby and member-copy returned above, so `open_mode` is ReadWrite here.
+    match native_ce::native_cli::serve_sqlite_stdio(
+        &path,
+        selected_account,
+        surface,
+        profile,
+        experimental_executors,
+    )
+    .await
     {
-        eprintln!("mcp-stdio: SQL commit requires the writable local executor surface");
-        return ExitCode::FAILURE;
-    }
-    let caller = sqlite_owner_caller(account);
-    let outcome = match sqlite_surface(surface, open_mode) {
-        McpSurfaceMode::Legacy => {
-            StdioServer::new(registry, db.clone(), caller)
-                .serve_stdio()
-                .await
-        }
-        surface @ (McpSurfaceMode::Executor | McpSurfaceMode::Lean) => {
-            #[cfg(feature = "mcp-executor-prototype")]
-            {
-                if open_mode == DatabaseOpenMode::StandbyReadOnly {
-                    // A verified standby engine has no plan store, sidecar,
-                    // expiry, telemetry, or trace file to construct.
-                    match ExecutorPrototypeStdioServer::new_standby_read_only(
-                        registry,
-                        db.clone(),
-                        caller,
-                    )
-                    .await
-                    {
-                        Ok(server) => server.serve_stdio().await,
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    match ExecutorTelemetryContext::structured_log() {
-                        Ok(telemetry) => {
-                            match ExecutorPrototypeStdioServer::new_for_surface(
-                                registry,
-                                db.clone(),
-                                caller,
-                                None,
-                                Some(telemetry),
-                                experimental_executors,
-                                surface,
-                            )
-                            .await
-                            {
-                                Ok(server) => match if sql_commit {
-                                    server.with_local_sql_commit()
-                                } else {
-                                    Ok(server)
-                                } {
-                                    Ok(server) => server.serve_stdio().await,
-                                    Err(error) => Err(error),
-                                },
-                                Err(error) => Err(error),
-                            }
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            }
-            #[cfg(not(feature = "mcp-executor-prototype"))]
-            {
-                let _ = surface;
-                unreachable!("executor availability was checked before opening the database")
-            }
-        }
-    };
-    exports.drain().await;
-    db.close().await;
-    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("mcp-stdio: {err}");
@@ -1323,10 +1162,15 @@ mod tests {
     }
 
     #[test]
-    fn lean_surface_is_opt_in_and_read_only_copies_keep_the_executor_projection() {
+    fn lean_surface_is_default_and_read_only_copies_keep_the_executor_projection() {
+        assert_eq!(configured_surface(None).unwrap(), McpSurfaceMode::Lean);
         assert_eq!(
             configured_surface(Some("lean".into())).unwrap(),
             McpSurfaceMode::Lean
+        );
+        assert_eq!(
+            configured_surface(Some("executor".into())).unwrap(),
+            McpSurfaceMode::Executor
         );
         assert_eq!(
             configured_profile_for_surface(McpSurfaceMode::Lean, Some("focused".into())).unwrap(),
@@ -1349,8 +1193,12 @@ mod tests {
     }
 
     #[test]
-    fn startup_surface_is_executor_by_default_and_profile_is_legacy_only() {
-        assert_eq!(configured_surface(None).unwrap(), McpSurfaceMode::Executor);
+    fn startup_surface_is_lean_by_default_and_profile_is_legacy_only() {
+        assert_eq!(configured_surface(None).unwrap(), McpSurfaceMode::Lean);
+        assert_eq!(
+            configured_surface(Some("executor".into())).unwrap(),
+            McpSurfaceMode::Executor
+        );
         assert_eq!(
             configured_surface(Some("legacy".into())).unwrap(),
             McpSurfaceMode::Legacy

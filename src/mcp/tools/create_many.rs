@@ -95,7 +95,7 @@ enum ItemState {
 pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
     registry.register(
         ToolKind::CreateMany,
-        "Create up to 25 non-Message records as one dependency graph. Local refs support parent_ref, links[].target_ref, and [[ref]] body mentions. The graph is cycle-checked before writes; items then use create_record semantics in stable topological order. Failures block only dependants, and receipts preserve input positions with null ids for failures. Use response_mode=verbose for created record shapes. With idempotency_key, retry with identical arguments: created items replay, failed ones are tried again; changed arguments are refused.",
+        "Create up to 25 non-Message records as one dependency graph. Local refs support parent_ref, links[].target_ref, and [[ref]] body mentions. The graph is cycle-checked before writes; items then use create_record semantics in stable topological order. Failures block only dependants; receipts keep input positions with null ids for failures. response_mode=verbose returns created shapes. With idempotency_key, retry with identical arguments: created items replay, failed ones retry; changed arguments are refused.",
         json!({
             "type": "object",
             "properties": {
@@ -131,6 +131,7 @@ pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
                             "maturity": { "type": "string" },
                             "sources": lifecycle::source_basis_input_schema(),
                             "facets": { "type": "object", "additionalProperties": true },
+                            "confirm": { "type": "boolean" },
                             "links": {
                                 "type": "array",
                                 "items": {
@@ -175,7 +176,8 @@ pub fn register_create_many_tool(registry: &mut ToolRegistry) -> Result<()> {
 
 async fn create_many(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     // The digests run over the raw arguments: ids this attempt reserves must
-    // never enter the conflict detector.
+    // never enter the conflict detector. Per-item `confirm` is stripped from
+    // the digest by the provenance layer, not here.
     let provenance_arguments = arguments.clone();
     let args: CreateManyArgs = parse_args(TOOL, arguments)?;
     require_nonblank_reason(TOOL, &args.reason)?;
@@ -696,7 +698,7 @@ async fn execute(
             }
             Err(error) => {
                 states[index] = ItemState::Failed;
-                errors.push(item_error(record, "create_failed", error.to_string(), None));
+                errors.push(item_failure(record, &error));
             }
         }
     }
@@ -769,6 +771,53 @@ async fn create_keyed_item(
     .await
 }
 
+/// One item's creation failure. A duplicate-gate refusal keeps its own code
+/// and candidates as structured fields — with batch coordinates in the
+/// advice — instead of burying the refusal JSON in the message. Every other
+/// failure keeps the generic `create_failed` shape.
+fn item_failure(record: &PreparedRecord, error: &Error) -> Value {
+    if let Error::Engine(message) = error {
+        if let Some(duplicate) = duplicate_refusal(message, record.index) {
+            let mut error = duplicate;
+            if let Some(local_ref) = &record.local_ref {
+                error["ref"] = json!(local_ref);
+            }
+            return error;
+        }
+    }
+    item_error(record, "create_failed", error.to_string(), None)
+}
+
+/// Reframe a singular duplicate refusal for its batch position, or `None`
+/// when the failure is anything else. Only the whole message parsing as the
+/// refusal object classifies: a prefix before refusal-shaped JSON stays an
+/// ordinary failure.
+fn duplicate_refusal(message: &str, index: usize) -> Option<Value> {
+    let refusal: Value = serde_json::from_str(message).ok()?;
+    if refusal["code"] != "likely_duplicate"
+        || refusal["outcome"] != "refused"
+        || refusal["applied"] != false
+    {
+        return None;
+    }
+    if refusal
+        .get("candidates")
+        .and_then(Value::as_array)
+        .is_none_or(|candidates| candidates.is_empty())
+    {
+        return None;
+    }
+    Some(json!({
+        "index": index,
+        "code": "likely_duplicate",
+        "message": refusal.get("message").cloned().unwrap_or(Value::Null),
+        "candidates": refusal.get("candidates").cloned().unwrap_or(Value::Null),
+        "advice": format!(
+            "Set confirm: true on records[{index}] to create despite the match, or change the identity tuple."
+        ),
+    }))
+}
+
 fn item_error(
     record: &PreparedRecord,
     code: &str,
@@ -792,6 +841,48 @@ fn item_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failed_record(index: usize) -> PreparedRecord {
+        PreparedRecord {
+            index,
+            local_ref: None,
+            dependencies: BTreeSet::new(),
+            arguments: Value::Null,
+            materialized_body: None,
+        }
+    }
+
+    #[test]
+    fn refusal_shaped_json_with_a_text_prefix_stays_create_failed() {
+        let refusal = json!({
+            "code": "likely_duplicate", "applied": false, "outcome": "refused",
+            "message": "Nothing was created.",
+            "candidates": [{"id": "rec:1"}],
+        });
+        let error = item_failure(
+            &failed_record(3),
+            &Error::engine(format!("create_many: {refusal}")),
+        );
+        assert_eq!(error["code"], "create_failed");
+        assert!(error.get("candidates").is_none());
+        assert!(error.get("advice").is_none());
+    }
+
+    #[test]
+    fn whole_message_refusal_classifies_with_candidates_and_advice() {
+        let refusal = json!({
+            "code": "likely_duplicate", "applied": false, "outcome": "refused",
+            "message": "Nothing was created.",
+            "candidates": [{"id": "rec:1"}],
+        });
+        let error = item_failure(&failed_record(3), &Error::engine(refusal.to_string()));
+        assert_eq!(error["code"], "likely_duplicate");
+        assert_eq!(error["candidates"], json!([{"id": "rec:1"}]));
+        assert_eq!(
+            error["advice"],
+            json!("Set confirm: true on records[3] to create despite the match, or change the identity tuple.")
+        );
+    }
 
     #[test]
     fn forward_refs_materialize_against_preassigned_ids_and_sort_stably() {

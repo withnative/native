@@ -81,6 +81,8 @@ pub use bundle_delivery::AppBundleDelivery;
 mod gate_cache;
 mod prepare_install;
 pub use batch_read::LiveReadItem;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) use batch_read::{item_result as live_read_item_result, LIVE_READ_BATCH_MAX};
 #[doc(hidden)]
 pub mod hosted_producer;
 #[doc(hidden)]
@@ -800,7 +802,7 @@ pub(crate) fn parse_sql_need_entry(entry: &Value) -> std::result::Result<SqlNeed
 /// database. Refusal codes: `unknown_sql_param` (undeclared name),
 /// `missing_sql_param` (absent required param), `invalid_sql_param`
 /// (mistyped, over `max_len`, or a non-object `params` envelope).
-fn bind_sql_params(
+pub(crate) fn bind_sql_params(
     need: &SqlNeed,
     params: Option<&Value>,
 ) -> std::result::Result<Vec<crate::query::sql_contract::QuerySqlParameter>, &'static str> {
@@ -5043,9 +5045,9 @@ pub(crate) async fn check_facet_set_post_replay_with_admission_in(
 /// strings or `sql.snapshot.v1` objects (`{need, key, label, sql}`). The
 /// shape is pinned so the consent digest covers declared bytes.
 #[derive(Debug)]
-struct ParsedDeclaration {
-    needs: Vec<String>,
-    effects: Vec<String>,
+pub(crate) struct ParsedDeclaration {
+    pub(crate) needs: Vec<String>,
+    pub(crate) effects: Vec<String>,
 }
 
 /// Whether a declaration carries the app-contract v2 marker. Callers that
@@ -5056,7 +5058,7 @@ pub(crate) fn is_app_v2_declaration(declaration: &Value) -> bool {
         == Some(crate::alpha_tab_sessions::APP_CONTRACT_V2)
 }
 
-fn require_declaration(declaration: &Value) -> Result<ParsedDeclaration> {
+pub(crate) fn require_declaration(declaration: &Value) -> Result<ParsedDeclaration> {
     require_declaration_for_adoption(declaration, false)
 }
 
@@ -7446,25 +7448,25 @@ fn sql_needs_in(declaration: &Value) -> Result<Vec<SqlNeed>> {
 /// `revision_digest` even when the returned 1,000-row prefix is unchanged.
 /// Growth further beyond that cap is invisible here, exactly as it is to a
 /// direct `query_sql` caller.
-struct SnapshotSqlNeed {
+pub(crate) struct SnapshotSqlNeed {
     /// Frame input: rows capped at [`SQL_SNAPSHOT_ROW_CAP`] with `row_count`
     /// reporting the full returned count and `row_count_complete` saying
     /// whether that count is the true total, so a package can show "200 of
     /// N" only when it is true. Fields are [`SQL_NEED_RESULT_FIELDS`].
-    input: Value,
+    pub(crate) input: Value,
     /// Digest material: `{columns, rows, truncated, row_count_complete}`
     /// over the full returned rows, before the snapshot cap.
-    digest: Value,
+    pub(crate) digest: Value,
     /// Statement-fixed clock from the `query_sql` engine (M1 slice 1): the
     /// single value bound for every `now_ms()` use in this need's statement,
     /// or `None` when the statement is clock-free. Preserved per need
     /// because sequential snapshot evaluation gives each statement its own
     /// clock; the snapshot-level `as_of_ms` is only the maximum of these,
     /// never any one need's exact bind value.
-    now_ms_ms: Option<i64>,
+    pub(crate) now_ms_ms: Option<i64>,
     /// Genuinely server-detected time dependence: the engine's own
     /// `time_dependent` flag for this need's statement.
-    time_dependent: bool,
+    pub(crate) time_dependent: bool,
 }
 
 /// Pure SnapshotSqlNeed projection shared by the owned and caller-transaction
@@ -7474,7 +7476,7 @@ struct SnapshotSqlNeed {
 /// were removed with the snapshot/on-request rewiring so only one executor
 /// remains. Paging's row_count_complete is computed here, shared: engine
 /// full-result completeness, distinct from our delivered-200 truncation.
-fn project_snapshot_need(need: &SqlNeed, raw: &Value) -> Result<SnapshotSqlNeed> {
+pub(crate) fn project_snapshot_need(need: &SqlNeed, raw: &Value) -> Result<SnapshotSqlNeed> {
     let columns = raw.get("columns").cloned().unwrap_or(Value::Null);
     let full_rows: Vec<Value> = raw
         .get("rows")
@@ -8909,19 +8911,21 @@ fn sql_keyed_revision(
     sql_need: &SqlNeed,
     result_digest: &Value,
 ) -> Option<String> {
-    crate::keyed_freshness::is_keyed_read_key(&sql_need.key).then(|| {
-        crate::canonical_json::digest_json(&json!({
-            "pin": {
-                "package": row.package,
-                "version": row.version,
-                "digest": row.digest,
-                "artifact_id": row.artifact_id,
-                "source_revision": row.consented_source_revision,
-                "declaration_digest": row.declaration_digest,
-            },
-            "result": result_digest,
-        }))
-    })
+    sql_keyed_revision_for_pin(
+        &json!({"package":row.package,"version":row.version,"digest":row.digest,
+        "artifact_id":row.artifact_id,"source_revision":row.consented_source_revision,"declaration_digest":row.declaration_digest}),
+        sql_need,
+        result_digest,
+    )
+}
+
+pub(crate) fn sql_keyed_revision_for_pin(
+    pin: &Value,
+    sql_need: &SqlNeed,
+    result_digest: &Value,
+) -> Option<String> {
+    crate::keyed_freshness::is_keyed_read_key(&sql_need.key)
+        .then(|| crate::canonical_json::digest_json(&json!({"pin":pin,"result":result_digest})))
 }
 
 /// Re-evaluate one retained keyed variant through the identical gate chain
@@ -14440,8 +14444,8 @@ mod sql_snapshot_tests {
     #[test]
     fn unordered_limit_need_refusal_names_the_exact_default() {
         // E2: an unordered top-level LIMIT need still refuses, but names the
-        // default the ad-hoc path would apply. A nested-only unordered LIMIT
-        // refuses without it.
+        // default the ad-hoc path would apply. Nested levels name their
+        // own explicit ordering repairs.
         let error = parse_sql_need_entry(&entry(
             "lane.records",
             "Records",
@@ -14459,9 +14463,8 @@ mod sql_snapshot_tests {
             "SELECT * FROM (SELECT id FROM records LIMIT 1) s ORDER BY id",
         ))
         .unwrap_err();
-        assert!(!nested.contains("ad-hoc default"), "{nested}");
-        // Top-level unordered over an unordered nest: the default would not
-        // cure it, so no repair suffix either.
+        assert!(nested.contains("in subquery s: add ORDER BY 1"), "{nested}");
+        // Mixed levels name both explicit fixes; execution still refuses.
         let combo = parse_sql_need_entry(&entry(
             "lane.records",
             "Records",
@@ -14469,7 +14472,8 @@ mod sql_snapshot_tests {
         ))
         .unwrap_err();
         assert!(combo.contains("LIMIT without ORDER BY"), "{combo}");
-        assert!(!combo.contains("ad-hoc default"), "{combo}");
+        assert!(combo.contains("in top level: add ORDER BY 1"), "{combo}");
+        assert!(combo.contains("in subquery s: add ORDER BY 1"), "{combo}");
     }
 
     #[test]

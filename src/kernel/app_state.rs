@@ -383,20 +383,21 @@ pub(crate) async fn evidence_at(
     seq: i64,
     before: i64,
 ) -> Result<(String, RetainedAppState)> {
-    let raw: Option<String> =
-        sqlx::query_scalar("SELECT payload FROM content_events WHERE seq=? AND type=? AND seq<?")
-            .bind(seq)
-            .bind(IMPORTED_EVENT)
-            .bind(before)
-            .fetch_optional(&mut *conn)
-            .await?;
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT payload FROM main.content_events WHERE seq=? AND type=? AND seq<?",
+    )
+    .bind(seq)
+    .bind(IMPORTED_EVENT)
+    .bind(before)
+    .fetch_optional(&mut *conn)
+    .await?;
     let p: Imported =
         serde_json::from_str(&raw.ok_or_else(|| Error::engine("app custody evidence missing"))?)?;
     if p.bearer != bearer {
         return Err(Error::engine("app custody evidence bearer mismatch"));
     }
     let latest: Option<i64> = sqlx::query_scalar(
-        "SELECT max(seq) FROM content_events WHERE type=? AND record_id=? AND seq<?",
+        "SELECT max(seq) FROM main.content_events WHERE type=? AND record_id=? AND seq<?",
     )
     .bind(IMPORTED_EVENT)
     .bind(aggregate(bearer))

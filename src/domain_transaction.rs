@@ -331,9 +331,15 @@ where
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    if event.event_type.starts_with("kernel.hcp_") {
+        return Err(Error::engine(
+            "HCP events require the sealed kernel HCP route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -453,9 +459,15 @@ where
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    if event.event_type.starts_with("kernel.hcp_") {
+        return Err(Error::engine(
+            "HCP events require the sealed kernel HCP route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -497,10 +509,33 @@ where
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine(
             "kernel provider admission requires a provider outcome",
         ));
+    }
+    append_and_project_admitted(
+        transaction,
+        event,
+        control,
+        RecordIdAuthority::CallerSupplied,
+        &CausalAdmission::LocalComputed,
+    )
+    .await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_and_project_kernel_hcp<T>(
+    transaction: &mut T,
+    event: &mut EventRow,
+    control: &ExecutionControl,
+) -> Result<ProjectorIntent>
+where
+    T: EventCursorPort + ProjectorPort,
+{
+    if !crate::mcp::tools::hcp_v2::kernel::TYPES.contains(&event.event_type.as_str()) {
+        return Err(Error::engine("invalid sealed kernel HCP event"));
     }
     append_and_project_admitted(
         transaction,
@@ -656,6 +691,15 @@ impl ProjectorIntent {
                 )?;
                 Ok(Self::LinkRemoved(link))
             }
+            event_type
+                if crate::named_views::is_new_event(event_type)
+                    || event_type == crate::named_views::LEGACY =>
+            {
+                Ok(Self::Extended {
+                    event_type: event_type.to_owned(),
+                    payload,
+                })
+            }
             #[cfg(any(test, feature = "v2-kernel-probe"))]
             event_type
                 if matches!(
@@ -671,6 +715,7 @@ impl ProjectorIntent {
                         | "kernel.v1_state_imported.v1"
                         | "kernel.instruction_binding_imported.v1"
                         | "kernel.instruction_binding_updated.v1"
+                        | "kernel.notification_preference_set.v1"
                         | "kernel.principal_created.v1"
                         | "kernel.home_created.v1"
                         | "kernel.home_policy_replaced.v1"
@@ -688,7 +733,11 @@ impl ProjectorIntent {
                         | "kernel.import_hosted_accounts.v1"
                         | "kernel.host_import_created.v1"
                         | "kernel.app_state_imported.v1"
+                        | "kernel.canvas_activated.v1"
+                        | "kernel.canvas_batch_committed.v1"
                         | "kernel.app_installs_activated.v1"
+                        | "kernel.artifact_closure_activated.v1"
+                        | "kernel.artifact_excluded.v1"
                         | "kernel.app_install_removed.v1"
                         | "kernel.app_install_recorded.v1"
                         | "kernel.app_install_adopted.v1"
@@ -709,6 +758,8 @@ impl ProjectorIntent {
                         | "kernel.attachment_bound.v1"
                         | "kernel.body_set.v1"
                         | "kernel.metadata_set.v1"
+                        | "kernel.identity_binding_added.v1"
+                        | "kernel.account_config_bound.v1"
                         | "kernel.generic_link_note_updated.v1"
                         | "kernel.generic_link_note_imported.v1"
                         | "kernel.generic_link_added.v1"
@@ -728,6 +779,12 @@ impl ProjectorIntent {
                         | "kernel.archive_changed.v1"
                         | "kernel.record_deleted.v1"
                         | "kernel.link_removed.v1"
+                        | "kernel.hcp_entry_versioned.v1"
+                        | "kernel.hcp_entry_status_set.v1"
+                        | "kernel.hcp_entry_suggestion.v1"
+                        | "kernel.hcp_entry_confirmed.v1"
+                        | "kernel.hcp_read.v1"
+                        | "kernel.hcp_human_resolution.v1"
                         | "kernel.slot_provisioned.v1"
                         | "kernel.slot_replaced.v1"
                         | "kernel.home_created_for.v1"

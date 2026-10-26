@@ -395,9 +395,10 @@ impl ExpectationRead<'_, '_> {
     }
 }
 
-/// Snapshot importer read seam: exactly the v1 evidence evaluator on the
-/// source's pinned read-only connection, without opening another database.
-#[cfg(any(test, feature = "v2-kernel-probe"))]
+/// Derive on a connection the caller already holds: the snapshot importer's
+/// read seam (the v1 evidence evaluator on the source's pinned read-only
+/// connection) and the delivery backstop, neither of which may open another
+/// database connection.
 pub(crate) async fn derive_message_expectation_state_on(
     conn: &mut sqlx::SqliteConnection,
     message_id: &str,

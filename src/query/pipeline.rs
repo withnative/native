@@ -37,7 +37,7 @@ use super::error::contract_violation;
 /// SQLite's default variable cap is 999; stay under it when binding id sets.
 const CHUNK: usize = 400;
 
-const MAX_LIMIT: i64 = 500;
+pub(crate) const MAX_LIMIT: i64 = 500;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct HiddenVisibility {
@@ -408,75 +408,15 @@ fn exact_string(value: &Value, operator: &str) -> Result<String> {
     }
 }
 
-fn filter_sql(
-    filter: &Filter,
-    visibility: HiddenVisibility,
+/// Compile the v1 facet predicate over caller-filtered `facet_values` as well
+/// as the ordinary v1 projection. All authored keys/values remain bindings.
+pub(crate) fn facet_filter_sql(
+    facets: &[FacetFilter],
     member: bool,
-) -> Result<(String, Vec<String>)> {
-    let mut clauses: Vec<String> = vec!["r.deleted_at IS NULL".into()];
-    let mut binds: Vec<String> = Vec::new();
-    let any_of =
-        |column: &str, values: &[String], clauses: &mut Vec<String>, binds: &mut Vec<String>| {
-            if !values.is_empty() {
-                let placeholders = vec!["?"; values.len()].join(", ");
-                clauses.push(format!("r.{column} IN ({placeholders})"));
-                binds.extend(values.iter().cloned());
-            }
-        };
-    any_of("id", &filter.ids, &mut clauses, &mut binds);
-    any_of("type", &filter.types, &mut clauses, &mut binds);
-    any_of("kind", &filter.kinds, &mut clauses, &mut binds);
-    // Member slice holds only E(m); the generic predicate names the excluded
-    // `semantic_units` table, so the member path uses the constant instead.
-    clauses.push(if member {
-        super::member_not_hidden_predicate("r")
-    } else {
-        super::hidden_visibility_predicate(
-            "r",
-            visibility.suggestions,
-            visibility.citations,
-            visibility.comments,
-        )
-    });
-    any_of("lifecycle", &filter.lifecycle, &mut clauses, &mut binds);
-    any_of("maturity", &filter.maturity, &mut clauses, &mut binds);
-    if let Some(home_id) = &filter.home_id {
-        clauses.push("r.home_id = ?".into());
-        binds.push(home_id.clone());
-    }
-    if let Some(persistence) = &filter.persistence {
-        clauses.push("r.persistence = ?".into());
-        binds.push(persistence.clone());
-    }
-    if let Some(owner_id) = &filter.owner_id {
-        clauses.push("r.owner_id = ?".into());
-        binds.push(owner_id.clone());
-    }
-    if let Some(bears_shape) = filter.bears_shape {
-        if filter.shape_capability_ids.is_none() {
-            clauses.push(format!(
-                "{}EXISTS (SELECT 1 FROM schema_config sc WHERE sc.applies_to_collection_id = r.id)",
-                if bears_shape { "" } else { "NOT " }
-            ));
-        }
-    }
-    if let Some(name) = &filter.name_contains {
-        clauses.push("r.name LIKE ? ESCAPE '\\'".into());
-        let escaped = name
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        binds.push(format!("%{escaped}%"));
-    }
-    if let Some(ts) = &filter.updated_since {
-        clauses.push("r.updated_at >= ?".into());
-        binds.push(ts.clone());
-    }
-    if let Some(ts) = &filter.last_activity_since {
-        clauses.push("r.last_activity_at >= ?".into());
-        binds.push(ts.clone());
-    }
-    for facet in &filter.facets {
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut clauses = Vec::new();
+    let mut binds = Vec::new();
+    for facet in facets {
         match &facet.op {
             FacetOp::Exists => {
                 clauses.push(
@@ -582,6 +522,80 @@ fn filter_sql(
             }
         }
     }
+    Ok((clauses, binds))
+}
+
+fn filter_sql(
+    filter: &Filter,
+    visibility: HiddenVisibility,
+    member: bool,
+) -> Result<(String, Vec<String>)> {
+    let mut clauses: Vec<String> = vec!["r.deleted_at IS NULL".into()];
+    let mut binds: Vec<String> = Vec::new();
+    let any_of =
+        |column: &str, values: &[String], clauses: &mut Vec<String>, binds: &mut Vec<String>| {
+            if !values.is_empty() {
+                let placeholders = vec!["?"; values.len()].join(", ");
+                clauses.push(format!("r.{column} IN ({placeholders})"));
+                binds.extend(values.iter().cloned());
+            }
+        };
+    any_of("id", &filter.ids, &mut clauses, &mut binds);
+    any_of("type", &filter.types, &mut clauses, &mut binds);
+    any_of("kind", &filter.kinds, &mut clauses, &mut binds);
+    // Member slice holds only E(m); the generic predicate names the excluded
+    // `semantic_units` table, so the member path uses the constant instead.
+    clauses.push(if member {
+        super::member_not_hidden_predicate("r")
+    } else {
+        super::hidden_visibility_predicate(
+            "r",
+            visibility.suggestions,
+            visibility.citations,
+            visibility.comments,
+        )
+    });
+    any_of("lifecycle", &filter.lifecycle, &mut clauses, &mut binds);
+    any_of("maturity", &filter.maturity, &mut clauses, &mut binds);
+    if let Some(home_id) = &filter.home_id {
+        clauses.push("r.home_id = ?".into());
+        binds.push(home_id.clone());
+    }
+    if let Some(persistence) = &filter.persistence {
+        clauses.push("r.persistence = ?".into());
+        binds.push(persistence.clone());
+    }
+    if let Some(owner_id) = &filter.owner_id {
+        clauses.push("r.owner_id = ?".into());
+        binds.push(owner_id.clone());
+    }
+    if let Some(bears_shape) = filter.bears_shape {
+        if filter.shape_capability_ids.is_none() {
+            clauses.push(format!(
+                "{}EXISTS (SELECT 1 FROM schema_config sc WHERE sc.applies_to_collection_id = r.id)",
+                if bears_shape { "" } else { "NOT " }
+            ));
+        }
+    }
+    if let Some(name) = &filter.name_contains {
+        clauses.push("r.name LIKE ? ESCAPE '\\'".into());
+        let escaped = name
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        binds.push(format!("%{escaped}%"));
+    }
+    if let Some(ts) = &filter.updated_since {
+        clauses.push("r.updated_at >= ?".into());
+        binds.push(ts.clone());
+    }
+    if let Some(ts) = &filter.last_activity_since {
+        clauses.push("r.last_activity_at >= ?".into());
+        binds.push(ts.clone());
+    }
+    let (facet_clauses, facet_binds) = facet_filter_sql(&filter.facets, member)?;
+    clauses.extend(facet_clauses);
+    binds.extend(facet_binds);
     if !filter.include_archived {
         clauses.push(NOT_ARCHIVED.into());
     }
@@ -806,7 +820,7 @@ async fn apply_traverse_on(
     Ok(dedup(neighbours))
 }
 
-enum FacetSortValue {
+pub(crate) enum FacetSortValue {
     Number(f64),
     Text(String),
 }
@@ -868,7 +882,7 @@ fn compare_secondary(a: &RecordRow, b: &RecordRow, order: Order) -> Ordering {
     }
 }
 
-fn compare_facet_values(
+pub(crate) fn compare_facet_values(
     a: Option<&FacetSortValue>,
     b: Option<&FacetSortValue>,
     direction: FacetOrderDirection,

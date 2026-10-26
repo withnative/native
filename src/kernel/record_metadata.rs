@@ -6,6 +6,24 @@ pub(crate) const DDL: &str = "CREATE TABLE kernel_record_metadata (
  record_id TEXT PRIMARY KEY REFERENCES kernel_records(id), persistence TEXT NOT NULL,
  maturity TEXT, last_activity_at TEXT NOT NULL, event_seq INTEGER NOT NULL)";
 
+/// Keep clock reads off overflow pages containing retained source payloads.
+pub(crate) const CLOCK_INDEX: &str =
+    "CREATE INDEX idx_kernel_record_event_clock ON content_events(record_id,seq,created_at)";
+
+pub(crate) const REHOME_INDEX: &str = "CREATE INDEX idx_kernel_record_moves ON content_events(record_id,seq) WHERE type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')";
+
+// A tiny index over filing/annotation identities; never index body values.
+pub(crate) const FILING_TYPE_INDEX: &str = "CREATE INDEX idx_kernel_record_filing_types ON kernel_record_fields(record_id) WHERE name='v1_type' AND value_json IN ('\"Annotation\"','\"Collection\"')";
+// Cover both the presence probe and per-bearer carrier checks without reading
+// the wide field-value table. The audience predicate itself stays unchanged.
+pub(crate) const MESSAGE_TYPE_INDEX: &str = "CREATE INDEX idx_kernel_record_message_types ON kernel_record_fields(record_id) WHERE name='v1_type' AND value_json='\"Message\"'";
+// Historical filing and directed-link candidates are structural supersets;
+// their readers still authorize every record through the live kernel gate.
+pub(crate) const HISTORICAL_HOME_EXPR: &str = "CASE WHEN type IN ('kernel.record_created.v1','kernel.record_created.v2','kernel.import_record_created.v1') THEN json_extract(payload,'$.home_id') WHEN type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') THEN json_extract(payload,'$.new_home_id') ELSE json_extract(payload,'$.record.home_id') END";
+pub(crate) const HISTORICAL_HOME_TYPES: &str = "'kernel.record_created.v1','kernel.record_created.v2','kernel.import_record_created.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.import_state_delta.v1'";
+pub(crate) const HISTORICAL_HOME_INDEX: &str = "CREATE INDEX idx_kernel_historical_home ON content_events(CASE WHEN type IN ('kernel.record_created.v1','kernel.record_created.v2','kernel.import_record_created.v1') THEN json_extract(payload,'$.home_id') WHEN type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2') THEN json_extract(payload,'$.new_home_id') ELSE json_extract(payload,'$.record.home_id') END,seq,record_id) WHERE type IN ('kernel.record_created.v1','kernel.record_created.v2','kernel.import_record_created.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.import_state_delta.v1')";
+pub(crate) const HISTORICAL_TARGET_INDEX: &str = "CREATE INDEX idx_kernel_historical_target ON content_events(coalesce(json_extract(payload,'$.target_id'),json_extract(payload,'$.target.record_id')),record_id,seq) WHERE type IN ('kernel.link_added.v1','kernel.link_removed.v1','kernel.link_added.v2')";
+
 // Bindings, policies and unrelated provider events are not record mutations,
 // even if a legacy identifier coincides with their stream identifier. Claims
 // resolve their validated record subjects explicitly below.
@@ -210,6 +228,18 @@ pub async fn ensure_record_metadata(db: &Db) -> Result<()> {
     let mut tx = begin_write(db.write_pool()).await?;
     super::legacy_history::ensure_schema(&mut tx).await?;
     super::messaging::ensure_schema(&mut tx).await?;
+    for index in [
+        CLOCK_INDEX,
+        REHOME_INDEX,
+        FILING_TYPE_INDEX,
+        MESSAGE_TYPE_INDEX,
+        HISTORICAL_HOME_INDEX,
+        HISTORICAL_TARGET_INDEX,
+    ] {
+        sqlx::query(&index.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query(super::hosted_identity::EVENT_INDEX_DDL)
         .execute(&mut *tx)
         .await?;
@@ -231,6 +261,23 @@ pub async fn ensure_record_metadata(db: &Db) -> Result<()> {
         .execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// One v2 content clock for SQL, write guards and private configuration receipts.
+/// This includes facet/body/control events that do not revise typed fields.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) fn updated_clock_sql(record_expression: &str) -> String {
+    format!("(SELECT created_at FROM main.content_events e WHERE e.record_id={record_expression} ORDER BY seq DESC LIMIT 1)")
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn updated_at_on(conn: &mut SqliteConnection, record: &str) -> Result<String> {
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ',{})",
+        updated_clock_sql("?")
+    ))
+    .bind(record)
+    .fetch_one(conn)
+    .await?)
 }
 
 #[cfg(test)]

@@ -226,7 +226,7 @@ pub(super) fn values(search: &Value, list: &str) -> Vec<(String, Value)> {
 // ---- registry and descriptors ------------------------------------------
 
 #[test]
-fn only_the_five_slice_two_tools_are_advertised() {
+fn all_nine_hcp_tools_are_advertised() {
     let descriptors = hcp_tool_descriptors();
     let names: Vec<&str> = descriptors
         .iter()
@@ -239,7 +239,11 @@ fn only_the_five_slice_two_tools_are_advertised() {
             "searchPreferences",
             "listPermissionGrants",
             "mutatePreferences",
-            "smartSearchPreferences"
+            "smartSearchPreferences",
+            "searchContext",
+            "traceContextItem",
+            "proposeContextItem",
+            "resolveContextItem"
         ]
     );
     let mut registry = ToolRegistry::new();
@@ -265,6 +269,12 @@ fn only_the_five_slice_two_tools_are_advertised() {
                     .len(),
                 6
             );
+        } else if descriptor["name"] == "proposeContextItem"
+            || descriptor["name"] == "resolveContextItem"
+        {
+            // The two Layer 3 writes are writes, not retry-safe.
+            assert_eq!(annotations["readOnlyHint"], false);
+            assert_eq!(annotations["idempotentHint"], false);
         } else {
             assert_eq!(annotations["readOnlyHint"], true);
         }

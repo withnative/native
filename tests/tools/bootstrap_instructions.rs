@@ -343,7 +343,7 @@ async fn manage_instructions_resolve_enforces_exact_instruction_budget() {
     }
     let bootstrap = call(&registry, &db, Caller::local(), "bootstrap", json!({})).await;
     let key = bootstrap["run"]["run_key"].as_str().unwrap().to_string();
-    let maximum_valid_body = "a".repeat(32 * 1024 - "valid".len());
+    let maximum_valid_body = "a".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES - "valid".len());
     sqlx::query(&format!(
         "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
     ))
@@ -360,8 +360,12 @@ async fn manage_instructions_resolve_enforces_exact_instruction_budget() {
     .await
     .unwrap();
     assert_eq!(maximum_valid["instructions"]["status"], "ready");
-    assert_eq!(maximum_valid["instructions"]["resolved_bytes"], 32 * 1024);
-    let over_budget_body = "a".repeat(32 * 1024 - "valid".len() + 1);
+    assert_eq!(
+        maximum_valid["instructions"]["resolved_bytes"],
+        native_ce::MAX_RESOLVED_INSTRUCTION_BYTES
+    );
+    let over_budget_body =
+        "a".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES - "valid".len() + 1);
     sqlx::query(&format!(
         "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
     ))
@@ -1013,7 +1017,7 @@ async fn bootstrap_returns_no_partial_authoritative_stack_when_active_state_is_i
         "instruction_source_corrupt"
     );
 
-    let maximum_valid_body = "a".repeat(32 * 1024 - "valid".len());
+    let maximum_valid_body = "a".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES - "valid".len());
     sqlx::query(&format!(
         "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
     ))
@@ -1023,7 +1027,10 @@ async fn bootstrap_returns_no_partial_authoritative_stack_when_active_state_is_i
     .unwrap();
     let maximum_valid = call(&registry, &db, Caller::local(), "bootstrap", json!({})).await;
     assert_eq!(maximum_valid["instructions"]["status"], "ready");
-    assert_eq!(maximum_valid["instructions"]["resolved_bytes"], 32 * 1024);
+    assert_eq!(
+        maximum_valid["instructions"]["resolved_bytes"],
+        native_ce::MAX_RESOLVED_INSTRUCTION_BYTES
+    );
     assert_eq!(
         maximum_valid["contract"]["bounds_bytes"]["total"],
         native_ce::mcp::tools::orientation::MAX_BOOTSTRAP_TOTAL_BYTES
@@ -1097,7 +1104,7 @@ async fn bootstrap_returns_no_partial_authoritative_stack_when_active_state_is_i
     sqlx::query(&format!(
         "UPDATE records SET body=? WHERE id='{BROKEN_SOURCE}'"
     ))
-    .bind("é".repeat(16_385))
+    .bind("é".repeat(native_ce::MAX_RESOLVED_INSTRUCTION_BYTES / 2 + 1))
     .execute(&crate::common::fixture_write_pool(&db).await)
     .await
     .unwrap();
@@ -1107,7 +1114,10 @@ async fn bootstrap_returns_no_partial_authoritative_stack_when_active_state_is_i
         oversize["instructions"]["diagnostics"][0]["code"],
         "instruction_budget_exceeded"
     );
-    assert!(oversize["instructions"]["resolved_bytes"].as_u64().unwrap() > 32 * 1024);
+    assert!(
+        oversize["instructions"]["resolved_bytes"].as_u64().unwrap()
+            > native_ce::MAX_RESOLVED_INSTRUCTION_BYTES as u64
+    );
 
     sqlx::query(&format!("UPDATE records SET body='private',policy_anchor_id='{BROKEN_SOURCE}' WHERE id='{BROKEN_SOURCE}'"))
         .execute(&crate::common::fixture_write_pool(&db).await).await.unwrap();

@@ -250,20 +250,47 @@ pub(crate) fn admit_kernel_v2<'a>(
                 "{operation} is not available to apps (app_operation_refused)"
             )));
         }
-        // Each admitted write below owns native atomic attribution. Keep
-        // unported handlers closed rather than returning un-attributed success.
-        if !matches!(
-            operation,
-            "get_record"
-                | "query_sql"
-                | "get_history"
-                | "search"
-                | "attach_text"
-                | "create_record"
-                | "update_record"
-                | "manage_links"
-                | "archive_record"
-        ) {
+        // Each admitted write below owns native atomic attribution. Inbox
+        // reads re-admit on their snapshot and derive the viewer from the
+        // authenticated principal, preserving ordinary member visibility.
+        // Keep unported handlers closed rather than returning un-attributed success.
+        let messaging = operation == "manage_messages"
+            && matches!(
+                arguments["action"].as_str(),
+                Some(
+                    "send"
+                        | "list_inbox"
+                        | "list_message_state"
+                        | "set_preference"
+                        | "list_destinations"
+                        | "set_destination"
+                        | "mutate_human_awareness"
+                        | "mark_no_longer_relevant"
+                        | "unmark_no_longer_relevant"
+                )
+            );
+        if !messaging
+            && !matches!(
+                operation,
+                "get_record"
+                    | "query_record"
+                    | "whats_changed"
+                    | "query_sql"
+                    | "get_history"
+                    | "search"
+                    | "render_artifact"
+                    | "invoke_artifact_interaction"
+                    | "read_attachment"
+                    | "manage_attachments"
+                    | "read_canvas"
+                    | "manage_canvas"
+                    | "attach_text"
+                    | "create_record"
+                    | "update_record"
+                    | "manage_links"
+                    | "archive_record"
+            )
+        {
             return Err(Error::engine(format!(
                 "{operation} is not yet available to native apps (app_operation_unsupported_on_v2)"
             )));

@@ -232,6 +232,7 @@ pub(super) fn without_source(mut report: Report) -> Report {
 /// Allowlisted projection of the CLI report; legacy report identifiers stay private.
 pub fn sanitized_report(report: &serde_json::Value) -> serde_json::Value {
     json!({"schema":"native.v2-import-sanitized.v1",
+        "importer_build_sha":report["importer_build_sha"].as_str().filter(|sha| *sha == "dev" || (sha.len()==40 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))),
         "refusal_breakdown":report["refusal_breakdown"],
         "counted_breakdown":report["counted_breakdown"],
         "excluded_deleted":report["excluded_deleted"],

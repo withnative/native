@@ -515,6 +515,18 @@ pub async fn effective_capability_on(
     effective_capability_on_inner(transaction, principal, record_id, false).await
 }
 
+/// The caller's capability on a record as if it were not tombstoned. A
+/// tombstone keeps its policy and owner, so this answers "could this caller see
+/// the record before it was deleted", for the few reads that name a deleted
+/// record to someone who could have seen it.
+pub(crate) async fn effective_capability_including_tombstone_on(
+    transaction: &mut Transaction<'_, Sqlite>,
+    principal: Principal<'_>,
+    record_id: &str,
+) -> Result<Capability> {
+    effective_capability_on_inner(transaction, principal, record_id, true).await
+}
+
 /// Validate the complete derived-artifact and semantic-Unit bearer shape
 /// without evaluating grants. The trusted local compatibility boundary may
 /// bypass policy, but it must never bypass structural validity.

@@ -77,6 +77,17 @@ even when the verified v1 owner names another account (Richard’s private-polic
 different administrator. The importer requires exactly one explicit root account
 with Manage to identify the workspace administrator.
 
+Public external bindings have a separate v2 list/add projection. Existing
+imports do not populate it: a missing public binding is returned as an empty
+`bindings` list, never reconstructed from a kernel principal UUID. A visible
+Person's verified kernel mapping is reported separately as `kernel_identity`
+(`principal_id`, `person_id`). Public additions use the v1 address normalizer,
+require Manage, and are naturally idempotent; email/account additions remain
+reserved. Binding audits use the kernel root stream and are excluded from
+record history, leaving record body modification guards unchanged. Older v2
+files need explicit `prepare_v2_database` before serving the new projection;
+reads do not create or repair it.
+
 Home replacement policies are preserved. Since the probe kernel has no live
 membership roster, `members` grants require `--members-file`, one live hosted roster account ID per line. Missing input for an in-scope members policy refuses before target creation. Only the supplied roster is expanded; canonical account bindings are identity evidence, not membership evidence. The report includes the exact `expanded_members` set and `excluded_bound_accounts`. An explicitly empty file supplies an empty roster. This is a frozen roster, not future hosted membership synchronization. Direct account policy grants also get stable principal
 bindings. Reconciliation checks visibility for every mapped account against the source replacement policy and original v1 owner bindings, independently of the chosen v2 owner. At exclusive account-only private boundaries, Richard’s private-policy-wins decision supersedes any conflicting legacy owner floor; verification expects only the policy account, and preserves the conflict as override evidence. The sealed
@@ -424,6 +435,13 @@ Custody events use reserved aggregates and are excluded from ordinary history
 and SQL. They do not change the bearer's revision or expose another account's
 installation consent. No MCP tool reads custody directly.
 
+`Document/artifact` records are included in current-state import even when
+their executable closure has not been activated. Attachments whose terminal
+bearer is an artifact import with their held bytes and bearer-derived
+visibility. Their own stale policy anchor or uploader grants no additional
+access: get, SQL, search, links and byte reads follow the artifact's current
+visibility, including after projection rebuild.
+
 Each capsule records its format, source schema and content/control frontiers,
 and missing referenced evidence. Frontiers cannot regress. Missing required
 source tables skip the entire custody reconciliation, preserving prior capsules
@@ -473,9 +491,21 @@ W7 native consent activation (probe only): `kernel::app_installs` is a separate
 native authority derived from a host-sealed activation receipt. The host proof
 binds the exact frozen source head, verified report digest and capsule event
 positions; an attempted import head alone is insufficient. H3 identity activation
-must precede it. Only frozen adopted Docs 0.8.2/0.9.0, Spaces 0.7.0 and Whiteboard
-0.2.0 pins are eligible. Unmapped accounts remain in forensic custody. Other
-mapped installs retain their rows with an explicit unsupported verdict.
+must precede it. New operator activations use format 5 and admit any package/version
+with the `native.app.v2` contract and empty needs/effects, no sessions and no
+unsupported declaration keys. Exact pinned source/digest and verified adoption
+witnesses remain required. Exact declarative SQL/params/search and narrowed body/title
+effect declarations are also supported through caller-scoped guarded surfaces;
+shell batches retain v1's 16-item limit and per-item errors, with a fresh authority
+check before any captured result is returned;
+Class 2 frames cannot acquire Class 1 broad app-host claims. Formats 1–4 preserve
+their original replay decisions (including format 4 Class 2 exclusions). Unmapped accounts remain in forensic custody. Other mapped
+installs retain their rows; unsupported declarations receive the stable
+`app_not_yet_available_on_v2` exclusion without aborting the supported batch.
+Unsupported need/effect families stay excluded. Bound effects additionally require
+a separately verified artifact closure and fresh binding, SQL membership, Edit,
+CAS and same-act attribution checks. An earlier activation cannot be reinterpreted
+by a retry; build a fresh unpublished target for a new admission format.
 
 Activation copies pinned bytes and consent generations into replayable native
 state. Later custody is not consulted as current consent. User removal changes
@@ -493,11 +523,10 @@ Opening-time checks and a renamed database path do not fence older open handles.
 No live activation is qualified by the preservation-only real snapshot run.
 
 W7 day-one acceptance also requires the other HQ members to install and adopt
-the same frozen Docs/Spaces/Whiteboard versions through v1-equivalent consent,
-source acknowledgements, declared-read checks and account/database scope rules.
-Preserving the four existing installs is not sufficient. New package versions
-and catalogue changes are outside this cutover. The consent-storage foundation
-does not yet implement that complete install/preview/adopt flow. Personal staging
+verified sources through the existing hosted Preview/Adopt flow, with source
+acknowledgements and account/database scope rules. Source pins still bind exact
+bytes and versions; version numbers do not decide contract admission.
+Personal staging
 through `app_installs::install_as` accepts only a full frozen source pin that the
 current admitted account can view. It creates `caller_asserted`, non-executable
 consent on that account's private aggregate. Replacement requires a removed
@@ -573,6 +602,11 @@ Authenticated KernelV2 transport callers reject the entire `host:` binding names
 
 Native consent and frozen-source projection recovery runs during explicit v2
 preparation. Serving opens verify these projections without rebuilding them.
+The public identity-binding projection also requires explicit
+`kernel::prepare_v2_database` on existing v2 files before serving: readiness
+verification now requires `kernel_identity_bindings`. Include it in the same
+re-preparation pass as account/private-home projections; see the cutover
+runbook's staged H3 identity preparation step.
 
 W7 custody schema upgrades and recovery run during explicit v2 preparation.
 Serving opens only verify readiness and never rebuild missing custody.
@@ -638,6 +672,11 @@ payload version 1 is unchanged. Every preview GET rechecks the issuing catalogue
 session, native account admission, source View/runtime, generation, revocation
 and unspent receipt before a transformed-body cache hit. Missing or consumed
 preview evidence never falls back to installed-app admission or one-use tickets.
+Previews and installed launches now share the `/app/` route; the shell validates
+that common delivery route and does not infer which authority it carries.
+The server distinguishes the signed preview version byte and receipt from
+installed consent, refuses preview effect channels, and enforces their separate
+admission (`held/hosting/src/hosting/bundle_app.rs`, preview dispatch).
 Cold native bundle reads open only already-marked, prepared primary files with
 physical read-only pools; they perform no preparation or identity reconciliation
 writes. Standby v2 serving remains unavailable.
@@ -647,6 +686,283 @@ app-call admission, mutation attribution, declared-data evaluation, rendering or
 canvas execution. Unsupported management actions refuse explicitly. Native app
 launch and those adapters follow separately; this is not cutover readiness.
 
+W7 artifact closure activation is a separate host preparation step. The host
+must verify a frozen source and completed import before supplying an unsafe,
+non-MCP `VerifiedArtifactClosure` for each selected MDX artifact. The activation
+fold checks the source-head identity, capsule frontier, exact source event and
+compiler attestation, and records the selected bindings and grants on a private
+aggregate. It refuses deleted sources, missing evidence and module imports.
+Activation also checks that the imported W5 body-bearing history names the
+same source revision as the attestation, even when a later revision has the
+same text. The retained capsule remains non-executable. This projection alone
+does not render artifacts or grant access to their inputs; a render adapter
+must recheck current artifact and input visibility and refuse any body revision
+after activation. Docs and Spaces still require that adapter for cutover.
+
+## Activated canvas reads (W7)
+
+The probe-only `read_canvas` adapter supports `get_scene`, `changes` and
+`describe` for a canvas whose frozen scene and complete batch ledger have been
+verified and activated. Custody alone does not enable reads. The caller must
+still have current View on the canvas; app callers also require current native
+install admission. Historical `as_of` scenes and export remain unsupported.
+
+Imported object group tokens and batch `event_seq` values retain their v1
+positions. The scene head is the latest actual canvas batch, never the global
+frozen allocation floor. Changes page strictly after the supplied public cursor;
+the last returned batch's `event_seq` advances an unchanged Whiteboard client,
+without relying on reset metadata or `next_after`. Source custody and W5 wrappers
+are not additional canvas batches.
+
+Record cards, operations and pre-images use the existing v1 reference redaction
+rules under current kernel visibility. Asserted connector semantics require View
+on both endpoints; removed links read as broken only for an authorized viewer.
+The probe-only native mutation lane supports `commit_batch` and plan-required
+`promote`. Connector assertion, historical scenes and export remain unsupported.
+
+Promotion reuses the v1 plan digest and object-version checks. Records, links,
+card conversion, the reserved provenance facet and app attribution commit in
+one native act. Its default destination uses the canvas's logical v1 filing
+home, not a private policy home. The batch event is the native promotion witness;
+its ID occupies the existing `attestation_id` wire field without creating a
+legacy provenance-table authority. Replay verifies the same-actor, same-act
+creation evidence. Client batches cannot claim promotion authority.
+
+
+## Native canvas batch commits (W7)
+
+`manage_canvas.commit_batch` uses the shared v1 CAS and undo-evidence logic,
+with current canvas Edit, referenced-record View and native app admission checked
+inside the write transaction. A successful app write and its acts-as-user
+attribution share one act and commit; a refusal, conflict or retry appends no new
+action. Post-commit content wakeups use the native commit path.
+
+Source batches retain their actor-and-ops retry semantics and never claim a new
+native app action. Native app retries additionally retain the original package,
+version and consent generation boundary, preventing a different app from
+borrowing a receipt or learning its private attribution. Removal and roster
+admission are checked before any success replay.
+
+Imported canvases keep their original tokens. Every native canvas batch uses
+`F + native event sequence` for public batch positions and changed group tokens,
+including the first batch on a board created after cutover. The first imported
+canvas activation establishes the shared frozen allocation floor; all later
+activations must agree. The operator must activate that clock before new boards
+can be used. Only records created after the first hosted roster can initialize
+as empty native boards; retained source boards still require verified scene
+activation. Empty boards have head `canvas:0`. Native storage receipts continue
+to identify the canonical native event sequence separately from the public
+canvas position. Clock arithmetic refuses overflow or loss of JavaScript exact
+integer precision.
+
+## Installed-app artifact and attachment reads (W7)
+
+Frozen native apps can call `render_artifact`, `read_attachment` and the
+`manage_attachments` inspect/list actions through the ordinary KernelV2 app
+admission path. Artifact rendering still requires an activated source closure
+and current target visibility. Attachment metadata and bytes follow the current
+terminal bearer, including a `Document/artifact` bearer; the uploader or a stale
+attachment policy cannot grant additional View.
+
+Each attachment read transaction rechecks the app's current consent, source
+View/liveness and membership before reading data. The adapter revalidates app
+admission before returning the result. The renderer already checks admission on
+its initial and final snapshots. Removal therefore refuses a subsequent read
+even when the compiled render is cached.
+
+### W7 native HTML and legacy board rendering (probe only)
+
+`render_artifact` accepts frozen `native.html.v1` and `native.board.v1`
+closures on KernelV2. HTML reuses the v1 validator, injector, bridge and CSP;
+board rendering calls the same `BoardRuntime` adapter. The corresponding v1
+paths at `747293269` are `src/mcp/tools/artifacts.rs:8261` (live HTML
+materialization), `:8372` (isolated HTML launch), `:9245` (input size/digest
+checks), `:9345` (named-input resolution), and `:7739` (board rendering). Shared delivery lives
+at `crates/artifact-html/src/html.rs:3005`, `:3064`, `:3085`, and `:3753`.
+No sanitizer rules are relaxed. The existing workbench host keeps an opaque
+`allow-scripts` frame, no permissions, and no referrer
+(`web/workbench/src/htmlArtifactHost/mount.ts:364`).
+
+Only an explicit host-verified closure activation permits rendering. Existing
+v1 HTML attestations are recomputed against their exact retained source and
+compiler descriptor. Legacy HTML or board sources lacking a v1 attestation
+require a separate format-2 **native host attestation** binding the frozen
+source head, verified report digest, exact canonical W5 body event and SHA-256,
+runtime, and legacy `renders` edges. It refuses an existing v1 attestation,
+named-input declaration, or input/grant closure rather than bypassing their
+verification. This is an unsafe host admission seam, never an MCP operation.
+Its sealed activation event is the attestation; it does not invent a v1 event.
+Historical HTML descriptors keep their original hash and optional-field shape:
+absent diagnostics stay absent, and absent interactions cannot acquire newly
+compiled effects. A completely captured source with an unbound required port
+may activate, but rendering still returns v1's `named_input_missing`; an absent
+exact-source grant returns `module_capability_denied`. Activation grants neither
+missing binding nor missing consent.
+
+Activate only after the completed import and hosted roster verification, on an
+exclusively owned serving generation from which importers have been excluded.
+Activation/replay retains the source pin; later body text (even identical text
+under a different revision), runtime changes, or repointed `renders` edges do
+not replace it. Historical as-of rendering remains unavailable in this lane.
+Ordinary render URLs use opaque encrypted purpose byte `0x04` and a five-minute
+lease, distinct from install `0x01` and preview `0x02`. Every GET, including a compiled-cache hit, requires
+current H2/H3 admission, View, non-archived/non-tombstoned liveness and the exact
+frozen source. A second source check follows composition. The ordinary URL
+never grants installation, preview consent, or App API authority.
+
+HTML can consume its declared, authorized input envelopes. Native input
+materialization uses the same per-record visibility rules as MDX, typed ports,
+root-readable grants and governed SQL. Revalidation compares the artifact and
+actual materialized inputs after preparation; unrelated workspace events do
+not invalidate a render. A governed-query timeout gets at most one retry with
+a fresh authority snapshot. A verified saved input has a separate bounded
+native relation-preparation allowance (8 seconds); its caller SQL VM retains
+the existing 2-second deadline after preparation. Ad hoc SQL retains its
+2-second combined preparation/execution deadline. Non-timeout refusals are not
+retried. Legacy board/HTML `renders` collections also filter
+each record under the current user. Input limits and digest serialization are
+the existing HTML adapter's limits and serialization.
+
+The ordinary workbench HTML host advertises inputs and optional view reporting,
+not `app.call.v2` (`mount.ts:1003`). Adopted HTML **app** frames may use the App
+API through their separately revalidated install/consent and acts-as-user gate;
+ordinary rendering does not advertise those features. Native app reads recheck
+source View, membership and data visibility. Neither HTML declarations nor a
+render URL add user authority. Native declared interaction execution reuses the
+supported MDX facet/lifecycle/create lanes; other effect kinds remain honestly
+unavailable rather than reporting successful writes.
+
+The `v2-html-census` example runs only in a fresh `w7-html-census-*` directory
+under the system temporary directory, with a read-only frozen `source.db`, a
+writable **copy** of its verified full-history `target.db`, and that run's
+`import-report.json`. It checks complete custody and zero import refusals/review
+items, activates each unarchived HTML/board source, executes ordinary native
+rendering, and composes HTML through the shared bundle composer. Output is
+counts and closed-vocabulary refusal categories only. Its temporary counts-only
+checkpoint explicitly marks whether the census has finished. Every artifact
+is rendered through both the read-only v1 path and the native path, including
+native successes. The gate requires equal per-artifact outcomes: a v1 success
+must render on v2, and a v1 refusal must retain the same refusal class on v2.
+Unknown errors, incomplete comparisons, activation failures and any disagreement
+fail the gate. Equal totals alone do not prove parity; pre-existing v1 refusals
+are acceptable only after their individual comparison. Its synthetic local
+catalogue/session is not a browser or production-host qualification. Delete the
+whole directory after the run; retain only counts, never copied source/target
+or report contents. The completed frozen-copy rehearsal compares every one of
+184 artifacts and exits successfully with zero disagreements or uncomparable
+results:
+
+| Outcome | v1 | KernelV2 |
+| --- | ---: | ---: |
+| Unarchived HTML rendered | 143 | 143 |
+| `named_input_missing` | 6 | 6 |
+| `module_capability_denied` | 12 | 12 |
+| `html_source_too_large` | 22 | 22 |
+| Legacy board rendered | 1 | 1 |
+
+All 184 closures activate: 175 retain v1 source attestations and 9 have explicit
+native legacy-source attestations. Activation and bundle failures are both zero.
+The 22 package-marked sources exceed the ordinary renderer's source ceiling;
+installed-app preview/launch retains its separate package ceiling. The read-only
+source copy, target, private report and rehearsal log were deleted after the run.
+
+The runner explicitly calls `prepare_v2_database` on its
+copied target before serving-readiness checks. `NATIVE_CE_HTML_CENSUS_REPLAY_COPY`
+additionally requests a full projection replay; that separate, expensive check
+is not required to compare render outcomes on a verified imported target.
+
+Frozen HTML inputs also require the stored governed-SQL rules (including their
+retained function and ordering allowances), facet observation history, and the
+pseudonymous `agent_activity` relation. This does not broaden ad hoc SQL or
+permit physical-table access. Observation rows are derived from witnessed
+legacy/native facet events and filtered through current record visibility.
+Relationship SQL preserves the original directional link IDs, notes and birth
+times from active imported assertions, with both endpoints authorized. Native
+assertions without imported sources use their host-attested assertion time.
+
+Activity uses the current hosted roster and the v1 pseudonym calculation.
+Imported runs remain closed; native runs use durable start, content and close
+activity. Transient intent capture is unavailable and reported as such; this
+relation does not expose Person identities, client/model fields or private
+intent. Metadata-only SQL stages authorized logical homes before applying the
+public value-size limit, so a large retained body cannot break a query that
+reads only metadata. Explicit body reads retain the existing value-size limit.
+
+Ordinary HTML render and its bundle redemption retain v1's 512 KiB source
+ceiling, including records carrying the package marker. Installed-app preview
+and launch keep their separate 1 MiB package ceiling. Source closure activation
+preserves the full frozen package bytes; it does not enlarge ordinary rendering.
+
+HTML input resolution retains its 20,000-record / 16 MiB capacity; MDX keeps
+its separate 10,000-record / 8 MiB limits. Saved record queries retain v1's
+updated-descending default, authored time/name order, facet primary order
+(including missing values last), offset, and 500-row page cap. Without an
+explicit page, the default is 50 records unless the Collection explicitly sets
+`input_membership=all_matching`. Membership is selected before data hydration;
+the delivered input records then use v1's canonical name/id order. Filtering
+reads metadata after current View authorization instead of loading every
+candidate body. Traversals include imported and native links and the retained
+`relates_to` provider, preserving imported source directions and checking both
+endpoints before decoding provider state.
+
+### W7 guarded editing and browser audit disposition
+
+The cutover editing path for frozen Docs 0.8.2/0.9.0/0.9.1 and Spaces 0.7.0 is a
+local draft with guarded saves. V2 does not run the v1 coedit service. After
+normal same-origin authentication and H2/H3 admission, the coedit WebSocket
+returns an immediate keyed `session.refused` with `code: live_unavailable`.
+It creates no live peer, reads no document and never acknowledges updates.
+The refusal message explains guarded saves rather than promising that a paused
+live service will resume. Unsupported, hidden and missing record IDs receive
+the same deployment-capability refusal. Ordinary reads and each save still
+undergo their own current authorization and app admission.
+
+All three frozen bundles contain the initial-open failure fallback, `body_set`
+and `if_body_digest`. A failed initial join selects their existing local editor.
+A successful save receipt confirms persistence; a stale body digest refuses the
+save without replacing the stored body. Drafts are not durable merely because
+they are visible in the editor. Check save status and copy unconfirmed text
+before closing/reloading. This path provides neither character-level merging
+nor shared cursors. A session already live before cutover does not automatically
+become a guarded editor: the cutover must flush server-held v1 edits, fence the
+old serving generation, and require a fresh mount. Unacknowledged client text
+must be copied/recovered; the server flush cannot confirm it.
+
+Qualification is deliberately split. `liveDeclined.app.test.ts` exercises both
+actual app components falling back, editing and confirming a guarded save.
+The production-H3 hosted fixture checks authenticated cookie+Origin WebSocket
+refusal without kernel events, then a successful guarded save and another
+member's stale-digest 409. A focused hosted editor proof executes the exact
+frozen Docs 0.8.2/0.9.0 and Spaces 0.7.0 bundles in jsdom, using the production
+shell HTTP client and H2/H3/W7 admission. Docs 0.9.1 (0.9.0 plus an editor
+selection fix) has no retained exact bundle in that proof; CI's guarded-apps
+proof builds it from source. With no host subscription capability,
+their actual W6c `whats_changed` poll refreshes a clean open draft and marks a
+dirty draft “Changed elsewhere”, retaining that text without reload. Saves send
+the real `X-Native-App` header and commit attribution and body effects together.
+The native app allowlist admits this poll through the same current-install,
+consent, membership and source-visibility checks as other app reads.
+
+CI builds the public Docs and Spaces sources through their npm script for the
+same proof, without adding Spaces to the shipping catalogue. The optional exact
+frozen-source rehearsal keeps its source/pins outside the repository. The
+jsdom driver preserves the real frame's JSON/WebCrypto realm boundaries; its
+HTTP transport serves the fixture's localhost virtual host. This qualifies the
+guarded editor and polling behavior, not Chromium, frame isolation or a full
+shell journey; H1/H5 owns that separate browser qualification.
+
+The W7 rows in `docs/v2-browser-read-surface.md` (audit PR #2578) have the
+following disposition **after the accepted W7 stack lands**. This is an
+implementation inventory, not a claim that every v1 selector works:
+
+| Surface | Implemented in the accepted stack | Remaining refusal / visible effect |
+| --- | --- | --- |
+| `render_artifact` | #2535/#2536/#2540/#2541/#2544/#2555: attested MDX, bound inputs, governed SQL, styles, interactions and app-authorized reads in `src/mcp/kernel_v2/artifacts.rs`; #2590 adds frozen `native.html.v1` and `native.board.v1` through the shared v1 adapters and live-authorized delivery. | Historical/conditional/timed rendering and module-importing closures refuse. HTML/board rendering requires an activated frozen source closure. Installed frozen HTML app delivery remains a separate verified bundle path (#2527/#2576). |
+| `read_canvas` | #2553/#2555: `get_scene`, `describe`, `changes`, caller-filtered referenced cards and continuous imported/native batch positions in `src/mcp/kernel_v2/canvas.rs` | A canvas must be activated (or qualify as a newly created native-empty canvas). No claim of unregistered selectors. |
+| `manage_canvas` | #2554/#2573: atomic `commit_batch` with group CAS/retries, plus `promote`, in `src/mcp/kernel_v2/canvas.rs` and `canvas/promotion.rs` | `assert_connector` is not implemented. HQ's earlier counts-only census found zero asserted connectors/assertion batches; assertion authoring still needs an explicit adapter. |
+| Canvas presence HTTP/SSE | Not implemented by the W7 stack: `post_canvas_presence` in `held/hosting/src/http.rs` still enters the v1-only connection path | Other participants' pointers/presence are unavailable on v2; scene reads and guarded commits do not provide this feature. The frozen Whiteboard 0.2.0 bundle has no presence calls. This remains an open W7 audit gap for the workbench. |
+| `manage_mdx_modules` | Module/release/grant custody is preserved by #2509 | There is no KernelV2 management handler. Inspect/impact/publish/deprecate/withdraw and executable module-import closure resolution remain missing. Module authoring controls and module-dependent renders cannot be called supported. The private snapshot has zero published module releases and zero module-release dependency rows; this does not establish support for authoring controls. This remains an open W7 audit gap. |
+| `invoke_artifact_interaction` | #2547/#2548/#2572: exact authorized Document/artifact source, facet set/unset including lifecycle, record creation, user/app gesture evidence, acts-as-user admission and atomic attribution in `src/mcp/kernel_v2/intents.rs` | Closed declared effect subset only; unsupported effects refuse. Preservation or rendering alone never grants effect authority. |
 
 ## Native deletion after cutover
 
@@ -665,3 +981,92 @@ It does not activate the v1 derivation runtime. Unknown source tables remain nul
 older imports without these facts receive an unavailable-guard refusal rather
 than assuming a record is unbound. Refresh the source evidence before activation.
 Identical imports append no guard event, and replay preserves the guard facts.
+
+## Retained intervention identity evidence
+
+The sealed account directory includes the source's exact canonical
+`native-principal` identifier (explicit null if absent), tied to its verified
+portable account and Person. This does not populate public binding list/add
+state. Ambiguous canonical principals are blocking report refusals. A versioned
+`identity_directory_capture` receipt binds the directory count; cutover target
+verification requires matching origin, count and prepared fields. Resume the
+original full/history/member import before H3 activation for older targets. The
+rehearsal capture gate requires `state.identity_directory_prepared`; serving
+opens do not repair it. Native canonical additions take precedence in the
+intervention target check. Ordinary history/SQL withhold sealed directory rows.
+
+Canonical account preferences are materialized from the actual `account_configs`
+rows, including deletion/missing-target evidence. Imported mappings are never
+replaced by a kind scan. Resume updates or removes only mappings from the same
+source; native/different-source mappings refuse. `state.account_configs_prepared`
+acknowledges this phase without inventing source rows. An older imported target
+needs the original import resumed before H3 activation; schema preparation alone
+does not establish canonical absence. The cutover capture gate checks this flag
+and the account-config section counts against the read-only source snapshot.
+
+A deleted non-folder self-policy namespace remains for history. After verified
+record tombstoning, an empty namespace with no child homes or native home edits
+needs no placement review. Deleted folders, live records, child homes, native
+namespace edits and physically missing source homes still require review.
+
+Current reserved `surface_binding` links are retained separately in sealed
+`surface_bindings` state, including workspace-root links and the caller's
+personal bindings. They do not become generic native links. Full import and
+resume reconcile counts, deletions and a versioned capture receipt. An older
+target needs its original `--all --history --resume --members-file` import before
+H3 activation; `prepare_v2_database` alone cannot infer missing metadata. The
+independent rehearsal capture gate checks the source reserved-link count.
+
+Ordinary HTML delivery is now an opaque encrypted capability with a five-minute
+lease (`0x04`), rather than the readable hour-long artifact token (`0x03`). The
+installed-app and preview formats remain unchanged. Reusable delivery is not
+needed for kit subresources or ongoing input/App API messages. New renders and
+the existing **Render again** action obtain fresh URLs; loaded documents do not
+stop when a source-delivery lease expires. The short reusable window only
+supports re-navigation of that source URL. Stateless encrypted context avoids
+process affinity while keeping session/principal/database identifiers out of
+readable URL payloads. Live admission and frozen-source checks still run on
+every GET. The required HQ environment settings, durable-key restart check and
+remaining bounded bearer exposure are recorded in the runbook's **W7 HTML
+delivery preflight**.
+
+Success descriptors include the same `runtime.verification` overlay as v1;
+invalid board bodies return v1's `native.artifact-diagnostic.v1` envelope. Native
+saved-query inputs hydrate candidates in order until their requested visible
+page is full, so discarded records consume neither offset nor limit, without
+hydrating later pages unnecessarily.
+
+## Retained member-context associations
+
+The importer captures `member_contexts` as typed sealed current state, preserving
+its exact account, Person, private-root and creation-time association. Context-only
+accounts are included in principal discovery. Missing/deleted references remain
+explicit evidence; conflicting identity or record shapes remain invalid evidence
+and block preparation. Neither a directory Person, a visible home nor an account
+configuration supplies a fallback root.
+
+`state.member_contexts_source_present`, `member_contexts_prepared` and the section
+reconciliation counts distinguish a verified empty source from a missing table.
+A versioned capture receipt is required by cutover target verification, including
+for zero rows. Older unactivated imports need the original source imported again
+before H3 activation; schema preparation and ordinary opens cannot invent this
+state. Activated import resume and local projection patching remain forbidden.
+Same-source preactivation refresh, removal and replay use the existing sealed
+state lane; identical retries append no association or capture events.
+
+Native bootstrap adds `source_context`, separate from its native authenticated
+principal and kernel workspace. Person disclosure requires current View; the
+caller's own retained root independently requires current Manage and a live
+record. A hidden Person does not erase an otherwise authorized own root. This
+field neither grants access nor claims an exclusive private policy or a valid
+starting-context creation contract. Reads perform no repair or canonical run
+lookup. The future member-delivery seam requires both references to be visible;
+it returns only the two authorized IDs, never raw sealed state, other accounts,
+email bindings or private configuration. This seam alone does not qualify an
+installed member copy.
+
+Email behavior is unchanged: all email aliases attached to a live Person with a
+canonical portable account can contribute normalized, lineage-salted H3 matching
+keys. Canonical-versus-secondary email display flags and raw email rows are not
+fabricated as native public bindings. This is distinct from the retained exact
+member-context association and does not expand the email presentation contract.

@@ -48,11 +48,11 @@ enum ManageInterventionsArgs {
     },
 }
 
-struct Raised {
-    message_id: String,
-    event_seq: i64,
-    event_created_at: String,
-    payload: InterventionRaisedPayload,
+pub(crate) struct Raised {
+    pub message_id: String,
+    pub event_seq: i64,
+    pub event_created_at: String,
+    pub payload: InterventionRaisedPayload,
 }
 
 struct ResumeDeliveryParams {
@@ -245,16 +245,6 @@ async fn intervention_view(db: &Db, caller: &Caller, intervention_id: &str) -> R
         _ if raised.payload.disposition == "block_and_request_authority" => "blocked",
         _ => "proceeded",
     };
-    let path = crate::interventions::canonical_route(&database_id, intervention_id);
-    let affordances = if execution == "blocked" {
-        json!([
-            {"kind":"record_decision","enabled":true,"reason_code":null},
-            {"kind":"resume","enabled":true,"reason_code":"requires_exact_authority_evidence"},
-            {"kind":"cancel","enabled":true,"reason_code":null}
-        ])
-    } else {
-        json!([])
-    };
     tx.rollback().await?;
     let obligation = crate::message_expectation::derive_message_expectation_state(
         db,
@@ -262,40 +252,15 @@ async fn intervention_view(db: &Db, caller: &Caller, intervention_id: &str) -> R
         &target_account,
     )
     .await?;
-    let message_summary = raised
-        .payload
-        .disclosure_preview
-        .clone()
-        .unwrap_or_else(|| "The sender did not supply a disclosure-safe preview".into());
-    Ok(json!({
-        "format":crate::interventions::VIEW_FORMAT,
-        "identity":{"intervention_id":intervention_id,"resolver_database_id":database_id,"canonical_url":path},
-        "lineage":{"predecessor_intervention_id":null,"successor_intervention_id":null},
-        "trigger":{
-            "message_id":raised.message_id,
-            "message_content_seq":raised.event_seq,
-            "summary":message_summary,
-            "created_at":message.try_get::<String,_>("created_at")?,
-        },
-        "target":{"person_record_id":raised.payload.target_person_record_id,"principal_id":raised.payload.target_principal_id},
-        "disposition":raised.payload.disposition,
-        "action_snapshot":{"requested_outcome":raised.payload.requested_outcome,"action":raised.payload.action,"action_digest":raised.payload.action_digest},
-        "request":raised.payload.request,
-        "reason":{"summary":raised.payload.reason,"context_refs":raised.payload.context_refs},
-        "state":{
-            "attention":{"state":"unknown","source_format":null},
-            "obligation":serde_json::to_value(obligation)?,
-            "execution":{"state":execution,"basis_event_seq":latest_seq},
-            "timing":{"state":"none","respond_by":null}
-        },
-        "policy_explanation":{"trace_digest":raised.payload.evaluation_digest,"disposition":raised.payload.disposition,"reason_codes":sanitized_policy_reason_codes(&raised.payload.policy_trace),"summary":"Effective policy was evaluated by Native. Private policy source details remain visible only to their authorized principals."},
-        "intended_recipients":raised.payload.intended_recipients,
-        "affordances":affordances,
-        "viewer":{"intent_format":"native.viewer-intent.intervention.v1","supported_focus":["summary"],"supported_evidence":["collapsed","expanded"],"supported_controls":["primary","hidden"],"ref_supported":false},
-        "guard_tokens":{"expected_intervention_seq":latest_seq,"expected_evaluation_digest":raised.payload.evaluation_digest},
-        "projection_seq":latest_seq,
-        "raised_at":raised.event_created_at,
-    }))
+    Ok(view_response(
+        intervention_id,
+        &raised,
+        &database_id,
+        &message.try_get::<String, _>("created_at")?,
+        latest_seq,
+        execution,
+        serde_json::to_value(obligation)?,
+    ))
 }
 
 async fn cancel(
@@ -1008,4 +973,60 @@ pub fn register_intervention_tools(registry: &mut ToolRegistry) -> Result<()> {
         }),
         manage_interventions,
     )
+}
+
+/// The v1 wire shape, shared by native retained-intervention reads.
+pub(crate) fn view_response(
+    intervention_id: &str,
+    raised: &Raised,
+    database_id: &str,
+    message_created_at: &str,
+    latest_seq: i64,
+    execution: &str,
+    obligation: Value,
+) -> Value {
+    let path = crate::interventions::canonical_route(database_id, intervention_id);
+    let affordances = if execution == "blocked" {
+        json!([
+            {"kind":"record_decision","enabled":true,"reason_code":null},
+            {"kind":"resume","enabled":true,"reason_code":"requires_exact_authority_evidence"},
+            {"kind":"cancel","enabled":true,"reason_code":null}
+        ])
+    } else {
+        json!([])
+    };
+    let message_summary = raised
+        .payload
+        .disclosure_preview
+        .clone()
+        .unwrap_or_else(|| "The sender did not supply a disclosure-safe preview".into());
+    json!({
+        "format":crate::interventions::VIEW_FORMAT,
+        "identity":{"intervention_id":intervention_id,"resolver_database_id":database_id,"canonical_url":path},
+        "lineage":{"predecessor_intervention_id":null,"successor_intervention_id":null},
+        "trigger":{
+            "message_id":raised.message_id,
+            "message_content_seq":raised.event_seq,
+            "summary":message_summary,
+            "created_at":message_created_at,
+        },
+        "target":{"person_record_id":raised.payload.target_person_record_id,"principal_id":raised.payload.target_principal_id},
+        "disposition":raised.payload.disposition,
+        "action_snapshot":{"requested_outcome":raised.payload.requested_outcome,"action":raised.payload.action,"action_digest":raised.payload.action_digest},
+        "request":raised.payload.request,
+        "reason":{"summary":raised.payload.reason,"context_refs":raised.payload.context_refs},
+        "state":{
+            "attention":{"state":"unknown","source_format":null},
+            "obligation":obligation,
+            "execution":{"state":execution,"basis_event_seq":latest_seq},
+            "timing":{"state":"none","respond_by":null}
+        },
+        "policy_explanation":{"trace_digest":raised.payload.evaluation_digest,"disposition":raised.payload.disposition,"reason_codes":sanitized_policy_reason_codes(&raised.payload.policy_trace),"summary":"Effective policy was evaluated by Native. Private policy source details remain visible only to their authorized principals."},
+        "intended_recipients":raised.payload.intended_recipients,
+        "affordances":affordances,
+        "viewer":{"intent_format":"native.viewer-intent.intervention.v1","supported_focus":["summary"],"supported_evidence":["collapsed","expanded"],"supported_controls":["primary","hidden"],"ref_supported":false},
+        "guard_tokens":{"expected_intervention_seq":latest_seq,"expected_evaluation_digest":raised.payload.evaluation_digest},
+        "projection_seq":latest_seq,
+        "raised_at":raised.event_created_at,
+    })
 }

@@ -1019,6 +1019,58 @@ async fn publication_busy_receipt_and_missing_receipt_keep_new_sample_unpublishe
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: isolated process; `preview` only try_locks the store
+async fn preview_reports_a_held_receipt_store_as_classified_contention_not_a_genuine_refusal() {
+    if isolated_receipt_process().await {
+        return;
+    }
+    let (db, c, v) = fixture().await;
+    let o = installed(&db, &c, &v).await;
+    let pv = preview_request(&v, &o.event_id);
+    let r = request(&pv);
+    let d = delivery();
+    let g = unsafe { Ingress::from_verified_host(&db, &c, &r, Instant::now()) }.unwrap();
+    {
+        let _held = preview_receipt_store().lock().unwrap();
+        let error = preview(&g, &d).await.err().expect("store is held");
+        assert_eq!(error.to_string(), refused().to_string());
+        assert_eq!(
+            take_preview_refusal(),
+            Some(PreviewRefusal::ReceiptStoreBusy)
+        );
+    }
+    // Released: the same request succeeds and leaves no classification.
+    let p = match preview(&g, &d).await {
+        Ok(p) => p,
+        Err(e) => panic!("{e:?} {:?}", take_preview_refusal()),
+    };
+    assert_eq!(take_preview_refusal(), None);
+    drop(p);
+    // A genuine refusal (malformed install generation) is never classified as
+    // contention.
+    let mut wrong = pv.clone();
+    wrong["expected_install_event_id"] = json!("not-a-generation");
+    let wrong = request(&wrong);
+    let g = unsafe { Ingress::from_verified_host(&db, &c, &wrong, Instant::now()) }.unwrap();
+    assert!(preview(&g, &d).await.is_err());
+    assert_eq!(take_preview_refusal(), None);
+    // A poisoned store is a genuine failure, never classified as contention.
+    let poisoner = std::thread::spawn(|| {
+        let _held = preview_receipt_store().lock().unwrap();
+        panic!("intentionally poison the receipt store");
+    });
+    assert!(poisoner.join().is_err());
+    assert!(preview_receipt_store().is_poisoned());
+    // A valid request (not the malformed one above), so the refusal can only
+    // come from the poisoned store.
+    let g = unsafe { Ingress::from_verified_host(&db, &c, &r, Instant::now()) }.unwrap();
+    let error = preview(&g, &d).await.err().expect("store is poisoned");
+    assert_eq!(error.to_string(), refused().to_string());
+    assert_eq!(take_preview_refusal(), None);
+    // (This test runs in its own isolated process, so the poison stays here.)
+}
+
+#[tokio::test]
 async fn new_feature_receipt_capacity_refuses_without_evicting_older_live_receipts() {
     if isolated_receipt_process().await {
         return;

@@ -643,6 +643,7 @@ async fn claiming_adds_no_event_type_or_claims_table() {
             "persona.registered.v1",
             "persona.retired.v1",
             "message.speaker.declared.v1",
+            "message.revision.recorded.v1",
             "message.audience.declared",
             "message.audience.legacy_unknown",
             "message.origin.declared.v1",

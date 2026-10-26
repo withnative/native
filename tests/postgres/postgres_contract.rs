@@ -6437,6 +6437,153 @@ async fn postgres_content_events_discloses_attribution_by_history_rule() {
 }
 
 #[tokio::test]
+async fn postgres_unknown_column_facet_hint_respects_visibility() {
+    let Some(harness) = configured_harness().await else {
+        return;
+    };
+    let database = harness.fresh_logical_database().await.unwrap();
+    for (id, account, key) in [
+        ("9c150000-0000-4000-8000-300000000001", "acct:alice", "area"),
+        (
+            "9c150000-0000-4000-8000-300000000002",
+            "acct:bea",
+            "secret_key",
+        ),
+    ] {
+        harness
+            .call(
+                &database,
+                TestCaller::Local,
+                "create_record",
+                json!({
+                    "id": id, "type": "Document", "kind": "note", "name": "Facet hint fixture",
+                    "reason": "Test caller-visible facet hints.",
+                    "facets": { (key): "now" }
+                }),
+            )
+            .await
+            .unwrap();
+        database.append_policy_event(PostgresPolicyEvent {
+            id: format!("event:facet-hint:{account}"), record_id: id.into(), event_type: "policy.replaced".into(),
+            payload: Some(json!({"entries":[{"subject_kind":"account", "subject_id":account, "effect":"allow", "capability":"view"}]})),
+            actor: "contract:facet-hint".into(), reason: "Restrict facet hint fixture".into(),
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), act: None,
+        }).await.unwrap();
+    }
+    let visible = qualification_query_sql(
+        database.clone(),
+        Caller::authenticated("acct:alice"),
+        QuerySqlRequest {
+            sql: "SELECT key FROM facet_values ORDER BY key".into(),
+            parameters: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        visible.rows,
+        vec![json!({"key":"area"})],
+        "visible facet fixture"
+    );
+    for (sql, hinted) in [
+        ("SELECT records.area FROM records", true),
+        ("SELECT r.area FROM records r", true),
+        (
+            "SELECT r.area FROM records r JOIN links f ON f.source_id = r.id",
+            true,
+        ),
+        (
+            "SELECT r2.area FROM records r JOIN records r2 ON r2.id = r.id",
+            true,
+        ),
+        ("SELECT id FROM records WHERE area = 'now'", true),
+        ("SELECT secret_key FROM records", false),
+        ("SELECT imaginary_key FROM records", false),
+    ] {
+        let error = qualification_query_sql(
+            database.clone(),
+            Caller::authenticated("acct:alice"),
+            QuerySqlRequest {
+                sql: sql.into(),
+                parameters: vec![],
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Hint: valid columns of records"), "{error}");
+        assert_eq!(
+            error.contains("is a facet, not a column"),
+            hinted,
+            "{error}"
+        );
+        if hinted {
+            assert!(
+                error.ends_with(&native_ce::query::sql_contract::records_facet_column_hint(
+                    sql, &error, "area"
+                )),
+                "{error}"
+            );
+            if sql.contains("records r") {
+                let join = error
+                    .split_once(": JOIN facet_values ")
+                    .unwrap()
+                    .1
+                    .split_once(" and filter ")
+                    .unwrap()
+                    .0;
+                let alias = join.split_whitespace().next().unwrap();
+                let repaired = sql
+                    .replace("r.area", &format!("{alias}.value"))
+                    .replace("r2.area", &format!("{alias}.value"))
+                    + " JOIN facet_values "
+                    + join;
+                qualification_query_sql(
+                    database.clone(),
+                    Caller::authenticated("acct:alice"),
+                    QuerySqlRequest {
+                        sql: repaired,
+                        parameters: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+    let non_column_error = qualification_query_sql(
+        database.clone(),
+        Caller::authenticated("acct:alice"),
+        QuerySqlRequest {
+            sql: "SELECT id FROM records WHERE archived = 'column area does not exist'".into(),
+            parameters: vec![],
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        non_column_error.contains("invalid input syntax"),
+        "{non_column_error}"
+    );
+    assert!(
+        !non_column_error.contains("is a facet"),
+        "{non_column_error}"
+    );
+    qualification_query_sql(
+        database.clone(),
+        Caller::authenticated("acct:alice"),
+        QuerySqlRequest {
+            sql: "SELECT lifecycle, persistence, maturity, archived FROM records".into(),
+            parameters: vec![],
+        },
+    )
+    .await
+    .unwrap();
+    harness.close(&database).await;
+}
+
+#[tokio::test]
 async fn postgres_unknown_column_names_that_relations_columns() {
     // E1 M2 I6: an unknown column on a known logical relation names the
     // valid columns of that relation, identically on every engine. The

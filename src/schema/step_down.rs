@@ -141,6 +141,47 @@ pub const ADDITIONS: &[EngineAddition] = &[
         version: 90,
         added: &[Added::Table("sql_write_receipts")],
     },
+    EngineAddition {
+        version: 91,
+        added: &[
+            Added::Trigger("authorization_subject_record_policies_insert"),
+            Added::Trigger("authorization_subject_record_policies_delete"),
+            Added::Trigger("authorization_subject_record_policies_update"),
+            Added::Trigger("authorization_subject_policy_entries_insert"),
+            Added::Trigger("authorization_subject_policy_entries_delete"),
+            Added::Trigger("authorization_subject_policy_entries_update"),
+            Added::Trigger("authorization_subject_bindings_insert"),
+            Added::Trigger("authorization_subject_bindings_delete"),
+            Added::Trigger("authorization_subject_bindings_update"),
+            Added::Trigger("authorization_subject_records_update"),
+            Added::Trigger("authorization_subject_records_delete"),
+            Added::Trigger("authorization_subject_links_insert"),
+            Added::Trigger("authorization_subject_links_delete"),
+            Added::Trigger("authorization_subject_links_update"),
+            Added::Trigger("authorization_subject_semantic_units_write"),
+            Added::Trigger("authorization_subject_semantic_units_delete"),
+            Added::Trigger("authorization_subject_semantic_units_update"),
+            Added::Trigger("authorization_subject_records_owner"),
+            Added::Table("authorization_subject_births"),
+            Added::Table("authorization_subject_birth_fence"),
+            Added::Table("authorization_subject_revision"),
+        ],
+    },
+    EngineAddition {
+        version: 92,
+        added: &[
+            Added::Trigger("content_event_heads_event_insert"),
+            Added::Trigger("content_event_heads_event_delete"),
+            Added::Trigger("content_event_heads_frontier_insert"),
+            Added::Trigger("content_event_heads_frontier_delete"),
+            Added::Index("idx_content_events_basis_run"),
+            Added::Table("content_event_heads"),
+        ],
+    },
+    EngineAddition {
+        version: 93,
+        added: &[Added::Index("idx_records_unfiled_message_owner")],
+    },
 ];
 
 /// The columns of `records`, in definition order, copied (with `rowid`) when
@@ -210,7 +251,16 @@ pub fn records_type_check_statements() -> Vec<String> {
         crate::schema::DDL_STATEMENTS
             .iter()
             .copied()
-            .filter(|statement| on_records(statement))
+            .filter(|statement| {
+                on_records(statement)
+                    && !ADDITIONS
+                        .iter()
+                        .filter(|edge| edge.version > 86)
+                        .flat_map(|edge| edge.added)
+                        .filter_map(|added| added.object())
+                        .filter(|(kind, _)| matches!(*kind, "trigger" | "index"))
+                        .any(|(_, name)| statement.split_whitespace().any(|word| word == name))
+            })
             .map(str::to_owned),
     );
     statements.push("PRAGMA legacy_alter_table=OFF".to_owned());
@@ -496,8 +546,14 @@ mod tests {
         assert_eq!(object_drop_statements(CURRENT, false), Vec::<String>::new());
         assert_eq!(
             dropped_objects(CURRENT - 1),
-            vec![("table", "sql_write_receipts")]
+            vec![("index", "idx_records_unfiled_message_owner")]
         );
+        assert!(dropped_objects(CURRENT - 2).contains(&("table", "content_event_heads")));
+        assert!(
+            dropped_objects(CURRENT - 2).contains(&("index", "idx_records_unfiled_message_owner"))
+        );
+        assert!(dropped_objects(90).contains(&("table", "authorization_subject_revision")));
+        assert!(!dropped_objects(90).contains(&("table", "sql_write_receipts")));
     }
 
     #[tokio::test]

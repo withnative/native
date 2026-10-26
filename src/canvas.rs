@@ -1442,6 +1442,176 @@ pub async fn apply_batch(
     Ok(detached)
 }
 
+pub(crate) struct Conflict {
+    pub id: String,
+    pub group: Option<&'static str>,
+    pub code: &'static str,
+    pub current: Option<Value>,
+    pub competing_seq: Option<i64>,
+}
+
+/// The groups an op touches, so replay can reproduce the versions a batch
+/// left without re-reading the scene.
+fn touched_groups(op: &Op) -> (bool, bool) {
+    match op {
+        Op::Create { .. } | Op::Delete { .. } | Op::Restore { .. } => (true, true),
+        Op::Patch { set, .. } => (set.touches_geometry(), set.touches_content()),
+    }
+}
+
+pub(crate) fn versions_after(
+    seq: i64,
+    ops: &[Op],
+    pre_images: &BTreeMap<String, PreImage>,
+    detached: &[String],
+) -> Value {
+    let mut objects = Map::new();
+    for op in ops {
+        let (geometry, content) = touched_groups(op);
+        let geometry = geometry || detached.iter().any(|id| id == op.object_id());
+        let pre = pre_images.get(op.object_id());
+        let geometry_seq = if geometry {
+            seq
+        } else {
+            pre.map_or(seq, |pre| pre.geometry)
+        };
+        let content_seq = if content {
+            seq
+        } else {
+            pre.map_or(seq, |pre| pre.content)
+        };
+        objects.insert(
+            op.object_id().to_owned(),
+            json!({
+                "geometry": CanvasVersion(geometry_seq).encode(),
+                "content": CanvasVersion(content_seq).encode(),
+            }),
+        );
+    }
+    // Children detached by a frame delete moved too, without an op of their
+    // own; a client holding their old geometry token must learn the new one.
+    for id in detached {
+        if objects.contains_key(id) {
+            continue;
+        }
+        let content_seq = pre_images.get(id).map_or(seq, |pre| pre.content);
+        objects.insert(
+            id.clone(),
+            json!({
+                "geometry": CanvasVersion(seq).encode(),
+                "content": CanvasVersion(content_seq).encode(),
+            }),
+        );
+    }
+    Value::Object(objects)
+}
+
+fn expected_version(expected: &Expected, group: &str) -> Option<i64> {
+    let token = match group {
+        "geometry" => expected.geometry.as_deref(),
+        _ => expected.content.as_deref(),
+    }?;
+    CanvasVersion::parse(token).map(|version| version.0)
+}
+
+/// Compare every op's `expected` against the snapshot and collect the
+/// pre-image the event will carry. Runs before the dry fold so a stale
+/// precondition is reported as a conflict, never as a referential refusal.
+pub(crate) async fn compare_and_preimage(
+    tx: &mut SqliteConnection,
+    canvas_id: &str,
+    ops: &[Op],
+) -> Result<(Vec<Conflict>, BTreeMap<String, PreImage>)> {
+    let mut conflicts = Vec::new();
+    let mut pre_images = BTreeMap::new();
+    for op in ops {
+        let (id, expected) = match op {
+            Op::Create { .. } => continue,
+            Op::Patch { id, expected, .. }
+            | Op::Delete { id, expected }
+            | Op::Restore { id, expected } => (id, expected),
+        };
+        let Some(current) = load_object(tx, canvas_id, id).await? else {
+            // Referential; the dry fold names it as `unknown_object`.
+            continue;
+        };
+        let current_versions = json!({
+            "geometry": CanvasVersion(current.geometry_seq).encode(),
+            "content": CanvasVersion(current.content_seq).encode(),
+        });
+        if current.deleted && !matches!(op, Op::Restore { .. }) {
+            conflicts.push(Conflict {
+                id: id.clone(),
+                group: None,
+                code: "object_deleted",
+                current: Some(current_versions),
+                competing_seq: Some(current.geometry_seq),
+            });
+            continue;
+        }
+        let mut stale = false;
+        for (group, actual) in [
+            ("geometry", current.geometry_seq),
+            ("content", current.content_seq),
+        ] {
+            if let Some(expected_seq) = expected_version(expected, group) {
+                if expected_seq != actual {
+                    stale = true;
+                    conflicts.push(Conflict {
+                        id: id.clone(),
+                        group: Some(group),
+                        code: "version_mismatch",
+                        current: Some(current_versions.clone()),
+                        competing_seq: Some(actual),
+                    });
+                }
+            }
+        }
+        if stale {
+            continue;
+        }
+        let mut pre = PreImage {
+            geometry: current.geometry_seq,
+            content: current.content_seq,
+            ..PreImage::default()
+        };
+        match op {
+            Op::Patch { set, .. } => {
+                if set.x.is_some() {
+                    pre.x = Some(current.x);
+                }
+                if set.y.is_some() {
+                    pre.y = Some(current.y);
+                }
+                if set.w.is_some() {
+                    pre.w = Some(current.w);
+                }
+                if set.h.is_some() {
+                    pre.h = Some(current.h);
+                }
+                if set.z.is_some() {
+                    pre.z = Some(current.z.clone());
+                }
+                if set.parent.is_some() {
+                    pre.parent = Some(current.parent.clone());
+                }
+                if let Some(patch) = &set.props {
+                    let (_, previous) = merge_props(&current.props, patch);
+                    pre.props = Some(previous);
+                }
+            }
+            Op::Delete { .. } => pre.deleted = Some(false),
+            Op::Restore { .. } => {
+                pre.deleted = Some(true);
+                pre.parent = Some(current.parent.clone());
+            }
+            Op::Create { .. } => unreachable!("creates carry no pre-image"),
+        }
+        pre_images.insert(id.clone(), pre);
+    }
+    Ok((conflicts, pre_images))
+}
+
 /// The digest the ledger stores: JCS over the normalised ops array.
 pub fn ops_digest(ops: &[Op]) -> Result<String> {
     Ok(digest_json(&serde_json::to_value(ops)?))

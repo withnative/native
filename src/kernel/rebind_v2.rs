@@ -56,6 +56,8 @@ pub(super) async fn rebind_record_as(
             pin: Some(pin),
             interpreter: Some(interpreter),
             fields: Some(fields.clone()),
+            origin: None,
+            basis: None,
         },
     };
     append_in(

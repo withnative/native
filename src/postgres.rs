@@ -5364,6 +5364,8 @@ fn stable_tool_result(tool: &str, result: Result<Value>) -> Result<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateArgs {
+    #[serde(rename = "confirm")]
+    _confirm: Option<bool>,
     id: Option<String>,
     #[serde(rename = "type")]
     record_type: String,

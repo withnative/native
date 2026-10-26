@@ -113,6 +113,16 @@ pub(super) enum PlanPolicy {
 /// frozen by `plan_policy_table_is_frozen`.
 pub(super) const PLAN_POLICY_TABLE: &[(&str, &str, PlanPolicy)] = &[
     (
+        RECORDS_WRITE_EXECUTOR,
+        "activate_view",
+        PlanPolicy::RequiredSupported,
+    ),
+    (
+        RECORDS_WRITE_EXECUTOR,
+        "unpublish_view",
+        PlanPolicy::RequiredSupported,
+    ),
+    (
         ACCESS_EXECUTOR,
         POLICY_GRANT_OPERATION,
         PlanPolicy::RequiredSupported,
@@ -411,6 +421,7 @@ pub(super) fn validate(
             identity_action(operation)?,
             source,
         ),
+        (RECORDS_WRITE_EXECUTOR, "activate_view" | "unpublish_view") => Ok(()),
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => Ok(()),
         (RECORDS_DELETE_EXECUTOR, DELETE_RECORD_OPERATION)
         | (RECORDS_DELETE_EXECUTOR, DETACH_ATTACHMENT_OPERATION)
@@ -507,14 +518,14 @@ pub(super) struct WriteRuntime {
 }
 
 #[cfg(test)]
-struct DispatchGate {
-    entered: Arc<tokio::sync::Semaphore>,
-    release: Arc<tokio::sync::Semaphore>,
+pub(super) struct DispatchGate {
+    pub(super) entered: Arc<tokio::sync::Semaphore>,
+    pub(super) release: Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(test)]
 impl DispatchGate {
-    fn new() -> Arc<Self> {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
             release: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -642,10 +653,9 @@ async fn engine_binding(engine: &EngineHandle, caller: &Caller) -> Result<Caller
         .unwrap_or(crate::schema::ROOT_RECORD_ID);
     let database = match engine {
         #[cfg(feature = "v2-kernel-probe")]
-        EngineHandle::KernelV2(_) => {
-            return Err(Error::engine(
-                "kernel-v2: executor write plans are unavailable",
-            ))
+        EngineHandle::KernelV2(db) => {
+            let database=caller.hosting_database().filter(|_|db.open_mode()==crate::db::DatabaseOpenMode::ReadWrite).ok_or_else(||Error::engine("view_profile_unsupported: named-view plans require the authenticated hosted writer route"))?;
+            format!("kernel-v2:{database}")
         }
         EngineHandle::Sqlite(db) => format!("sqlite:{}", crate::identity::database_id(db).await?),
         #[cfg(feature = "postgres")]
@@ -727,6 +737,9 @@ fn canonical_source_arguments(executor: &str, operation: &str, arguments: Value)
             Some(artifact_grant_action(operation)?)
         }
         (IDENTITY_EXECUTOR, operation) => Some(identity_action(operation)?),
+        (RECORDS_WRITE_EXECUTOR, operation @ ("activate_view" | "unpublish_view")) => {
+            Some(operation)
+        }
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => None,
         (RECORDS_DELETE_EXECUTOR, DELETE_RECORD_OPERATION) => None,
         (RECORDS_DELETE_EXECUTOR, DETACH_ATTACHMENT_OPERATION) => Some("detach"),
@@ -2886,6 +2899,52 @@ async fn prepare_operation(
                 }),
             })
         }
+        (RECORDS_WRITE_EXECUTOR, operation @ ("activate_view" | "unpublish_view")) => {
+            #[cfg(feature = "v2-kernel-probe")]
+            if let EngineHandle::KernelV2(db) = engine {
+                let actor = crate::mcp::kernel_v2::principal(db, caller).await?;
+                let evidence = crate::mcp::kernel_v2::writes::named_views::preview(
+                    db,
+                    &actor,
+                    caller,
+                    &canonical_source_arguments,
+                )
+                .await?;
+                let canonical = canonical_source_arguments;
+                let id = canonical["id"]
+                    .as_str()
+                    .ok_or_else(|| Error::engine("named view bearer id required"))?
+                    .to_owned();
+                let state = evidence["state_digest"].as_str().unwrap().to_owned();
+                return Ok(PreparedWrite {
+                    revalidation_arguments,
+                    canonical_source_arguments: canonical,
+                    target_id: id.clone(),
+                    target: format!("named view on {id}"),
+                    state_revision: state.clone(),
+                    target_state_digest: state,
+                    effect: evidence["payload"].clone(),
+                    effect_summary: if operation == "activate_view" {
+                        format!(
+                            "Activate SQL name '{}' at exact revision '{}' on {id}",
+                            evidence["payload"]["name"].as_str().unwrap(),
+                            evidence["payload"]["pin"]["revision_id"].as_str().unwrap()
+                        )
+                    } else {
+                        format!(
+                            "Unpublish SQL name '{}' on {id}",
+                            evidence["current_name"]
+                                .as_str()
+                                .unwrap_or("already unpublished")
+                        )
+                    },
+                    operation_evidence: json!({"kind":"named_view_publication","authority":"workspace_owner"}),
+                });
+            }
+            Err(Error::engine(format!(
+                "view_profile_unsupported: {operation} plans require hosted v2"
+            )))
+        }
         (RECORDS_WRITE_EXECUTOR, CORRECT_RECORD_TYPE_OPERATION) => {
             let prepared = match engine {
                 #[cfg(feature = "v2-kernel-probe")]
@@ -3899,6 +3958,92 @@ impl ExecutorPrototypeStdioServer {
         body
     }
 
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(super) fn set_view_dispatch_gate(&mut self) -> Arc<DispatchGate> {
+        let gate = DispatchGate::new();
+        self.write_runtime.as_mut().unwrap().dispatch_gate = Some(gate.clone());
+        gate
+    }
+    #[cfg(all(test, feature = "v2-kernel-probe"))]
+    pub(super) fn view_dispatch_attempts(&self) -> usize {
+        self.write_runtime
+            .as_ref()
+            .unwrap()
+            .dispatch_attempts
+            .load(Ordering::Relaxed)
+    }
+
+    /// Catalog then workspace, after claim and before completion. The same
+    /// SQL guard verifies the ingress role and excludes demotion until the
+    /// source transaction ends; no view-specific lock or persisted role.
+    async fn dispatch_view_publication(
+        &self,
+        arguments: &Value,
+        message: Value,
+        caller: Caller,
+        persistence_lease: Option<DeploymentPersistenceLease>,
+    ) -> std::result::Result<RpcOutcome, (Error, bool)> {
+        if self.hosted_authority.is_none() {
+            return Err((
+                Error::auth("view publication requires hosted commit authority"),
+                false,
+            ));
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        let prepared = {
+            let EngineHandle::KernelV2(db) = &self.engine else {
+                return Err((Error::engine("view_profile_unsupported"), false));
+            };
+            let actor = crate::mcp::kernel_v2::principal(db, &caller)
+                .await
+                .map_err(|e| (e, false))?;
+            crate::mcp::kernel_v2::writes::named_views::prepare_commit(
+                db, &actor, &caller, arguments,
+            )
+            .await
+            .map_err(|e| (e, false))?
+        };
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let _ = arguments;
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let work = async {
+            let guard = self.acquire_sql_commit_authority(&caller).await.map_err(
+                |(_, detail, uncertain)| {
+                    // Match SQL's definite conflict classification without
+                    // claiming that an unentered workspace dispatch ran.
+                    if uncertain {
+                        Error::engine(detail)
+                    } else {
+                        Error::conflict(detail)
+                    }
+                },
+            )?;
+            dispatched.store(true, Ordering::Relaxed);
+            #[cfg(test)]
+            self.write_runtime
+                .as_ref()
+                .unwrap()
+                .dispatch_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            let dispatch =
+                self.delegate_with_caller_and_persistence(message, caller, persistence_lease);
+            #[cfg(feature = "v2-kernel-probe")]
+            let outcome =
+                crate::mcp::kernel_v2::writes::named_views::with_prevalidated(prepared, dispatch)
+                    .await;
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            let outcome = dispatch.await;
+            if let Some(guard) = guard {
+                guard.rollback().await?;
+            }
+            Ok(outcome)
+        };
+        let result = tokio::time::timeout(sql_commit::HOSTED_GUARDED_SQL_DEADLINE, work).await
+            .map_err(|_| Error::engine("view publication guarded dispatch exceeded 5 seconds; verify the original plan receipt before retrying"))
+            .and_then(|result| result);
+        result.map_err(|error| (error, dispatched.load(Ordering::Relaxed)))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute_write_plan(
         &self,
@@ -4121,6 +4266,35 @@ impl ExecutorPrototypeStdioServer {
                     PlanError::new("plan_integrity_failed", &error.to_string(), false),
                 )
                 .await;
+        }
+        #[cfg(feature = "v2-kernel-probe")]
+        if plan.source_tool == "manage_named_views" {
+            let authorization = async {
+                let EngineHandle::KernelV2(db) = &self.engine else {
+                    return Err(Error::engine("view_profile_unsupported"));
+                };
+                let actor = crate::mcp::kernel_v2::principal(db, &self.caller).await?;
+                crate::mcp::kernel_v2::writes::named_views::authorize_retry(
+                    db,
+                    &actor,
+                    &plan.canonical_source_arguments,
+                    matches!(stored.state, StoredState::Completed { .. }),
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = authorization {
+                return self
+                    .write_plan_error(
+                        id,
+                        modern,
+                        &contract,
+                        &envelope,
+                        telemetry_request.as_ref(),
+                        PlanError::new("view_authority_changed", &error.to_string(), false),
+                    )
+                    .await;
+            }
         }
         let visible_target = envelope.get("target").and_then(Value::as_str);
         let visible_effect = envelope.get("effect_summary").and_then(Value::as_str);
@@ -4439,6 +4613,29 @@ impl ExecutorPrototypeStdioServer {
                 ..super::telemetry::EventSpec::default()
             });
         }
+        let view_publication = plan.source_tool == "manage_named_views"
+            && matches!(plan.operation.as_str(), "activate_view" | "unpublish_view");
+        // Reuse SQL's existing single-flight bound before claiming a plan.
+        // Completed receipt replay returned above and needs no owner lease.
+        let publication_permit = if view_publication {
+            match self.try_acquire_sql_commit_single_flight() {
+                Ok(permit) => permit,
+                Err((code, detail, _)) => {
+                    return self
+                        .write_plan_error(
+                            id,
+                            modern,
+                            &contract,
+                            &envelope,
+                            telemetry_request.as_ref(),
+                            PlanError::new(code, &detail, false),
+                        )
+                        .await
+                }
+            }
+        } else {
+            None
+        };
         let hosted_atomic_membership = self.hosted_membership_plans
             && is_hosted_atomic_membership_operation(&contract.executor, &contract.operation);
         let attempt_id = if hosted_atomic_membership {
@@ -4666,12 +4863,82 @@ impl ExecutorPrototypeStdioServer {
             operation: plan.operation.clone(),
         });
         #[cfg(test)]
-        write_runtime
-            .dispatch_attempts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let outcome = self
-            .delegate_with_caller_and_persistence(message, caller, persistence_lease)
-            .await;
+        if !view_publication {
+            write_runtime
+                .dispatch_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let outcome = if view_publication {
+            match self
+                .dispatch_view_publication(
+                    &plan.canonical_source_arguments,
+                    message,
+                    caller,
+                    persistence_lease,
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err((error, dispatched)) => {
+                    if !dispatched {
+                        // Preflight and catalog admission cannot have entered
+                        // the workspace handler. Keep the source's category,
+                        // release only this claim, and allow normal revalidation.
+                        let detail = error.to_string();
+                        let code = match &error {
+                            Error::Conflict(_) => "plan_stale",
+                            Error::Auth(_) => "view_authority_changed",
+                            Error::Engine(_) => "preparation_rejected",
+                            _ => "plan_preparation_unavailable",
+                        };
+                        let failure = match write_runtime
+                            .store
+                            .release_undispatched(&plan_id, &attempt_id, now_ms())
+                            .await
+                        {
+                            Ok(()) => PlanError::new(code, &detail, false),
+                            Err(_) => PlanError::new("plan_store_unavailable", &detail, false),
+                        };
+                        return self
+                            .write_plan_error(
+                                id,
+                                modern,
+                                &contract,
+                                &envelope,
+                                telemetry_request.as_ref(),
+                                failure,
+                            )
+                            .await;
+                    }
+                    let _ = write_runtime
+                        .store
+                        .mark_indeterminate(
+                            &plan_id,
+                            &attempt_id,
+                            "view publication authority/dispatch did not complete",
+                            now_ms(),
+                        )
+                        .await;
+                    let detail = error.to_string();
+                    let mut failure = PlanError::indeterminate(&detail);
+                    failure.source_dispatch_count = u64::from(dispatched);
+                    return self
+                        .write_plan_error(
+                            id,
+                            modern,
+                            &contract,
+                            &envelope,
+                            telemetry_request.as_ref(),
+                            failure,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            self.delegate_with_caller_and_persistence(message, caller, persistence_lease)
+                .await
+        };
+        drop(publication_permit);
         let mut body = outcome_body(outcome).unwrap_or_else(|| {
             protocol::error_response(
                 id.clone(),
@@ -7022,6 +7289,16 @@ mod tests {
     fn plan_policy_table_is_frozen() {
         let expected: &[(&str, &str, PlanPolicy)] = &[
             (
+                "records_write",
+                "activate_view",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
+                "records_write",
+                "unpublish_view",
+                PlanPolicy::RequiredSupported,
+            ),
+            (
                 "access_admin",
                 "manage_record_policy.grant",
                 PlanPolicy::RequiredSupported,
@@ -7204,13 +7481,13 @@ mod tests {
             ("sql_write", "sql_write", PlanPolicy::RequiredSupported),
         ];
         assert_eq!(PLAN_POLICY_TABLE, expected);
-        assert_eq!(PLAN_POLICY_TABLE.len(), 37);
+        assert_eq!(PLAN_POLICY_TABLE.len(), 39);
         assert_eq!(
             PLAN_POLICY_TABLE
                 .iter()
                 .filter(|(_, _, policy)| *policy == PlanPolicy::RequiredSupported)
                 .count(),
-            35
+            37
         );
         assert_eq!(
             PLAN_POLICY_TABLE
@@ -9762,13 +10039,13 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(classified.len(), 36);
+        assert_eq!(classified.len(), 38);
         assert_eq!(
             classified
                 .iter()
                 .filter(|(executor, operation)| supports(executor, operation))
                 .count(),
-            34
+            36
         );
         assert!(supports(EXECUTOR, OPERATION));
         for operation in [

@@ -7,7 +7,7 @@
   "candidate_surfaces": {
     "stable": {
       "ordinary": {
-        "descriptor_bytes": 43840,
+        "descriptor_bytes": 44228,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -236,10 +236,12 @@
                     "get_record",
                     "get_reuse_context",
                     "get_structure",
+                    "get_view_revision",
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
                     "get_workspace_snapshot.resume",
+                    "list_view_revisions",
                     "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
@@ -251,6 +253,7 @@
                     "query_record",
                     "read_attachment",
                     "read_attributions",
+                    "read_hcp_audit",
                     "render_record",
                     "render_record_version_diff",
                     "render_suggestion_review",
@@ -297,6 +300,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "activate_view",
                     "attach_text",
                     "batch_write",
                     "claim_unowned_record",
@@ -318,9 +322,12 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "prepare_named_views",
+                    "record_view_revision",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
                     "save_account",
+                    "unpublish_view",
                     "update_record"
                   ]
                 },
@@ -358,6 +365,7 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "activate_view",
                         "attach_text",
                         "batch_write",
                         "claim_unowned_record",
@@ -379,9 +387,12 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "prepare_named_views",
+                        "record_view_revision",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
                         "save_account",
+                        "unpublish_view",
                         "update_record"
                       ]
                     },
@@ -426,7 +437,9 @@
                     "operation": {
                       "type": "string",
                       "enum": [
-                        "correct_record_type"
+                        "activate_view",
+                        "correct_record_type",
+                        "unpublish_view"
                       ]
                     },
                     "run_key": {
@@ -1551,6 +1564,7 @@
                     "manage_interventions.get",
                     "manage_interventions.query",
                     "manage_messages.get_attention",
+                    "manage_messages.get_notification_preference",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -1599,6 +1613,8 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.delete",
+                    "manage_messages.edit",
                     "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
@@ -1607,6 +1623,7 @@
                     "manage_messages.send",
                     "manage_messages.set_agent_disposition",
                     "manage_messages.set_destination",
+                    "manage_messages.set_notification_preference",
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
@@ -2444,7 +2461,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 50087,
+        "descriptor_bytes": 50458,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -2699,10 +2716,12 @@
                     "get_record",
                     "get_reuse_context",
                     "get_structure",
+                    "get_view_revision",
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
                     "get_workspace_snapshot.resume",
+                    "list_view_revisions",
                     "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
@@ -2772,6 +2791,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "activate_view",
                     "attach_text",
                     "batch_write",
                     "claim_unowned_record",
@@ -2793,9 +2813,12 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "prepare_named_views",
+                    "record_view_revision",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
                     "save_account",
+                    "unpublish_view",
                     "update_record"
                   ]
                 },
@@ -2837,6 +2860,7 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "activate_view",
                         "attach_text",
                         "batch_write",
                         "claim_unowned_record",
@@ -2858,9 +2882,12 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "prepare_named_views",
+                        "record_view_revision",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
                         "save_account",
+                        "unpublish_view",
                         "update_record"
                       ]
                     },
@@ -2909,7 +2936,9 @@
                     "operation": {
                       "type": "string",
                       "enum": [
-                        "correct_record_type"
+                        "activate_view",
+                        "correct_record_type",
+                        "unpublish_view"
                       ]
                     },
                     "run_key": {
@@ -4175,6 +4204,7 @@
                     "manage_interventions.get",
                     "manage_interventions.query",
                     "manage_messages.get_attention",
+                    "manage_messages.get_notification_preference",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -4235,6 +4265,8 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.delete",
+                    "manage_messages.edit",
                     "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
@@ -4243,6 +4275,7 @@
                     "manage_messages.send",
                     "manage_messages.set_agent_disposition",
                     "manage_messages.set_destination",
+                    "manage_messages.set_notification_preference",
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
@@ -5106,7 +5139,7 @@
     },
     "build_enabled_experimental": {
       "ordinary": {
-        "descriptor_bytes": 46930,
+        "descriptor_bytes": 47318,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -5336,10 +5369,12 @@
                     "get_record",
                     "get_reuse_context",
                     "get_structure",
+                    "get_view_revision",
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
                     "get_workspace_snapshot.resume",
+                    "list_view_revisions",
                     "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
@@ -5351,6 +5386,7 @@
                     "query_record",
                     "read_attachment",
                     "read_attributions",
+                    "read_hcp_audit",
                     "render_record",
                     "render_record_version_diff",
                     "render_suggestion_review",
@@ -5397,6 +5433,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "activate_view",
                     "attach_text",
                     "batch_write",
                     "claim_unowned_record",
@@ -5418,9 +5455,12 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "prepare_named_views",
+                    "record_view_revision",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
                     "save_account",
+                    "unpublish_view",
                     "update_record"
                   ]
                 },
@@ -5458,6 +5498,7 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "activate_view",
                         "attach_text",
                         "batch_write",
                         "claim_unowned_record",
@@ -5479,9 +5520,12 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "prepare_named_views",
+                        "record_view_revision",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
                         "save_account",
+                        "unpublish_view",
                         "update_record"
                       ]
                     },
@@ -5526,7 +5570,9 @@
                     "operation": {
                       "type": "string",
                       "enum": [
-                        "correct_record_type"
+                        "activate_view",
+                        "correct_record_type",
+                        "unpublish_view"
                       ]
                     },
                     "run_key": {
@@ -6651,6 +6697,7 @@
                     "manage_interventions.get",
                     "manage_interventions.query",
                     "manage_messages.get_attention",
+                    "manage_messages.get_notification_preference",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -6699,6 +6746,8 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.delete",
+                    "manage_messages.edit",
                     "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
@@ -6707,6 +6756,7 @@
                     "manage_messages.send",
                     "manage_messages.set_agent_disposition",
                     "manage_messages.set_destination",
+                    "manage_messages.set_notification_preference",
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
@@ -7719,7 +7769,7 @@
         ]
       },
       "lens": {
-        "descriptor_bytes": 53709,
+        "descriptor_bytes": 54080,
         "descriptors": [
           {
             "name": "bootstrap",
@@ -7975,10 +8025,12 @@
                     "get_record",
                     "get_reuse_context",
                     "get_structure",
+                    "get_view_revision",
                     "get_workspace_snapshot.catch_up",
                     "get_workspace_snapshot.open",
                     "get_workspace_snapshot.page",
                     "get_workspace_snapshot.resume",
+                    "list_view_revisions",
                     "manage_account_config.inspect",
                     "manage_attachments.inspect",
                     "manage_attachments.list",
@@ -8048,6 +8100,7 @@
                 "operation": {
                   "type": "string",
                   "enum": [
+                    "activate_view",
                     "attach_text",
                     "batch_write",
                     "claim_unowned_record",
@@ -8069,9 +8122,12 @@
                     "manage_relationships.assert",
                     "manage_relationships.contest",
                     "manage_relationships.retract",
+                    "prepare_named_views",
+                    "record_view_revision",
                     "resolve_suggestions.accept",
                     "resolve_suggestions.reject",
                     "save_account",
+                    "unpublish_view",
                     "update_record"
                   ]
                 },
@@ -8113,6 +8169,7 @@
                     "operation": {
                       "type": "string",
                       "enum": [
+                        "activate_view",
                         "attach_text",
                         "batch_write",
                         "claim_unowned_record",
@@ -8134,9 +8191,12 @@
                         "manage_relationships.assert",
                         "manage_relationships.contest",
                         "manage_relationships.retract",
+                        "prepare_named_views",
+                        "record_view_revision",
                         "resolve_suggestions.accept",
                         "resolve_suggestions.reject",
                         "save_account",
+                        "unpublish_view",
                         "update_record"
                       ]
                     },
@@ -8185,7 +8245,9 @@
                     "operation": {
                       "type": "string",
                       "enum": [
-                        "correct_record_type"
+                        "activate_view",
+                        "correct_record_type",
+                        "unpublish_view"
                       ]
                     },
                     "run_key": {
@@ -9451,6 +9513,7 @@
                     "manage_interventions.get",
                     "manage_interventions.query",
                     "manage_messages.get_attention",
+                    "manage_messages.get_notification_preference",
                     "manage_messages.list_context",
                     "manage_messages.list_conversation",
                     "manage_messages.list_destinations",
@@ -9511,6 +9574,8 @@
                     "manage_interventions.resume_delivery",
                     "manage_messages.add_reaction",
                     "manage_messages.classify",
+                    "manage_messages.delete",
+                    "manage_messages.edit",
                     "manage_messages.mark_no_longer_relevant",
                     "manage_messages.move",
                     "manage_messages.mutate_human_awareness",
@@ -9519,6 +9584,7 @@
                     "manage_messages.send",
                     "manage_messages.set_agent_disposition",
                     "manage_messages.set_destination",
+                    "manage_messages.set_notification_preference",
                     "manage_messages.set_preference",
                     "manage_messages.set_routing",
                     "manage_messages.share_history",
@@ -10850,6 +10916,17 @@
       "candidate_plan_policy": "direct"
     },
     {
+      "legacy_tool": "read_hcp_audit",
+      "legacy_action": "call",
+      "stability": "stable",
+      "availability": [
+        "ordinary"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "read_hcp_audit",
+      "candidate_plan_policy": "direct"
+    },
+    {
       "legacy_tool": "resolve_external",
       "legacy_action": "call",
       "stability": "stable",
@@ -11511,6 +11588,30 @@
     },
     {
       "legacy_tool": "manage_messages",
+      "legacy_action": "delete",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_messages.delete",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
+      "legacy_action": "edit",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_messages.edit",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
       "legacy_action": "get_attention",
       "stability": "stable",
       "availability": [
@@ -11519,6 +11620,18 @@
       ],
       "candidate_executor": "messaging_read",
       "candidate_operation": "manage_messages.get_attention",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
+      "legacy_action": "get_notification_preference",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_read",
+      "candidate_operation": "manage_messages.get_notification_preference",
       "candidate_plan_policy": "direct"
     },
     {
@@ -11715,6 +11828,18 @@
     },
     {
       "legacy_tool": "manage_messages",
+      "legacy_action": "set_notification_preference",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "messaging_write",
+      "candidate_operation": "manage_messages.set_notification_preference",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_messages",
       "legacy_action": "set_preference",
       "stability": "stable",
       "availability": [
@@ -11856,6 +11981,78 @@
       "candidate_executor": "messaging_write",
       "candidate_operation": "manage_interventions.resume_delivery",
       "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "activate_view",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "activate_view",
+      "candidate_plan_policy": "plan_required"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "get_view_revision",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "get_view_revision",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "list_view_revisions",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_read",
+      "candidate_operation": "list_view_revisions",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "prepare_named_views",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "prepare_named_views",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "record_view_revision",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "record_view_revision",
+      "candidate_plan_policy": "direct"
+    },
+    {
+      "legacy_tool": "manage_named_views",
+      "legacy_action": "unpublish_view",
+      "stability": "stable",
+      "availability": [
+        "ordinary",
+        "lens"
+      ],
+      "candidate_executor": "records_write",
+      "candidate_operation": "unpublish_view",
+      "candidate_plan_policy": "plan_required"
     },
     {
       "legacy_tool": "instantiate_artifact",

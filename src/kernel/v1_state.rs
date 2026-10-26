@@ -3,6 +3,17 @@
 use super::*;
 use serde_json::Value;
 
+pub(crate) mod member_context;
+
+pub(crate) const SOURCE_HEAD_INDEX: &str = "CREATE INDEX idx_kernel_import_source_head ON content_events(seq) WHERE type='kernel.import_source_head.v1'";
+
+pub(crate) const IDENTITY_CAPTURE: &str = "identity_directory_capture";
+// Version 2 makes refusal accounting mandatory. Version-1-aware cutover
+// operators reject this receipt before activation. Pre-protocol binaries must
+// be excluded by the runbook's installed-revision preflight.
+pub(crate) const IDENTITY_CAPTURE_VERSION: u64 = 2;
+pub(crate) const SURFACE_CAPTURE: &str = "surface_bindings_capture";
+
 pub(crate) const EVENT: &str = "kernel.v1_state_imported.v1";
 pub(crate) const DDL: &str = "CREATE TABLE kernel_v1_state (
  section TEXT NOT NULL, source_id TEXT NOT NULL, origin TEXT NOT NULL,
@@ -12,6 +23,9 @@ pub(crate) const DDL: &str = "CREATE TABLE kernel_v1_state (
 
 pub(crate) const RUN_INDEX:&str="CREATE INDEX idx_kernel_v1_state_run ON kernel_v1_state(section,json_extract(payload,'$.run_key'))";
 pub(crate) const ACCOUNT_INDEX:&str="CREATE INDEX idx_kernel_v1_state_account ON kernel_v1_state(section,account_principal,record_id)";
+
+pub(crate) const RECORD_INDEX: &str =
+    "CREATE INDEX idx_kernel_v1_state_record ON kernel_v1_state(section,record_id,source_id)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +54,14 @@ fn validate(row: &ImportedState) -> Result<()> {
     }
     if !matches!(
         row.section.as_str(),
-        "record_deletion_guards"
+        "member_contexts"
+            | "member_context_capture"
+            | "identity_directory_capture"
+            | "surface_bindings"
+            | "surface_bindings_capture"
+            | "account_config_capture"
+            | "account_configs"
+            | "record_deletion_guards"
             | "account_directory"
             | "vocabularies"
             | "vocabulary_values"
@@ -66,7 +87,7 @@ pub(crate) async fn ensure_schema(conn: &mut SqliteConnection) -> Result<()> {
     sqlx::query(&DDL.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
         .execute(&mut *conn)
         .await?;
-    for ddl in [RUN_INDEX, ACCOUNT_INDEX] {
+    for ddl in [RUN_INDEX, ACCOUNT_INDEX, RECORD_INDEX, SOURCE_HEAD_INDEX] {
         sqlx::query(&ddl.replacen("CREATE INDEX", "CREATE INDEX IF NOT EXISTS", 1))
             .execute(&mut *conn)
             .await?;
@@ -144,6 +165,9 @@ pub async fn import_state_batch_as(
             _ => false,
         };
         if unchanged {
+            if !account_config::imported_matches_on(&mut tx, row).await? {
+                return Err(Error::conflict("account config projection differs from its sealed import; reproject explicitly"));
+            }
             result.push(ImportResult::Unchanged);
             continue;
         }
@@ -193,8 +217,9 @@ async fn validate_account(conn: &mut SqliteConnection, row: &ImportedState) -> R
             return Err(Error::engine("invalid imported account identity"));
         }
         let key = match row.section.as_str() {
+            "member_contexts" => Some("root_record_id"),
             "account_directory" => Some("person_record_id"),
-            "claims" | "record_deletion_guards" => Some("record_id"),
+            "claims" | "record_deletion_guards" | "account_configs" => Some("record_id"),
             _ => None,
         };
         if let Some(key) = key {
@@ -203,6 +228,7 @@ async fn validate_account(conn: &mut SqliteConnection, row: &ImportedState) -> R
             }
         }
     }
+    member_context::validate_envelope(row)?;
     let account = value
         .as_ref()
         .and_then(|v| v.get("account_id"))
@@ -251,6 +277,7 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
             preserve_identity(&row.section, &old, new)?;
         }
     }
+    account_config::project_imported_on(conn, &row, event.local_seq).await?;
     match &row.value_json {
         Some(value) => {
             sqlx::query("INSERT INTO kernel_v1_state VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(section,source_id) DO UPDATE SET payload=excluded.payload,account_principal=excluded.account_principal,record_id=excluded.record_id,observed_at=excluded.observed_at,event_seq=excluded.event_seq")
@@ -360,24 +387,32 @@ pub(crate) async fn lifecycle_bearer_on(
 }
 
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) async fn lifecycle_as(
-    db: &Db,
+pub(crate) async fn lifecycle_on(
+    tx: &mut SqliteConnection,
     actor: &str,
     typ: &str,
     kind: Option<&str>,
     id: &str,
     lifecycle: Option<&str>,
 ) -> Result<Value> {
-    let mut tx = db.write_pool().begin().await?;
     #[cfg(feature = "v2-kernel-probe")]
-    app_installs::admit_dispatched_on(&mut tx, actor).await?;
-    kernel_require(&mut tx, actor, id, Capability::View).await?;
+    app_installs::admit_dispatched_on(tx, actor).await?;
+    kernel_require(tx, actor, id, Capability::View).await?;
     let home: String = sqlx::query_scalar("SELECT home_id FROM kernel_records WHERE id=?")
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-    let bearer = lifecycle_bearer_on(&mut tx, &home, Some(id)).await?;
-    let interpreter = interpreter_on(&mut tx, actor).await?;
+    let bearer = lifecycle_bearer_on(tx, &home, Some(id)).await?;
+    let key = super::read_cache::key_on(tx, actor, "lifecycle").await?;
+    let interpreter =
+        match super::read_cache::get::<crate::query::lifecycle::LifecycleInterpreter>(&key) {
+            Some(cached) => cached,
+            None => {
+                let interpreter = std::sync::Arc::new(interpreter_on(tx, actor).await?);
+                super::read_cache::put(key, interpreter.clone());
+                interpreter
+            }
+        };
     Ok(serde_json::to_value(interpreter.interpret(
         typ,
         kind,
@@ -443,6 +478,10 @@ pub(crate) async fn disclosed_accounts_on(
     conn: &mut SqliteConnection,
     actor: &str,
 ) -> Result<std::collections::BTreeSet<String>> {
+    let key = super::read_cache::key_on(conn, actor, "disclosed_accounts").await?;
+    if let Some(cached) = super::read_cache::get::<std::collections::BTreeSet<String>>(&key) {
+        return Ok((*cached).clone());
+    }
     let mut allowed = std::collections::BTreeSet::from([actor.to_owned()]);
     // SQL staging may own a TEMP content_events facade. The import witness
     // must always come from the canonical main log.
@@ -455,15 +494,19 @@ pub(crate) async fn disclosed_accounts_on(
             allowed.insert(account);
         }
     }
+    super::read_cache::put(key, std::sync::Arc::new(allowed.clone()));
     Ok(allowed)
 }
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) async fn claims_as(db: &Db, actor: &str, id: &str) -> Result<Vec<Value>> {
-    let mut tx = db.write_pool().begin().await?;
+pub(crate) async fn claims_on(
+    tx: &mut SqliteConnection,
+    actor: &str,
+    id: &str,
+) -> Result<Vec<Value>> {
     #[cfg(feature = "v2-kernel-probe")]
-    app_installs::admit_dispatched_on(&mut tx, actor).await?;
-    kernel_require(&mut tx, actor, id, Capability::View).await?;
-    let allowed = disclosed_accounts_on(&mut tx, actor).await?;
+    app_installs::admit_dispatched_on(tx, actor).await?;
+    kernel_require(tx, actor, id, Capability::View).await?;
+    let allowed = disclosed_accounts_on(tx, actor).await?;
     let rows:Vec<(String,String,Option<String>)>=sqlx::query_as("SELECT payload,observed_at,account_principal FROM kernel_v1_state WHERE section='claims' AND record_id=? ORDER BY source_id").bind(id).fetch_all(&mut *tx).await?;
     rows.into_iter()
         .filter(|(_, _, account)| account.as_ref().is_some_and(|a| allowed.contains(a)))
@@ -570,4 +613,49 @@ pub(crate) async fn validate_native_event(
         Some(&bearer),
         fields.get("lifecycle").and_then(Value::as_str),
     )
+}
+
+/// Data readiness for the cutover target and source-identity consumers. Native
+/// databases have no source directory; an imported empty set needs a receipt.
+pub(crate) async fn require_identity_directory_capture_on(
+    conn: &mut SqliteConnection,
+) -> Result<()> {
+    let origin:Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.origin') FROM main.content_events WHERE type='kernel.import_source_head.v1' ORDER BY seq DESC LIMIT 1").fetch_optional(&mut *conn).await?;
+    let Some(origin) = origin else { return Ok(()) };
+    let row:Option<(String,String)>=sqlx::query_as("SELECT payload,origin FROM main.kernel_v1_state WHERE section=? AND source_id='identity-directory/v1'").bind(IDENTITY_CAPTURE).fetch_optional(&mut *conn).await?;
+    let error = || {
+        Error::engine(
+            "identity directory needs preparation; resume the original import before H3 activation",
+        )
+    };
+    let (raw, recorded_origin) = row.ok_or_else(error)?;
+    let value: Value = serde_json::from_str(&raw)?;
+    let count = value["accounts"]
+        .as_i64()
+        .filter(|n| *n >= 0)
+        .ok_or_else(error)?;
+    if recorded_origin != origin
+        || value["version"].as_u64() != Some(IDENTITY_CAPTURE_VERSION)
+        || value["refused"].as_u64() != Some(0)
+    {
+        return Err(error());
+    }
+    let (rows,ready):(i64,i64)=sqlx::query_as("SELECT count(*),coalesce(sum(CASE WHEN origin=? AND json_type(payload,'$.native_principal_id') IN ('text','null') THEN 1 ELSE 0 END),0) FROM main.kernel_v1_state WHERE section='account_directory'").bind(&origin).fetch_one(conn).await?;
+    if rows != count || ready != count {
+        return Err(error());
+    }
+    Ok(())
+}
+
+/// Data-dependent surface/cutover readiness; structural preparation cannot invent a
+/// missing root/personal binding capture. Generic import opens remain usable.
+pub(crate) async fn require_surface_capture_on(conn: &mut SqliteConnection) -> Result<()> {
+    let origin:Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.origin') FROM main.content_events WHERE type='kernel.import_source_head.v1' ORDER BY seq DESC LIMIT 1").fetch_optional(&mut *conn).await?;
+    if let Some(origin) = origin {
+        let captured:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.kernel_v1_state WHERE section=? AND source_id='surface-bindings/v1' AND origin=? AND json_extract(payload,'$.version')=1)").bind(SURFACE_CAPTURE).bind(origin).fetch_one(conn).await?;
+        if !captured {
+            return Err(Error::engine("imported surface bindings need preparation: resume the original import before H3 activation"));
+        }
+    }
+    Ok(())
 }

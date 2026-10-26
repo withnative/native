@@ -14,6 +14,9 @@ use crate::{
 use serde_json::{json, Map, Value};
 use sqlx::{Sqlite, Transaction};
 
+mod batch;
+pub(crate) mod named_views;
+
 pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
     for tool in [
         "attach_text",
@@ -21,6 +24,8 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
         "update_record",
         "manage_links",
         "archive_record",
+        "batch_write",
+        "manage_named_views",
     ] {
         registry.register_engine_handler(
             tool,
@@ -29,7 +34,27 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
                 let EngineHandle::KernelV2(db) = engine else {
                     unreachable!()
                 };
+                if tool == "manage_named_views" {
+                    crate::named_views::gate::require()?;
+                    if matches!(
+                        args["action"].as_str(),
+                        Some("activate_view" | "unpublish_view")
+                    ) {
+                        let action = args["action"].as_str().unwrap();
+                        if !caller
+                            .write_plan_execution()
+                            .is_some_and(|p| p.executor == "records_write" && p.operation == action)
+                        {
+                            return Err(Error::engine(
+                                "named view publication requires an executor write plan",
+                            ));
+                        }
+                    }
+                }
                 let actor = principal(&db, &caller).await?;
+                if tool == "manage_named_views" {
+                    return named_views::execute(&db, &actor, &caller, args).await;
+                }
                 execute(&db, &actor, tool, args).await
             },
         )?;
@@ -74,7 +99,7 @@ fn allowed(args: &Value, keys: &[&str]) -> Result<()> {
 
 // Durable adapter state, deliberately independent of rebuildable kernel
 // projections. BEGIN IMMEDIATE serializes lookup, mutation and receipt insert.
-pub(super) const RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS kernel_mcp_write_receipts (principal_id TEXT NOT NULL, operation TEXT NOT NULL, operation_key TEXT NOT NULL, request_json TEXT NOT NULL, receipt_json TEXT NOT NULL, PRIMARY KEY(principal_id,operation,operation_key))";
+pub(super) const RECEIPTS: &str = crate::kernel::MCP_WRITE_RECEIPTS_DDL;
 
 // Digest only attachment text; retain every other argument for exact conflicts.
 // Accept old receipts on retry, then replace their full text after authorization.
@@ -118,6 +143,14 @@ fn dispatched_fingerprint(tool: &str, request: Value) -> Result<String> {
 }
 
 async fn execute(db: &Db, actor: &str, tool: &str, args: Value) -> Result<Value> {
+    if tool == "manage_named_views" {
+        return Err(Error::auth(
+            "named view operations require authenticated caller dispatch",
+        ));
+    }
+    if tool == "batch_write" {
+        return batch::execute(db, actor, args).await;
+    }
     if tool == "manage_links" && args["action"] == "list" {
         return list_links(db, actor, args).await;
     }
@@ -327,11 +360,7 @@ async fn receipt(
         &current.fields,
     );
 
-    let updated_at: String =
-        sqlx::query_scalar("SELECT created_at FROM content_events WHERE seq=?")
-            .bind(current.revision)
-            .fetch_one(&mut **tx)
-            .await?;
+    let updated_at = kernel::record_metadata::updated_at_on(tx, id).await?;
     let changed = effect != "unchanged";
     let mut result = json!({"id":id, "changed":changed, "short_ref":display_reference, "display_reference":display_reference, "effect":effect,
         "name":current.fields.get("title"), "type":record_type, "kind":kind,
@@ -455,7 +484,7 @@ async fn metadata_patch(
     Ok(())
 }
 
-async fn create(
+pub(super) async fn create(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
     acts: &mut ActAllocation,
@@ -464,6 +493,16 @@ async fn create(
 ) -> Result<Value> {
     create_with_message(db, tx, acts, actor, args, None).await
 }
+pub(super) async fn create_with_origin(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+    origin: Value,
+) -> Result<Value> {
+    create_with_details(db, tx, acts, actor, args, None, Some(origin)).await
+}
 pub(super) async fn create_with_message(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
@@ -471,6 +510,19 @@ pub(super) async fn create_with_message(
     actor: &str,
     args: &Value,
     message: Option<&kernel::MessageState>,
+) -> Result<Value> {
+    create_with_details(db, tx, acts, actor, args, message, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_with_details(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+    message: Option<&kernel::MessageState>,
+    origin: Option<Value>,
 ) -> Result<Value> {
     allowed(
         args,
@@ -490,7 +542,10 @@ pub(super) async fn create_with_message(
             "target",
             "reason",
             "response_mode",
+            "confirm",
             "idempotency_key",
+            "access_policy",
+            "sources",
         ],
     )?;
     let typ = text(args, "type")?;
@@ -515,6 +570,32 @@ pub(super) async fn create_with_message(
     }
     validate_lifecycle(args)?;
     let comment = super::comments::is_comment_type(typ, kind);
+    let account_only = match optional_text(args, "access_policy")? {
+        None => false,
+        Some("account_only") => true,
+        Some(_) => {
+            return Err(invalid(
+                "access_policy must be the single literal account_only",
+            ))
+        }
+    };
+    if account_only && (typ == "Message" || typ == "Annotation" || message.is_some()) {
+        return Err(invalid("access_policy is not supported for derived records or Messages; the bearer or audience owns the policy boundary"));
+    }
+    if account_only {
+        let account: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_principals WHERE principal_id=? AND kind='account')")
+            .bind(actor).fetch_one(&mut **tx).await?;
+        if !account {
+            return Err(invalid(
+                "access_policy requires an authenticated account principal",
+            ));
+        }
+    }
+    let basis = super::source_basis::resolve(tx, actor, args.get("sources")).await?;
+    let declared_sources = basis
+        .as_ref()
+        .map(|b| b["sources"].as_array().unwrap().len());
+
     if !comment && args.get("target").is_some_and(|target| !target.is_null()) {
         return Err(Error::engine(
             "create_record: target is valid only for Annotation kind:citation or a comment root",
@@ -633,6 +714,7 @@ pub(super) async fn create_with_message(
                 kernel::FieldInput::Raw(&raw),
                 &home,
                 &plan.bearer,
+                basis.clone(),
             )
             .await?
         }
@@ -649,6 +731,8 @@ pub(super) async fn create_with_message(
                 None,
                 true,
                 optional_text(args, "id")?,
+                origin,
+                basis,
             )
             .await?
         }
@@ -664,6 +748,9 @@ pub(super) async fn create_with_message(
             serde_json::to_value(message)?,
         )
         .await?;
+    }
+    if account_only {
+        kernel::account_only_record_in(db, tx, acts, actor, &id).await?;
     }
     if typ == "Collection" && kind == "folder" {
         kernel::folder_home_in(db, tx, acts, actor, &id).await?;
@@ -715,15 +802,32 @@ pub(super) async fn create_with_message(
     if let Some(bearer) = annotation_bearer {
         kernel::comments_v2::append_bearer_link_in(db, tx, acts, actor, &id, &bearer).await?;
     }
-    receipt(tx, actor, &id, "created", None, targets).await
+    let mut result = receipt(tx, actor, &id, "created", None, targets).await?;
+    if let Some(feedback) =
+        super::super::tools::lifecycle::declared_basis_feedback(declared_sources)
+    {
+        result["basis"] = feedback;
+    }
+    Ok(result)
 }
 
-pub(super) async fn update(
+pub(crate) async fn update(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
     acts: &mut ActAllocation,
     actor: &str,
     args: &Value,
+) -> Result<Value> {
+    update_with_origin(db, tx, acts, actor, args, None).await
+}
+
+pub(super) async fn update_with_origin(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    args: &Value,
+    origin: Option<Value>,
 ) -> Result<Value> {
     if kernel::messaging::is_message(tx, text(args, "id")?).await? {
         return Err(invalid(
@@ -746,6 +850,7 @@ pub(super) async fn update(
             "body_replace",
             "if_body_digest",
             "if_unmodified_since",
+            "if_policy_revision",
             "facets",
             "links",
             "reason",
@@ -783,6 +888,13 @@ pub(super) async fn update(
     } else {
         kernel::kernel_require(tx, actor, id, Capability::Edit).await?;
     }
+    kernel::policy_read::assert_revision_on(
+        tx,
+        actor,
+        id,
+        optional_text(args, "if_policy_revision")?,
+    )
+    .await?;
     if args.get("home_id").is_some_and(Value::is_null) {
         return Err(invalid(
             "home_id must name a destination; it cannot be cleared",
@@ -834,14 +946,10 @@ pub(super) async fn update(
     if let Some(expected) = optional_text(args, "if_unmodified_since")? {
         let expected = chrono::DateTime::parse_from_rfc3339(expected)
             .map_err(|_| invalid("if_unmodified_since must be RFC3339"))?;
-        let updated: String =
-            sqlx::query_scalar("SELECT created_at FROM content_events WHERE seq=?")
-                .bind(previous.revision)
-                .fetch_one(&mut **tx)
-                .await?;
+        let updated = kernel::record_metadata::updated_at_on(tx, id).await?;
         let updated = chrono::DateTime::parse_from_rfc3339(&updated)
             .map_err(|_| invalid("invalid kernel timestamp"))?;
-        if updated > expected {
+        if updated != expected {
             return Err(Error::conflict(
                 "stale if_unmodified_since; nothing written",
             ));
@@ -896,7 +1004,12 @@ pub(super) async fn update(
                     "Document/note definition has no {input} field"
                 )));
             }
-            if previous.fields.get(field).unwrap_or(&Value::Null) != value {
+            let explicit_title_effect = input == "name"
+                && origin
+                    .as_ref()
+                    .is_some_and(|origin| origin["effect"] == "title.set");
+            if explicit_title_effect || previous.fields.get(field).unwrap_or(&Value::Null) != value
+            {
                 fields.insert(field.into(), value.clone());
             }
         }
@@ -1006,7 +1119,7 @@ pub(super) async fn update(
     };
     if !fields.is_empty() {
         let raw = serde_json::to_string(&fields)?;
-        kernel::revise_input_in(
+        kernel::revise_input_with_origin_in(
             db,
             tx,
             acts,
@@ -1014,21 +1127,22 @@ pub(super) async fn update(
             id,
             kernel::FieldInput::Raw(&raw),
             Some(edit_revision),
+            origin.clone(),
         )
         .await?;
     }
     metadata_patch(db, tx, acts, actor, id, args).await?;
-    if let Some(body) = next_body.filter(|body| body != previous.body.as_deref().unwrap_or("")) {
-        event(
-            db,
-            tx,
-            acts,
-            actor,
-            id,
-            "kernel.body_set.v1",
-            json!({"body":body}),
-        )
-        .await?;
+    let explicit_body_effect = origin
+        .as_ref()
+        .is_some_and(|origin| origin["effect"] == "body.set");
+    if let Some(body) = next_body
+        .filter(|body| explicit_body_effect || body != previous.body.as_deref().unwrap_or(""))
+    {
+        let mut payload = json!({"body":body});
+        if let Some(origin) = &origin {
+            payload["origin"] = origin.clone();
+        }
+        event(db, tx, acts, actor, id, "kernel.body_set.v1", payload).await?;
     }
     facets(db, tx, acts, actor, id, args.get("facets"), "update_record").await?;
     // Updates never carry a comment bearer link: part_of on a comment is
@@ -1051,7 +1165,7 @@ fn replace_body(body: &str, args: Value) -> Result<String> {
 
 type FacetRow = (Option<String>, Option<f64>, Option<String>, String);
 
-async fn facets(
+pub(crate) async fn facets(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
     acts: &mut ActAllocation,
@@ -1059,6 +1173,20 @@ async fn facets(
     id: &str,
     values: Option<&Value>,
     tool: &str,
+) -> Result<()> {
+    facets_with_origin(db, tx, acts, actor, id, values, tool, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn facets_with_origin(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    acts: &mut ActAllocation,
+    actor: &str,
+    id: &str,
+    values: Option<&Value>,
+    tool: &str,
+    origin: Option<Value>,
 ) -> Result<()> {
     let Some(values) = values.filter(|v| !v.is_null()) else {
         return Ok(());
@@ -1079,13 +1207,38 @@ async fn facets(
                 vocab_ref: None,
                 as_of: now,
             },
-            Value::String(s) => kernel::FacetObservation {
-                key: key.clone(),
-                value: Some(s.clone()),
-                value_num: None,
-                vocab_ref: None,
-                as_of: now,
-            },
+            Value::String(_) | Value::Number(_) => {
+                let parsed =
+                    super::super::tools::lifecycle::parse_facet_entry(tool, key, value, false)?
+                        .ok_or_else(|| invalid("facet value missing"))?;
+                kernel::FacetObservation {
+                    key: key.clone(),
+                    value: Some(parsed.stored_value()),
+                    value_num: parsed.value.as_f64(),
+                    vocab_ref: parsed.vocab_ref,
+                    as_of: now,
+                }
+            }
+            Value::Object(map)
+                if !(map.keys().all(|k| {
+                    ["value", "value_num", "vocab_ref", "as_of"].contains(&k.as_str())
+                }) && (map.contains_key("as_of")
+                    || map.contains_key("value_num")
+                    || map.get("value") == Some(&Value::Null))) =>
+            {
+                // Use v1's single object / {value,vocab_ref} grammar. An atomic
+                // object is data, not an invented set of observation options.
+                let parsed =
+                    super::super::tools::lifecycle::parse_facet_entry(tool, key, value, false)?
+                        .ok_or_else(|| invalid("facet value missing"))?;
+                kernel::FacetObservation {
+                    key: key.clone(),
+                    value: Some(parsed.stored_value()),
+                    value_num: parsed.value.as_f64(),
+                    vocab_ref: parsed.vocab_ref,
+                    as_of: now,
+                }
+            }
             Value::Object(map) => {
                 if map
                     .keys()
@@ -1136,16 +1289,11 @@ async fn facets(
         } else if observation.value.is_none() && !explicit_as_of {
             continue;
         }
-        event(
-            db,
-            tx,
-            acts,
-            actor,
-            id,
-            "kernel.facet_observed.v1",
-            serde_json::to_value(observation)?,
-        )
-        .await?;
+        let mut payload = serde_json::to_value(observation)?;
+        if let Some(origin) = &origin {
+            payload["origin"] = origin.clone();
+        }
+        event(db, tx, acts, actor, id, "kernel.facet_observed.v1", payload).await?;
     }
     Ok(())
 }
@@ -1236,7 +1384,7 @@ async fn directed_link(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn change_link(
+pub(super) async fn change_link(
     db: &Db,
     tx: &mut Transaction<'static, Sqlite>,
     acts: &mut ActAllocation,

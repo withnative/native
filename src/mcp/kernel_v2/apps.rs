@@ -42,7 +42,9 @@ pub(super) fn register(registry: &mut ToolRegistry) -> Result<()> {
 }
 
 fn availability(entry: &mut Value, delivery: Option<&AppBundleDelivery>) {
-    if entry["launch_binding"]["delivery"] != "reusable.v1" {
+    if entry["launch_binding"]["delivery"] != "reusable.v1"
+        || entry["launch_binding"]["reason"] == "readopt_required_on_v2"
+    {
         return;
     }
     if !delivery.is_some_and(|config| config.enabled && config.keyring.is_some()) {
@@ -93,7 +95,25 @@ async fn execute(
             watch,
             reads,
         } => {
-            if watch.is_some() || reads.is_some() {
+            if let Some(reads) = reads {
+                if need.is_some()
+                    || params.is_some()
+                    || subscribe.is_some()
+                    || if_revision.is_some()
+                    || watch.is_some()
+                {
+                    return Err(Error::engine("manage_alpha_tabs: reads excludes need, params, subscribe, if_revision and watch [invalid_params]"));
+                }
+                return super::app_data::batch_read(
+                    db,
+                    caller,
+                    package,
+                    expected_install_event_id,
+                    reads,
+                )
+                .await;
+            }
+            if watch.is_some() {
                 return Err(Error::engine(
                     "manage_alpha_tabs: live read refused [undeclared_need]",
                 ));
@@ -183,7 +203,7 @@ async fn execute(
                 "launch":launch,
                 "sandbox":{"sandbox":"allow-scripts","referrerPolicy":"no-referrer","allow":"","bridge_version":crate::artifact_html::BRIDGE_VERSION},
                 "input_digest":alpha_tabs::alpha_tab_sample_input_digest(&sample),"input":sample,
-                "live_reads":false,"effects_wired":false}),
+                "live_reads":source.pin["consented_declaration"].as_str().and_then(|raw| serde_json::from_str::<Value>(raw).ok()).is_some_and(|d| d.get("contract").is_none()),"effects_wired":false}),
             )
         }
         ManageAlphaTabsArgs::List {

@@ -33,7 +33,7 @@ async fn home_on(
     if moved.is_some() {
         return Ok(moved);
     }
-    let provenance: Option<(Option<String>,Option<String>)> = sqlx::query_as("SELECT json_extract(payload,'$.legacy.payload.policy_anchor'),json_extract(payload,'$.legacy.payload.original_home') FROM content_events WHERE record_id=? AND seq<=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1")
+    let provenance: Option<(Option<String>,Option<String>)> = sqlx::query_as("SELECT json_extract(e.payload,'$.legacy.payload.policy_anchor'),json_extract(e.payload,'$.legacy.payload.original_home') FROM kernel_legacy_sql_events h JOIN content_events e ON e.seq=h.seq WHERE h.record_id=? AND h.seq<=? AND h.source_stream='snapshot_provenance' ORDER BY h.seq DESC LIMIT 1")
         .bind(id).bind(seq).fetch_optional(&mut *conn).await?;
     if home == crate::v1_import::derived(id) {
         if let Some((anchor, original)) = provenance {
@@ -448,6 +448,7 @@ pub(super) async fn render(db: &Db, actor: &str, args: Value) -> Result<Value> {
     kernel::read_record_on(&mut live, actor, &args.record_id)
         .await?
         .ok_or_else(|| Error::engine(kernel::HIDDEN_OR_MISSING))?;
+    kernel::legacy_history::require_sql_frontier_on(&mut live).await?;
     let before = match (args.before_seq, args.before_event_id) {
         (Some(seq), None) => seq,
         (None, Some(_)) => {
@@ -494,8 +495,12 @@ pub(super) async fn render(db: &Db, actor: &str, args: Value) -> Result<Value> {
     {
         return Err(Error::engine("render_record_version_diff: source_position_unavailable: retained v1 provenance is not a reconstructable v2 record version"));
     }
+    let started = std::time::Instant::now();
     let older = record_at(&mut live, actor, &args.record_id, before, true).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="historical_before",elapsed_us=started.elapsed().as_micros() as u64);
+    let started = std::time::Instant::now();
     let after = record_at(&mut live, actor, &args.record_id, head, false).await?;
+    tracing::debug!(target:"native_ce::read_staging",phase="historical_after",elapsed_us=started.elapsed().as_micros() as u64);
     let mut events = Vec::new();
     let mut cursor = before;
     loop {

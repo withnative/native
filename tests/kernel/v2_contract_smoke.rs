@@ -2717,7 +2717,11 @@ async fn v2_contract_smoke_kernel_mcp_banner_describes_persisted_runtime() {
     .await
     .unwrap();
     db.close().await;
-    let output = Command::new(env!("CARGO_BIN_EXE_mcp-stdio"))
+    // Check/lint does not provide executable paths; Cargo test supplies it.
+    #[allow(clippy::option_env_unwrap)]
+    let binary = option_env!("CARGO_BIN_EXE_mcp-stdio")
+        .expect("the mcp-stdio binary path must be supplied when this test runs");
+    let output = Command::new(binary)
         .args([
             "--kernel-v2",
             "--account",

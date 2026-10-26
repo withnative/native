@@ -15,7 +15,7 @@ const plan = (options = {}) => planInstall({ descriptor, html, homeId: "c59dffa3
 // A stand-in for the Native tools, enforcing what the real ones enforce on
 // this route: the if_body_digest guard, and whole-document validation only
 // once the record is an artifact with the runtime facet.
-function fakeNative({ corruptChunk, adoptionCarried = true, presentation = { name: "Workspace app", facets: [] } } = {}) {
+function fakeNative({ corruptChunk, duplicateSource = false, adoptionCarried = true, presentation = { name: "Workspace app", facets: [] } } = {}) {
   const calls = [];
   const record = { id: "a0000000-0000-4000-8000-000000000001", body: "", kind: null, events: [] };
   let install = { event_id: "current", artifact_id: "old-artifact", status: "adopted" };
@@ -26,6 +26,7 @@ function fakeNative({ corruptChunk, adoptionCarried = true, presentation = { nam
     async call(executor, operation, args) {
       calls.push({ executor, operation, args });
       if (operation === "create_record") {
+        if (duplicateSource && args.confirm !== true) throw new Error("likely_duplicate: nothing was created; retry with confirm: true");
         record.kind = args.kind;
         record.name = args.name;
         record.facets = { ...args.facets };
@@ -72,6 +73,63 @@ test("chunks never split a code point and reassemble exactly", () => {
   const chunks = chunkUtf8(text, 7);
   assert.equal(chunks.join(""), text);
   for (const chunk of chunks) assert.ok(Buffer.byteLength(chunk) <= 7);
+});
+
+test("same-name source generations install and update through every source route", async () => {
+  for (const updateInstallEventId of [undefined, "current"]) {
+    for (const route of [{}, { bodyEncoding: "utf8" }, { bodyEncoding: "base64" }, { chunked: true }, { fallback: true }]) {
+      const native = fakeNative({ duplicateSource: true });
+      const call = native.call.bind(native);
+      let encodedAttempts = 0;
+      native.call = async (executor, operation, args) => {
+        if (route.fallback && operation === "create_record" && args.body_encoding) {
+          encodedAttempts++;
+          assert.equal(args.confirm, true);
+          throw new Error("unknown field `body_encoding`");
+        }
+        return call(executor, operation, args);
+      };
+      const result = await runInstall(plan({ ...route, updateInstallEventId }), native, { onNotice() {} });
+      assert.equal(native.record.body, html);
+      assert.equal(result.record_id, native.record.id);
+      assert.equal(encodedAttempts, route.fallback ? 1 : 0);
+      assert.equal(native.calls.filter(c => c.operation === "create_record").length, 1);
+      assert.ok(native.calls.filter(c => c.operation !== "create_record").every(c => !Object.hasOwn(c.args, "confirm")));
+      const installed = native.calls.find(c => c.operation === (updateInstallEventId ? "manage_alpha_tabs.update" : "manage_alpha_tabs.install"));
+      assert.equal(installed.args.artifact_id, result.record_id);
+      assert.equal(installed.args.source_revision, result.source_revision);
+    }
+  }
+});
+
+test("source creation refusals surface clearly without retrying or using candidate ids", async () => {
+  const refusal = { code: "likely_duplicate", outcome: "refused", applied: false,
+    message: "Nothing was created. Retry with confirm: true.", candidates: [{ id: "existing-source" }] };
+  for (const chunked of [false, true]) {
+    for (const mode of ["returned", "wrapped", "thrown", "fallback"]) {
+      const p = plan({ chunked });
+      // Old saved plans must fail clearly, without being silently rewritten.
+      delete p.steps[0].arguments.confirm;
+      const before = structuredClone(p);
+      const calls = [];
+      const original = new Error(JSON.stringify(refusal));
+      await assert.rejects(runInstall(p, { async call(executor, operation, args) {
+        calls.push({ executor, operation, args });
+        if (mode === "thrown") throw original;
+        if (mode === "fallback" && args.body_encoding) throw new Error("unknown field `body_encoding`");
+        return mode === "wrapped" ? { write_receipt: refusal } : refusal;
+      } }, { onNotice() {} }), error => {
+        assert.match(error.message, /likely_duplicate/);
+        assert.match(error.message, /Nothing was created/);
+        assert.doesNotMatch(error.message, /no record id|Staged source record/);
+        if (mode === "thrown") assert.equal(error, original);
+        return true;
+      });
+      assert.equal(calls.length, mode === "fallback" && !chunked ? 2 : 1);
+      assert.ok(calls.every(c => c.operation === "create_record"));
+      assert.deepEqual(p, before);
+    }
+  }
 });
 
 test("the plan is the proven route, each write guarded by the digest of the body so far", () => {

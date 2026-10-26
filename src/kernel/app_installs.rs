@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "v2-kernel-probe")]
 mod admission;
 mod consent;
+pub(crate) mod declarations;
+use declarations::activation_supported;
 mod management;
 mod preview;
 #[cfg(feature = "v2-kernel-probe")]
@@ -19,15 +21,17 @@ pub(crate) use consent::ACTIONS_DDL;
 pub(crate) use consent::OUTCOMES_DDL;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use consent::{
-    admit_app_on, adopt_as, bundle_source_on, launch_source_on, prepare_source_as, preview_as,
-    AdoptRequest, AppSourceAdmission,
+    admit_app_on, admit_install_on, adopt_as, bundle_source_on, launch_source_on,
+    prepare_source_as, preview_as, AdoptRequest, AppSourceAdmission,
 };
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) use consent::{finish_app_action_in, start_app_action_in};
+pub(crate) use consent::{finish_app_action_in, start_app_action_in, start_declared_app_action_in};
 pub use consent::{install_as, InstallOutcome, InstallRequest};
 pub(crate) use management::ManagementOutcome;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) use management::{inspect_as, list_as};
+
+const RETAINED_SOURCE_UNVERIFIED: &str = "retained_source_unverified_on_v2";
 
 pub(crate) const ACTIVATED: &str = "kernel.app_installs_activated.v1";
 pub(crate) const REMOVED: &str = "kernel.app_install_removed.v1";
@@ -80,12 +84,55 @@ impl VerifiedFrozenApps {
     ) -> Self {
         Self {
             evidence: Activation {
-                format: 1,
+                // Version 2 admits the two existing frozen Slack pins. Version
+                // 1 replay keeps its original four-pin activation decision.
+                format: 2,
                 source_head,
                 report_sha256,
                 capsules,
             },
         }
+    }
+    /// Contract-based admission for new cutovers. Formats 1–3 retain their
+    /// historical package/version decisions during replay.
+    /// # Safety
+    /// The same frozen-source and exclusive-importer requirements as
+    /// `from_verified_import_unchecked` apply.
+    pub unsafe fn from_verified_contract_import_unchecked(
+        source_head: Value,
+        report_sha256: String,
+        capsules: BTreeMap<String, i64>,
+    ) -> Self {
+        let mut proof = Self::from_verified_import_unchecked(source_head, report_sha256, capsules);
+        proof.evidence.format = 4;
+        proof
+    }
+    /// Declarative SQL/effect activation. Earlier formats keep their decisions.
+    /// # Safety
+    /// The frozen-source and exclusive-importer requirements above apply.
+    pub unsafe fn from_verified_declarative_import_unchecked(
+        source_head: Value,
+        report_sha256: String,
+        capsules: BTreeMap<String, i64>,
+    ) -> Self {
+        let mut proof = Self::from_verified_import_unchecked(source_head, report_sha256, capsules);
+        proof.evidence.format = 5;
+        proof
+    }
+    /// v1 parity operator format. Earlier activation formats keep their
+    /// original replay decisions; format 3 also retains verified shell-auto
+    /// adoptions, which v1 admits through its authored-app adoption producer.
+    /// # Safety
+    /// The same frozen source, complete verification and exclusive importer
+    /// requirements as `from_verified_import_unchecked` apply.
+    pub unsafe fn from_verified_v1_parity_import_unchecked(
+        source_head: Value,
+        report_sha256: String,
+        capsules: BTreeMap<String, i64>,
+    ) -> Self {
+        let mut proof = Self::from_verified_import_unchecked(source_head, report_sha256, capsules);
+        proof.evidence.format = 3;
+        proof
     }
 }
 
@@ -112,14 +159,49 @@ fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| invalid("missing install evidence"))
 }
-fn supported(package: &str, version: &str) -> bool {
+// Historical replay only: never extend these pins for new app releases.
+fn legacy_supported(format: u32, package: &str, version: &str) -> bool {
     matches!(
         (package, version),
-        ("agent.docs", "0.8.2" | "0.9.0")
+        ("agent.docs", "0.8.2" | "0.9.0" | "0.9.1")
             | ("agent.spaces", "0.7.0")
             | ("agent.whiteboard", "0.2.0")
+    ) || (matches!(format, 2 | 3)
+        && matches!(
+            (package, version),
+            ("agent.slack-workspace-v2", "0.4.1" | "0.5.7")
+        ))
+}
+pub(crate) const NOT_YET_AVAILABLE: &str = "app_not_yet_available_on_v2";
+const UNSUPPORTED_WITNESS: &str = "app_adoption_witness_not_yet_available_on_v2";
+
+fn adoption_witness_supported(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some(
+            "alpha_tab.adopted"
+                | "alpha_tab.updated"
+                | "alpha_tab.installed"
+                | "alpha_tab.restored"
+                | "alpha_tab.adopted.v2"
+        )
     )
 }
+
+fn contract_supported(declaration: &Value) -> bool {
+    crate::mcp::tools::alpha_tabs::is_app_v2_declaration(declaration)
+        && crate::alpha_tab_sessions::validate_declaration_contract(declaration).is_ok()
+        && declaration.as_object().is_some_and(|object| {
+            object
+                .keys()
+                .all(|key| matches!(key.as_str(), "contract" | "needs" | "effects"))
+        })
+}
+
+fn verified_adoption(adoption: &str) -> bool {
+    matches!(adoption, "shell_adopt.v1" | "shell_auto.v1")
+}
+
 fn aggregate(principal: &str, package: &str) -> String {
     format!(
         "{PREFIX}{}",
@@ -200,11 +282,22 @@ pub async fn activate_as(db: &Db, host: &str, proof: VerifiedFrozenApps) -> Resu
     let mut tx = begin_write(db.write_pool()).await?;
     hq::require_import(&mut tx, host).await?;
     ensure_schema(&mut tx).await?;
+    activate_on(db, &mut tx, host, &proof).await?;
+    db.commit_kernel_content(tx).await?;
+    Ok(())
+}
+
+pub(crate) async fn activate_on(
+    db: &Db,
+    tx: &mut Transaction<'static, Sqlite>,
+    host: &str,
+    proof: &VerifiedFrozenApps,
+) -> Result<()> {
     let prior: Option<String> = sqlx::query_scalar(
         "SELECT payload FROM main.content_events WHERE type=? ORDER BY seq LIMIT 1",
     )
     .bind(ACTIVATED)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     if let Some(prior) = prior {
         if serde_json::from_str::<Activation>(&prior)? != proof.evidence {
@@ -214,33 +307,185 @@ pub async fn activate_as(db: &Db, host: &str, proof: VerifiedFrozenApps) -> Resu
     }
     // Live admission uses the shared carrier resolver. Replay verifies the
     // retained outcome without consulting a source's later type or policy.
-    for install in verify(&mut tx, &proof.evidence, i64::MAX).await? {
+    for install in verify(tx, &proof.evidence, i64::MAX).await? {
         if install.body.is_some() {
             let artifact = string(&install.row, "artifact_id")?;
-            let record = read_record_unchecked_on(&mut tx, host, artifact)
+            let record = read_record_unchecked_on(tx, host, artifact)
                 .await?
                 .ok_or_else(|| invalid("app artifact missing"))?;
-            if hq::tombstoned_on(&mut tx, artifact).await?
-                || !is_artifact_on(&mut tx, &record).await?
-            {
+            if hq::tombstoned_on(tx, artifact).await? || !is_artifact_on(tx, &record).await? {
                 return Err(invalid("app source is not a live Document/artifact"));
             }
         }
     }
     append_in(
         db,
-        &mut tx,
+        tx,
         AppendSpec {
             record_id: ACTIVATION_ID.into(),
             event_type: ACTIVATED.into(),
-            payload: serde_json::to_value(proof.evidence)?,
+            payload: serde_json::to_value(&proof.evidence)?,
             actor: Some(host.into()),
         },
         &mut crate::act::ActAllocation::new(),
     )
     .await?;
-    db.commit_kernel_content(tx).await?;
     Ok(())
+}
+
+/// Read-only operator preflight. Uses the same verifier as activation/replay;
+/// returns counts only, never source, account IDs, declarations or read SQL.
+/// `catalog_members` is a freshly fenced hosted owner/member roster.
+pub async fn inspect_frozen_activation_on(
+    conn: &mut SqliteConnection,
+    proof: &VerifiedFrozenApps,
+    catalog_members: &BTreeSet<String>,
+) -> Result<Value> {
+    let prior: Option<String> =
+        sqlx::query_scalar("SELECT payload FROM content_events WHERE type=? ORDER BY seq LIMIT 1")
+            .bind(ACTIVATED)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if let Some(prior) = &prior {
+        if serde_json::from_str::<Activation>(prior)? != proof.evidence {
+            return Err(invalid("activation evidence changed"));
+        }
+    }
+    // Count the complete stale-capsule class before refusing the batch. These
+    // diagnostics carry no imported IDs, declarations or application content.
+    let mut stale = 0usize;
+    for (bearer, seq) in &proof.evidence.capsules {
+        let (_, state) = app_state::evidence_at(conn, bearer, *seq, i64::MAX).await?;
+        if state.custody.as_ref().is_none_or(|f| {
+            f.format != 1
+                || f.content_frontier != proof.evidence.source_head["seq"].as_i64().unwrap_or(-1)
+                || f.control_frontier
+                    != proof.evidence.source_head["control_seq"]
+                        .as_i64()
+                        .unwrap_or(-1)
+                || !f.missing_source_events.is_empty()
+                || !f.missing_control_events.is_empty()
+        }) {
+            stale += 1;
+        }
+    }
+    if stale > 0 {
+        return Err(invalid(&format!(
+            "incomplete or stale capsule; class=stale_capsule count={stale}"
+        )));
+    }
+    let mut counts = BTreeMap::<(String, String), (usize, BTreeMap<String, usize>)>::new();
+    // verify() keeps unmapped accounts as forensic custody. The operator must
+    // instead refuse any otherwise active adopted install without an identity.
+    for (bearer, seq) in &proof.evidence.capsules {
+        let (_, state) = app_state::evidence_at(conn, bearer, *seq, i64::MAX).await?;
+        for row in &state.alpha_tab_installs {
+            // Excluded apps carry no executable authority and must not make
+            // identity preflight block activation of the supported installs.
+            if proof.evidence.format >= 4
+                && !row["consented_declaration"]
+                    .as_str()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .is_some_and(|declaration| {
+                        activation_supported(proof.evidence.format, &declaration)
+                    })
+            {
+                continue;
+            }
+            if proof.evidence.format >= 4
+                && state
+                    .control_events
+                    .get(row["event_id"].as_str().unwrap_or_default())
+                    .is_some_and(|event| !adoption_witness_supported(event["type"].as_str()))
+            {
+                continue;
+            }
+            if row["status"] == "installed"
+                && matches!(
+                    row["adoption"].as_str(),
+                    Some("shell_adopt.v1" | "shell_auto.v1")
+                )
+            {
+                let binding = string(row, "account_id")?;
+                let principal: Option<String> = sqlx::query_scalar(
+                    "SELECT principal_id FROM kernel_principals WHERE kind='account' AND auth_binding=?"
+                ).bind(binding).fetch_optional(&mut *conn).await?;
+                let principal = principal
+                    .ok_or_else(|| invalid("adopting member unmapped in hosted identity"))?;
+                let revoked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM kernel_app_consent_revocations WHERE principal=?)",
+                )
+                .bind(&principal)
+                .fetch_one(&mut *conn)
+                .await?;
+                if revoked
+                    || !hosted_identity::account_admitted_before(conn, &principal, i64::MAX).await?
+                {
+                    return Err(invalid("adopting member offboarded or not admitted"));
+                }
+                let mut mapped = false;
+                for account in catalog_members {
+                    mapped |= hosted_identity::catalog_account_matches_on(
+                        conn, account, binding, &principal,
+                    )
+                    .await?;
+                }
+                if !mapped {
+                    return Err(invalid(
+                        "adopting member unmapped in current hosted catalog",
+                    ));
+                }
+            }
+        }
+    }
+    for install in verify(conn, &proof.evidence, i64::MAX).await? {
+        if install.body.is_some() {
+            let artifact = string(&install.row, "artifact_id")?;
+            let host: String = sqlx::query_scalar(
+                "SELECT principal_id FROM kernel_principals WHERE auth_binding=?",
+            )
+            .bind(HOST_IMPORT_BINDING)
+            .fetch_one(&mut *conn)
+            .await?;
+            let record = read_record_unchecked_on(conn, &host, artifact)
+                .await?
+                .ok_or_else(|| invalid("app source is not a live Document/artifact"))?;
+            if hq::tombstoned_on(conn, artifact).await? || !is_artifact_on(conn, &record).await? {
+                return Err(invalid("app source is not a live Document/artifact"));
+            }
+        }
+        let entry = counts
+            .entry((
+                string(&install.row, "package")?.into(),
+                string(&install.row, "version")?.into(),
+            ))
+            .or_default();
+        if install.body.is_some() {
+            entry.0 += 1;
+        } else {
+            let reason = match install.row["status"].as_str() {
+                Some("disabled") => "inactive_on_v1",
+                Some("removed") => "removed_on_v1",
+                _ if !matches!(
+                    install.row["adoption"].as_str(),
+                    Some("shell_adopt.v1" | "shell_auto.v1")
+                ) =>
+                {
+                    "unadopted_on_v1"
+                }
+                _ => install
+                    .refusal
+                    .as_deref()
+                    .filter(|_| proof.evidence.format >= 4)
+                    .unwrap_or("source_deleted_or_unsupported_on_v2"),
+            };
+            *entry.1.entry(reason.into()).or_default() += 1;
+        }
+    }
+    Ok(
+        json!({"already_active":prior.is_some(), "packages":counts.into_iter().map(|((package,version),(eligible,excluded))|
+        json!({"package":package,"version":version,"eligible":eligible,"excluded":excluded.values().sum::<usize>(),"exclusion_reasons":excluded})).collect::<Vec<_>>()}),
+    )
 }
 
 struct CapturedInstall {
@@ -255,7 +500,18 @@ async fn verify(
     p: &Activation,
     before: i64,
 ) -> Result<Vec<CapturedInstall>> {
-    if p.format != 1
+    verify_sources(conn, p, before, false).await
+}
+
+// Source admission may verify retained Class 2 evidence from format 4 without
+// changing its activation or granting executable consent.
+async fn verify_sources(
+    conn: &mut SqliteConnection,
+    p: &Activation,
+    before: i64,
+    retained_declarative: bool,
+) -> Result<Vec<CapturedInstall>> {
+    if !matches!(p.format, 1..=5)
         || p.report_sha256.len() != 64
         || !p
             .report_sha256
@@ -286,126 +542,242 @@ async fn verify(
     let mut installs = Vec::new();
     let mut identities = BTreeSet::new();
     for (bearer, capsule_seq) in &p.capsules {
-        if *capsule_seq >= before {
-            return Err(invalid("capsule is not preceding evidence"));
-        }
-        let (origin, state) = app_state::evidence_at(conn, bearer, *capsule_seq, before).await?;
-        if p.source_head["origin"] != origin {
-            return Err(invalid("capsule identity changed"));
-        }
-        let f = state
-            .custody
-            .as_ref()
-            .ok_or_else(|| invalid("capsule frontier missing"))?;
-        if f.format != 1
-            || f.content_frontier != p.source_head["seq"].as_i64().unwrap_or(-1)
-            || f.control_frontier != p.source_head["control_seq"].as_i64().unwrap_or(-1)
-            || !f.missing_source_events.is_empty()
-            || !f.missing_control_events.is_empty()
-        {
-            return Err(invalid("incomplete or stale capsule"));
-        }
-        for row in state.alpha_tab_installs {
-            if row["artifact_id"] != *bearer {
-                return Err(invalid("install bearer mismatch"));
+        let state = async {
+            if *capsule_seq >= before {
+                return Err(invalid("capsule is not preceding evidence"));
             }
-            let account = string(&row, "account_id")?;
-            let principal: Option<String> = sqlx::query_scalar("SELECT p.principal_id FROM kernel_principals p WHERE p.kind='account' AND p.auth_binding=? AND EXISTS(SELECT 1 FROM main.content_events e WHERE e.record_id=p.principal_id AND e.type='kernel.principal_created.v1' AND e.seq<?)").bind(account).bind(before).fetch_optional(&mut *conn).await?;
-            // Unmapped foreign accounts remain forensic custody, not native authority.
-            let Some(principal) = principal else {
-                continue;
-            };
-            let package = string(&row, "package")?;
-            if !identities.insert((principal.clone(), package.to_owned())) {
-                return Err(invalid("duplicate install identity"));
+            let (origin, state) =
+                app_state::evidence_at(conn, bearer, *capsule_seq, before).await?;
+            if p.source_head["origin"] != origin {
+                return Err(invalid("capsule identity changed"));
             }
-            let version = string(&row, "version")?;
-            string(&row, "event_id")?;
-            let status = string(&row, "status")?;
-            if !matches!(status, "installed" | "removed" | "disabled") {
-                return Err(invalid("invalid install status"));
-            }
-            let mut refusal = Some("unsupported_on_v2".to_owned());
-            let mut body = None;
-            if !state.source_deleted
-                && status == "installed"
-                && row["adoption"] == "shell_adopt.v1"
-                && supported(package, version)
+            let f = state
+                .custody
+                .as_ref()
+                .ok_or_else(|| invalid("capsule frontier missing"))?;
+            if f.format != 1
+                || f.content_frontier != p.source_head["seq"].as_i64().unwrap_or(-1)
+                || f.control_frontier != p.source_head["control_seq"].as_i64().unwrap_or(-1)
+                || !f.missing_source_events.is_empty()
+                || !f.missing_control_events.is_empty()
             {
-                let declaration: Value =
-                    serde_json::from_str(string(&row, "consented_declaration")?)?;
-                if !crate::mcp::tools::alpha_tabs::is_app_v2_declaration(&declaration)
-                    || crate::alpha_tab_sessions::validate_declaration_contract(&declaration)
-                        .is_err()
-                {
-                    return Err(invalid("unsupported app contract"));
-                }
-                let event = state
-                    .source_events
-                    .get(string(&row, "consented_source_revision")?)
-                    .ok_or_else(|| invalid("pinned source missing"))?;
-                if event["record_id"] != *bearer
-                    || !matches!(
-                        event["type"].as_str(),
-                        Some("record.created" | "record.updated" | "record.body.updated")
-                    )
-                {
-                    return Err(invalid("pinned source does not belong to artifact"));
-                }
-                let payload: Value = serde_json::from_str(string(event, "payload")?)?;
-                let source = string(&payload, "body")?.to_owned();
-                let digest =
-                    crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(&declaration)?;
-                if row["declaration_digest"] != digest
-                    || row["digest"]
-                        != crate::mcp::tools::alpha_tabs::alpha_tab_digest(
-                            &crate::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(&source),
-                            &digest,
-                            "native.html.v1",
-                        )
-                {
-                    return Err(invalid("source or declaration digest mismatch"));
-                }
-                let control = state
-                    .control_events
-                    .get(string(&row, "event_id")?)
-                    .ok_or_else(|| invalid("install control witness missing"))?;
-                if !matches!(
-                    control["type"].as_str(),
-                    Some("alpha_tab.adopted" | "alpha_tab.updated")
-                ) {
-                    return Err(invalid("unsupported adoption witness"));
-                }
-                let evidence: Value = serde_json::from_str(string(control, "payload")?)?;
-                for key in [
-                    "account_id",
-                    "package",
-                    "version",
-                    "digest",
-                    "artifact_id",
-                    "consented_source_revision",
-                    "declaration_digest",
-                    "adoption",
-                ] {
-                    if evidence[key] != row[key] {
-                        return Err(invalid("install control witness mismatch"));
-                    }
-                }
-                if evidence["consented_declaration"] != declaration || control["actor"] != account {
-                    return Err(invalid("adoption ownership mismatch"));
-                }
-                body = Some(source);
-                refusal = None;
+                return Err(invalid("incomplete or stale capsule"));
             }
-            installs.push(CapturedInstall {
-                principal,
-                row,
-                body,
-                refusal,
-            });
+            Ok(state)
+        }
+        .await;
+        let state = match state {
+            Ok(state) => state,
+            Err(_) if retained_declarative => continue,
+            Err(error) => return Err(error),
+        };
+        let context = InstallEvidence {
+            p,
+            before,
+            retained_declarative,
+            bearer,
+            state: &state,
+        };
+        for row in &state.alpha_tab_installs {
+            match verify_install_row(conn, &context, row.clone(), &mut identities).await {
+                Ok(Some(install)) => installs.push(install),
+                Ok(None) => {}
+                Err(_) if retained_declarative => installs.push(CapturedInstall {
+                    principal: String::new(),
+                    row: row.clone(),
+                    body: None,
+                    refusal: Some(RETAINED_SOURCE_UNVERIFIED.into()),
+                }),
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(installs)
+}
+
+struct InstallEvidence<'a> {
+    p: &'a Activation,
+    before: i64,
+    retained_declarative: bool,
+    bearer: &'a str,
+    state: &'a app_state::RetainedAppState,
+}
+
+async fn verify_install_row(
+    conn: &mut SqliteConnection,
+    context: &InstallEvidence<'_>,
+    row: Value,
+    identities: &mut BTreeSet<(String, String)>,
+) -> Result<Option<CapturedInstall>> {
+    let &InstallEvidence {
+        p,
+        before,
+        retained_declarative,
+        bearer,
+        state,
+    } = context;
+    if row["artifact_id"] != bearer {
+        return Err(invalid("install bearer mismatch"));
+    }
+    let account = string(&row, "account_id")?;
+    let principal: Option<String> = sqlx::query_scalar("SELECT p.principal_id FROM kernel_principals p WHERE p.kind='account' AND p.auth_binding=? AND EXISTS(SELECT 1 FROM main.content_events e WHERE e.record_id=p.principal_id AND e.type='kernel.principal_created.v1' AND e.seq<?)").bind(account).bind(before).fetch_optional(&mut *conn).await?;
+    // Unmapped foreign accounts remain forensic custody, not native authority.
+    let Some(principal) = principal else {
+        return Ok(None);
+    };
+    let package = string(&row, "package")?;
+    if !identities.insert((principal.clone(), package.to_owned())) {
+        return Err(invalid("duplicate install identity"));
+    }
+    let version = string(&row, "version")?;
+    string(&row, "event_id")?;
+    let status = string(&row, "status")?;
+    if !matches!(status, "installed" | "removed" | "disabled") {
+        return Err(invalid("invalid install status"));
+    }
+    // Unsupported declarations are per-install exclusions, including
+    // unadopted or malformed legacy declarations. They grant no source
+    // or consent authority and never abort activation of other apps.
+    if p.format >= 4
+        && !row["consented_declaration"]
+            .as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .is_some_and(|declaration| {
+                activation_supported(p.format, &declaration)
+                    || (retained_declarative && declarations::declarative(&declaration).is_ok())
+            })
+    {
+        return Ok(Some(CapturedInstall {
+            principal,
+            row,
+            body: None,
+            refusal: Some(NOT_YET_AVAILABLE.into()),
+        }));
+    }
+    let mut refusal = Some("unsupported_on_v2".to_owned());
+    let mut body = None;
+    if !state.source_deleted
+        && status == "installed"
+        && (row["adoption"] == "shell_adopt.v1"
+            || (p.format >= 3 && row["adoption"] == "shell_auto.v1"))
+        && (p.format >= 4 || legacy_supported(p.format, package, version))
+    {
+        let declaration: Value = serde_json::from_str(string(&row, "consented_declaration")?)?;
+        if p.format < 4 && !contract_supported(&declaration) {
+            return Err(invalid("unsupported app contract"));
+        }
+        let event = state
+            .source_events
+            .get(string(&row, "consented_source_revision")?)
+            .ok_or_else(|| invalid("pinned source missing"))?;
+        if event["record_id"] != bearer
+            || !matches!(
+                event["type"].as_str(),
+                Some("record.created" | "record.updated" | "record.body.updated")
+            )
+        {
+            return Err(invalid("pinned source does not belong to artifact"));
+        }
+        let payload: Value = serde_json::from_str(string(event, "payload")?)?;
+        let source = string(&payload, "body")?.to_owned();
+        let digest = crate::mcp::tools::alpha_tabs::alpha_tab_declaration_digest(&declaration)?;
+        if row["declaration_digest"] != digest
+            || row["digest"]
+                != crate::mcp::tools::alpha_tabs::alpha_tab_digest(
+                    &crate::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(&source),
+                    &digest,
+                    "native.html.v1",
+                )
+        {
+            return Err(invalid("source or declaration digest mismatch"));
+        }
+        let control = state
+            .control_events
+            .get(string(&row, "event_id")?)
+            .ok_or_else(|| invalid("install control witness missing"))?;
+        let evidence: Value = serde_json::from_str(string(control, "payload")?)?;
+        if p.format >= 4 && !adoption_witness_supported(control["type"].as_str()) {
+            // A future transition type grants no executable authority.
+            // Still reject any contradictory retained pin fields.
+            for key in [
+                "account_id",
+                "package",
+                "version",
+                "digest",
+                "artifact_id",
+                "consented_source_revision",
+                "declaration_digest",
+                "adoption",
+            ] {
+                if evidence.get(key).is_some_and(|value| value != &row[key]) {
+                    return Err(invalid("install control witness mismatch"));
+                }
+            }
+            if evidence
+                .get("consented_declaration")
+                .is_some_and(|value| value != &declaration)
+                || control["actor"] != account
+            {
+                return Err(invalid("adoption ownership mismatch"));
+            }
+            return Ok(Some(CapturedInstall {
+                principal,
+                row,
+                body: None,
+                refusal: Some(UNSUPPORTED_WITNESS.into()),
+            }));
+        }
+        if !matches!(
+            control["type"].as_str(),
+            Some("alpha_tab.adopted" | "alpha_tab.updated")
+        ) {
+            if p.format < 4 {
+                return Err(invalid("unsupported adoption witness"));
+            }
+            // v1 stored (not new-append) validation preserves legacy
+            // installed/restored shell_adopt bases. See predecessor.rs
+            // :388–407 and control::validate_stored_control_event.
+            let event: crate::control::ControlEventRow = serde_json::from_value(control.clone())
+                .map_err(|_| invalid("invalid stored adoption witness"))?;
+            crate::control::validate_stored_control_event(&event)?;
+        }
+
+        for key in [
+            "account_id",
+            "package",
+            "version",
+            "digest",
+            "artifact_id",
+            "consented_source_revision",
+            "declaration_digest",
+            "adoption",
+        ] {
+            if evidence[key] != row[key] {
+                return Err(invalid("install control witness mismatch"));
+            }
+        }
+        // Stored legacy state events bind account/package through the
+        // canonical aggregate; v1 does not require their import actor
+        // to be the account. Direct adoption/update retain their fence.
+        let legacy_state = p.format >= 4
+            && matches!(
+                control["type"].as_str(),
+                Some("alpha_tab.installed" | "alpha_tab.restored")
+            );
+        if evidence["consented_declaration"] != declaration
+            || (!legacy_state && control["actor"] != account)
+        {
+            return Err(invalid("adoption ownership mismatch"));
+        }
+        body = Some(source);
+        refusal = None;
+    }
+    Ok(Some(CapturedInstall {
+        principal,
+        row,
+        body,
+        refusal,
+    }))
 }
 
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
@@ -657,6 +1029,7 @@ async fn project_source(
     let Some(body) = &install.body else {
         return Ok(());
     };
+    let pin = source_pin(&install.row, body)?.to_string();
     let row = &install.row;
     let package = string(row, "package")?;
     let version = string(row, "version")?;
@@ -664,21 +1037,6 @@ async fn project_source(
     let artifact = string(row, "artifact_id")?;
     let revision = string(row, "consented_source_revision")?;
     let declaration_digest = string(row, "declaration_digest")?;
-    // Consent rows retain their original JSON TEXT. The shared source pin
-    // canonicalizes only declaration JSON, so equivalent consent spellings
-    // cannot make another account's otherwise identical source ambiguous.
-    let declaration: Value = serde_json::from_str(string(row, "consented_declaration")?)?;
-    let pin = json!({
-        "format":1,
-        "package":package, "version":version, "digest":digest,
-        "artifact_id":artifact,
-        "source_revision":revision,
-        "consented_declaration":String::from_utf8(crate::canonical_json::canonical_json(&declaration)).map_err(|_| invalid("canonical declaration encoding"))?,
-        "declaration_digest":declaration_digest,
-        "runtime":"native.html.v1",
-        "bundle_sha256":crate::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(body)
-    })
-    .to_string();
     sqlx::query("INSERT INTO kernel_app_package_sources VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(package,version,digest,artifact_id,source_revision,declaration_digest) DO NOTHING")
         .bind(package).bind(version).bind(digest).bind(artifact).bind(revision).bind(declaration_digest).bind(&pin).bind(body).bind(seq).execute(&mut *conn).await?;
     let stored:(String,String,i64)=sqlx::query_as("SELECT pin_json,source_body,event_seq FROM kernel_app_package_sources WHERE package=? AND version=? AND digest=? AND artifact_id=? AND source_revision=? AND declaration_digest=?")
@@ -689,17 +1047,97 @@ async fn project_source(
     Ok(())
 }
 
+fn source_pin(row: &Value, body: &str) -> Result<Value> {
+    let package = string(row, "package")?;
+    let version = string(row, "version")?;
+    let digest = string(row, "digest")?;
+    let artifact = string(row, "artifact_id")?;
+    let revision = string(row, "consented_source_revision")?;
+    let declaration_digest = string(row, "declaration_digest")?;
+    // Consent rows retain their original JSON TEXT. The shared source pin
+    // canonicalizes only declaration JSON, so equivalent consent spellings
+    // cannot make another account's otherwise identical source ambiguous.
+    let declaration: Value = serde_json::from_str(string(row, "consented_declaration")?)?;
+    Ok(json!({
+        "format":1,
+        "package":package, "version":version, "digest":digest,
+        "artifact_id":artifact,
+        "source_revision":revision,
+        "consented_declaration":String::from_utf8(crate::canonical_json::canonical_json(&declaration)).map_err(|_| invalid("canonical declaration encoding"))?,
+        "declaration_digest":declaration_digest,
+        "runtime":"native.html.v1",
+        "bundle_sha256":crate::mcp::tools::alpha_tabs::alpha_tab_bundle_digest(body)
+    }))
+}
+
+/// Read-only evidence admission for the member consent path. Reuses the
+/// strict adoption/source verifier at the retained activation frontier; no
+/// activation event, source projection, or executable install is changed.
+async fn retained_sources_on(
+    conn: &mut SqliteConnection,
+    artifact: Option<&str>,
+) -> Result<Vec<(Value, String, i64)>> {
+    let activation: Option<(String, i64)> = sqlx::query_as(
+        "SELECT payload,seq FROM main.content_events WHERE type=? ORDER BY seq LIMIT 1",
+    )
+    .bind(ACTIVATED)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((raw, seq)) = activation else {
+        return Ok(vec![]);
+    };
+    let mut evidence: Activation = match serde_json::from_str(&raw) {
+        Ok(evidence) => evidence,
+        Err(_) => return Ok(vec![]),
+    };
+    if evidence.format != 4 {
+        return Ok(vec![]);
+    }
+    if let Some(id) = artifact {
+        evidence.capsules.retain(|bearer, _| bearer == id);
+    }
+    let mut sources = Vec::new();
+    let verified = match verify_sources(conn, &evidence, seq, true).await {
+        Ok(verified) => verified,
+        // Invalid retained activation evidence grants no source authority.
+        // Member list/prepare flows must remain usable for other source pins.
+        Err(_) => return Ok(sources),
+    };
+    for install in verified {
+        let declaration: Value = match install.row["consented_declaration"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+        {
+            Some(value) => value,
+            None => continue,
+        };
+        if declarations::declarative(&declaration).is_err() {
+            continue;
+        }
+        if let Some(body) = install.body.filter(|_| install.refusal.is_none()) {
+            if let Ok(pin) = source_pin(&install.row, &body) {
+                sources.push((pin, body, seq));
+            }
+        }
+    }
+    Ok(sources)
+}
+
 /// Exact frozen pins available for a new personal consent in this database.
 /// Revoking another account's install neither removes nor grants this access.
 /// Body bytes are reserved for the separately admitted preview/delivery lane.
 pub async fn frozen_sources_as(db: &Db, principal: &str) -> Result<Vec<Value>> {
     let mut snapshot = db.write_pool().begin().await?;
-    let pins = frozen_sources_on(&mut snapshot, principal).await?;
+    let pins = frozen_sources_on(&mut snapshot, principal, None).await?;
     snapshot.rollback().await?;
     Ok(pins)
 }
 
-async fn frozen_sources_on(conn: &mut SqliteConnection, principal: &str) -> Result<Vec<Value>> {
+async fn frozen_sources_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    retained: Option<&[(Value, String, i64)]>,
+) -> Result<Vec<Value>> {
     if !hosted_identity::account_admitted_before(conn, principal, i64::MAX).await? {
         return Err(Error::engine("database membership not found"));
     }
@@ -709,6 +1147,21 @@ async fn frozen_sources_on(conn: &mut SqliteConnection, principal: &str) -> Resu
     )
     .fetch_all(&mut *conn)
     .await?;
+    let mut pins = pins;
+    let owned;
+    let retained = match retained {
+        Some(retained) => retained,
+        None => {
+            owned = retained_sources_on(conn, None).await?;
+            &owned
+        }
+    };
+    for (pin, _, _) in retained {
+        let raw = pin.to_string();
+        if !pins.contains(&raw) {
+            pins.push(raw);
+        }
+    }
     let mut visible = Vec::new();
     for raw in pins {
         let pin: Value = serde_json::from_str(&raw)?;
@@ -747,4 +1200,26 @@ async fn is_artifact_on(conn: &mut SqliteConnection, record: &KernelRecordView) 
         record.kind.as_deref(),
         &record.fields,
     ) == (Some("Document"), Some("artifact")))
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+mod frozen_messaging_tests {
+    use super::*;
+
+    #[test]
+    fn activation_format_never_upgrades_an_earlier_retained_install() {
+        for version in ["0.4.1", "0.5.7"] {
+            assert!(!legacy_supported(1, "agent.slack-workspace-v2", version));
+            assert!(legacy_supported(2, "agent.slack-workspace-v2", version));
+        }
+        assert!(!legacy_supported(2, "agent.slack-workspace-v2", "0.5.13"));
+        assert!(!legacy_supported(2, "agent.slack-workspace", "0.5.7"));
+        for format in [1, 2] {
+            assert!(legacy_supported(format, "agent.docs", "0.8.2"));
+            assert!(legacy_supported(format, "agent.docs", "0.9.0"));
+            assert!(legacy_supported(format, "agent.docs", "0.9.1"));
+            assert!(legacy_supported(format, "agent.spaces", "0.7.0"));
+            assert!(legacy_supported(format, "agent.whiteboard", "0.2.0"));
+        }
+    }
 }

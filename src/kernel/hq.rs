@@ -89,6 +89,8 @@ pub(super) async fn refuse_message_collision(conn: &mut SqliteConnection, id: &s
 async fn refuse_collision(conn: &mut SqliteConnection, id: &str) -> Result<()> {
     if id.starts_with(super::app_state::AGGREGATE_PREFIX)
         || id.starts_with(super::app_installs::PREFIX)
+        || id.starts_with(super::artifact_closures::PREFIX)
+        || id.starts_with("kernel:canvas:")
     {
         return Err(Error::conflict("reserved app custody aggregate namespace"));
     }
@@ -317,6 +319,8 @@ async fn import_record_snapshot_as(
         pin: None,
         interpreter: None,
         fields: None,
+        origin: None,
+        basis: None,
     };
     if let Some(selection) = &state.definition {
         let pin = select_adoption_pin(
@@ -464,7 +468,7 @@ async fn import_record_snapshot_as(
 /// edits made before an interrupted resume. Legacy and relationship history
 /// alone do not overwrite record state.
 async fn refuse_native_changes(conn: &mut SqliteConnection, id: &str, before: i64) -> Result<()> {
-    let changed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e WHERE record_id=? AND seq<? AND (type IN ('kernel.record_revised.v1','kernel.record_revised.v2','kernel.body_set.v1','kernel.facet_observed.v1','kernel.metadata_set.v1','kernel.archive_changed.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.message_state.v1') OR (type='kernel.attachment_bound.v1' AND actor!=(SELECT principal_id FROM kernel_principals WHERE auth_binding='host:v1-import'))))")
+    let changed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM content_events e WHERE record_id=? AND seq<? AND (type IN ('kernel.record_revised.v1','kernel.record_revised.v2','kernel.body_set.v1','kernel.facet_observed.v1','kernel.named_view_admitted.v1','kernel.named_view_revision_recorded.v1','kernel.named_view_binding_changed.v1','kernel.metadata_set.v1','kernel.archive_changed.v1','kernel.record_rehomed.v1','kernel.record_rehomed.v2','kernel.message_state.v1') OR (type='kernel.attachment_bound.v1' AND actor!=(SELECT principal_id FROM kernel_principals WHERE auth_binding='host:v1-import'))))")
         .bind(id).bind(before).fetch_one(conn).await?;
     if changed {
         return Err(Error::conflict(
@@ -1174,6 +1178,17 @@ pub struct FacetObservation {
     pub vocab_ref: Option<String>,
     pub as_of: String,
 }
+// All facet consumers share the additive audit envelope, including admission
+// and history. Keep unknown observation members fail-closed.
+pub(super) fn decode_facet_observation(mut payload: serde_json::Value) -> Result<FacetObservation> {
+    if let Some(origin) = payload.as_object_mut().and_then(|p| p.remove("origin")) {
+        if !origin.is_object() {
+            return Err(Error::engine("invalid facet origin"));
+        }
+    }
+    Ok(serde_json::from_value(payload)?)
+}
+
 // Rust's number parser round-trips the immutable facet number token. Scoped to
 // the probe facet envelope; production v1 JSON parsing/canonicalization is unchanged.
 fn deserialize_facet_number<'de, D: serde::Deserializer<'de>>(
@@ -1183,6 +1198,13 @@ fn deserialize_facet_number<'de, D: serde::Deserializer<'de>>(
     raw.map(|raw| raw.get().parse::<f64>().map_err(serde::de::Error::custom))
         .transpose()
 }
+fn validate_new_facet(p: &FacetObservation) -> Result<()> {
+    if p.key == "named_view" {
+        return Err(Error::engine("named_view is reserved for engine admission"));
+    }
+    validate_facet(p)
+}
+
 pub(crate) fn validate_facet(p: &FacetObservation) -> Result<()> {
     if chrono::DateTime::parse_from_rfc3339(&p.as_of).is_err()
         || p.key == crate::schema::ARCHIVED_FACET_KEY
@@ -1527,7 +1549,7 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
             fold_body(conn, event, &p.body).await
         }
         "kernel.facet_observed.v1" => {
-            let p = event_payload(event)?;
+            let p = decode_facet_observation(event_payload(event)?)?;
             fold_facet(conn, event, &p).await
         }
         "kernel.archive_changed.v1" => {
@@ -1566,6 +1588,8 @@ pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Re
 #[serde(deny_unknown_fields)]
 struct KernelBodyPayload {
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<serde_json::Value>,
 }
 
 fn validate_body(body: &str) -> Result<()> {
@@ -1612,7 +1636,10 @@ pub async fn set_body_as(
         principal,
         record,
         "kernel.body_set.v1",
-        serde_json::to_value(KernelBodyPayload { body: body.into() })?,
+        serde_json::to_value(KernelBodyPayload {
+            body: body.into(),
+            origin: None,
+        })?,
         Some(expected_revision),
     )
     .await
@@ -1804,7 +1831,7 @@ pub async fn observe_facet_as(
     observation: &FacetObservation,
     expected_revision: Option<i64>,
 ) -> Result<()> {
-    validate_facet(observation)?;
+    validate_new_facet(observation)?;
     mutation_as(
         db,
         principal,
@@ -1861,6 +1888,10 @@ pub async fn unlink_as(
 }
 
 pub(crate) async fn admit(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    if event.event_type == "kernel.facet_observed.v1" {
+        validate_new_facet(&decode_facet_observation(event_payload(event)?)?)?;
+    }
+
     if event.event_type == super::deletion::EVENT {
         super::deletion::admit(conn, event).await?;
     }
@@ -2007,7 +2038,7 @@ pub async fn facet_history_as(
                 }
                 serde_json::from_str::<FacetEnvelope>(&raw)?.facet
             } else {
-                Some(serde_json::from_str(&raw)?)
+                Some(decode_facet_observation(serde_json::from_str(&raw)?)?)
             };
         if let Some(observation) = observation {
             if observation.key == key {

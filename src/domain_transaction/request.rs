@@ -350,7 +350,7 @@ fn add_run_context_arguments_inner(schema: &mut Value, kind: Option<ToolKind>, d
     let parent_key_schema = if describe {
         serde_json::json!({
             "type": "string",
-            "description": "Optional spawning run_key; unverified lineage hint. Minting sentinels invalid; coordination guide."
+            "description": "Spawning run_key; unverified lineage, no mint sentinels; coordination guide."
         })
     } else {
         serde_json::json!({"type": "string"})

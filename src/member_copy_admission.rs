@@ -304,6 +304,11 @@ pub(crate) fn validate_manifest(bytes: &[u8]) -> Result<ValidatedManifest, Admis
         ReplicaProfile::MemberReadV1 {
             member_schema_digest,
         } => member_schema_digest.clone(),
+        ReplicaProfile::MemberReadKernelV2 { .. } => {
+            return Err(AdmissionError::ManifestRejected {
+                detail: "kernel-v2 member profile requires native member admission".to_owned(),
+            })
+        }
         ReplicaProfile::CanonicalEngine => {
             return Err(AdmissionError::ManifestRejected {
                 detail: "member admission needs the member-read-v1 profile".to_owned(),
@@ -1373,6 +1378,34 @@ mod tests {
             .expect_err("consumer must refuse");
         assert_eq!(err, AdmissionError::ConsumerMismatch);
         assert_clean(&err);
+    }
+
+    #[test]
+    fn native_member_profile_never_uses_v1_admission_or_mutates_staged_bytes() {
+        let h = Harness::new();
+        let digest = write_member_file(&h.staged);
+        let before = fs::read(&h.staged).unwrap();
+        let mut manifest = manifest_for(&h.staged, &digest, SCOPE, 1);
+        manifest.profile = ReplicaProfile::MemberReadKernelV2 {
+            engine: crate::standby::kernel_v2::ENGINE.to_owned(),
+            member_schema_digest: member_schema_digest(),
+            identity: crate::replica_generation::NativeMemberProfileIdentity {
+                account_binding: "synthetic-member-account".to_owned(),
+                principal_id: "synthetic-member-principal".to_owned(),
+                genesis_event_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            },
+        };
+        let error = h.admit(&manifest, None).unwrap_err();
+        assert_eq!(
+            error,
+            AdmissionError::ManifestRejected {
+                detail: "kernel-v2 member profile requires native member admission".to_owned(),
+            }
+        );
+        assert_clean(&error);
+        assert_eq!(fs::read(&h.staged).unwrap(), before);
+        assert!(!h.copy_root.join("current.json").exists());
+        assert!(!h.copy_root.join("generations").exists());
     }
 
     #[test]

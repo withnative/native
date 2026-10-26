@@ -2,7 +2,8 @@
 //! The sealed import image includes original side rows for lossless migration;
 //! private lanes are served only to their subject and never through history.
 use super::*;
-use serde_json::Value;
+use crate::kernel;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 pub(crate) const PEOPLE_DDL: &str = "CREATE TABLE kernel_message_people (person_id TEXT PRIMARY KEY REFERENCES kernel_records(id), principal_id TEXT NOT NULL UNIQUE REFERENCES kernel_principals(principal_id))";
@@ -214,6 +215,29 @@ pub struct MessageState {
     pub mention_origin: Option<String>,
 }
 
+/// User-facing filing of native Direct messages is independent of the private
+/// policy home that protects their participants. Imported and explicitly moved
+/// records retain their existing provenance/placement rules. SQL uses alias
+/// `message` after filtering records for the caller's current View authority.
+pub(crate) const LOGICAL_DIRECT_HOME_SQL: &str = "CASE WHEN json_extract(message.state,'$.origin.type')='direct' AND EXISTS(SELECT 1 FROM main.content_events born WHERE born.record_id=message.message_id AND born.type='kernel.message_created.v1') AND NOT EXISTS(SELECT 1 FROM main.content_events moved WHERE moved.record_id=message.message_id AND moved.type IN ('kernel.record_rehomed.v1','kernel.record_rehomed.v2')) THEN json_extract(message.state,'$.home_id') END";
+
+/// Call only after admitting the caller and authorizing the Message itself.
+pub(crate) async fn logical_direct_home_on(
+    conn: &mut SqliteConnection,
+    id: &str,
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT {LOGICAL_DIRECT_HOME_SQL} FROM main.kernel_messages message WHERE message.message_id=?"
+    )).bind(id).fetch_optional(conn).await?.flatten())
+}
+
+// Shared record-state history for freshness and v1 reaction SQL. The generic
+// side-table custody event is not the initial/delta record-import baseline.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) const STATE_EVENTS_SQL: &str = "('kernel.message_created.v1','kernel.message_state.v1','kernel.import_state.v1','kernel.import_state_delta.v1','kernel.v1_state_imported.v1')";
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) const STATE_JSON_SQL: &str = "CASE e.type WHEN 'kernel.import_state.v1' THEN json_extract(e.payload,'$.state.message') WHEN 'kernel.import_state_delta.v1' THEN json_extract(e.payload,'$.snapshot.state.message') WHEN 'kernel.v1_state_imported.v1' THEN json_extract(e.payload,'$.state.message') ELSE e.payload END";
+
 /// Payload-free freshness for public reactions and the viewer's own private
 /// lane. Ordinary history still withholds every replacement payload. Compare
 /// immutable adjacent states rather than exposing or duplicating their data.
@@ -224,7 +248,17 @@ pub(crate) async fn change_as(
     seq: i64,
 ) -> Result<Option<KernelHistoryEvent>> {
     let mut tx = db.pool().begin().await?;
-    if !hosted_identity::admitted(&mut tx, principal).await? {
+    change_on(&mut tx, principal, seq).await
+}
+
+/// Same canonical change disclosure inside an existing authority snapshot.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn change_on(
+    tx: &mut SqliteConnection,
+    principal: &str,
+    seq: i64,
+) -> Result<Option<KernelHistoryEvent>> {
+    if !hosted_identity::admitted(&mut *tx, principal).await? {
         return Ok(None);
     }
     let row: Option<(String, String, Option<String>, String, String, String)> = sqlx::query_as(
@@ -237,16 +271,18 @@ pub(crate) async fn change_as(
     let Some((record, raw, actor, created_at, id, causal_status)) = row else {
         return Ok(None);
     };
-    if !legacy_history::visible(&mut tx, principal, &record, &mut BTreeMap::new()).await? {
+    if !legacy_history::visible(&mut *tx, principal, &record, &mut BTreeMap::new()).await? {
         return Ok(None);
     }
-    let previous: Option<String> = sqlx::query_scalar(
-        "SELECT CASE WHEN type='kernel.v1_state_imported.v1' THEN json_extract(payload,'$.state.message') ELSE payload END
-         FROM content_events WHERE record_id=? AND seq<? AND
-         (type IN ('kernel.message_created.v1','kernel.message_state.v1') OR
-          (type='kernel.v1_state_imported.v1' AND json_type(payload,'$.state.message')='object'))
-         ORDER BY seq DESC LIMIT 1",
-    ).bind(&record).bind(seq).fetch_optional(&mut *tx).await?;
+    let previous: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT {STATE_JSON_SQL} FROM content_events e WHERE e.record_id=? AND e.seq<?
+         AND e.type IN {STATE_EVENTS_SQL} AND json_type({STATE_JSON_SQL})='object'
+         ORDER BY e.seq DESC LIMIT 1"
+    ))
+    .bind(&record)
+    .bind(seq)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(previous) = previous else {
         return Ok(None);
     };
@@ -258,7 +294,7 @@ pub(crate) async fn change_as(
     {
         return Ok(None);
     }
-    let root_view = kernel_effective_capability_on(&mut tx, principal, KERNEL_ROOT_ID)
+    let root_view = kernel_effective_capability_on(&mut *tx, principal, KERNEL_ROOT_ID)
         .await?
         .allows(Capability::View);
     let actor = actor.filter(|actor| actor == principal || root_view);
@@ -407,19 +443,35 @@ pub(crate) async fn capability(
 /// Message/bearer guard over a caller's already evaluated home-policy snapshot.
 /// `homes` selects `id,view` for valid homes. This shares live hosted membership
 /// and imported member-policy evaluation with ordinary kernel authorization.
-pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str) -> String {
+// Index hints are reserved for reads that have passed serving readiness.
+// Unprepared write/admission callers must select the same unhinted predicate.
+pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str, prepared_read: bool) -> String {
+    let type_index = if prepared_read {
+        " INDEXED BY idx_kernel_read_type"
+    } else {
+        ""
+    };
     format!(
-        r#"NOT EXISTS(
+        // Most records are neither Messages nor bearers. Avoid starting a
+        // recursive VM for them, using exactly the recursive arm's identity
+        // and first-edge predicates. Unsealed Message carriers still enter
+        // the full fail-closed audience check.
+        r#"CASE WHEN NOT EXISTS(SELECT 1 FROM kernel_messages known WHERE known.message_id={alias}.id)
+        AND NOT EXISTS(SELECT 1 FROM kernel_records carrier WHERE carrier.id={alias}.id AND
+          ((carrier.pin_family='native.v1.record' AND carrier.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=carrier.id AND f.name='v1_type' AND f.value_json='"Message"'))
+           OR (carrier.primary_type='Message' AND NOT coalesce(carrier.pin_family='native.v1.record' AND carrier.pin_version=1,0))))
+        AND NOT EXISTS(SELECT 1 FROM kernel_generic_links l JOIN kernel_record_fields f{type_index} ON f.record_id=l.source_id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"') WHERE l.source_id={alias}.id AND l.active=1 AND l.relationship='part_of')
+        THEN 1 ELSE NOT EXISTS(
       WITH RECURSIVE bearers(id,depth) AS (
         SELECT {alias}.id,0 UNION ALL
         SELECT l.target_id,b.depth+1 FROM bearers b
         JOIN kernel_generic_links l ON l.source_id=b.id AND l.active=1 AND l.relationship='part_of'
-        JOIN kernel_record_fields f ON f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"')
+        JOIN kernel_record_fields f{type_index} ON f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"')
         WHERE b.depth<8)
       SELECT 1 FROM bearers b WHERE
         ((EXISTS(SELECT 1 FROM kernel_messages known WHERE known.message_id=b.id)
           OR EXISTS(SELECT 1 FROM kernel_records carrier WHERE carrier.id=b.id AND
-            ((carrier.pin_family='native.v1.record' AND carrier.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json='"Message"'))
+            ((carrier.pin_family='native.v1.record' AND carrier.pin_version=1 AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json='"Message"'))
              OR (carrier.primary_type='Message' AND NOT coalesce(carrier.pin_family='native.v1.record' AND carrier.pin_version=1,0)))))
          AND NOT EXISTS(
             SELECT 1 FROM kernel_messages m JOIN kernel_records mr ON mr.id=m.message_id
@@ -429,9 +481,9 @@ pub(crate) fn sql_guard(alias: &str, actor: &str, homes: &str) -> String {
             AND NOT EXISTS(SELECT 1 FROM kernel_principals service WHERE service.principal_id={actor} AND service.auth_binding='host:relates-to:transform')
             AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones tomb WHERE tomb.record_id=mr.id)))
         OR (b.depth=8
-          AND EXISTS(SELECT 1 FROM kernel_record_fields f WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"'))
+          AND EXISTS(SELECT 1 FROM kernel_record_fields f{type_index} WHERE f.record_id=b.id AND f.name='v1_type' AND f.value_json IN ('"Annotation"','"Document"'))
           AND EXISTS(SELECT 1 FROM kernel_generic_links l WHERE l.source_id=b.id AND l.active=1 AND l.relationship='part_of'))
-    )"#
+    ) END"#
     )
 }
 
@@ -527,7 +579,12 @@ async fn project_in(conn: &mut SqliteConnection, event: &EventRow, replaying: bo
                 kernel_require_on(conn, actor, &mention.target_id, Capability::View).await?;
             }
             let expected = match mention.target_kind.as_str() {
-                "principal" if state.addressed_to.contains(&mention.target_id) => {
+                // A Collection-origin Message may mention a person it does not
+                // address; a direct context's readers are its participants.
+                "principal"
+                    if state.addressed_to.contains(&mention.target_id)
+                        || state.origin["type"] == "collection" =>
+                {
                     let principal: String = sqlx::query_scalar(
                         "SELECT principal_id FROM kernel_message_people WHERE person_id=?",
                     )
@@ -780,4 +837,272 @@ pub(crate) async fn deleted_on(conn: &mut SqliteConnection, event: &EventRow) ->
         super::notifications::deleted_on(conn, event).await?;
     }
     Ok(())
+}
+
+pub(crate) async fn own_relevance_marks_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    message: &str,
+) -> Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as("SELECT r.id,l.link_id FROM kernel_generic_links l JOIN kernel_records r ON r.id=l.source_id WHERE l.target_id=? AND l.relationship='resolves' AND l.note='no_longer_relevant' AND l.active=1 AND r.owner_id=? AND r.pin_family='native.v1.record' AND r.pin_version=1 AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle WHERE record_id=r.id AND archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones WHERE record_id=r.id) AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_type' AND value_json='\"Annotation\"') AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_kind' AND value_json='\"no_longer_relevant\"') ORDER BY l.created_at,l.link_id")
+        .bind(message).bind(actor).fetch_all(conn).await?)
+}
+
+/// v1 message_expectation.rs:984: real satisfying evidence wins; otherwise a
+/// recipient's own mark closes only their obligation, and the sender's closes
+/// every recipient's. Ownership (or CREATE fallback) and link authorship are necessary.
+async fn relevance_evidence_on(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    id: &str,
+    state: &MessageState,
+) -> Result<Option<Value>> {
+    let rows: Vec<(String,Option<String>,Option<String>)> = sqlx::query_as("SELECT r.id,r.owner_id,CASE WHEN assertion.seq IS NOT NULL THEN assertion.actor ELSE l.actor END FROM kernel_generic_links l JOIN kernel_records r ON r.id=l.source_id LEFT JOIN main.content_events assertion ON assertion.seq=l.event_seq AND assertion.type IN ('kernel.generic_link_added.v1','kernel.generic_link_note_updated.v1') WHERE l.target_id=? AND l.relationship='resolves' AND l.note='no_longer_relevant' AND l.active=1 AND r.pin_family='native.v1.record' AND r.pin_version=1 AND NOT EXISTS(SELECT 1 FROM kernel_lifecycle WHERE record_id=r.id AND archived=1) AND NOT EXISTS(SELECT 1 FROM kernel_import_tombstones WHERE record_id=r.id) AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_type' AND value_json='\"Annotation\"') AND EXISTS(SELECT 1 FROM kernel_record_fields WHERE record_id=r.id AND name='v1_kind' AND value_json='\"no_longer_relevant\"') ORDER BY l.created_at,l.link_id")
+        .bind(id).fetch_all(&mut *conn).await?;
+    for (evidence, owner, link_actor) in rows {
+        let Some(link_actor) = link_actor else {
+            continue;
+        };
+        // v1 falls back to the CREATE actor only for ownerless evidence.
+        let owner = match owner {
+            Some(owner) => owner,
+            None => {
+                let creator: Option<String> = sqlx::query_scalar("SELECT json_extract(payload,'$.legacy.payload.creator') FROM main.content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1")
+                    .bind(&evidence).fetch_optional(&mut *conn).await?.flatten();
+                let principal: Option<String> = if let Some(account) = creator {
+                    sqlx::query_scalar("SELECT principal_id FROM kernel_principals WHERE kind='account' AND auth_binding=?").bind(account).fetch_optional(&mut *conn).await?
+                } else {
+                    sqlx::query_scalar("SELECT actor FROM main.content_events WHERE record_id=? AND type='kernel.record_created.v1' ORDER BY seq LIMIT 1").bind(&evidence).fetch_optional(&mut *conn).await?.flatten()
+                };
+                let Some(owner) = principal else { continue };
+                owner
+            }
+        };
+        let account: Option<String> =
+            sqlx::query_scalar("SELECT auth_binding FROM kernel_principals WHERE principal_id=?")
+                .bind(&owner)
+                .fetch_optional(&mut *conn)
+                .await?;
+        let legacy = account.map(|a| format!("v1:{a}")).unwrap_or_default();
+        let by = if owner == actor {
+            "recipient"
+        } else if state.author.as_deref() == Some(owner.as_str()) {
+            "sender"
+        } else {
+            continue;
+        };
+        if (link_actor == owner || link_actor == legacy)
+            && read_record_on(conn, actor, &evidence).await?.is_some()
+        {
+            return Ok(Some(
+                serde_json::json!({"kind":"no_longer_relevant","record_id":evidence,"by":by}),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+// Shared by caller-relative state/SQL reads and closed-obligation notification
+// withdrawal, so relevance writes honor the same live reply/work evidence.
+async fn governed_work_evidence(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    id: &str,
+    expectation: &str,
+    rules: &kernel::MessageRules,
+) -> Result<Option<Value>> {
+    let account: Option<String> =
+        sqlx::query_scalar("SELECT auth_binding FROM kernel_principals WHERE principal_id=?")
+            .bind(actor)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let legacy_actor = account.as_ref().map(|a| format!("v1:{a}"));
+    let candidates:Vec<(String,Option<String>)>=sqlx::query_as("SELECT l.source_id,l.actor FROM kernel_generic_links l JOIN kernel_records r ON r.id=l.source_id WHERE l.target_id=? AND l.relationship='derived_from' AND l.active=1 ORDER BY COALESCE((SELECT json_extract(e.payload,'$.legacy.payload.created_at') FROM main.content_events e WHERE e.record_id=r.id AND e.type='kernel.legacy_recorded.v1' AND json_extract(e.payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY e.seq DESC LIMIT 1),r.created_at),r.id").bind(id).fetch_all(&mut *conn).await?;
+    for (candidate, link_actor) in candidates {
+        if link_actor.as_deref() != Some(actor) && link_actor.as_ref() != legacy_actor.as_ref() {
+            continue;
+        }
+        let Some(view) = kernel::read_record_on(conn, actor, &candidate).await? else {
+            continue;
+        };
+        let (typ, kind) = crate::v2_standard::v1_compat::v1_type_and_kind(
+            view.family.as_deref(),
+            view.pin.as_ref().map(|p| p.version),
+            None,
+            view.kind.as_deref(),
+            &view.fields,
+        );
+        if (expectation == "action" && typ != Some("WorkItem"))
+            || (expectation == "decision" && typ != Some("Resolution"))
+        {
+            continue;
+        }
+        let provenance:Option<String>=sqlx::query_scalar("SELECT json_extract(payload,'$.legacy.payload') FROM main.content_events WHERE record_id=? AND type='kernel.legacy_recorded.v1' AND json_extract(payload,'$.legacy.event_type')='v1.snapshot_provenance' ORDER BY seq DESC LIMIT 1").bind(&candidate).fetch_optional(&mut *conn).await?;
+        let provenance: Option<Value> = provenance
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?;
+        let authored = if let Some(provenance) = &provenance {
+            account.as_ref().is_some_and(|account| {
+                provenance["creator"] == account.as_str()
+                    || provenance["verified_owner_accounts"]
+                        .as_array()
+                        .is_some_and(|owners| owners.iter().any(|owner| owner == account))
+            })
+        } else {
+            view.owner_id.as_deref()==Some(actor) || sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM main.content_events WHERE record_id=? AND type='kernel.record_created.v1' AND actor=?)").bind(&candidate).bind(actor).fetch_one(&mut *conn).await?
+        };
+        if !authored {
+            continue;
+        }
+        if expectation == "decision" {
+            if kind.is_some_and(|k| rules.decision_kinds.contains(k)) {
+                return Ok(Some(json!({"kind":"decision","record_id":candidate})));
+            }
+            continue;
+        }
+        let Some(lifecycle) = view.fields.get("lifecycle").and_then(Value::as_str) else {
+            continue;
+        };
+        let home = if let Some(provenance) = &provenance {
+            provenance["original_home"].as_str().map(str::to_owned)
+        } else if view.home_id == crate::events::KERNEL_ROOT_ID {
+            Some("native:root".into())
+        } else {
+            sqlx::query_scalar("SELECT json_extract(payload,'$.source_record_id') FROM main.content_events WHERE record_id=? AND type IN ('kernel.import_home.v1','kernel.home_created.v1') AND json_extract(payload,'$.source_record_id') IS NOT NULL ORDER BY seq LIMIT 1").bind(&view.home_id).fetch_optional(&mut *conn).await?.or(Some(view.home_id.clone()))
+        };
+        let rows: Vec<crate::query::cascade::SchemaConfigRow> = rules
+            .schemas
+            .iter()
+            .map(|row| crate::query::cascade::SchemaConfigRow {
+                id: row["id"].as_str().unwrap_or("").into(),
+                layer: row["layer"].as_str().unwrap_or("").into(),
+                name: None,
+                data: row["data"].clone(),
+                applies_to_collection_id: row["applies_to_collection_id"]
+                    .as_str()
+                    .map(str::to_owned),
+                version_lineage: None,
+                created_at: row["created_at"].as_str().unwrap_or("").into(),
+            })
+            .collect();
+        let facets = crate::query::cascade::facets_for_record_context(
+            &rows,
+            "WorkItem",
+            kind,
+            home.as_deref(),
+        );
+        let governing = facets
+            .get("lifecycle")
+            .and_then(|shape| shape.get("vocab").or_else(|| shape.get("vocab_ref")))
+            .and_then(Value::as_str)
+            .map(crate::meta::resolve_vocab_ref);
+        if governing.is_some_and(|g| {
+            rules
+                .positive
+                .get(g)
+                .is_some_and(|values| values.contains(lifecycle))
+        }) {
+            return Ok(Some(
+                json!({"kind":"completed_work_item","record_id":candidate}),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+// The projector also calls this evaluator. Box it so its read/derivation
+// frame does not enlarge every native write's projection future.
+#[inline(never)]
+pub(crate) fn expectation_value<'a>(
+    tx: &'a mut sqlx::SqliteConnection,
+    actor: &'a str,
+    id: &'a str,
+    state: &'a kernel::MessageState,
+) -> futures::future::BoxFuture<'a, Result<Value>> {
+    Box::pin(async move {
+        let declared = state
+            .expectation
+            .as_deref()
+            .filter(|e| crate::message_expectation::EXPECTATION_VALUES.contains(e));
+        let mut result = json!({"format":crate::message_expectation::EXPECTATION_DERIVATION_VERSION,"message_id":id,"recipient_id":actor,"expectation":declared,"state":match declared {None=>"unknown",Some("none")=>"not_required",_=>"open"}});
+        if matches!(declared, None | Some("none")) {
+            return Ok(result);
+        }
+        if let Some(imported) = state.expectations.get(actor) {
+            result = imported.clone();
+            if result["evidence"]["kind"] == "no_longer_relevant" {
+                result["state"] = json!("open");
+                result.as_object_mut().unwrap().remove("evidence");
+            }
+            result["recipient_id"] = json!(actor);
+            if let Some(evidence) = result["evidence"]["record_id"].as_str() {
+                if kernel::read_record_on(tx, actor, evidence).await?.is_none() {
+                    // Retain the source evaluator's satisfaction fact without
+                    // disclosing an evidence identity hidden on the kernel.
+                    result.as_object_mut().unwrap().remove("evidence");
+                }
+            }
+        }
+        if let (Some(expectation @ ("action" | "decision")), Some(rules)) =
+            (declared, state.rules.as_ref())
+        {
+            // Reconcile current kernel evidence on each read. Reopening a task or
+            // deleting evidence cannot leave a stale imported satisfaction flag.
+            result["state"] = json!("open");
+            result.as_object_mut().unwrap().remove("evidence");
+            if let Some(evidence) =
+                governed_work_evidence(tx, actor, id, expectation, rules).await?
+            {
+                result["state"] = json!("satisfied");
+                result["evidence"] = evidence;
+            }
+        }
+        if declared == Some("ack") && state.acknowledgements.contains_key(actor) {
+            result["state"] = json!("satisfied");
+            result["evidence"] = json!({"kind":"acknowledgement","record_id":id});
+            return Ok(result);
+        }
+        if matches!(declared, Some("ack" | "reply")) {
+            let replies:Vec<(String,String)>=sqlx::query_as("SELECT message_id,state FROM kernel_messages WHERE json_extract(state,'$.reply_to')=? AND json_extract(state,'$.author')=? ORDER BY event_seq,message_id").bind(id).bind(actor).fetch_all(&mut *tx).await?;
+            for (reply, raw) in replies {
+                let reply_state: kernel::MessageState = serde_json::from_str(&raw)?;
+                let sender_person: Option<String> = sqlx::query_scalar(
+                    "SELECT person_id FROM kernel_message_people WHERE principal_id=?",
+                )
+                .bind(state.author.as_deref().unwrap_or(""))
+                .fetch_optional(&mut *tx)
+                .await?;
+                let account: String = sqlx::query_scalar(
+                    "SELECT auth_binding FROM kernel_principals WHERE principal_id=?",
+                )
+                .bind(actor)
+                .fetch_one(&mut *tx)
+                .await?;
+                let authored:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kernel_generic_links WHERE source_id=? AND target_id=? AND relationship='reply_to' AND active=1 AND actor IN (?,?))").bind(&reply).bind(id).bind(actor).bind(format!("v1:{account}")).fetch_one(&mut *tx).await?;
+                // v1 also delivers replies to persona/agent utterances through
+                // an explicit reply_to in the same declared Collection.
+                let delivered = sender_person
+                    .is_some_and(|p| reply_state.addressed_to.contains(&p))
+                    || (state.speaker.is_some()
+                        && state.origin["type"] == "collection"
+                        && reply_state.origin == state.origin);
+                if authored
+                    && reply_state.speaker.is_none()
+                    && delivered
+                    && kernel::read_record_on(tx, actor, &reply).await?.is_some()
+                {
+                    result["state"] = json!("satisfied");
+                    result["evidence"] = json!({"kind":"reply","record_id":reply});
+                    break;
+                }
+            }
+        }
+        if result["state"] != "satisfied" {
+            if let Some(evidence) = relevance_evidence_on(tx, actor, id, state).await? {
+                result["state"] = json!("satisfied");
+                result["evidence"] = evidence;
+            }
+        }
+        Ok(result)
+    })
 }

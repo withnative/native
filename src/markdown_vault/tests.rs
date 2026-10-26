@@ -1530,3 +1530,147 @@ fn diagnostic_fields_stay_single_line_and_bounded() {
     assert_eq!(diag_field(&"x".repeat(100), 10), "x".repeat(10));
     assert!(diag_field(&"/vault", 0).is_empty());
 }
+
+#[tokio::test]
+async fn initial_status_samples_freshness_after_publication() {
+    let db = db().await;
+    record(
+        &db,
+        "freshness-note",
+        "Freshness note",
+        "Document",
+        "record",
+        "native:root",
+        "fixture body",
+    )
+    .await;
+    let mut source = source(&db, "alice").await;
+    source.freshness = json!({"freshness":{"age_seconds":290,"beyond_rpo":false}});
+    let directory = tempfile::tempdir().unwrap();
+    let vault = directory.path().join("vault");
+    let mut publisher = Publisher::open(&vault).unwrap();
+    publisher
+        .cycle_with_freshness(&source, || {
+            // The freshness sampler runs after the files and successful frontier
+            // have been committed, even on the very first publication. Model a
+            // 15-second collection/render crossing RPO without wall-clock sleeps.
+            let state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(vault.join(".native/state.json")).unwrap())
+                    .unwrap();
+            assert_eq!(state["successful_act"], source.act);
+            assert!(!state["rendered_at"].as_str().unwrap().is_empty());
+            assert!(!vault.join(".native/STATUS.md").exists());
+            Ok(json!({"freshness":{"age_seconds":305,"beyond_rpo":true}}))
+        })
+        .unwrap();
+    let status = std::fs::read_to_string(vault.join(".native/STATUS.md")).unwrap();
+    assert!(status.contains("\"age_seconds\":305"));
+    assert!(status.contains("\"beyond_rpo\":true"));
+    assert!(!status.contains("\"age_seconds\":290"));
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[test]
+fn native_member_vault_revocation_purges_edited_owned_files_and_refuses_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vault");
+    let mut publisher = Publisher::open(&root).unwrap();
+    let mut source = SourceSnapshot {
+        origin: "ndb_00000000000000000000000000000001".into(),
+        account: "acct_00000000000000000000000000000001".into(),
+        ..Default::default()
+    };
+    source.records.insert(
+        "native:root".into(),
+        SourceRecord {
+            id: "native:root".into(),
+            record_type: "Collection".into(),
+            kind: Some("folder".into()),
+            name: Some("Synthetic workspace".into()),
+            ..Default::default()
+        },
+    );
+    source.records.insert(
+        "00000000-0000-0000-0000-000000000001".into(),
+        SourceRecord {
+            id: "00000000-0000-0000-0000-000000000001".into(),
+            record_type: "Document".into(),
+            kind: Some("note".into()),
+            name: Some("Synthetic note".into()),
+            body: Some("synthetic body".into()),
+            ..Default::default()
+        },
+    );
+    let output = rendered(&source);
+    publisher.cycle(&source).unwrap();
+    let paths: Vec<_> = output.files.keys().cloned().collect();
+    assert!(!paths.is_empty());
+    for path in &paths {
+        edit(&root.join(path), "locally edited synthetic body");
+    }
+    super::publisher::FAIL_NEXT_DIRECTORY_SYNC.with(|flag| flag.set(true));
+    assert!(publisher.revoke_member().is_err());
+    let pending: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".native/state.json")).unwrap()).unwrap();
+    assert_eq!(pending["member_revoked"], true);
+    assert!(publisher.cycle(&source).is_err());
+    drop(publisher);
+    let mut reopened = Publisher::open(&root).unwrap();
+    for path in &paths {
+        assert!(!root.join(path).exists());
+    }
+    assert!(reopened.cycle(&source).is_err());
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".native/state.json")).unwrap()).unwrap();
+    assert_eq!(state["member_revoked"], true);
+    assert_eq!(state["allocations"], serde_json::json!({}));
+    assert_eq!(state["visible"], serde_json::json!([]));
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[test]
+fn native_member_vault_scope_change_recovers_only_after_verified_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vault");
+    let mut publisher = Publisher::open(&root).unwrap();
+    let mut source = SourceSnapshot {
+        origin: "ndb_00000000000000000000000000000001".into(),
+        account: "acct_00000000000000000000000000000001".into(),
+        ..Default::default()
+    };
+    source.records.insert(
+        "native:root".into(),
+        SourceRecord {
+            id: "native:root".into(),
+            record_type: "Collection".into(),
+            kind: Some("folder".into()),
+            name: Some("Synthetic root".into()),
+            body: Some("synthetic new scope".into()),
+            ..Default::default()
+        },
+    );
+    publisher.cycle(&source).unwrap();
+    publisher.mark_member_scope_change("new-scope").unwrap();
+    publisher.revoke_member().unwrap();
+    assert!(publisher.cycle(&source).is_err());
+    assert!(publisher
+        .publish_member_scope("old-scope", &source)
+        .is_err());
+    super::publisher::FAIL_AFTER_WRITES.with(|flag| flag.set(true));
+    assert!(publisher
+        .publish_member_scope("new-scope", &source)
+        .is_err());
+    assert!(publisher.scope_rebind_pending("new-scope"));
+    drop(publisher);
+    let mut reopened = Publisher::open(&root).unwrap();
+    assert!(reopened.cycle(&source).is_err());
+    reopened.publish_member_scope("new-scope", &source).unwrap();
+    assert!(!reopened.scope_rebind_pending("new-scope"));
+    reopened.cycle(&source).unwrap();
+    drop(reopened);
+    let mut reopened = Publisher::open(&root).unwrap();
+    reopened.cycle(&source).unwrap();
+    reopened.mark_member_revoked().unwrap();
+    reopened.revoke_member().unwrap();
+    assert!(reopened.publish_member_scope("new-scope", &source).is_err());
+}

@@ -77,6 +77,9 @@ pub fn lens_descriptor_projection_for_policy(
     }
     let mut tools = registry
         .specs_for_policy(policy)
+        // HCP audit is private to the authenticated account of one ordinary
+        // Native database; a lens must not advertise a destination selector.
+        .filter(|tool| tool.kind != Some(ToolKind::ReadHcpAudit))
         .map(|tool| {
             let mut descriptor = tool_descriptor(tool);
             let Some(schema) = descriptor
@@ -212,7 +215,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
     use LensToolPolicy::*;
     use ToolKind::*;
     match kind {
-        Some(ToolKind::OutboxStatus) => UnsupportedRead,
+        Some(ToolKind::OutboxStatus | ToolKind::ManageNamedViews) => UnsupportedRead,
         Some(GetRecord | QueryRecord | Search) => FederatedRead,
         Some(
             SetIntent
@@ -262,7 +265,7 @@ pub fn lens_tool_policy(kind: Option<ToolKind>, name: &str) -> LensToolPolicy {
         ) => DestinationPassThrough,
         // A moment projection is scoped to one database's own event log and
         // read log. There is nothing to federate and nothing to pass through.
-        Some(GetEventContext | GetReuseContext) => UnsupportedRead,
+        Some(GetEventContext | GetReuseContext | ReadHcpAudit) => UnsupportedRead,
         Some(
             Ping
             | EngineInfo
@@ -348,7 +351,14 @@ fn overlay_top_level_property(schema: &mut Map<String, Value>, name: &str, prope
                 {
                     continue;
                 }
-                overlay_top_level_property(branch, name, property);
+                // The root carries the complete routing instructions once.
+                // Closed branches need the same validation constraints, not
+                // repeated annotation prose. This preserves every field.
+                let mut branch_property = property.clone();
+                if let Some(object) = branch_property.as_object_mut() {
+                    object.remove("description");
+                }
+                overlay_top_level_property(branch, name, &branch_property);
             }
         }
     }
@@ -470,6 +480,46 @@ mod overlay_tests {
         assert!(
             !validator.is_valid(&json!({"id": "a", "record_id": "b", "destination_db_id": "db"}))
         );
+    }
+
+    #[test]
+    fn routing_instructions_stay_at_root_while_branch_constraints_are_identical() {
+        let mut schema = json!({"type":"object","oneOf":[
+            {"type":"object","properties":{"action":{"const":"read"}},"required":["action"],"additionalProperties":false},
+            {"type":"object","properties":{"action":{"const":"write"}},"required":["action"],"additionalProperties":false}
+        ]});
+        overlay_top_level_property(
+            schema.as_object_mut().unwrap(),
+            "destination_db_id",
+            &destination_schema(),
+        );
+        assert_eq!(
+            schema["properties"]["destination_db_id"],
+            destination_schema()
+        );
+        let mut verbose = schema.clone();
+        for branch in verbose["oneOf"].as_array_mut().unwrap() {
+            branch["properties"]["destination_db_id"] = destination_schema();
+        }
+        let compact = jsonschema::validator_for(&schema).unwrap();
+        let verbose = jsonschema::validator_for(&verbose).unwrap();
+        for action in ["read", "write", "unknown"] {
+            for destination in [json!("db"), json!(23), Value::Null] {
+                for extra in [false, true] {
+                    let mut args = json!({"action":action,"destination_db_id":destination});
+                    if extra {
+                        args["unexpected"] = json!(true);
+                    }
+                    assert_eq!(compact.is_valid(&args), verbose.is_valid(&args));
+                }
+            }
+        }
+        for branch in schema["oneOf"].as_array().unwrap() {
+            assert_eq!(
+                branch["properties"]["destination_db_id"],
+                json!({"type":"string"})
+            );
+        }
     }
 
     #[test]

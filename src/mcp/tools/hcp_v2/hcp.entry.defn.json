@@ -1,0 +1,37 @@
+{
+  "family": "hcp.entry",
+  "version": 1,
+  "interpreter": "native.defn/5",
+  "primary_type": "Resolution",
+  "kinds": [
+    {
+      "token": "hcp_entry",
+      "description": "Private HCP entry view.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "title",
+          "type": "text",
+          "required": false,
+          "description": "title"
+        },
+        {
+          "name": "summary",
+          "type": "text",
+          "required": false,
+          "description": "summary"
+        },
+        {
+          "name": "lifecycle",
+          "type": "text",
+          "required": false,
+          "description": "lifecycle"
+        }
+      ],
+      "links": []
+    }
+  ]
+}

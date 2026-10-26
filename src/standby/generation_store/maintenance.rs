@@ -152,7 +152,14 @@ impl GenerationStore {
             let mut warnings = self.cleanup_pruning_workspaces();
             warnings.extend(self.cleanup_rebind_temps());
             let ids = self.generation_ids()?;
-            let excess = ids.len() > 3;
+            let pinned_extra = self.pinned_v1_generation()?.is_some_and(|id| {
+                ids.contains(&id)
+                    && self
+                        .read_pointer()
+                        .ok()
+                        .is_some_and(|pointer| pointer.generation_id != id)
+            });
+            let excess = ids.len() > 3 + usize::from(pinned_extra);
             if !verify_priors && !excess {
                 return Ok(warnings);
             }
@@ -182,6 +189,9 @@ impl GenerationStore {
             Vec::new();
         for candidate in candidates {
             check_verification_cancellation()?;
+            if self.pinned_v1_generation()?.as_deref() == Some(&candidate.id) {
+                continue;
+            }
             let lease = {
                 let _lock = acquire_promotion_lock(self.root.join("promotion.lock")).await?;
                 if !self.pointer_still_selects(&pointer)? {

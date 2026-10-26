@@ -26,9 +26,7 @@ use super::binary_resume::{
     CompletedRange, PendingCapture, MAX_COMPLETED_RANGES, RESUME_CHUNK_BYTES,
 };
 use crate::error::{Error, Result};
-use crate::standby_snapshot::{
-    StandbyConsumerIdentity, StandbySnapshotManifest, STANDBY_SNAPSHOT_MANIFEST_CONTRACT,
-};
+use crate::standby_snapshot::{StandbyConsumerIdentity, StandbySnapshotManifest};
 
 /// Client-side copy of the v1 wire contract (mirrors `refresh/binary.rs`).
 pub const IDENTITY_EXPORT_API: &str = "native.standby-snapshot-export.v1";
@@ -230,7 +228,7 @@ fn check_manifest_binding(
     decoded_size: u64,
     decoded_sha: &str,
 ) -> Result<()> {
-    if manifest.contract != STANDBY_SNAPSHOT_MANIFEST_CONTRACT || manifest.version != 1 {
+    if !manifest.has_supported_contract() {
         return Err(Error::engine(
             "standby transfer manifest contract is not supported",
         ));
@@ -599,7 +597,7 @@ mod tests {
     use crate::standby_snapshot::{
         CanonicalFrontierV1, StandbyConsumerPlatform, StandbyGenerationMaterialization,
         StandbySnapshotBytes, StandbySnapshotEngineIdentity, STANDBY_CONSUMER_CONTRACT,
-        STANDBY_FRONTIER_CONTRACT, STANDBY_SNAPSHOT_MEDIA_TYPE,
+        STANDBY_FRONTIER_CONTRACT, STANDBY_SNAPSHOT_MANIFEST_CONTRACT, STANDBY_SNAPSHOT_MEDIA_TYPE,
     };
     use std::path::PathBuf;
 
@@ -647,12 +645,167 @@ mod tests {
                 storage_portability_policy_revision: 1,
             },
             head_act: None,
+            kernel_v2: None,
             materialization: StandbyGenerationMaterialization::Snapshot,
             snapshot: StandbySnapshotBytes {
                 media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),
                 size_bytes: decoded_size,
                 sha256: decoded_sha.into(),
             },
+        }
+    }
+
+    fn native_manifest() -> StandbySnapshotManifest {
+        let mut manifest = test_manifest(300_000, DECODED_SHA);
+        manifest.contract = crate::standby::kernel_v2::MANIFEST.into();
+        manifest.engine.name = crate::standby::kernel_v2::ENGINE.into();
+        manifest.engine.schema_version = 0;
+        manifest.frontier = CanonicalFrontierV1 {
+            contract: STANDBY_FRONTIER_CONTRACT.into(),
+            version: 1,
+            content_event_seq: 0,
+            policy_event_seq: 0,
+            awareness_event_seq: 0,
+            notification_candidate_event_seq: 0,
+            binding_audit_seq: 0,
+            database_identity_audit_seq: 0,
+            meta_event_seq: 0,
+            control_event_seq: 0,
+            derivation_event_seq: 0,
+            relationship_event_seq: 0,
+            authorization_revision_epoch: 0,
+            storage_portability_policy_revision: 0,
+        };
+        manifest.head_act = Some(1);
+        manifest.kernel_v2 = Some(crate::standby::kernel_v2::KernelGeneration {
+            application_id: crate::db::V2_APPLICATION_ID,
+            genesis_event_id: HANDLE.into(),
+            content_event_seq: 1,
+            meta_event_seq: 0,
+            head_act: 1,
+            schema_sha256: manifest.engine.ddl_sha256.clone(),
+            projection_tables: vec!["kernel_records".into()],
+            blob_count: 0,
+        });
+        manifest.validate().unwrap();
+        manifest
+    }
+
+    fn ready_native(
+        manifest: StandbySnapshotManifest,
+        gzip: bool,
+    ) -> Result<ReadyTransferIdentity> {
+        let binding = test_binding();
+        if gzip {
+            ReadyTransferIdentity::from_gzip_poll(
+                HANDLE.into(),
+                manifest,
+                300_000,
+                DECODED_SHA.into(),
+                12_000,
+                ENCODED_SHA.into(),
+                &binding.hosted_route_database_id,
+                &binding.origin_database_id,
+                &binding.consumer,
+            )
+        } else {
+            ReadyTransferIdentity::from_identity_poll(
+                HANDLE.into(),
+                manifest,
+                300_000,
+                DECODED_SHA.into(),
+                &binding.hosted_route_database_id,
+                &binding.origin_database_id,
+                &binding.consumer,
+            )
+        }
+    }
+
+    #[test]
+    fn ready_native_identity_accepts_supported_manifest_contract() {
+        let manifest = native_manifest();
+        let ready = ready_native(manifest.clone(), false).unwrap();
+        assert_eq!(ready.manifest, manifest);
+        assert_eq!(ready.encoded_size_bytes, None);
+        ready
+            .check_against_poll(&manifest, 300_000, DECODED_SHA, None, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn ready_native_gzip_accepts_supported_manifest_contract() {
+        let manifest = native_manifest();
+        let ready = ready_native(manifest.clone(), true).unwrap();
+        assert_eq!(ready.manifest, manifest);
+        assert_eq!(ready.encoded_size_bytes, Some(12_000));
+        ready
+            .check_against_poll(
+                &manifest,
+                300_000,
+                DECODED_SHA,
+                Some(12_000),
+                Some(ENCODED_SHA),
+            )
+            .unwrap();
+        assert!(ready
+            .check_against_poll(
+                &manifest,
+                300_000,
+                DECODED_SHA,
+                Some(12_000),
+                Some(&"a".repeat(64))
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn ready_native_refuses_unknown_headers_and_mismatched_bindings() {
+        for gzip in [false, true] {
+            for field in [
+                "contract", "version", "route", "origin", "consumer", "size", "sha",
+            ] {
+                let mut manifest = native_manifest();
+                match field {
+                    "contract" => manifest.contract = "native.unknown-manifest.v1".into(),
+                    "version" => manifest.version = 2,
+                    "route" => manifest.hosted_route_database_id = "other-route".into(),
+                    "origin" => manifest.origin_database_id = format!("ndb_{}", "e".repeat(32)),
+                    "consumer" => manifest.consumer.artifact_sha256 = "e".repeat(64),
+                    "size" => manifest.snapshot.size_bytes += 1,
+                    "sha" => manifest.snapshot.sha256 = "e".repeat(64),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    ready_native(manifest, gzip).is_err(),
+                    "{field}, gzip={gzip}"
+                );
+            }
+        }
+        let binding = test_binding();
+        for (size, sha) in [(0, ENCODED_SHA), (12_000, "invalid")] {
+            assert!(ReadyTransferIdentity::from_gzip_poll(
+                HANDLE.into(),
+                native_manifest(),
+                300_000,
+                DECODED_SHA.into(),
+                size,
+                sha.into(),
+                &binding.hosted_route_database_id,
+                &binding.origin_database_id,
+                &binding.consumer,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn ready_native_recognition_does_not_replace_full_manifest_validation() {
+        let mut manifest = native_manifest();
+        manifest.engine.schema_version = 1;
+        assert!(manifest.validate().is_err());
+        // Acquisition binds representation custody, not engine admission.
+        for gzip in [false, true] {
+            assert!(ready_native(manifest.clone(), gzip).is_ok());
         }
     }
 

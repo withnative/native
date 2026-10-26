@@ -82,6 +82,12 @@ struct State {
     integrity: String,
     origin: String,
     account: String,
+    #[cfg(feature = "v2-kernel-probe")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    member_revoked: bool,
+    #[cfg(feature = "v2-kernel-probe")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    member_rebind_scope: Option<String>,
     act: i64,
     #[serde(default)]
     rendered_at: String,
@@ -174,7 +180,8 @@ impl Publisher {
         let lock = open(&native, "writer.lock", libc::O_RDWR | libc::O_CREAT, 0o600)?;
         lock.try_lock_exclusive()
             .map_err(|_| Error::engine("vault already has a writer"))?;
-        let publisher = Self {
+        #[allow(unused_mut)]
+        let mut publisher = Self {
             root,
             _lock: lock,
             state,
@@ -185,6 +192,10 @@ impl Publisher {
             publisher.root.sync_all()?;
         }
         publisher.cleanup()?;
+        #[cfg(feature = "v2-kernel-probe")]
+        if publisher.state.member_revoked {
+            publisher.revoke_member()?;
+        }
         Ok(publisher)
     }
 
@@ -365,7 +376,31 @@ impl Publisher {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cycle(&mut self, source: &SourceSnapshot) -> Result<Vec<String>> {
+        self.cycle_with_freshness(source, || Ok(source.freshness.clone()))
+    }
+
+    /// Sample serving-generation freshness after collection, rendering and
+    /// publication, immediately before writing STATUS. The caller must retain
+    /// the same generation lease throughout the cycle.
+    pub(crate) fn cycle_with_freshness(
+        &mut self,
+        source: &SourceSnapshot,
+        freshness: impl FnOnce() -> Result<Value>,
+    ) -> Result<Vec<String>> {
+        self.cycle_inner(source, freshness, false)
+    }
+    fn cycle_inner(
+        &mut self,
+        source: &SourceSnapshot,
+        freshness: impl FnOnce() -> Result<Value>,
+        _rebind: bool,
+    ) -> Result<Vec<String>> {
+        #[cfg(feature = "v2-kernel-probe")]
+        if self.state.member_revoked && !_rebind {
+            return Err(Error::engine("vault member access ended"));
+        }
         if source.origin.is_empty() || source.account.is_empty() {
             return Err(Error::engine("vault source binding is empty"));
         }
@@ -393,7 +428,11 @@ impl Publisher {
             }
         }
         sealing?;
-        result
+        let conflicts = result?;
+        let mut status = source.status_only();
+        status.freshness = freshness()?;
+        self.status(&status, &conflicts)?;
+        Ok(conflicts)
     }
     fn apply(&mut self, source: &SourceSnapshot, mut rendered: Rendered) -> Result<Vec<String>> {
         let visible: BTreeSet<_> = source.records.keys().cloned().collect();
@@ -629,11 +668,128 @@ impl Publisher {
             }
         }
         self.state.rendered_at = chrono::Utc::now().to_rfc3339();
-        self.state.successful_act = Some(source.act);
+        #[cfg(feature = "v2-kernel-probe")]
+        {
+            self.state.successful_act =
+                (source.freshness["content_act"] != "not_held").then_some(source.act);
+        }
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        {
+            self.state.successful_act = Some(source.act);
+        }
         self.state.successful_generation = source.generation.clone();
         self.save()?;
-        self.status(source, &conflicts)?;
         Ok(conflicts)
+    }
+
+    /// An existing N2 vault can only be adopted by its already authenticated
+    /// member-copy binding. An unbound first request cannot erase another
+    /// account's vault. A revoked tombstone already carries deletion authority.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn matches_member_copy(&self, origin: Option<&str>, account: Option<&str>) -> bool {
+        self.state.member_revoked
+            || (self.state.origin.is_empty() && self.state.account.is_empty())
+            || (origin == Some(self.state.origin.as_str())
+                && account == Some(self.state.account.as_str()))
+    }
+
+    /// This synchronous durable barrier precedes every cancellable await in
+    /// the owner. Reopening completes deletion even if the process stops while
+    /// copy leases are draining or the member SQLite file is being removed.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn mark_member_revoked(&mut self) -> Result<()> {
+        self.state.member_revoked = true;
+        self.state.member_rebind_scope = None;
+        self.save()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn mark_member_scope_change(&mut self, scope: &str) -> Result<()> {
+        self.state.member_revoked = true;
+        self.state.member_rebind_scope = Some(scope.into());
+        self.save()
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn scope_rebind_pending(&self, scope: &str) -> bool {
+        self.state.member_revoked && self.state.member_rebind_scope.as_deref() == Some(scope)
+    }
+
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn has_scope_rebind(&self) -> bool {
+        self.state.member_revoked && self.state.member_rebind_scope.is_some()
+    }
+
+    /// Only the serialized owner supplies a snapshot from a newly verified,
+    /// admitted copy. Keep the durable refusal through the entire publication.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn publish_member_scope(
+        &mut self,
+        scope: &str,
+        source: &SourceSnapshot,
+    ) -> Result<()> {
+        if !self.scope_rebind_pending(scope)
+            || source.origin != self.state.origin
+            || source.account != self.state.account
+        {
+            return Err(Error::engine("vault scope recovery binding refused"));
+        }
+        match self.cycle_inner(source, || Ok(source.freshness.clone()), true) {
+            Ok(conflicts) if conflicts.is_empty() => {}
+            result => {
+                let _ = self.revoke_member();
+                return Err(result
+                    .err()
+                    .unwrap_or_else(|| Error::engine("vault scope publication incomplete")));
+            }
+        }
+        self.state.member_revoked = false;
+        self.state.member_rebind_scope = None;
+        if let Err(error) = self.save() {
+            self.state.member_revoked = true;
+            self.state.member_rebind_scope = Some(scope.into());
+            let _ = self.revoke_member();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Persist refusal before the first unlink. Failed cleanup is retried on
+    /// reopen; edited owned files are still purged. Foreign paths/symlinks
+    /// fail visibly and can never turn a revoked vault back into a publisher.
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn revoke_member(&mut self) -> Result<()> {
+        // Preserve a scope-only recovery target across cleanup and restart.
+        // A real revocation explicitly clears it in mark_member_revoked.
+        self.state.member_revoked = true;
+        self.save()?;
+        for path in &self.state.directories {
+            match self.dir(path) {
+                Ok(dir) => chmod(&dir, 0o700)?,
+                Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let paths: Vec<_> = self.state.files.keys().cloned().collect();
+        for path in paths {
+            self.remove(&path)?;
+            self.state.files.remove(&path);
+        }
+        let mut directories: Vec<_> = self.state.directories.iter().cloned().collect();
+        directories.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+        for path in directories {
+            self.remove_dir(&path)?;
+            self.state.directories.remove(&path);
+            self.state.directory_inputs.remove(&path);
+        }
+        self.state.visible.clear();
+        self.state.allocations.clear();
+        self.state.directory_inputs.clear();
+        self.state.dirty_directories.clear();
+        self.state.successful_act = None;
+        self.state.successful_generation.clear();
+        self.save()?;
+        self.unavailable("member access ended")
     }
 
     pub(crate) fn unavailable(&mut self, reason: &str) -> Result<()> {

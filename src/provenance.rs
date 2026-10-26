@@ -648,6 +648,22 @@ fn action_arguments(operation: &str, arguments: &Value) -> Value {
         {
             object.remove("response_mode");
         }
+        if operation == "create_record" {
+            object.remove("confirm");
+        }
+        if operation == "create_many" {
+            // Per-item `confirm` is consent, not action identity — the same
+            // reason the singular create strips its own. A retry that adds
+            // consent after a duplicate refusal must resume the items it
+            // already created, not conflict with them.
+            if let Some(records) = object.get_mut("records").and_then(Value::as_array_mut) {
+                for record in records {
+                    if let Some(object) = record.as_object_mut() {
+                        object.remove("confirm");
+                    }
+                }
+            }
+        }
         if operation == "manage_relationships" {
             if let Some(key) = object.get_mut("idempotency_key") {
                 if let Some(value) = key.as_str() {
@@ -3343,6 +3359,60 @@ mod tests {
         assert!(Caller::authenticated("acct:human")
             .with_provenance_interaction_token(&issuer, &token, &tampered_scope)
             .is_err());
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn suggestion_interaction_refuses_changed_account_action_and_dispatched_arguments() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let issuer = ProvenanceInteractionTokenIssuer::random("host-ui");
+        let arguments = json!({"action":"reject", "suggestion_ids":["suggestion:one"],
+            "reason":"Keep the original", "idempotency_key":"review:one"});
+        let scope = verified_action_scope("resolve_suggestions", &arguments);
+        let token = issuer.issue("acct:human", &scope, 60).unwrap();
+        assert!(Caller::authenticated("acct:other")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .is_err());
+        let caller = Caller::authenticated("acct:human")
+            .with_provenance_interaction_token(&issuer, &token, &scope)
+            .unwrap();
+        let mut changed = Vec::new();
+        for (key, value) in [
+            ("action", json!("accept")),
+            ("suggestion_ids", json!(["suggestion:two"])),
+            ("reason", json!("Changed reason")),
+            ("idempotency_key", json!("review:two")),
+        ] {
+            let mut args = arguments.clone();
+            args[key] = value;
+            changed.push(("resolve_suggestions", args));
+        }
+        changed.push(("create_record", arguments.clone()));
+        for (operation, args) in changed {
+            let changed_scope = verified_action_scope(operation, &args);
+            assert!(Caller::authenticated("acct:human")
+                .with_provenance_interaction_token(&issuer, &token, &changed_scope)
+                .is_err());
+            // Verification at attachment is insufficient: dispatch must still
+            // reject an attached proof if its actual operation/arguments change.
+            let dispatch = ProvenanceDispatch::from_caller(&caller, operation, &args, None);
+            let error = dispatch
+                .scope(crate::store::append(
+                    &db,
+                    create_spec("b40ce000-0000-4000-8000-000000000017", "changed suggestion"),
+                ))
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("scope does not allow this accepted action"));
+            assert!(dispatch.receipt_ids().is_empty());
+        }
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provenance_action_attestations")
+            .fetch_one(db.write_pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
         db.close().await;
     }
 

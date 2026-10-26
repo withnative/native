@@ -12,6 +12,9 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 pub mod offboarding;
 tokio::task_local! {
     static REQUEST_ROSTERS: RefCell<HashMap<String, Arc<Roster>>>;
+    // Set only by the closed notification-creation capability reader below.
+    // Ordinary reads and delivery revalidation retain their current horizon.
+    static NOTIFICATION_CREATION_BEFORE: i64;
 }
 pub(crate) async fn scope_request<F: Future>(future: F) -> F::Output {
     if REQUEST_ROSTERS.try_with(|_| ()).is_ok() {
@@ -21,6 +24,29 @@ pub(crate) async fn scope_request<F: Future>(future: F) -> F::Output {
             .scope(RefCell::new(HashMap::new()), future)
             .await
     }
+}
+
+fn read_before() -> i64 {
+    NOTIFICATION_CREATION_BEFORE
+        .try_with(|before| *before)
+        .unwrap_or(i64::MAX)
+}
+
+/// Creation is a historical decision even on the live fold. Projections on
+/// `conn` already represent the preceding state, but hosted roster/templates
+/// are read directly from the immutable log and must share that same horizon.
+/// This closed scope cannot be selected by an MCP caller or used for delivery.
+pub(super) async fn notification_creation_capability_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    event: &EventRow,
+) -> Result<Capability> {
+    NOTIFICATION_CREATION_BEFORE
+        .scope(
+            event.local_seq,
+            super::kernel_effective_capability_uncached_on(conn, principal, &event.record_id),
+        )
+        .await
 }
 
 // Both absent-roster and policy-template lookups must stay indexed even when
@@ -39,6 +65,7 @@ pub struct VerifiedHostedMembership {
     members: BTreeSet<String>,
     catalog_users: Option<BTreeMap<String, String>>,
     catalog_directory: BTreeMap<String, String>,
+    expected_catalog_accounts: Option<BTreeMap<String, String>>,
 }
 impl VerifiedHostedMembership {
     /// # Safety
@@ -59,7 +86,16 @@ impl VerifiedHostedMembership {
             members: users.keys().cloned().collect(),
             catalog_users: Some(users),
             catalog_directory,
+            expected_catalog_accounts: None,
         }
+    }
+
+    /// Tighten staging admission with the v1 resolver's independently checked
+    /// accounts. This grants nothing; a different kernel mapping refuses before
+    /// any principal or roster write, in the same kernel transaction.
+    pub fn requiring_catalog_accounts(mut self, expected: BTreeMap<String, String>) -> Self {
+        self.expected_catalog_accounts = Some(expected);
+        self
     }
 
     /// Synthetic harness for already resolved portable bindings.
@@ -75,6 +111,7 @@ impl VerifiedHostedMembership {
             members,
             catalog_users: None,
             catalog_directory: BTreeMap::new(),
+            expected_catalog_accounts: None,
         }
     }
 }
@@ -322,6 +359,17 @@ where
             .cloned()
             .ok_or_else(|| Error::engine("database membership not found"))?;
     }
+    if let Some(expected) = &verified.expected_catalog_accounts {
+        let mismatches = expected
+            .iter()
+            .filter(|(id, account)| catalog_accounts.get(*id) != Some(*account))
+            .count();
+        if mismatches > 0 {
+            return Err(Error::engine(format!(
+                "catalog roster resolution; class=kernel_account_map_mismatch count={mismatches}"
+            )));
+        }
+    }
     let mut members = BTreeMap::new();
     let mut acts = crate::act::ActAllocation::new();
     for account in &verified.members {
@@ -385,8 +433,15 @@ where
 
 // Logical SQL installs a temp.content_events relation. Authority always reads main.
 async fn roster_on(conn: &mut SqliteConnection) -> Result<Option<Arc<Roster>>> {
-    roster_before(conn, i64::MAX).await
+    roster_before(conn, read_before()).await
 }
+/// Hosted member copies require an existing, valid activation roster. Unlike
+/// ordinary kernel reads, an unactivated standalone database is not eligible.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn activated_on(conn: &mut SqliteConnection) -> Result<bool> {
+    Ok(roster_on(conn).await?.is_some())
+}
+
 async fn roster_before(conn: &mut SqliteConnection, before: i64) -> Result<Option<Arc<Roster>>> {
     let raw: Option<(String, String)> = sqlx::query_as(
         "SELECT id,payload FROM main.content_events WHERE record_id=? AND type=? AND seq<? ORDER BY seq DESC LIMIT 1",
@@ -447,6 +502,20 @@ where
     Ok(crate::mcp::Caller::authenticated(account.clone()))
 }
 
+/// Current hosted membership for the v1-compatible pseudonymous activity
+/// relation. Its admission is independent of Person/content visibility.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn activity_members_on(
+    conn: &mut SqliteConnection,
+    viewer: &str,
+) -> Result<BTreeMap<String, String>> {
+    let roster = roster_on(conn)
+        .await?
+        .filter(|roster| roster.members.values().any(|id| id == viewer))
+        .ok_or_else(|| Error::auth("activity requires current hosted membership"))?;
+    Ok(roster.members.clone())
+}
+
 // Membership is a workspace-wide admission fence, before even owner floors.
 // Reserved host services remain usable; they cannot be authenticated accounts.
 pub(crate) async fn admitted(conn: &mut SqliteConnection, principal: &str) -> Result<bool> {
@@ -456,6 +525,46 @@ pub(crate) async fn admitted(conn: &mut SqliteConnection, principal: &str) -> Re
     let host: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.kernel_principals WHERE principal_id=? AND auth_binding IN ('host:v1-import','host:relates-to:transform'))")
         .bind(principal).fetch_one(conn).await?;
     Ok(host || roster.members.values().any(|id| id == principal))
+}
+
+/// Read a member's portable identity through the immutable H3 catalogue map
+/// and current roster. The host already authorized catalogue roster disclosure;
+/// this additional read must still respect the viewer's current Person View.
+#[cfg(feature = "v2-kernel-probe")]
+pub async fn visible_member_identity_as(
+    db: &Db,
+    viewer: &str,
+    catalog_account: &str,
+) -> Result<Option<(String, String)>> {
+    let mut tx = db.pool().begin().await?;
+    app_installs::admit_dispatched_on(&mut tx, viewer).await?;
+    if !admitted(&mut tx, viewer).await? {
+        return Err(Error::engine("database membership not found"));
+    }
+    let Some(roster) = roster_on(&mut tx).await? else {
+        return Ok(None);
+    };
+    let principal = roster
+        .catalog_accounts
+        .get(catalog_account)
+        .and_then(|binding| roster.members.get(binding));
+    let Some(principal) = principal else {
+        return Ok(None);
+    };
+    let person: Option<String> =
+        sqlx::query_scalar("SELECT person_id FROM kernel_message_people WHERE principal_id=?")
+            .bind(principal)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let result = if let Some(person) = person {
+        read_record_on(&mut tx, viewer, &person)
+            .await?
+            .map(|record| (principal.clone(), record.id))
+    } else {
+        None
+    };
+    tx.rollback().await?;
+    Ok(result)
 }
 
 /// Personal app consent requires an account admitted at the outcome's position.
@@ -503,7 +612,7 @@ pub(crate) async fn catalog_account_matches_on(
 /// directory access and any Person record. Retained mappings for former members
 /// are filtered against the current admitted roster as a second check.
 #[cfg(feature = "v2-kernel-probe")]
-pub(crate) async fn catalog_account_on(
+pub async fn catalog_account_on(
     conn: &mut SqliteConnection,
     catalog_account: &str,
 ) -> Result<Option<String>> {
@@ -516,6 +625,48 @@ pub(crate) async fn catalog_account_on(
     }))
 }
 
+/// Resolve only the authenticated host identity's retained account mapping.
+/// This does NOT admit the account: former members retain their immutable
+/// mapping so member-copy capture can return a verified purge instruction.
+/// Serving still requires the current roster and kernel root View in the
+/// same source transaction. Never expose this as a directory lookup.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn retained_catalog_account_on(
+    conn: &mut SqliteConnection,
+    authenticated_catalog_id: &str,
+) -> Result<Option<String>> {
+    Ok(roster_on(conn).await?.and_then(|roster| {
+        roster
+            .catalog_accounts
+            .get(authenticated_catalog_id)
+            .cloned()
+    }))
+}
+
+/// The current caller's stored H3 aliases, never a workspace directory.
+/// Catalogue ids differ from portable credentials after an imported cutover.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn catalog_identifiers_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+    account: &str,
+) -> Result<Vec<String>> {
+    let Some(roster) = roster_on(conn).await? else {
+        return Ok(vec![]);
+    };
+    if roster.members.get(account).map(String::as_str) != Some(principal) {
+        return Ok(vec![]);
+    }
+    Ok(roster
+        .catalog_accounts
+        .iter()
+        .filter(|(_, binding)| binding.as_str() == account)
+        .map(|(catalog, _)| catalog.clone())
+        .collect())
+}
+
+pub(super) type PolicyRows = Vec<(String, String, String, String)>;
+
 pub(crate) async fn policy_rows(
     conn: &mut SqliteConnection,
     principal: &str,
@@ -524,27 +675,17 @@ pub(crate) async fn policy_rows(
     let Some(roster) = roster_on(conn).await? else {
         return Ok(None);
     };
-    let raw: Option<(i64, String)> = sqlx::query_as(
-        "SELECT seq,payload FROM main.content_events WHERE type=? AND record_id=? ORDER BY seq DESC LIMIT 1",
-    )
-    .bind(POLICY_EVENT)
-    .bind(home)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let Some((_template_seq, raw)) = raw else {
+    let Some(p) = current_member_policy_on(conn, home).await? else {
         return Ok(None);
     };
-    let mut p: MemberPolicy = serde_json::from_str(&raw)?;
-    if p.policy_seq != policy_seq_before(conn, home, i64::MAX).await? {
-        return Ok(None);
-    }
-    // Cleanup deletes the physical account row. Keep import provenance only
-    // while that row still exists: rejoin can restore the member baseline,
-    // never a removed explicit grant. This also follows projection replay
-    // order, unlike scanning future cleanup events from the immutable log.
-    let subjects: BTreeSet<String> = sqlx::query_scalar("SELECT subject_id FROM main.kernel_policy_entries WHERE root_id=? AND subject_kind='account'")
-        .bind(home).fetch_all(&mut *conn).await?.into_iter().collect();
-    p.explicit.retain(|id, _| subjects.contains(id));
+    Ok(Some(expand_policy_rows(p, &roster, principal)))
+}
+
+fn expand_policy_rows(
+    p: MemberPolicy,
+    roster: &Roster,
+    principal: &str,
+) -> Vec<(String, String, String, String)> {
     let mut rows: Vec<_> = p
         .explicit
         .into_iter()
@@ -555,7 +696,93 @@ pub(crate) async fn policy_rows(
             rows.push(("account".into(), principal.into(), "allow".into(), cap));
         }
     }
+    rows
+}
+
+/// The same imported-policy override as `policy_rows`, loaded once for a bulk
+/// home evaluation. All facts belong to the caller's existing snapshot; no
+/// result survives the request or replaces the live roster/cleanup fences.
+pub(super) async fn policy_rows_bulk_on(
+    conn: &mut SqliteConnection,
+    principal: &str,
+) -> Result<BTreeMap<String, PolicyRows>> {
+    let Some(roster) = roster_on(conn).await? else {
+        return Ok(BTreeMap::new());
+    };
+    let templates: Vec<(String, String)> = sqlx::query_as("SELECT record_id,payload FROM main.content_events WHERE seq IN (SELECT max(e.seq) FROM main.content_events e JOIN main.kernel_policies p ON p.root_id=e.record_id WHERE e.type=? GROUP BY e.record_id)")
+        .bind(POLICY_EVENT).fetch_all(&mut *conn).await?;
+    let frontiers: BTreeMap<String, i64> = sqlx::query_as::<_, (String, i64)>("SELECT record_id,max(seq) FROM main.content_events WHERE type IN ('kernel.import_home.v1','kernel.import_home_delta.v1','kernel.import_home_policy.v1','kernel.home_policy_replaced.v1') AND seq<? GROUP BY record_id")
+        .bind(i64::MAX).fetch_all(&mut *conn).await?.into_iter().collect();
+    let mut subjects: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (home, subject) in sqlx::query_as::<_, (String, String)>(
+        "SELECT root_id,subject_id FROM main.kernel_policy_entries WHERE subject_kind='account'",
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        subjects.entry(home).or_default().insert(subject);
+    }
+    let mut result = BTreeMap::new();
+    for (home, raw) in templates {
+        let mut p: MemberPolicy = serde_json::from_str(&raw)?;
+        if p.policy_seq != frontiers.get(&home).copied().unwrap_or(0) {
+            continue;
+        }
+        p.explicit
+            .retain(|id, _| subjects.get(&home).is_some_and(|s| s.contains(id)));
+        result.insert(home, expand_policy_rows(p, &roster, principal));
+    }
+    Ok(result)
+}
+
+/// Source policy subjects, preserving members vs explicit-account grants.
+/// Never infer account-only privacy from a one-member expanded roster.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn policy_description_on(
+    conn: &mut SqliteConnection,
+    home: &str,
+) -> Result<Option<Vec<(String, String, String, String)>>> {
+    let Some(p) = current_member_policy_on(conn, home).await? else {
+        return Ok(None);
+    };
+    let mut rows: Vec<_> = p
+        .explicit
+        .into_iter()
+        .map(|(id, cap)| ("account".into(), id, "allow".into(), cap))
+        .collect();
+    if let Some(cap) = p.members {
+        rows.push(("members".into(), String::new(), "allow".into(), cap));
+    }
     Ok(Some(rows))
+}
+
+async fn current_member_policy_on(
+    conn: &mut SqliteConnection,
+    home: &str,
+) -> Result<Option<MemberPolicy>> {
+    let raw: Option<(i64, String)> = sqlx::query_as(
+        "SELECT seq,payload FROM main.content_events WHERE type=? AND record_id=? AND seq<? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(POLICY_EVENT)
+    .bind(home)
+    .bind(read_before())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((_template_seq, raw)) = raw else {
+        return Ok(None);
+    };
+    let mut p: MemberPolicy = serde_json::from_str(&raw)?;
+    if p.policy_seq != policy_seq_before(conn, home, read_before()).await? {
+        return Ok(None);
+    }
+    // Cleanup deletes the physical account row. Keep import provenance only
+    // while that row still exists: rejoin can restore the member baseline,
+    // never a removed explicit grant. This also follows projection replay
+    // order, unlike scanning future cleanup events from the immutable log.
+    let subjects: BTreeSet<String> = sqlx::query_scalar("SELECT subject_id FROM main.kernel_policy_entries WHERE root_id=? AND subject_kind='account'")
+        .bind(home).fetch_all(&mut *conn).await?.into_iter().collect();
+    p.explicit.retain(|id, _| subjects.contains(id));
+    Ok(Some(p))
 }
 
 pub(crate) async fn project(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {

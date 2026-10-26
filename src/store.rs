@@ -106,14 +106,7 @@ impl crate::domain_transaction::EventCursorPort for SqliteContentPorts<'_> {
             let causal_envelope = match causal_admission {
                 CausalAdmission::LocalComputed => {
                     let heads: Vec<String> = sqlx::query_scalar(
-                        "SELECT event.id
-                           FROM content_events event
-                          WHERE NOT EXISTS (
-                                SELECT 1
-                                  FROM content_event_causal_frontier frontier
-                                 WHERE frontier.parent_event_id = event.id
-                          )
-                          ORDER BY event.id",
+                        "SELECT event_id FROM content_event_heads ORDER BY event_id",
                     )
                     .fetch_all(&mut **self.transaction)
                     .await?;
@@ -319,9 +312,15 @@ pub(crate) async fn append_in(
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes require the sealed kernel commit port",
+        ));
+    }
+    if spec.event_type.starts_with("kernel.hcp_") {
+        return Err(Error::engine(
+            "HCP events require the sealed kernel HCP route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -371,6 +370,22 @@ pub(crate) async fn append_kernel_v1_state_in(
     append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
 }
 
+/// Feature-owned account preference admission. No generic event/import caller
+/// can acquire this route; the projector validates the account aggregate.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_notification_preference_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if spec.event_type != crate::kernel::notifications::PREFERENCE_EVENT {
+        return Err(Error::engine("invalid notification preference admission"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelProvider, acts).await
+}
+
 /// Sealed host instruction-binding import; generic append/import refuses it.
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub(crate) async fn append_kernel_instruction_binding_in(
@@ -411,6 +426,22 @@ pub(crate) async fn append_kernel_provider_in(
         act_alloc,
     )
     .await
+}
+
+/// Typed HCP admission. The seal cannot be constructed outside HCP handlers.
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn append_kernel_hcp_in(
+    db: &Db,
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    _seal: &crate::mcp::tools::hcp_v2::HcpWriteSeal,
+    spec: AppendSpec,
+    acts: &mut crate::act::ActAllocation,
+) -> Result<EventRow> {
+    if !crate::mcp::tools::hcp_v2::kernel::TYPES.contains(&spec.event_type.as_str()) {
+        return Err(Error::engine("invalid sealed kernel HCP event"));
+    }
+    let prepared = prepare_sealed_local_event(Uuid::new_v4().to_string(), spec)?;
+    append_prepared_admitted(db, tx, prepared, PreparedAdmission::KernelHcp, acts).await
 }
 
 /// Sealed slot-map registration; generic append, public append and imports
@@ -670,9 +701,15 @@ pub(crate) async fn append_migration_on(
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine(
             "provider outcomes cannot be imported through the generic event seam",
+        ));
+    }
+    if spec.event_type.starts_with("kernel.hcp_") {
+        return Err(Error::engine(
+            "HCP events require the sealed kernel HCP route",
         ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
@@ -702,6 +739,7 @@ pub(crate) async fn append_migration_on(
     // 681a449 N3).
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     crate::kernel::admit_home_event(&mut *conn, &event).await?;
+    crate::named_views::storage::admit_on(conn, &event).await?;
     let act = crate::act::ActAllocation::new()
         .get_or_allocate(conn)
         .await?;
@@ -798,6 +836,8 @@ enum PreparedAdmission {
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelProvider,
     #[cfg(any(test, feature = "v2-kernel-probe"))]
+    KernelHcp,
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelSlot,
     Ordinary,
     EngineSeed,
@@ -830,6 +870,7 @@ async fn append_prepared_admitted(
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     crate::db::enrolled::require_content_connection(tx, Some(db)).await?;
+    crate::named_views::storage::admit_on(tx, &prepared.event).await?;
     // The hosted image also compiles kernel intents. Refuse an ordinary v1
     // destination explicitly before allocating an act or appending anything,
     // including events admitted through import/replication's shared seam.
@@ -1022,6 +1063,18 @@ async fn append_prepared_admitted(
                 ));
             }
             crate::domain_transaction::append_and_project_kernel_provider(
+                &mut ports,
+                &mut prepared.event,
+                &control,
+            )
+            .await?;
+        }
+        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        PreparedAdmission::KernelHcp => {
+            if !matches!(causal_admission, CausalAdmission::LocalComputed) {
+                return Err(Error::engine("HCP events cannot carry imported causality"));
+            }
+            crate::domain_transaction::append_and_project_kernel_hcp(
                 &mut ports,
                 &mut prepared.event,
                 &control,
@@ -1319,9 +1372,18 @@ async fn reject_public_governed_attribution_in(
 }
 
 fn reject_public_runtime_event(spec: &AppendSpec) -> Result<()> {
+    if spec.event_type == "kernel.named_view_admitted.v1"
+        || crate::named_views::is_new_event(&spec.event_type)
+    {
+        return Err(Error::engine("named view admission is engine-owned"));
+    }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     if spec.event_type == crate::kernel::HOST_TRANSFORM_CREATED_EVENT
         || spec.event_type == "kernel.app_installs_activated.v1"
+        || spec.event_type == "kernel.canvas_activated.v1"
+        || spec.event_type == "kernel.canvas_batch_committed.v1"
+        || spec.event_type == "kernel.artifact_closure_activated.v1"
+        || spec.event_type == "kernel.artifact_excluded.v1"
         || spec.event_type == "kernel.app_install_removed.v1"
         || spec.event_type == "kernel.app_install_recorded.v1"
         || spec.event_type == "kernel.app_install_adopted.v1"
@@ -1369,8 +1431,14 @@ fn reject_public_runtime_event(spec: &AppendSpec) -> Result<()> {
             | "kernel.v1_state_imported.v1"
             | "kernel.instruction_binding_imported.v1"
             | "kernel.instruction_binding_updated.v1"
+            | "kernel.notification_preference_set.v1"
     ) {
         return Err(Error::engine("provider outcomes are kernel commit-port-owned and cannot be appended through the public event seam"));
+    }
+    if spec.event_type.starts_with("kernel.hcp_") {
+        return Err(Error::engine(
+            "HCP events require the sealed kernel HCP route",
+        ));
     }
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     if crate::kernel::slots::is_slot_event(&spec.event_type) {

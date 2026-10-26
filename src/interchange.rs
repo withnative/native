@@ -1906,6 +1906,7 @@ fn derive_record_mentions_rows(bundle: &Bundle) -> Result<Vec<Vec<Cell>>> {
                 | "record.updated"
                 | "receipt.committed.v1"
                 | "unit.revision.recorded.v1"
+                | "message.revision.recorded.v1"
         ) {
             continue;
         }

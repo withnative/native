@@ -34,7 +34,13 @@ pub(crate) async fn admit_data_as(
             "native app data request differs from its app identity",
         ));
     }
-    let admitted = admit_app_on(&mut snapshot, &principal, &claim).await?;
+    let admitted = admit_install_on(
+        &mut snapshot,
+        &principal,
+        &claim.package,
+        &claim.install_event_id,
+    )
+    .await?;
     snapshot.rollback().await?;
     Ok(admitted)
 }

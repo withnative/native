@@ -491,7 +491,9 @@ impl Aspect {
                 _ => false,
             },
             Self::Body => match event.event_type.as_str() {
-                "record.created" | "unit.revision.recorded.v1" => true,
+                "record.created" | "unit.revision.recorded.v1" | "message.revision.recorded.v1" => {
+                    true
+                }
                 "record.updated" | "receipt.committed.v1" => payload.get("body").is_some(),
                 _ => false,
             },

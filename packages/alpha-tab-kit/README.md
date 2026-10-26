@@ -107,7 +107,7 @@ invent failures (all seven demo tabs pass):
 | Rule | Mirrors |
 |---|---|
 | **LIMIT needs ORDER BY at the same query level**, including subqueries and CTEs | `check_limit_order`, `src/query/turso_ast_rules.rs:117` |
-| relations are the 16 logical relations or CTE names | `LOGICAL_RELATIONS` `sql_contract.rs:60`, `authorize_strict` `src/query/sql.rs:1197` |
+| relations are engine `LOGICAL_RELATIONS` or CTE names | `LOGICAL_RELATIONS` `sql_contract.rs:60`, `authorize_strict` `src/query/sql.rs:1197` |
 | functions are the 24 portable ones (+ `like`); two-argument `round`, `now_ms()` arity, `utc_date_label` arity | `FUNCTION_REGISTRY` :2695, `authorize_strict` `sql.rs:1207`, :3340-3558 |
 | ≤ 64 output columns; no duplicate output labels (for the forms it can resolve) | `alpha_tabs.rs:408`, `sql.rs:1255` |
 | HTML envelope: `html[lang]`, one non-empty `<title>` | `html.rs:1598` |
@@ -168,6 +168,12 @@ because the host delivers at most 200 rows and truncates the rest
 (`SQL_SNAPSHOT_ROW_CAP`, `alpha_tabs.rs:130`). The result says so in
 `truncated`, but only a tab that reads it will tell the viewer (see *Result
 completeness* below).
+
+`catalog_view_definitions` is present in the engine relation inventory, but
+requires standalone hosted read-write v2 SQL. Saved SQL and alpha-tab SQL needs
+refuse it with `view_profile_unsupported`; v1 and read-only copies also refuse.
+The kit rejects direct references before install. An unrelated same-named CTE
+remains a CTE, not a read of that detail catalog.
 
 **Not mirrored.** For these, the real `query_sql` or install is the only
 authority, so run each statement once with `query_sql` before installing:
@@ -521,6 +527,12 @@ There is no automatic fallback. Digest mismatches stop all subsequent calls.
 
 Retries stage a fresh source record, as in the chunked route. Archive orphaned
 source records left by failed or repeated installs.
+
+Each generation intentionally creates a distinct source, even when an earlier
+source has the same name. New plans set `confirm: true` on that create,
+including the chunked route and raw-body fallback, to pass the server's
+duplicate gate. Regenerate older saved plans if creation reports
+`likely_duplicate`; the runner preserves saved arguments and stops on refusal.
 
 **Package bundles over 512 KiB.** An ordinary `native.html.v1` body is limited to
 512 KiB (`html.body_max_bytes`); an installed app package bundle may be up to 1 MiB

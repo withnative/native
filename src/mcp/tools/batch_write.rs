@@ -205,7 +205,7 @@ pub fn register_batch_write_tool(registry: &mut ToolRegistry) -> Result<()> {
     )
 }
 
-async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
+pub(crate) async fn batch_write(db: Db, caller: Caller, arguments: Value) -> Result<Value> {
     // The provenance digests run over the raw tool arguments: no server-minted
     // id enters the conflict detector, or every retry would conflict with the
     // call it repeats. Run-context keys are stripped by the digest itself.

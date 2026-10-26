@@ -235,6 +235,13 @@ impl ConformanceCase {
 pub(crate) fn corpus() -> Vec<ConformanceCase> {
     let mut cases = vec![
         ConformanceCase {
+            name: "facet_keys_catalog_contract",
+            sql: "SELECT identity, profiles FROM catalog_relations WHERE relation_name = 'facet_keys'",
+            parameters: Vec::new(),
+            expected_columns: vec!["identity", "profiles"],
+            expected_rows: vec![serde_json::json!({"identity":"native.query-sql.facet-keys", "profiles":"sqlite-local"})],
+        },
+        ConformanceCase {
             name: "records_project_stable_columns",
             sql: "SELECT id, name FROM records WHERE type = 'Document' AND id LIKE 'conf:%' ORDER BY id",
             parameters: Vec::new(),
@@ -2065,6 +2072,151 @@ mod tests {
             .await;
             assert_eq!(result.rows[0]["label"], serde_json::Value::Null, "ms={ms}");
         }
+    }
+
+    #[tokio::test]
+    async fn facet_keys_visible_counts_and_resolved_declarations() {
+        let (db, alice, _) = seeded_sqlite().await;
+        sqlx::query("UPDATE records SET type='Document' WHERE id IN ('conf:common','conf:alice','conf:bea')")
+            .execute(db.write_pool()).await.unwrap();
+        sqlx::query("UPDATE records SET kind='other' WHERE id='conf:sort-a'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE records SET kind=NULL WHERE id='conf:sort-b'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        for (id, record, key) in [
+            ("fk:1", "conf:common", "fk:observed"),
+            ("fk:2", "conf:alice", "fk:observed"),
+            ("fk:3", "conf:bea", "fk:observed"),
+            ("fk:4", "conf:bea", "fk:hidden-only"),
+            ("fk:5", "conf:common", "fk:base"),
+            ("fk:6", "conf:alice", "fk:base"),
+            ("fk:7", "conf:sort-a", "fk:base"),
+            ("fk:8", "conf:sort-b", "fk:base"),
+            ("fk:archived-record-value", "m2:arch", "fk:archived"),
+        ] {
+            sqlx::query("INSERT INTO facet_values(id,record_id,key,value) VALUES (?,?,?,'x')")
+                .bind(id)
+                .bind(record)
+                .bind(key)
+                .execute(db.write_pool())
+                .await
+                .unwrap();
+        }
+        // Legacy stored spine/reserved values must never be advertised.
+        for key in crate::schema::SPINE_FACET_KEYS
+            .into_iter()
+            .chain(crate::schema::ENGINE_RESERVED_FACET_KEYS)
+        {
+            sqlx::query(
+                "INSERT INTO facet_values(id,record_id,key,value) VALUES (?,'conf:common',?,'x')",
+            )
+            .bind(format!("fk:{key}"))
+            .bind(key)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        }
+        let pack = serde_json::json!({"shapes":{"Document":{"facets":{
+            "fk:base":{"type":"text", "required":true},
+            "fk:zero":{"type":"text", "vocab_ref":"area"}
+        }}}});
+        let user = serde_json::json!({"shapes":{"Document:note":{"facets":{
+            "fk:zero":{"type":"number", "required":true},
+            "archived":{"type":"text"}, "owner":{}
+        }}}});
+        for (id, layer, data, scope) in [
+            ("fk:pack", "pack", pack, None),
+            ("fk:user", "user", user, None),
+            (
+                "fk:scope",
+                "user",
+                serde_json::json!({"shapes":{"Document:note":{"facets":{"fk:local":{"vocab_ref":"area"}}}}}),
+                Some("conf:common"),
+            ),
+            (
+                "fk:hidden",
+                "user",
+                serde_json::json!({"shapes":{"Document":{"facets":{"fk:secret":{}}}}}),
+                Some("conf:bea"),
+            ),
+        ] {
+            sqlx::query("INSERT INTO schema_config(id,layer,data,applies_to_collection_id) VALUES (?,?,?,?)")
+                .bind(id).bind(layer).bind(data.to_string()).bind(scope).execute(db.write_pool()).await.unwrap();
+        }
+        sqlx::query("UPDATE records SET home_id='conf:common' WHERE id='conf:alice'")
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let result = run_owned(
+            &db,
+            alice.clone(),
+            "SELECT * FROM facet_keys WHERE key LIKE 'fk:%' ORDER BY scope_id,type,kind,key",
+        )
+        .await;
+        let find = |scope: Value, kind: Value, key: &str| {
+            result
+                .rows
+                .iter()
+                .find(|row| row["scope_id"] == scope && row["kind"] == kind && row["key"] == key)
+                .unwrap()
+                .clone()
+        };
+        let observed = find(Value::Null, serde_json::json!("note"), "fk:observed");
+        assert_eq!(observed["record_count"], 2);
+        assert_eq!(observed["declared"], 0);
+        assert!(observed["required"].is_null());
+        assert!(observed["value_type"].is_null());
+        let observed_all = find(Value::Null, Value::Null, "fk:observed");
+        assert_eq!(observed_all["record_count"], 2);
+        assert_eq!(observed_all["declared"], 0);
+        assert!(observed_all["value_type"].is_null());
+        assert!(observed_all["required"].is_null());
+        let wildcard = find(Value::Null, Value::Null, "fk:zero");
+        assert_eq!(wildcard["record_count"], 0);
+        assert_eq!(wildcard["vocab_ref"], "area");
+        assert_eq!(wildcard["required"], 0);
+        let zero = find(Value::Null, serde_json::json!("note"), "fk:zero");
+        assert_eq!(zero["declared"], 1);
+        assert_eq!(zero["record_count"], 0);
+        assert_eq!(zero["value_type"], "number");
+        assert!(zero["vocab_ref"].is_null()); // facet shapes replace wholesale
+        assert_eq!(zero["required"], 1);
+        assert_eq!(
+            find(
+                serde_json::json!("conf:common"),
+                serde_json::json!("note"),
+                "fk:base"
+            )["record_count"],
+            1
+        );
+        assert_eq!(find(Value::Null, Value::Null, "fk:base")["record_count"], 4);
+        let inherited = find(Value::Null, serde_json::json!("other"), "fk:base");
+        assert_eq!(inherited["record_count"], 1);
+        assert_eq!(inherited["declared"], 1);
+        assert_eq!(inherited["required"], 1);
+        assert!(result
+            .rows
+            .iter()
+            .all(|row| row["key"] != "fk:secret" && row["key"] != "fk:hidden-only"));
+        let excluded = run_owned(&db, alice.clone(), "SELECT count(*) AS n FROM facet_keys WHERE key IN ('lifecycle','owner','persistence','maturity','archived','blob_ref','canvas.promoted_from','retraction')").await;
+        assert_eq!(excluded.rows[0]["n"], 0);
+        // The common record is superseded; its facet still contributes to
+        // discovery. Consumers can explicitly count only current records.
+        let current = run_owned(&db, alice.clone(), "SELECT count(*) AS n FROM facet_values f JOIN records r ON r.id=f.record_id WHERE f.key='fk:observed' AND r.is_current=1").await;
+        assert_eq!(current.rows[0]["n"], 1);
+        let archived = run_owned(&db, alice.clone(), "SELECT record_count FROM facet_keys WHERE key='fk:archived' AND scope_id IS NULL AND kind IS NULL").await;
+        assert_eq!(archived.rows[0]["record_count"], 1);
+        let count = run_owned(
+            &db,
+            alice,
+            "SELECT count(*) AS n FROM facet_keys WHERE key='fk:zero'",
+        )
+        .await;
+        assert!(count.rows[0]["n"].as_i64().unwrap() >= 2);
     }
 
     #[tokio::test]

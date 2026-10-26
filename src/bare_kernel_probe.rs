@@ -101,7 +101,7 @@ async fn kernel_mode_neutral_root_with_policy_anchor() {
     use crate::events::{KERNEL_GENESIS_ACTOR, KERNEL_GENESIS_EVENT, KERNEL_ROOT_ID};
 
     // Kernel mode uses the current frozen engine schema.
-    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 373);
+    assert_eq!(crate::schema::DDL_STATEMENTS.len(), 402);
     assert_eq!(
         crate::schema::ddl_sha256(),
         crate::schema::FROZEN_DDL_SHA256,

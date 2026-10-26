@@ -52,6 +52,9 @@ use crate::portable_sql::{
 };
 use crate::{Error, Result};
 
+mod did_you_mean;
+pub(crate) use did_you_mean::{record_id_arguments, with_did_you_mean};
+
 #[derive(Clone, Copy)]
 enum RecordSelectorCardinality {
     Batch,
@@ -1229,9 +1232,49 @@ pub(crate) async fn display_references_in<E: DomainStatementExecutor>(
     Ok(result)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: make the next display-reference lookup on this thread fail, once.
+/// A write's compact receipt does this lookup after the write has committed, so
+/// it reproduces an error raised inside a Native call after its commit.
+#[cfg(test)]
+pub(crate) fn fail_next_display_reference_lookup() {
+    FAIL_NEXT_LOOKUP.with(|flag| flag.set(true));
+}
+
 pub(crate) async fn display_references_in_pool(
     pool: &sqlx::SqlitePool,
     ids: &[&str],
+) -> Result<HashMap<String, Option<String>>> {
+    #[cfg(test)]
+    if FAIL_NEXT_LOOKUP.with(|flag| flag.replace(false)) {
+        return Err(crate::error::Error::engine(
+            "injected display reference lookup failure",
+        ));
+    }
+    display_references_pool(pool, ids, false).await
+}
+
+/// [`display_references_in_pool`] for a reference that must be *followable*:
+/// an id that is not a live record gets `None` rather than the prefix it would
+/// have had, because resolution excludes tombstones and a reference that cannot
+/// be opened is worse than the full id. The plain form keeps minting for ids it
+/// is handed that are no longer live, which a write receipt after a delete
+/// relies on.
+pub(crate) async fn live_display_references_in_pool(
+    pool: &sqlx::SqlitePool,
+    ids: &[&str],
+) -> Result<HashMap<String, Option<String>>> {
+    display_references_pool(pool, ids, true).await
+}
+
+async fn display_references_pool(
+    pool: &sqlx::SqlitePool,
+    ids: &[&str],
+    require_live: bool,
 ) -> Result<HashMap<String, Option<String>>> {
     let mut result = HashMap::with_capacity(ids.len());
     let mut by_prefix: HashMap<String, Vec<&str>> = HashMap::new();
@@ -1251,10 +1294,7 @@ pub(crate) async fn display_references_in_pool(
     }
 
     let mut snapshot = pool.begin().await?;
-    let batch = {
-        let mut executor = BorrowedSqliteStatementExecutor::new(&mut snapshot);
-        display_references_with(&mut executor, &by_prefix).await
-    };
+    let batch = batched_display_references(&mut snapshot, &by_prefix, require_live).await;
     let cleanup = snapshot.rollback().await;
     match batch {
         Ok(references) => {
@@ -1267,6 +1307,73 @@ pub(crate) async fn display_references_in_pool(
             Err(error)
         }
     }
+}
+
+/// Every seed's live candidate rows in one statement, each seed capped at
+/// [`MAX_CANDIDATES`] exactly as [`prefix_rows_with`] caps it, so saturation is
+/// still decided per seed and a crowded seed cannot shorten a quiet one.
+///
+/// Each seed gets its own correlated `ORDER BY id LIMIT` over the half-open
+/// primary-key range, so the scan for a seed stops after [`MAX_CANDIDATES`]
+/// index entries however many live records share it. A window function
+/// (`row_number() OVER (PARTITION BY seed)`) would produce the same rows but
+/// must rank every match first — bulk-imported UUIDv7 ids share a long time
+/// prefix, and that turns a 32-row lookup into a scan of the whole crowd.
+const BATCHED_CANDIDATE_SQL: &str = "SELECT s.value AS seed, j.value AS id
+      FROM json_each(?) s,
+           json_each((SELECT json_group_array(c.id)
+                        FROM (SELECT id FROM records
+                               WHERE id >= s.value AND id < s.value || ?
+                                 AND deleted_at IS NULL AND length(id) = ?
+                               ORDER BY id LIMIT ?) c)) j";
+
+async fn batched_prefix_rows(
+    conn: &mut sqlx::SqliteConnection,
+    seeds: &[&String],
+) -> Result<HashMap<String, Vec<String>>> {
+    use sqlx::Row as _;
+    #[cfg(test)]
+    PREFIX_ROW_QUERY_COUNT.with(|count| count.set(count.get() + 1));
+    let rows = sqlx::query(BATCHED_CANDIDATE_SQL)
+        .bind(serde_json::to_string(seeds)?)
+        .bind(PREFIX_SENTINEL.to_string())
+        .bind(UUID_LEN as i64)
+        .bind(MAX_CANDIDATES)
+        .fetch_all(conn)
+        .await?;
+    let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.try_get("seed")?)
+            .or_default()
+            .push(row.try_get("id")?);
+    }
+    for ids in grouped.values_mut() {
+        ids.sort();
+    }
+    Ok(grouped)
+}
+
+async fn batched_display_references(
+    conn: &mut sqlx::SqliteConnection,
+    by_prefix: &HashMap<String, Vec<&str>>,
+    require_live: bool,
+) -> Result<HashMap<String, Option<String>>> {
+    let seeds: Vec<&String> = by_prefix.keys().collect();
+    let mut rows = batched_prefix_rows(conn, &seeds).await?;
+    let mut result = HashMap::new();
+    for (prefix, group_ids) in by_prefix {
+        let rows = rows.remove(prefix).unwrap_or_default();
+        for id in group_ids {
+            let reference = if require_live && !rows.iter().any(|row| row == id) {
+                None
+            } else {
+                display_reference_from_rows(id, &rows)
+            };
+            result.insert(id.to_string(), reference);
+        }
+    }
+    Ok(result)
 }
 
 async fn display_references_with<E: DomainStatementExecutor>(
@@ -1349,22 +1456,53 @@ pub(crate) fn is_canonical_uuid(id: &str) -> bool {
 
 /// Visit every argument value that addresses an existing record.
 fn walk(value: &mut Value, top_level: bool, tool: &str, visit: &mut impl FnMut(&mut String)) {
+    walk_with_path(value, top_level, tool, &mut |_, text| visit(text));
+}
+
+/// [`walk`], also telling the visitor where the value sits, spelled the way an
+/// agent wrote it: `links[0].target_id`, `ids[2]`. The path buffer is one
+/// reused `String`, so the resolver's hot path pays no per-node allocation.
+fn walk_with_path(
+    value: &mut Value,
+    top_level: bool,
+    tool: &str,
+    visit: &mut dyn FnMut(&str, &mut String),
+) {
+    walk_at(value, top_level, tool, &mut String::new(), visit);
+}
+
+fn walk_at(
+    value: &mut Value,
+    top_level: bool,
+    tool: &str,
+    path: &mut String,
+    visit: &mut dyn FnMut(&str, &mut String),
+) {
     match value {
-        Value::Object(map) => walk_object(map, top_level, tool, visit),
+        Value::Object(map) => walk_object(map, top_level, tool, path, visit),
         Value::Array(items) => {
-            for item in items {
-                walk(item, false, tool, visit);
+            for (index, item) in items.iter_mut().enumerate() {
+                let mark = path.len();
+                push_index(path, index);
+                walk_at(item, false, tool, path, visit);
+                path.truncate(mark);
             }
         }
         _ => {}
     }
 }
 
+fn push_index(path: &mut String, index: usize) {
+    use std::fmt::Write;
+    let _ = write!(path, "[{index}]");
+}
+
 fn walk_object(
     map: &mut Map<String, Value>,
     top_level: bool,
     tool: &str,
-    visit: &mut impl FnMut(&mut String),
+    path: &mut String,
+    visit: &mut dyn FnMut(&str, &mut String),
 ) {
     let batch_read = top_level
         && tool == "manage_alpha_tabs"
@@ -1378,17 +1516,26 @@ fn walk_object(
         Some("principal")
     );
     for (key, entry) in map.iter_mut() {
+        let mark = path.len();
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(key);
         if batch_read && key == "reads" {
             // Artifact renders keep the single read's exact-target boundary:
             // the install gates precede any target lookup, and prefixes are
             // item-level invalid_params. Other needs retain normal resolution.
             if let Value::Array(items) = entry {
-                for item in items {
+                for (index, item) in items.iter_mut().enumerate() {
                     if item.get("need").and_then(Value::as_str) != Some("artifact.render.v1") {
-                        walk(item, false, tool, visit);
+                        let item_mark = path.len();
+                        push_index(path, index);
+                        walk_at(item, false, tool, path, visit);
+                        path.truncate(item_mark);
                     }
                 }
             }
+            path.truncate(mark);
             continue;
         }
         let addresses_a_record = if top_level && tool == "update_record" && key == "ids" {
@@ -1405,19 +1552,23 @@ fn walk_object(
             RECORD_ID_KEYS.contains(&key.as_str())
         };
         if addresses_a_record {
-            visit_strings(entry, visit);
+            visit_strings(entry, path, visit);
         }
-        walk(entry, false, tool, visit);
+        walk_at(entry, false, tool, path, visit);
+        path.truncate(mark);
     }
 }
 
-fn visit_strings(value: &mut Value, visit: &mut impl FnMut(&mut String)) {
+fn visit_strings(value: &mut Value, path: &mut String, visit: &mut dyn FnMut(&str, &mut String)) {
     match value {
-        Value::String(text) => visit(text),
+        Value::String(text) => visit(path, text),
         Value::Array(items) => {
-            for item in items {
+            for (index, item) in items.iter_mut().enumerate() {
                 if let Value::String(text) = item {
-                    visit(text);
+                    let mark = path.len();
+                    push_index(path, index);
+                    visit(path, text);
+                    path.truncate(mark);
                 }
             }
         }
@@ -2593,6 +2744,200 @@ mod tests {
             batch.get(lonely).map(Option::as_deref),
             Some(Some("7f3e21a")),
             "an unsaturated prefix group must not inherit saturation from another"
+        );
+        db.close().await;
+    }
+
+    /// The batched pool lookup must answer exactly what one scan per seed
+    /// answers — shared seeds, a saturated seed, a collision, a tombstone and a
+    /// caller-chosen id included — and must cost one statement however many
+    /// distinct seeds it is asked about.
+    #[tokio::test]
+    async fn batched_display_references_match_per_seed_scans_in_one_statement() {
+        let db = crate::create_database(":memory:").await.unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        // 60 distinct seeds.
+        for index in 0..60 {
+            ids.push(format!(
+                "{:07x}0-0000-4000-8000-0000000000{:02x}",
+                0x1000 + index * 17,
+                index
+            ));
+        }
+        // A saturated seed.
+        let crowded: Vec<String> = (0..=MAX_CANDIDATES as usize)
+            .map(|index| {
+                format!(
+                    "0189d4c{:x}-{:04x}-4000-8000-000000000001",
+                    index % 16,
+                    index / 16
+                )
+            })
+            .collect();
+        // A collision that forces a longer reference.
+        let twin_a = "7f3e21a9-0000-4000-8000-000000000001".to_string();
+        let twin_b = "7f3e21a9-1111-4000-8000-000000000002".to_string();
+        let tombstone = "5a5a5a5a-0000-4000-8000-000000000003".to_string();
+        let mut all: Vec<&str> = ids.iter().map(String::as_str).collect();
+        all.extend(crowded.iter().map(String::as_str));
+        all.extend([twin_a.as_str(), twin_b.as_str(), tombstone.as_str()]);
+        seed(&db, &all).await;
+        sqlx::query("UPDATE records SET deleted_at = '2026-08-13' WHERE id = ?")
+            .bind(&tombstone)
+            .execute(db.write_pool())
+            .await
+            .unwrap();
+        let mut asked: Vec<&str> = all.clone();
+        asked.push("native:root");
+
+        // Oracle: one scan per seed through the generic path.
+        let mut expected = HashMap::new();
+        {
+            let mut conn = db.write_pool().acquire().await.unwrap();
+            let mut executor = BorrowedSqliteStatementExecutor::new(&mut conn);
+            expected.extend(display_references_in(&mut executor, &asked).await.unwrap());
+        }
+
+        reset_prefix_row_query_count();
+        let batched = display_references_in_pool(db.write_pool(), &asked)
+            .await
+            .unwrap();
+        assert_eq!(batched, expected);
+        assert_eq!(
+            prefix_row_query_count(),
+            1,
+            "{} distinct seeds must share one statement",
+            ids.len() + 3
+        );
+        assert_eq!(batched.get(&crowded[0]), Some(&None));
+        assert_eq!(batched.get(&twin_a).unwrap().as_deref(), Some("7f3e21a90"));
+
+        // Followable references only: the tombstone mints a prefix on the
+        // plain lookup (unchanged) and none on the live-only one.
+        assert!(batched.get(&tombstone).unwrap().is_some());
+        reset_prefix_row_query_count();
+        let live = live_display_references_in_pool(db.write_pool(), &asked)
+            .await
+            .unwrap();
+        assert_eq!(prefix_row_query_count(), 1);
+        assert_eq!(live.get(&tombstone), Some(&None));
+        for id in &asked {
+            if *id != tombstone {
+                assert_eq!(live.get(*id), batched.get(*id), "{id}");
+            }
+        }
+        db.close().await;
+    }
+
+    /// The batched scan keeps the primary-key range search per seed rather than
+    /// degrading to a scan of `records` for each one.
+    #[tokio::test]
+    async fn the_batched_candidate_scan_searches_the_primary_key() {
+        use sqlx::Row as _;
+        let db = crate::create_database(":memory:").await.unwrap();
+        let plan: Vec<String> = sqlx::query(&format!("EXPLAIN QUERY PLAN {BATCHED_CANDIDATE_SQL}"))
+            .bind("[\"abc123d\"]")
+            .bind("g")
+            .bind(UUID_LEN as i64)
+            .bind(MAX_CANDIDATES)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter().any(|detail| detail.contains("SEARCH")
+                && detail.contains("records")
+                && detail.contains("id>?")),
+            "the range bound must reach the primary key index: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN records")),
+            "records must not be scanned per seed: {plan:?}"
+        );
+        db.close().await;
+    }
+
+    /// A connection whose every SQLite VM instruction is counted (the progress
+    /// handler fires once per instruction when asked for an interval of 1).
+    async fn counting_connection(
+        db: &Db,
+    ) -> (
+        sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let steps = std::sync::Arc::new(AtomicU64::new(0));
+        let mut conn = db.write_pool().acquire().await.unwrap();
+        let counter = std::sync::Arc::clone(&steps);
+        conn.lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+                true
+            });
+        (conn, steps)
+    }
+
+    /// A crowded seed — bulk-imported UUIDv7 ids share their time prefix — must
+    /// cost the same few dozen index entries as a quiet one. The statement
+    /// count and the index-search plan do not catch a window function that
+    /// ranks the whole crowd before applying the cap, so this counts VM work.
+    #[tokio::test]
+    async fn the_batched_scan_stops_after_the_cap_in_a_dense_seed() {
+        let crowd = |db: &Db, from: usize, to: usize| {
+            let db = db.clone();
+            async move {
+                let mut tx = db.write_pool().begin().await.unwrap();
+                for index in from..to {
+                    sqlx::query(
+                        "INSERT INTO records (id, type, name, created_at, updated_at) \
+                         VALUES (?, 'Document', 'seed', '2026-08-12', '2026-08-12')",
+                    )
+                    .bind(format!(
+                        "0189d4c6-{:04x}-7000-8000-{:012x}",
+                        index % 65_536,
+                        index
+                    ))
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                }
+                tx.commit().await.unwrap();
+            }
+        };
+        let db = crate::create_database(":memory:").await.unwrap();
+        let probe = "0189d4c6-0000-7000-8000-000000000000".to_string();
+        let seeds = [probe[..MIN_DISPLAY_HEX].to_string()];
+        let seed_refs: Vec<&String> = seeds.iter().collect();
+
+        let mut steps = Vec::new();
+        for (from, to) in [(0, 200), (200, 6_000)] {
+            crowd(&db, from, to).await;
+            let (mut conn, counter) = counting_connection(&db).await;
+            let rows = batched_prefix_rows(&mut conn, &seed_refs).await.unwrap();
+            assert_eq!(rows[&seeds[0]].len(), MAX_CANDIDATES as usize);
+            let batched = counter.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let mut executor = BorrowedSqliteStatementExecutor::new(&mut conn);
+            let rows = prefix_rows_with(&mut executor, &seeds[0]).await.unwrap();
+            assert_eq!(rows.len(), MAX_CANDIDATES as usize);
+            let single = counter.load(std::sync::atomic::Ordering::Relaxed);
+            conn.lock_handle().await.unwrap().remove_progress_handler();
+            steps.push((batched, single));
+        }
+        let (small_batched, _) = steps[0];
+        let (dense_batched, dense_single) = steps[1];
+        // The crowd grew thirty-fold; the work did not move.
+        assert!(
+            dense_batched <= small_batched * 2,
+            "work grew with the crowd: {steps:?}"
+        );
+        // And it stays within a small constant of the per-seed query it replaces.
+        assert!(
+            dense_batched <= dense_single * 10 + 200,
+            "batched scan is not bounded like the single-seed scan: {steps:?}"
         );
         db.close().await;
     }

@@ -428,7 +428,9 @@ impl StandbyStatusProvider {
         let mut serving = self.serving.clone()?;
         if let Ok(Some(head)) = self.store.generation_head(&serving.generation_id) {
             serving.head_act = Some(head.head_act);
-            serving.materialization = head.materialization;
+            if serving.engine.name != super::kernel_v2::ENGINE {
+                serving.materialization = head.materialization;
+            }
             serving.synced_at = Some(head.synced_at);
         }
         let counts = self.store.deferral_counts(&serving.generation_id);
@@ -486,9 +488,12 @@ fn generation_status(
             .as_ref()
             .map(|head| head.head_act)
             .or(manifest.head_act),
-        materialization: head
-            .as_ref()
-            .map_or(manifest.materialization, |head| head.materialization),
+        materialization: if manifest.kernel_v2.is_some() {
+            manifest.materialization
+        } else {
+            head.as_ref()
+                .map_or(manifest.materialization, |head| head.materialization)
+        },
         synced_at: head.map(|head| normalized_timestamp(&head.synced_at)),
         source_history: source_history(&generation.snapshot_path),
         engine: manifest.engine.clone(),
@@ -1006,6 +1011,12 @@ fn safe_delta_fallback_message(class: super::refresh::DeltaFallbackClass) -> &'s
         DeltaTooLarge => {
             "the catch-up is too large for a delta transfer; a whole snapshot is required"
         }
+        BlobInventoryLimit => {
+            "kernel v2 blob inventory exceeded the limit; a whole snapshot is required"
+        }
+        ProjectionDivergence => {
+            "kernel v2 projection digest differed; a whole snapshot is required"
+        }
     }
 }
 
@@ -1087,6 +1098,7 @@ mod tests {
             consumer: consumer(),
             frontier: frontier(),
             head_act: Some(0),
+            kernel_v2: None,
             materialization: StandbyGenerationMaterialization::Snapshot,
             snapshot: StandbySnapshotBytes {
                 media_type: STANDBY_SNAPSHOT_MEDIA_TYPE.into(),

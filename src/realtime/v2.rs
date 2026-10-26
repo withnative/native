@@ -19,6 +19,8 @@ pub struct AppDataRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppDataGate {
     pub principal: String,
+    /// Internal only: fences membership and visibility changes between capture and emit.
+    pub authorization_epoch: String,
     pub consent_status: String,
     pub executable: bool,
     pub revocation_epoch: u64,

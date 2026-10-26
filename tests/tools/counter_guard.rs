@@ -61,6 +61,7 @@ use native_ce::identity::hosted::{
     HostedMembershipSource,
 };
 use native_ce::mcp::counter_fence::{find_counters, text_names_head};
+use native_ce::mcp::tools::hcp_v2::{register_hcp_v2_tools, PseudonymKey, ADD_PREFERENCE};
 use native_ce::mcp::{
     register_builtin_tools, register_surface_tools, AuthoritativeDisposition, Caller, ToolRegistry,
 };
@@ -182,6 +183,7 @@ const ALLOWLIST: &[(&str, &str, Slice)] = &[
         Slice::S6,
     ),
     ("manage_links", "$.previous_seq", Slice::S6),
+    ("manage_messages", "$.candidates[].seq", Slice::S6),
     ("manage_messages", "$.content_head", Slice::S2),
     ("manage_messages", "$.facets[].version", Slice::S6),
     ("manage_messages", "$.heads", Slice::S2),
@@ -380,6 +382,7 @@ const ERROR_ONLY: &[(&str, &str)] = &[
 /// `ERROR_ONLY`, with the fixture it would need. The coverage test fails if one
 /// starts succeeding, so the gap is deleted when it is closed (M4).
 const READ_SUCCESS_GAPS: &[(&str, &str)] = &[
+    ("manage_named_views", "all six actions refuse on this ordinary SQLite fixture; hosted-v2 successes and authority boundaries are tested in src/named_views/execution_tests.rs"),
     ("manage_onboarding", "database owner host role required"),
     ("manage_mdx_modules", "no module fixture"),
     ("resolve_citation", "no citation fixture"),
@@ -500,6 +503,10 @@ struct Ids {
     /// A visible `native.mdx.v2` artifact, so `render_artifact` reaches its
     /// success path (M2).
     mdx: String,
+    /// Sealed HCP histories, interleaved across accounts; never fake facets.
+    audit_entry: String,
+    owner_audit_entry: String,
+    owner_audit_cursor: String,
 }
 
 async fn fixture() -> (Fixture, Ids) {
@@ -772,7 +779,49 @@ async fn fixture() -> (Fixture, Ids) {
             .await
             .unwrap();
 
+    crate::common::govern_kind(&fx.db, "Resolution", "hcp_entry").await;
+    let mut hcp = ToolRegistry::new();
+    register_hcp_v2_tools(&mut hcp, PseudonymKey::from_secret(&[0x42; 32]).unwrap()).unwrap();
+    let mut entries = Vec::new();
+    // Member -> owner -> member makes a global position disclose hidden work.
+    for (who, preference) in [
+        (member(), "Member audit first"),
+        (Caller::authenticated("acct:owner"), "Owner audit private"),
+        (member(), "Member audit last"),
+    ] {
+        let frame = hcp
+            .call(
+                fx.db.clone(),
+                who.with_oauth_client_id(Some("counter-audit-client".into())),
+                ADD_PREFERENCE,
+                json!({"category":"general_preferences", "preference":preference,
+                "declarationType":"user-declared", "sourceContext":"counter-guard"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frame["isError"], false, "{frame}");
+        entries.push(
+            frame["structuredContent"]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    let owners = fx
+        .registry
+        .call(
+            fx.db.clone(),
+            Caller::authenticated("acct:owner"),
+            "read_hcp_audit",
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let owner_audit_cursor = owners["events"][0]["eventId"].as_str().unwrap().to_owned();
     let ids = Ids {
+        audit_entry: entries[0].clone(),
+        owner_audit_entry: entries[1].clone(),
+        owner_audit_cursor,
         owner,
         member: member_person,
         shared,
@@ -900,6 +949,12 @@ fn plan(ids: &Ids, too_far: i64) -> Vec<Call> {
         call("get_reuse_context", json!({ "record_id": shared })),
         call("open_collection", json!({ "id": &ids.folder })),
         // ---- history and activity
+        call("read_hcp_audit", json!({})),
+        call_err(
+            "read_hcp_audit",
+            json!({"after_cursor":ids.owner_audit_cursor}),
+        ),
+        call_err("read_hcp_audit", json!({"account_id":"acct:owner"})),
         call("get_history", json!({ "limit": 50 })),
         call(
             "get_history",
@@ -1090,6 +1145,30 @@ fn plan(ids: &Ids, too_far: i64) -> Vec<Call> {
             "manage_account_config",
             json!({"action":"replace","kind":"focus_preferences",
             "expected_record_id":"$preferences","reason":"Counter probe refuses healthy replacement."}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"get_view_revision","view_id":"native.named-view:bearer","revision_id":"revision"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"list_view_revisions","view_id":"native.named-view:bearer"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"record_view_revision","id":ids.shared,"definition":{},"idempotency_key":"counter-draft"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"activate_view","id":ids.shared,"pin":{},"name":"view_counter","expected_binding_event_id":null,"idempotency_key":"counter-publish"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"unpublish_view","id":ids.shared,"expected_binding_event_id":null,"idempotency_key":"counter-unpublish"}),
+        ),
+        call_err(
+            "manage_named_views",
+            json!({"action":"prepare_named_views"}),
         ),
         call("query_change_summaries", json!({ "action": "list" })),
         call(
@@ -1401,6 +1480,14 @@ async fn run_plan() -> (
                 if planned.expected == Expected::Err {
                     call_problems.push(format!("{} expected Err but returned Ok", planned.tool));
                 }
+                if planned.tool == "read_hcp_audit" {
+                    let events = response["events"].as_array().unwrap();
+                    assert_eq!(events.len(), 2, "exercise non-empty success");
+                    assert_eq!(events[0]["entryId"], ids.audit_entry);
+                    assert!(events.iter().all(|e| e["entryId"] != ids.owner_audit_entry));
+                    assert!(find_counters(&response).is_empty());
+                    assert_eq!(head_before, head_after);
+                }
                 if planned.tool == "create_record" {
                     created = response["id"].as_str().unwrap_or_default().to_string();
                 }
@@ -1466,6 +1553,57 @@ async fn run_plan() -> (
         }
     }
     (observed, outcomes, call_problems, fx)
+}
+
+/// Authorization owner for the per-person audit operation: successful private
+/// reads and uniform foreign/unknown cursor denials, through production dispatch.
+#[tokio::test]
+async fn hcp_audit_non_owner_reads_only_own_events_and_refuses_foreign_cursors() {
+    let (fx, ids) = fixture().await;
+    let before = head(&fx.db).await;
+    let read =
+        |who: Caller, args: Value| fx.registry.call(fx.db.clone(), who, "read_hcp_audit", args);
+    let own = read(member(), json!({"limit":1})).await.unwrap();
+    assert_eq!(own["events"][0]["entryId"], ids.audit_entry);
+    assert_eq!(own["next_cursor"], own["events"][0]["eventId"]);
+    assert_eq!(own["has_more"], true);
+    let last = read(member(), json!({"after_cursor":own["next_cursor"]}))
+        .await
+        .unwrap();
+    assert_eq!(last["events"].as_array().unwrap().len(), 1);
+    assert_ne!(last["events"][0]["entryId"], ids.owner_audit_entry);
+    let owner = read(Caller::authenticated("acct:owner"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(owner["events"].as_array().unwrap().len(), 1);
+    assert_eq!(owner["events"][0]["entryId"], ids.owner_audit_entry);
+    let empty = read(Caller::authenticated("acct:no-hcp-history"), json!({}))
+        .await
+        .unwrap();
+    assert_eq!(empty["events"], json!([]));
+    for response in [&own, &last, &owner, &empty] {
+        assert!(find_counters(response).is_empty(), "{response}");
+    }
+    for cursor in [
+        ids.owner_audit_cursor.as_str(),
+        "urn:uuid:00000000-0000-4000-8000-000000000001",
+        "invalid-cursor",
+    ] {
+        let error = read(member(), json!({"after_cursor":cursor}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "invalid HCP audit cursor");
+        assert!(!text_names_head(&error, before));
+    }
+    assert!(read(member(), json!({"account_id":"acct:owner"}))
+        .await
+        .is_err());
+    assert_eq!(
+        head(&fx.db).await,
+        before,
+        "audit and denials are read-only"
+    );
 }
 
 #[tokio::test]

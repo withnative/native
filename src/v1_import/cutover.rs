@@ -2,6 +2,41 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+/// Provenance emitted by every library/CLI report, including failed captures.
+#[derive(Serialize)]
+pub struct ImportBuild {
+    pub importer_build_sha: &'static str,
+}
+impl Default for ImportBuild {
+    fn default() -> Self {
+        Self {
+            importer_build_sha: crate::FULL_GIT_SHA,
+        }
+    }
+}
+
+/// An override acknowledges a build mismatch only; all data/admission guards
+/// remain mandatory. Unstamped development binaries cannot prove same-build.
+pub fn admit_build_sha(
+    importer: Option<&str>,
+    operator: &str,
+    allow_mismatch: bool,
+) -> crate::Result<bool> {
+    let valid = |s: &str| {
+        s.len() == 40
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let matches = valid(operator) && importer.is_some_and(|s| valid(s) && s == operator);
+    if matches {
+        return Ok(false);
+    }
+    if allow_mismatch {
+        return Ok(true);
+    }
+    Err(crate::Error::engine("v2 cutover refused: build SHA differs or is unavailable; use matching stamped importer/operator/hosting builds, or explicitly --allow-build-mismatch"))
+}
+
 /// Hash the complete logical SQLite snapshot, including WAL-visible rows.
 /// Length-prefix schema/table/row bytes; sort encoded rows, preserving duplicate
 /// rows and SQLite value types. Never emit source values in diagnostics.
@@ -71,7 +106,7 @@ pub async fn attach_receipt(
         return Err("source changed during import; fresh immutable snapshot required".into());
     }
     let proof = &value["cutover_verification"];
-    value["cutover_verification"] = json!({"schema":"native.v2-import-receipt.v1","all":all,"history":history,"resume":resume,"history_complete":proof["history_complete"],"source_records":proof["source_records"],"origin_db_id":proof["origin_db_id"],"source_digest":source_digest,"target_digest":snapshot_digest(target).await?,"target":target.canonicalize()?});
+    value["cutover_verification"] = json!({"schema":"native.v2-import-receipt.v1","importer_build_sha":crate::FULL_GIT_SHA,"all":all,"history":history,"resume":resume,"history_complete":proof["history_complete"],"source_records":proof["source_records"],"origin_db_id":proof["origin_db_id"],"source_digest":source_digest,"target_digest":snapshot_digest(target).await?,"target":target.canonicalize()?});
     Ok(value)
 }
 
@@ -146,6 +181,7 @@ pub async fn capture_report(
             .sum::<usize>()
             == report.counted.len();
     let capture_complete = all
+        && report.state.member_contexts_prepared
         && counted_complete
         && history_complete
         && mismatches == 0
@@ -158,6 +194,6 @@ pub async fn capture_report(
     let mut value = serde_json::to_value(report)?;
     value["capture_complete"] = json!(capture_complete);
     value["mismatches"] = json!(mismatches);
-    value["cutover_verification"] = json!({"schema":"native.v2-import-capture.v1","all":all,"history":history,"resume":resume,"history_complete":history_complete,"source_records":count,"origin_db_id":origin});
+    value["cutover_verification"] = json!({"schema":"native.v2-import-capture.v1","importer_build_sha":crate::FULL_GIT_SHA,"all":all,"history":history,"resume":resume,"history_complete":history_complete,"source_records":count,"origin_db_id":origin});
     Ok(value)
 }

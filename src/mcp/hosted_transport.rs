@@ -57,6 +57,19 @@ pub async fn hosted_artifact_stylesheet(
     super::tools::artifacts::artifact_stylesheet(db, caller, artifact_id, digest).await
 }
 
+/// The v2 stylesheet route uses the same current membership and record
+/// visibility checks as the ordinary KernelV2 render handler.
+#[cfg(feature = "v2-kernel-probe")]
+pub async fn hosted_kernel_artifact_stylesheet(
+    db: &Db,
+    caller: &Caller,
+    artifact_id: &str,
+    digest: &str,
+) -> Result<Option<String>> {
+    let actor = super::kernel_v2::principal(db, caller).await?;
+    super::kernel_v2::artifacts::stylesheet(db, &actor, artifact_id, digest).await
+}
+
 /// Read the exact installed source through launch's shared admission chain.
 /// The portable account must be the authenticated caller's own credential.
 /// Returns only body bytes and the current validation limit, never private install rows.
@@ -83,6 +96,23 @@ pub async fn admit_kernel_app_bundle_source_in(
         preview_receipt,
     )
     .await
+}
+
+/// Current View, liveness and exact frozen source for ordinary native HTML.
+#[cfg(feature = "v2-kernel-probe")]
+pub async fn admit_kernel_artifact_bundle_source_in(
+    tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
+    caller: &Caller,
+    artifact_id: &str,
+    digest: &str,
+) -> Result<(String, usize)> {
+    let actor: String =
+        sqlx::query_scalar("SELECT principal_id FROM kernel_principals WHERE auth_binding=?")
+            .bind(caller.credential())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| Error::auth("artifact caller unavailable"))?;
+    super::kernel_v2::artifacts::html_board::bundle_source_on(tx, &actor, artifact_id, digest).await
 }
 
 /// Read an installed v1 source through its existing admission chain.
@@ -170,6 +200,18 @@ pub async fn resolve_hosted_run_context(
         registry.deployment_mutation_barrier(),
     )
     .await
+}
+
+/// Resolve validation-failure context against the admitted workspace engine.
+pub async fn resolve_hosted_engine_run_context(
+    registry: &ToolRegistry,
+    engine: &super::registry::EngineHandle,
+    caller: Caller,
+    arguments: &Value,
+) -> Value {
+    registry
+        .run_context_for_engine(engine, caller, arguments)
+        .await
 }
 
 /// Attach the canonical run-context envelope to a federated tool result.

@@ -375,6 +375,18 @@ async fn schema_config_rows_with_scope<E: DomainStatementExecutor>(
         )
         .await
         .map_err(|error| {
+            // SQLite progress-handler interruption loses its raw text during
+            // portable normalization. Preserve the deadline category before
+            // turning other schema-loader failures into contract violations.
+            if (error.backend == Some(crate::portable_sql::Backend::Sqlite)
+                && error.backend_code.as_deref() == Some("9"))
+                || error.category == crate::portable_sql::ErrorCategory::DeadlineExceeded
+            {
+                return super::sql_contract::categorized_error(
+                    super::sql_contract::QuerySqlErrorCategory::Timeout,
+                    super::sql_contract::deadline_hint(),
+                );
+            }
             contract_violation(format!("read schema config: {}", error.stable_message()))
         })?;
     rows.into_iter()

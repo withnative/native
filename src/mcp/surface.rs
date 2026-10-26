@@ -82,14 +82,17 @@ impl ExperimentalExecutors {
 /// The one MCP product selected for the lifetime of a server process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum McpSurfaceMode {
-    /// The stable permission-shaped executor catalogue.
-    #[default]
+    /// The full stable permission-shaped executor catalogue, selected
+    /// explicitly. Standby, member-copy and lens surfaces keep their own
+    /// read-only projections.
     Executor,
     /// Hidden emergency rollback to the original tool registry surface.
     Legacy,
     /// The executor catalogue projected onto a small directly advertised set
     /// plus `call_executor`, which reaches every other contracted operation
-    /// through the same governed dispatch. Opt-in; never the default.
+    /// through the same governed dispatch. The default when
+    /// `NATIVE_CE_MCP_SURFACE` is unset.
+    #[default]
     Lean,
 }
 
@@ -139,8 +142,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn executor_is_the_only_default_and_values_are_exact() {
-        assert_eq!(McpSurfaceMode::default(), McpSurfaceMode::Executor);
+    fn lean_is_the_default_and_values_are_exact() {
+        assert_eq!(McpSurfaceMode::default(), McpSurfaceMode::Lean);
         assert_eq!("executor".parse(), Ok(McpSurfaceMode::Executor));
         assert_eq!("legacy".parse(), Ok(McpSurfaceMode::Legacy));
         assert_eq!("lean".parse(), Ok(McpSurfaceMode::Lean));

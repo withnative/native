@@ -19,6 +19,7 @@ pub(crate) const V1: Entry = Entry {
     decode: decode_v1,
     fold: fold_v1,
     state_codec: view_v1,
+    link_read: Some(link_read),
 };
 pub(crate) const V2: Entry = Entry {
     pins: v2::pins,
@@ -30,6 +31,7 @@ pub(crate) const V2: Entry = Entry {
     decode: decode_v2,
     fold: fold_v2,
     state_codec: view_v2,
+    link_read: Some(link_read),
 };
 pub(crate) const V3: Entry = Entry {
     pins: v3::pins,
@@ -41,6 +43,7 @@ pub(crate) const V3: Entry = Entry {
     decode: decode_v3,
     fold: fold_v3,
     state_codec: view_v3,
+    link_read: Some(link_read),
 };
 /// Relation-only compatibility data; never parsed by shared host infrastructure.
 #[derive(Serialize, Deserialize)]
@@ -369,4 +372,46 @@ fn view_v3(s: &StoredState) -> Result<Value> {
     Ok(serde_json::to_value(serde_json::from_value::<v3::State>(
         s.state.clone(),
     )?)?)
+}
+
+/// Host read rows derive exclusively from the selected retained codec's view.
+fn link_read(view: Value) -> Result<crate::kernel::provider_link_reads::LinkView> {
+    use crate::kernel::provider_link_reads::{LinkOperation, LinkView};
+    let state: super::relates_to::State = serde_json::from_value(view)?;
+    let mut rows = Vec::new();
+    for assertion in state.assertions.iter().filter(|a| !a.retracted) {
+        if assertion.sources.is_empty() {
+            for (from, to) in [(&state.left, &state.right), (&state.right, &state.left)] {
+                rows.push(LinkOperation {
+                    id: format!("v2:relates_to:{from}:{to}"),
+                    source: from.clone(),
+                    target: to.clone(),
+                    note: None,
+                    timestamp: assertion.asserted_at.clone(),
+                    if_absent: true,
+                });
+            }
+        } else {
+            for source in &assertion.sources {
+                rows.push(LinkOperation {
+                    id: source.source_id.clone(),
+                    source: source.from.clone(),
+                    target: source.to.clone(),
+                    note: source.note.clone(),
+                    timestamp: source
+                        .claimed_timestamp
+                        .clone()
+                        .unwrap_or_else(|| assertion.asserted_at.clone()),
+                    if_absent: false,
+                });
+            }
+        }
+    }
+    let active = state.active();
+    Ok(LinkView {
+        left: state.left,
+        right: state.right,
+        active,
+        rows,
+    })
 }

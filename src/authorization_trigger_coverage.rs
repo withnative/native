@@ -1,4 +1,4 @@
-//! Mechanical trigger-coverage test for both authorization counters.
+//! Mechanical trigger-coverage test for all authorization counters.
 //!
 //! Slice F-B of the member-offline contract (§4.1, "Mechanical
 //! trigger-coverage test"). Test-only module (`#[cfg(test)]` in
@@ -12,11 +12,12 @@
 //! trigger SQL and checks two properties:
 //!
 //! * Per counter: for each recorded pair, insert/update(column)/delete
-//!   on EACH of `authorization_revision` (broad cache fence) and
-//!   `authorization_grant_revision` (grant-only realtime fence) must be
+//!   on EACH of `authorization_revision` (broad cache fence),
+//!   `authorization_grant_revision` (workspace grant fence), and
+//!   `authorization_subject_revision` (viewer fence) must be
 //!   covered or waived by a commented `EXEMPTIONS` entry.
 //! * Union safety net (`unwatched_by_both`): for each recorded pair and
-//!   each operation, AT LEAST ONE counter fires (only the hardcoded
+//!   each operation, AT LEAST ONE of the two member-copy counters fires (only the hardcoded
 //!   766ede6 `unit_id` exception).
 //!
 //! "Covered" for an update means the column is in the `UPDATE OF` list
@@ -52,6 +53,7 @@ use rusqlite::{Connection, OpenFlags};
 enum Counter {
     Broad,
     Grant,
+    Subject,
 }
 
 impl Counter {
@@ -59,11 +61,12 @@ impl Counter {
         match self {
             Counter::Broad => "authorization_revision_",
             Counter::Grant => "authorization_grant_",
+            Counter::Subject => "authorization_subject_",
         }
     }
 
-    fn all() -> [Counter; 2] {
-        [Counter::Broad, Counter::Grant]
+    fn all() -> [Counter; 3] {
+        [Counter::Broad, Counter::Grant, Counter::Subject]
     }
 }
 
@@ -79,7 +82,7 @@ struct Exemption {
     /// `None` waives the gap for every column of the table (used for the
     /// table-level insert/delete requirements).
     column: Option<&'static str>,
-    /// `None` waives the gap on both counters.
+    /// `None` waives the gap on every counter.
     counter: Option<Counter>,
     /// Empty waives every gap kind for the (table, column, counter) cell.
     gaps: &'static [GapKind],
@@ -100,8 +103,14 @@ const EXEMPTIONS: &[Exemption] = &[
         gaps: &[GapKind::Insert],
         reason: "§4.1: intentional; a new record is not a grant change",
     },
+    // New records arrive through content; only later authority changes need
+    // a subject prompt. Certification handles composed initial boundaries.
+    Exemption {
+        table: "records", column: None, counter: Some(Counter::Subject),
+        gaps: &[GapKind::Insert], reason: "births are content, not access narrowing",
+    },
     // RESOLVED (task 766ede6, P2a): not a hole in the member fence. A
-    // `semantic_units.unit_id` update is watched by NEITHER counter (the
+    // `semantic_units.unit_id` update is watched by NEITHER member-copy counter (the
     // broad counter has no `semantic_units` triggers at all; the grant
     // counter watches `authority_bearer_record_id` only). E(m) nevertheless
     // reads `unit_id` (`_query_sql_visible_records`, `src/query/sql.rs`), so
@@ -112,7 +121,8 @@ const EXEMPTIONS: &[Exemption] = &[
     //
     // MUST BE REVISITED if the authorization counters become the only fence
     // input: then a real `AFTER UPDATE OF unit_id ON semantic_units` trigger
-    // (or an equivalent) is required.
+    // (or an equivalent) is required. The separate subject counter already
+    // watches unit_id because realtime does not read units_state_digest.
     Exemption {
         table: "semantic_units",
         column: Some("unit_id"),
@@ -375,8 +385,16 @@ fn parse_auth_trigger(name: &str, sql: &str) -> Result<ParsedAuthTrigger, String
     let bump = match counter {
         Counter::Broad => "UPDATE AUTHORIZATION_REVISION SET EPOCH",
         Counter::Grant => "UPDATE AUTHORIZATION_GRANT_REVISION SET EPOCH",
+        Counter::Subject => "AUTHORIZATION_SUBJECT_REVISION",
     };
-    if !body.contains(bump) {
+    let bumps = if counter == Counter::Subject {
+        body.contains("UPDATE AUTHORIZATION_SUBJECT_REVISION SET REVISION")
+            || (body.contains("INSERT INTO AUTHORIZATION_SUBJECT_REVISION")
+                && body.contains("DO UPDATE SET REVISION"))
+    } else {
+        body.contains(bump)
+    };
+    if !bumps {
         return Err(format!(
             "trigger '{name}' body does not bump its {counter:?} counter table"
         ));
@@ -412,7 +430,7 @@ fn parse_auth_trigger(name: &str, sql: &str) -> Result<ParsedAuthTrigger, String
     }
 }
 /// Load per-counter coverage from the live schema. Only triggers in
-/// the two counter families are considered; every other trigger
+/// the three counter families are considered; every other trigger
 /// (FTS, append-only guards, …) is out of scope for this test.
 fn load_coverage(conn: &Connection) -> Result<BTreeMap<Counter, CounterCoverage>, String> {
     let mut coverage: BTreeMap<Counter, CounterCoverage> = BTreeMap::new();
@@ -420,7 +438,8 @@ fn load_coverage(conn: &Connection) -> Result<BTreeMap<Counter, CounterCoverage>
         .prepare(
             "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' \
              AND (name LIKE 'authorization\\_revision\\_%' ESCAPE '\\' \
-               OR name LIKE 'authorization\\_grant\\_%' ESCAPE '\\') \
+               OR name LIKE 'authorization\\_grant\\_%' ESCAPE '\\' \
+               OR name LIKE 'authorization\\_subject\\_%' ESCAPE '\\') \
              ORDER BY name",
         )
         .map_err(|error| format!("cannot list live triggers: {error}"))?;
@@ -581,7 +600,7 @@ fn unwatched_by_both(
             continue;
         }
         let fires = |gap: GapKind| {
-            Counter::all().into_iter().any(|counter| {
+            [Counter::Broad, Counter::Grant].into_iter().any(|counter| {
                 let counter_coverage = coverage.get(&counter).unwrap_or(&empty);
                 match gap {
                     GapKind::Insert => counter_coverage.insert_tables.contains(&read.table),
@@ -1008,5 +1027,26 @@ fn trigger_parser_fails_loudly_on_unknown_shapes() {
     assert_eq!(
         when_columns("OLD.a IS NOT NEW.a OR RENEW.b = 1 OR xOLD.y = 2"),
         BTreeSet::from(["a".to_owned()]),
+    );
+}
+
+#[test]
+fn checker_detects_missing_subject_column_coverage() {
+    let conn = Connection::open_in_memory().unwrap();
+    apply_ddl(&conn, str::to_owned);
+    conn.execute_batch("ALTER TABLE records ADD COLUMN new_auth_input TEXT")
+        .unwrap();
+    let reads = record_reads(
+        &conn,
+        &["SELECT new_auth_input FROM records WHERE id=?".to_owned()],
+    );
+    let coverage = load_coverage(&conn).unwrap();
+    let (uncovered, _) = evaluate(&reads, &coverage);
+    assert!(
+        uncovered.iter().any(|gap| gap.table == "records"
+            && gap.column == "new_auth_input"
+            && gap.counter == Counter::Subject
+            && gap.gap == GapKind::Update),
+        "subject coverage must fail for a new authorization input: {uncovered:?}"
     );
 }

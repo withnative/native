@@ -874,6 +874,7 @@ impl TursoLocalDb {
             && shared_record_body_carrier_ready(&connection).await?
             && shared_account_config_carrier_ready(&connection).await?
             && shared_sql_write_receipt_carrier_ready(&connection).await?
+            && shared_content_event_heads_carrier_ready(&connection).await?
             && shared_app_attribution_carrier_ready(&connection).await?
             && runtime_genesis_ready(&connection).await?
             && seeded_runtime_vocabulary_ready(&connection).await?
@@ -2654,6 +2655,88 @@ async fn migrate_existing_engine_schema(connection: &turso::Connection) -> Resul
         version = 90;
     }
 
+    if version == 90 {
+        // Parity carrier for the subject-authorization revisions (engine 91):
+        // main added the shared DDL without a Turso edge, so the ladder carries
+        // it here to keep the file identical to the SQLite engine.
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        let migration = async {
+            for statement in crate::schema::ddl::AUTHORIZATION_SUBJECT_DDL {
+                connection
+                    .execute(statement, ())
+                    .await
+                    .map_err(|e| Error::engine(e.to_string()))?;
+            }
+            connection
+                .execute("PRAGMA user_version=91", ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = migration {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        version = 91;
+    }
+
+    if version == 91 {
+        // Parity carrier: Turso-local keeps its own head scan, but the shared
+        // schema's table and triggers are installed (and backfilled with the
+        // same definition) so the file stays identical to the SQLite engine.
+        connection
+            .execute("BEGIN IMMEDIATE", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        let migration = async {
+            let ddl = crate::schema::ddl::CONTENT_EVENT_HEADS_DDL;
+            connection
+                .execute(ddl[0], ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            connection
+                .execute(
+                    "INSERT INTO content_event_heads(event_id)
+                     SELECT event.id FROM content_events event
+                      WHERE NOT EXISTS (
+                            SELECT 1 FROM content_event_causal_frontier frontier
+                             WHERE frontier.parent_event_id = event.id)",
+                    (),
+                )
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            for statement in &ddl[1..] {
+                connection
+                    .execute(*statement, ())
+                    .await
+                    .map_err(|e| Error::engine(e.to_string()))?;
+            }
+            connection
+                .execute("PRAGMA user_version=92", ())
+                .await
+                .map_err(|e| Error::engine(e.to_string()))?;
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(error) = migration {
+            let _ = connection.execute("ROLLBACK", ()).await;
+            return Err(error);
+        }
+        connection
+            .execute("COMMIT", ())
+            .await
+            .map_err(|e| Error::engine(e.to_string()))?;
+        version = 92;
+    }
+
     // The ladder above must end at the current schema: a block that runs
     // without advancing `version` silently strands every later block (as
     // 67→68 was stranded until the 66→67 block advanced it).
@@ -4346,6 +4429,11 @@ async fn validate_runtime(connection: &turso::Connection, logical_database_id: &
             "Turso-local shared sql-write-receipt carrier is incomplete",
         ));
     }
+    if !shared_content_event_heads_carrier_ready(connection).await? {
+        return Err(Error::engine(
+            "Turso-local shared causal-heads carrier is incomplete",
+        ));
+    }
     if !shared_app_attribution_carrier_ready(connection).await? {
         return Err(Error::engine(
             "Turso-local shared app-attribution carrier is incomplete",
@@ -4600,6 +4688,12 @@ fn compiled_required_runtime_schema() -> Result<BTreeMap<(String, String), Strin
         // probe-compatible.
         if !sqlite_fts_statement(statement)
             && !sqlite_content_events_append_only_statement(statement)
+            // Parity carrier validated by `shared_content_event_heads_carrier_ready`;
+            // keeping it out of the frozen runtime describe contract.
+            && !statement.starts_with("CREATE TRIGGER content_event_heads_")
+            // Engine-91 subject-authorization triggers are likewise shared-schema
+            // parity, not part of the frozen Turso describe contract.
+            && !name.starts_with("authorization_subject_")
             && ddl_trigger_targets_required_table(statement)
         {
             contract.insert(
@@ -4792,6 +4886,31 @@ async fn shared_sql_write_receipt_carrier_ready(connection: &turso::Connection) 
             normalized_runtime_schema_sql(ddl[3].into()),
         ),
     ]);
+    Ok(installed_required_runtime_schema(connection, &expected).await? == expected)
+}
+
+/// Causal-heads carrier for shared schema parity: Turso-local keeps its own
+/// head scan, and the triggers keep this table equal to it.
+async fn shared_content_event_heads_carrier_ready(connection: &turso::Connection) -> Result<bool> {
+    let ddl = crate::schema::ddl::CONTENT_EVENT_HEADS_DDL;
+    let names = [
+        ("table", "content_event_heads"),
+        ("index", "idx_content_events_basis_run"),
+        ("trigger", "content_event_heads_event_insert"),
+        ("trigger", "content_event_heads_event_delete"),
+        ("trigger", "content_event_heads_frontier_insert"),
+        ("trigger", "content_event_heads_frontier_delete"),
+    ];
+    let expected = names
+        .iter()
+        .zip(ddl)
+        .map(|((kind, name), sql)| {
+            (
+                ((*kind).into(), (*name).into()),
+                normalized_runtime_schema_sql(sql.into()),
+            )
+        })
+        .collect::<BTreeMap<(String, String), String>>();
     Ok(installed_required_runtime_schema(connection, &expected).await? == expected)
 }
 
@@ -9709,6 +9828,8 @@ struct NewLink {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateRecordArguments {
+    #[serde(rename = "confirm")]
+    _confirm: Option<bool>,
     id: Option<String>,
     #[serde(rename = "type")]
     record_type: String,
@@ -14174,6 +14295,16 @@ mod tests {
                 "LIMIT without ORDER BY",
             ),
             (
+                "facet_keys_unavailable",
+                "SELECT key FROM facet_keys ORDER BY key LIMIT 2",
+                "relation 'facet_keys' is unavailable in profile turso-local",
+            ),
+            (
+                "facet_keys_columnless_count",
+                "SELECT count(*) AS n FROM facet_keys",
+                "relation 'facet_keys' is unavailable in profile turso-local",
+            ),
+            (
                 "config_nodes_unavailable",
                 "SELECT config_id FROM schema_config_json_nodes LIMIT 2",
                 "unavailable in profile turso-local",
@@ -16206,6 +16337,9 @@ mod tests {
             .execute("DROP TABLE sql_write_receipts", ())
             .await
             .unwrap();
+        for statement in crate::schema::step_down::object_drop_statements(90, true) {
+            connection.execute(&statement, ()).await.unwrap();
+        }
         migrate_existing_engine_schema(&connection).await.unwrap();
         assert_eq!(
             scalar_i64(&connection, "PRAGMA user_version")
@@ -16317,6 +16451,9 @@ mod tests {
             .execute("DROP TABLE sql_write_receipts", ())
             .await
             .unwrap();
+        for statement in crate::schema::step_down::object_drop_statements(90, true) {
+            connection.execute(&statement, ()).await.unwrap();
+        }
         migrate_existing_engine_schema(&connection).await.unwrap();
         assert_eq!(
             scalar_i64(&connection, "PRAGMA user_version")
@@ -16327,6 +16464,82 @@ mod tests {
         assert!(shared_sql_write_receipt_carrier_ready(&connection)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn turso_causal_heads92_carrier_migrates_backfills_and_tracks_appends() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = TursoLocalRuntimeConfig {
+            format: TURSO_LOCAL_RUNTIME_CONFIG_FORMAT.into(),
+            logical_database_id: "causal-heads92-migration".into(),
+            data_directory: directory.path().to_path_buf(),
+        };
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        assert!(shared_content_event_heads_carrier_ready(&connection)
+            .await
+            .unwrap());
+        for statement in crate::schema::step_down::object_drop_statements(91, true) {
+            connection.execute(&statement, ()).await.unwrap();
+        }
+        connection
+            .execute("PRAGMA user_version=91", ())
+            .await
+            .unwrap();
+        assert!(!shared_content_event_heads_carrier_ready(&connection)
+            .await
+            .unwrap());
+        drop(connection);
+        drop(db);
+
+        let db = config.open().await.unwrap();
+        let connection = db.connect().unwrap();
+        assert_eq!(
+            scalar_i64(&connection, "PRAGMA user_version")
+                .await
+                .unwrap(),
+            crate::CURRENT_ENGINE_SCHEMA_VERSION
+        );
+        assert!(shared_content_event_heads_carrier_ready(&connection)
+            .await
+            .unwrap());
+        // Backfill equals the scan the triggers replace.
+        let scan = "SELECT count(*) FROM content_events e WHERE NOT EXISTS (SELECT 1 FROM content_event_causal_frontier f WHERE f.parent_event_id=e.id)";
+        assert_eq!(
+            scalar_i64(&connection, "SELECT count(*) FROM content_event_heads")
+                .await
+                .unwrap(),
+            scalar_i64(&connection, scan).await.unwrap()
+        );
+        // Turso accepts the trigger-maintained writes alongside its own scan.
+        connection.execute("INSERT INTO content_events(id,record_id,type,causal_envelope_version,causal_status) VALUES('heads91-a','r','t',1,'complete')", ()).await.unwrap();
+        connection.execute("INSERT INTO content_events(id,record_id,type,causal_envelope_version,causal_status) VALUES('heads91-b','r','t',1,'complete')", ()).await.unwrap();
+        connection.execute("INSERT INTO content_event_causal_frontier(event_id,parent_event_id) VALUES('heads91-b','heads91-a')", ()).await.unwrap();
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT count(*) FROM content_event_heads WHERE event_id='heads91-a'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            scalar_i64(
+                &connection,
+                "SELECT count(*) FROM content_event_heads WHERE event_id='heads91-b'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            scalar_i64(&connection, "SELECT count(*) FROM content_event_heads")
+                .await
+                .unwrap(),
+            scalar_i64(&connection, scan).await.unwrap()
+        );
+        assert!(db.health().await.unwrap().ready);
     }
 
     // Engine-77 fixtures must peel this derived table and source trigger

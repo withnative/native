@@ -2115,22 +2115,454 @@ async fn channel_post_requires_the_expectation_that_obliges_nobody() {
     assert_eq!(message_count(&db).await, 0);
 }
 
+fn mention_of(label: &str, target: &str) -> Value {
+    json!([{
+        "mention_id":"channel-post-mention",
+        "target_kind":"principal",
+        "target_id":target,
+        "span_start":0,
+        "span_end":label.len(),
+        "authored_label":label
+    }])
+}
+
+const OUTSIDER_ACCOUNT: &str = "acct_outsider";
+
 #[tokio::test]
-async fn channel_post_cannot_mention_a_principal_it_does_not_address() {
+async fn channel_post_mentions_a_viewer_without_addressing_or_narrowing() {
     let db = create_database(":memory:").await.unwrap();
     install_people(&db).await;
     let registry = registry();
     let folder = channel(&registry, &db).await;
+    // The mentioned person (THIRD) and a bystander (RECIPIENT) can both read
+    // the channel; an outsider cannot.
+    replace_explicit_policy(
+        &db,
+        "test:policy-with-bystander",
+        &folder,
+        vec![
+            AllowEntry::account(SENDER_ACCOUNT, Capability::Edit),
+            AllowEntry::account(THIRD_ACCOUNT, Capability::View),
+            AllowEntry::account(RECIPIENT_ACCOUNT, Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let mut args = channel_post_args("mentioning-channel-post", &folder);
+    args["body"] = json!("Third owns the launch date.");
+    args["mentions"] = mention_of("Third", THIRD_PERSON);
+    let posted = call(&registry, &db, SENDER_ACCOUNT, "manage_messages", args)
+        .await
+        .unwrap();
+    let message_id = posted["id"].as_str().unwrap();
+    assert_eq!(posted["delivery"]["status"], "delivered");
+
+    // Visibility is the Collection's, untouched by the mention.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM record_policies WHERE record_id=?")
+            .bind(message_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0,
+        "a mention must not seal the post away from its channel"
+    );
+    for (account, expected) in [
+        (THIRD_ACCOUNT, Capability::View),
+        (RECIPIENT_ACCOUNT, Capability::View),
+        (OUTSIDER_ACCOUNT, Capability::None),
+    ] {
+        assert_eq!(
+            effective_capability(&db, Principal::bound(account, true), message_id)
+                .await
+                .unwrap(),
+            expected,
+            "{account}"
+        );
+    }
+    // A non-mentioned member reads it in the channel stream.
+    let stream = call(
+        &registry,
+        &db,
+        RECIPIENT_ACCOUNT,
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"collection","collection_id":&folder}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream["messages"][0]["id"], message_id);
+
+    // The mentioned person is alerted, and only by a mention: no addressee,
+    // no obligation candidate, no obligation in their inbox.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM message_audiences
+              WHERE message_id=? AND source='addressed_to'"
+        )
+        .bind(message_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap(),
+        0
+    );
+    let candidates: Vec<(String, String)> = sqlx::query_as(
+        "SELECT recipient_account_id,reason FROM notification_candidates
+          WHERE message_id=? AND status='effective' ORDER BY recipient_account_id,reason",
+    )
+    .bind(message_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        candidates,
+        vec![(THIRD_ACCOUNT.to_string(), "principal_mention".to_string())]
+    );
+    let harvest = native_ce::awareness::harvest_host_notification_candidates(
+        &db,
+        THIRD_ACCOUNT,
+        true,
+        0,
+        500,
+    )
+    .await
+    .unwrap();
+    assert_eq!(harvest.candidates.len(), 1);
+    assert_eq!(harvest.candidates[0].reason, "principal_mention");
+    assert!(inbox_principal_mention(&registry, &db, THIRD_ACCOUNT, message_id).await);
+    let inbox = call(
+        &registry,
+        &db,
+        THIRD_ACCOUNT,
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse","limit":50}),
+    )
+    .await
+    .unwrap();
+    let item = inbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["message_id"] == message_id)
+        .unwrap();
+    assert_eq!(item["obligation"]["state"], "none", "{item}");
+
+    // A bystander is not alerted, and an outsider sees and counts nothing.
+    assert!(!inbox_principal_mention(&registry, &db, RECIPIENT_ACCOUNT, message_id).await);
+    let outsider_inbox = call(
+        &registry,
+        &db,
+        OUTSIDER_ACCOUNT,
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse","limit":50}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outsider_inbox["items"], json!([]));
+    call(
+        &registry,
+        &db,
+        OUTSIDER_ACCOUNT,
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"collection","collection_id":&folder}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+/// The accepted guest design: the send check reads a mentioned person's access
+/// at member footing, because the engine cannot know a third party's live
+/// membership. A guest mentioned in a members-wide channel therefore passes the
+/// send check but cannot read the post, and every viewer-relative surface must
+/// say nothing about it. RECIPIENT is the member control that proves the
+/// candidate is real.
+#[tokio::test]
+async fn guest_mentioned_in_a_members_wide_channel_is_never_told_about_the_post() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let folder = channel(&registry, &db).await;
+    replace_explicit_policy(
+        &db,
+        "test:members-wide",
+        &folder,
+        vec![
+            AllowEntry::account(SENDER_ACCOUNT, Capability::Edit),
+            AllowEntry::members(Capability::View),
+        ],
+    )
+    .await
+    .unwrap();
+    let guest = || Caller::authenticated(THIRD_ACCOUNT).with_hosting_member(false);
+    let member = || Caller::authenticated(RECIPIENT_ACCOUNT).with_hosting_member(true);
+    let mut args = channel_post_args("guest-mention", &folder);
+    args["body"] = json!("Third and Recipient own the zebra launch.");
+    args["mentions"] = json!([
+        {"mention_id":"guest","target_kind":"principal","target_id":THIRD_PERSON,
+         "span_start":0,"span_end":5,"authored_label":"Third"},
+        {"mention_id":"member","target_kind":"principal","target_id":RECIPIENT_PERSON,
+         "span_start":10,"span_end":19,"authored_label":"Recipient"}
+    ]);
+    let posted = call(&registry, &db, SENDER_ACCOUNT, "manage_messages", args)
+        .await
+        .expect("a guest passes the member-footing send check");
+    let message_id = posted["id"].as_str().unwrap();
+
+    // The post reads as the Collection does: members yes, the guest no.
+    assert_eq!(
+        effective_capability(&db, Principal::bound(THIRD_ACCOUNT, false), message_id)
+            .await
+            .unwrap(),
+        Capability::None
+    );
+    assert_eq!(
+        effective_capability(&db, Principal::bound(RECIPIENT_ACCOUNT, true), message_id)
+            .await
+            .unwrap(),
+        Capability::View
+    );
+    // Both candidates are really stored.
+    let stored: Vec<(String, String)> = sqlx::query_as(
+        "SELECT recipient_account_id,reason FROM notification_candidates
+          WHERE message_id=? AND status='effective' ORDER BY recipient_account_id",
+    )
+    .bind(message_id)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            (
+                RECIPIENT_ACCOUNT.to_string(),
+                "principal_mention".to_string()
+            ),
+            (THIRD_ACCOUNT.to_string(), "principal_mention".to_string()),
+        ]
+    );
+
+    // Member control: every surface shows the member their candidate.
+    let inbox = call_caller(
+        &registry,
+        &db,
+        member(),
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse","limit":50}),
+    )
+    .await
+    .unwrap();
+    let item = inbox["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["message_id"] == message_id)
+        .expect("the member sees the post");
+    assert_eq!(item["mention"]["principal"], true);
+    assert_eq!(item["delivery"]["candidate_count"], 1);
+    assert_eq!(
+        call_caller(
+            &registry,
+            &db,
+            member(),
+            "manage_messages",
+            json!({"action":"get_attention"})
+        )
+        .await
+        .unwrap()["has_new_messages"],
+        true
+    );
+    let listed = call_caller(
+        &registry,
+        &db,
+        member(),
+        "manage_messages",
+        json!({"action":"list_notification_candidates"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["candidates"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["candidates"][0]["reason"], "principal_mention");
+    let found = call_caller(&registry, &db, member(), "search", json!({"query":"zebra"}))
+        .await
+        .unwrap();
+    assert_eq!(found["hits"].as_array().unwrap().len(), 1, "{found}");
+    let harvest = native_ce::awareness::harvest_host_notification_candidates(
+        &db,
+        RECIPIENT_ACCOUNT,
+        true,
+        0,
+        500,
+    )
+    .await
+    .unwrap();
+    assert_eq!(harvest.candidates.len(), 1);
+    let member_candidate: String = sqlx::query_scalar(
+        "SELECT candidate_id FROM notification_candidates WHERE recipient_account_id=?",
+    )
+    .bind(RECIPIENT_ACCOUNT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        native_ce::awareness::revalidate_host_notification_candidate(
+            &db,
+            &member_candidate,
+            RECIPIENT_ACCOUNT,
+            true
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .effective_viewable_unmuted
+    );
+
+    // The guest: nothing, on every viewer-relative surface.
+    let inbox = call_caller(
+        &registry,
+        &db,
+        guest(),
+        "manage_messages",
+        json!({"action":"list_inbox","view":"browse","limit":50}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inbox["items"], json!([]), "{inbox}");
+    assert_eq!(
+        call_caller(
+            &registry,
+            &db,
+            guest(),
+            "manage_messages",
+            json!({"action":"get_attention"})
+        )
+        .await
+        .unwrap()["has_new_messages"],
+        false
+    );
+    let listed = call_caller(
+        &registry,
+        &db,
+        guest(),
+        "manage_messages",
+        json!({"action":"list_notification_candidates"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed["candidates"], json!([]), "{listed}");
+    let found = call_caller(&registry, &db, guest(), "search", json!({"query":"zebra"}))
+        .await
+        .unwrap();
+    assert_eq!(found["hits"], json!([]), "{found}");
+    let person = call_caller(
+        &registry,
+        &db,
+        guest(),
+        "get_record",
+        json!({"ids":[THIRD_PERSON]}),
+    )
+    .await
+    .unwrap();
+    let record = &person["records"][0];
+    assert_eq!(
+        record["mentions_in_count"].as_i64().unwrap_or(0),
+        0,
+        "{record}"
+    );
+    assert!(
+        record["mentions_in"].as_array().is_none_or(Vec::is_empty),
+        "{record}"
+    );
+    call_caller(
+        &registry,
+        &db,
+        guest(),
+        "manage_messages",
+        json!({"action":"list_context","origin":{"type":"collection","collection_id":&folder}}),
+    )
+    .await
+    .unwrap_err();
+    // Delivery: harvest withholds the candidate and revalidation refuses it.
+    let harvest = native_ce::awareness::harvest_host_notification_candidates(
+        &db,
+        THIRD_ACCOUNT,
+        false,
+        0,
+        500,
+    )
+    .await
+    .unwrap();
+    assert!(harvest.candidates.is_empty(), "guest harvest must be empty");
+    let guest_candidate: String = sqlx::query_scalar(
+        "SELECT candidate_id FROM notification_candidates WHERE recipient_account_id=?",
+    )
+    .bind(THIRD_ACCOUNT)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        !native_ce::awareness::revalidate_host_notification_candidate(
+            &db,
+            &guest_candidate,
+            THIRD_ACCOUNT,
+            false
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .effective_viewable_unmuted,
+        "revalidation at guest footing must refuse the candidate"
+    );
+    assert!(rebuild_and_diff(&db).await.unwrap().equal);
+}
+
+#[tokio::test]
+async fn channel_post_cannot_mention_a_principal_who_cannot_see_the_channel() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    // RECIPIENT has no access to this channel.
+    let folder = channel(&registry, &db).await;
     let mut args = channel_post_args("mentioning-channel-post", &folder);
     args["body"] = json!("Recipient owns the launch date.");
-    args["mentions"] = json!([{
-        "mention_id":"channel-post-mention",
-        "target_kind":"principal",
-        "target_id":RECIPIENT_PERSON,
-        "span_start":0,
-        "span_end":9,
-        "authored_label":"Recipient"
-    }]);
+    args["mentions"] = mention_of("Recipient", RECIPIENT_PERSON);
+    let error = call(&registry, &db, SENDER_ACCOUNT, "manage_messages", args)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("must be able to see the Collection"),
+        "{error}"
+    );
+    assert_eq!(message_count(&db).await, 0);
+    assert_eq!(
+        effective_capability(&db, Principal::bound(RECIPIENT_ACCOUNT, true), &folder)
+            .await
+            .unwrap(),
+        Capability::None,
+        "the refusal must not widen access"
+    );
+    let candidates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_candidates")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(candidates, 0);
+}
+
+#[tokio::test]
+async fn direct_send_still_requires_a_principal_mention_to_be_addressed() {
+    let db = create_database(":memory:").await.unwrap();
+    install_people(&db).await;
+    let registry = registry();
+    let mut args = json!({
+        "action":"send",
+        "body":"Third is copied for context.",
+        "origin":{"type":"direct","participant_ids":[SENDER_PERSON,RECIPIENT_PERSON,THIRD_PERSON]},
+        "addressed_to":[RECIPIENT_PERSON],
+        "expectation":"none",
+        "idempotency_key":"direct-unaddressed-mention",
+        "reason":"Mention a direct participant without addressing them."
+    });
+    args["mentions"] = mention_of("Third", THIRD_PERSON);
     let error = call(&registry, &db, SENDER_ACCOUNT, "manage_messages", args)
         .await
         .unwrap_err()

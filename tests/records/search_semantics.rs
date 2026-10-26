@@ -956,3 +956,128 @@ async fn added_tokens_only_narrow() {
         "AND-composition can only narrow: {three:?} must be a subset of {one:?}"
     );
 }
+
+// ---- exclusion predicate ----------------------------------------------------------
+//
+// `FtsOptions::exclude_predicate` keeps matching records out of the hits before
+// the pool, the ranking and every cap. It has to hold on EVERY match path, or a
+// caller that relies on it gets a record back from the path that forgot it.
+
+/// One record the predicate will exclude, and one that stays, matching every
+/// path: strict full-text (body), name prefix, and name infix.
+async fn exclusion_corpus() -> (native_ce::db::Db, String, String) {
+    let db = native_ce::create_database(":memory:").await.unwrap();
+    let excluded = create_record(
+        &db,
+        json!({
+            "type": "Document", "kind": "note",
+            "name": "ExcludeCamelRecall",
+            "body": "excludestrictterm",
+        }),
+    )
+    .await
+    .unwrap();
+    let kept = create_record(
+        &db,
+        json!({
+            "type": "Document", "kind": "note",
+            "name": "ExcludeCamelRecallKept",
+            "body": "excludestrictterm",
+        }),
+    )
+    .await
+    .unwrap();
+    (db, excluded, kept)
+}
+
+fn excluding(id: &str) -> FtsOptions {
+    FtsOptions {
+        exclude_predicate: Some(format!("r.id = '{id}'")),
+        ..FtsOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn the_exclusion_predicate_holds_on_the_strict_match() {
+    let (db, excluded, kept) = exclusion_corpus().await;
+    let all = fts::search(
+        &db,
+        "alice",
+        true,
+        "excludestrictterm",
+        &FtsOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.len(), 2);
+    let hits = fts::search(
+        &db,
+        "alice",
+        true,
+        "excludestrictterm",
+        &excluding(&excluded),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+        [kept]
+    );
+}
+
+#[tokio::test]
+async fn the_exclusion_predicate_holds_on_the_name_prefix_match() {
+    let (db, excluded, kept) = exclusion_corpus().await;
+    let all = fts::name_prefix(&db, "alice", true, "excludecamel", &FtsOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let hits = fts::name_prefix(&db, "alice", true, "excludecamel", &excluding(&excluded))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+        [kept]
+    );
+}
+
+#[tokio::test]
+async fn the_exclusion_predicate_holds_on_the_name_infix_match() {
+    let (db, excluded, kept) = exclusion_corpus().await;
+    let all = fts::name_infix(&db, "alice", true, "camel recall", &FtsOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    let hits = fts::name_infix(&db, "alice", true, "camel recall", &excluding(&excluded))
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+        [kept]
+    );
+}
+
+#[tokio::test]
+async fn the_exclusion_predicate_holds_in_the_pool_count() {
+    let (db, excluded, _) = exclusion_corpus().await;
+    let all = fts::search_pool_count(
+        &db,
+        "alice",
+        true,
+        "excludestrictterm",
+        &FtsOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all, 2);
+    let counted = fts::search_pool_count(
+        &db,
+        "alice",
+        true,
+        "excludestrictterm",
+        &excluding(&excluded),
+    )
+    .await
+    .unwrap();
+    assert_eq!(counted, 1);
+}

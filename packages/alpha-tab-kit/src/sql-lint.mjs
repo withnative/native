@@ -240,6 +240,9 @@ export function lintSql(sql, params = [], where = "sql") {
       if (name === "catalog_operations" && !ctes.has(name)) {
         fail("sql.catalog-operations", "src/query/sql.rs resolve_catalog_operations_snapshot; src/mcp/tools/alpha_tabs.rs parse_sql_need_entry", "'catalog_operations' resolves only in online executor ad-hoc query_sql; alpha-tab needs refuse it");
       }
+      if (name === "catalog_view_definitions" && !ctes.has(name)) {
+        fail("sql.view-profile", "src/query/sql.rs validate_saved_sql", "'catalog_view_definitions' requires standalone hosted read-write v2 query_sql; saved SQL and alpha-tab needs refuse it (view_profile_unsupported)");
+      }
       expectTable = "after";
       return;
     }
