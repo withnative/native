@@ -13,6 +13,8 @@ pub(crate) mod contract;
 pub(crate) mod details;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod gate;
+#[cfg(feature = "v2-kernel-probe")]
+mod source_proof;
 pub(crate) mod storage;
 mod v2;
 pub(crate) use storage::load_prefix;
@@ -232,6 +234,11 @@ fn decode<T: serde::de::DeserializeOwned>(event: &EventRow, cap: usize) -> Resul
 impl ReplayChecker {
     /// Validate before changing the checker; callers discard it on any error.
     pub(crate) fn apply(&mut self, event: &EventRow) -> Result<()> {
+        self.apply_with_headers(event, true)
+    }
+
+    // Only the separately typed live reducer may trust canonical historical pins.
+    fn apply_with_headers(&mut self, event: &EventRow, certified: bool) -> Result<()> {
         if !is_new_event(&event.event_type) && event.event_type != LEGACY {
             return Ok(());
         }
@@ -304,6 +311,7 @@ impl ReplayChecker {
             let active = match transition.action {
                 Action::Activate { name, pin } => {
                     validate_name(&name)?;
+                    contract::validate_pin(&pin)?;
                     if self.transitions >= MAX_TRANSITIONS - MAX_ACTIVE {
                         return Err(invalid("transition unpublish reserve"));
                     }
@@ -311,24 +319,26 @@ impl ReplayChecker {
                         .revisions
                         .get(&pin.revision_id)
                         .ok_or_else(|| invalid("revision unavailable"))?;
-                    if header
-                        .generated_name
-                        .as_ref()
-                        .is_some_and(|expected| expected != &name)
+                    if certified
+                        && header
+                            .generated_name
+                            .as_ref()
+                            .is_some_and(|expected| expected != &name)
                     {
                         return Err(invalid("generated revision name mismatch"));
                     }
-                    if header.generated && !name.starts_with("view_gen_") {
+                    if certified && header.generated && !name.starts_with("view_gen_") {
                         return Err(invalid("generated revision requires view_gen_ name"));
                     }
-                    if !header.generated {
+                    if certified && !header.generated {
                         contract::authored_name(&name)?;
                     }
                     if pin.view_id != transition.view_id
                         || header.record_id != event.record_id
                         || header.seq >= event.local_seq
-                        || header.digest != pin.definition_sha256
-                        || header.schema_digest != pin.schema_sha256
+                        || (certified
+                            && (header.digest != pin.definition_sha256
+                                || header.schema_digest != pin.schema_sha256))
                     {
                         return Err(invalid("revision pin mismatch"));
                     }
@@ -391,6 +401,38 @@ type StoredEvent = (
     String,
 );
 
+#[cfg(test)]
+tokio::task_local! { static REVISION_READS: std::cell::Cell<usize>;
+static REVISION_READ_IDS: std::cell::RefCell<BTreeMap<String, usize>>; }
+#[cfg(test)]
+async fn measured_revision_reads<T>(work: impl std::future::Future<Output = T>) -> (T, usize) {
+    REVISION_READS
+        .scope(std::cell::Cell::new(0), async {
+            let result = work.await;
+            (result, REVISION_READS.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+async fn measured_revision_ids<T>(
+    work: impl std::future::Future<Output = T>,
+) -> (T, BTreeMap<String, usize>) {
+    REVISION_READ_IDS
+        .scope(std::cell::RefCell::new(BTreeMap::new()), async {
+            let result = work.await;
+            (result, REVISION_READ_IDS.with(|ids| ids.borrow().clone()))
+        })
+        .await
+}
+
+#[cfg(test)]
+fn record_revision_access(id: &str) {
+    let _ = REVISION_READS.try_with(|n| n.set(n.get() + 1));
+    let _ =
+        REVISION_READ_IDS.try_with(|ids| *ids.borrow_mut().entry(id.to_owned()).or_default() += 1);
+}
+
 pub(crate) async fn read_event(
     conn: &mut SqliteConnection,
     id: &str,
@@ -401,6 +443,10 @@ pub(crate) async fn read_event(
         .bind(id).bind(head).fetch_optional(conn).await?;
     let (local_seq, id, record_id, event_type, payload, actor, created_at) =
         row.ok_or_else(|| invalid("view_revision_unavailable"))?;
+    #[cfg(test)]
+    if event_type == REVISION {
+        record_revision_access(&id);
+    }
     Ok(EventRow {
         local_seq,
         id,

@@ -1,4 +1,68 @@
-# Native: ChatGPT Space, made open-source and more powerful
+<h1 align="center">Native</h1>
+
+<p align="center">
+  <strong>Open-source ChatGPT Space. Powered by your Markdown vault.</strong>
+</p>
+
+<p align="center">
+  <a href="https://www.withnative.ai/#start"><strong>Join the waitlist →</strong></a> ·
+  <a href="https://www.loom.com/share/07f9d34afc67409e9f1bbc856eb15fe5">Watch the demo</a>
+</p>
+
+<p align="center">
+  <a href="https://www.loom.com/share/07f9d34afc67409e9f1bbc856eb15fe5">
+    <img src="https://raw.githubusercontent.com/withnative/native/main/docs/figures/readme/demo-video.jpg" width="946" alt="Native demo: a shared document open in Native, with Codex working alongside">
+  </a>
+</p>
+
+<h2 align="center">Why we built Native</h2>
+
+<p align="center">
+  <a href="https://chatgpt.com/features/space/">ChatGPT Space</a> is an
+  <a href="https://x.com/petergyang/status/2104990784017871049">AI-native</a>
+  <a href="https://x.com/danshipper/status/2104982021626007885">workspace</a> from OpenAI.
+</p>
+
+<p align="center">We think it just needs three changes:</p>
+
+<table align="center">
+  <thead>
+    <tr>
+      <th align="left">Problem</th>
+      <th align="left">Solution</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="left">Context locked to one provider</td>
+      <td align="left">Own and self-host your context</td>
+    </tr>
+    <tr>
+      <td align="left">Limited to OpenAI models</td>
+      <td align="left">Bring any model</td>
+    </tr>
+    <tr>
+      <td align="left">Another interface to switch to</td>
+      <td align="left">Choose your interface</td>
+    </tr>
+  </tbody>
+</table>
+
+<p align="center">
+  <strong>See our research:</strong>
+  <a href="https://www.withnative.ai/research-and-posts/markdown-context-benchmark">40x more token-efficient than Markdown</a>
+</p>
+
+<p align="center">
+  <a href="docs/README.md">Docs</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="LICENSE.md">License</a>
+</p>
+
+<details>
+<summary>Longer stuff we haven't made more concise yet</summary>
+
+## ChatGPT Space, made open-source and more powerful
 
 **An agent-native workspace for documents, projects and messaging.**
 
@@ -8,9 +72,8 @@ Work and build shared context together, in one place. Every teammate, any AI age
 >
 > In our [context retrieval benchmark](https://www.withnative.ai/research-and-posts/markdown-context-benchmark), agents using Native consumed 40× fewer tokens per fully correct answer than agents searching a Markdown vault with wikilinks.
 
-[![Native demo: a shared document open in Native, with Codex working alongside](docs/figures/readme/demo-video.jpg)](https://www.youtube.com/watch?v=BlMRqRRk-HI)
 
-[Watch the 2-minute demo video](https://www.youtube.com/watch?v=BlMRqRRk-HI) · [Ask ChatGPT about Native](https://withnative.ai/askchatgpt)
+[Ask ChatGPT about Native](https://withnative.ai/askchatgpt)
 
 An open-source alternative to ChatGPT Space, with extra power.
 
@@ -19,22 +82,6 @@ An open-source alternative to ChatGPT Space, with extra power.
 - **Granular sharing options** for your team and their agents to view and edit
 - **UIs that you can mould** however you like: e.g. as Google Docs, Linear, Notion or Slack
 - **Use your existing subscriptions** and work with ChatGPT, Claude, Copilot, Muse and many more
-
-## Motivation
-
-[ChatGPT Space](https://chatgpt.com/features/space/) is an AI-native workspace from OpenAI, that [prominent](https://x.com/petergyang/status/2104990784017871049) [commentators](https://x.com/danshipper/status/2104982021626007885) in AI are bullish on.
-
-There's three big problems, though:
-
-1. Your context is now owned by OpenAI
-2. You can only use OpenAI models with that context
-3. You have to give up your familiar UIs from other tools
-
-Native fixes all three of these problems.
-
-- Bring any model
-- Own and self-host your context
-- Use any UI you like
 
 ## Rich context, in any form you like
 
@@ -130,3 +177,5 @@ Native is developed in private repositories and published here as read-only snap
 Contributions are by invitation; see the [contribution policy](CONTRIBUTING.md) and the [snapshot notes](RELEASE_NOTES.md). You don't need to contribute here to build your own apps or plugins.
 
 Issues and pull requests are not the place for support. Email [richard@withnative.ai](mailto:richard@withnative.ai) or visit [withnative.ai](https://www.withnative.ai/).
+
+</details>

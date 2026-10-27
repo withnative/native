@@ -2,6 +2,50 @@ use super::*;
 use crate::Error;
 use std::collections::BTreeSet;
 
+// Source-level fixtures below attach a simulated committed plan. Supply the
+// same outside-guard preflight that the real executor now requires, rather
+// than allowing a source handler to silently prepare under an owner guard.
+trait PreparedViewFixture {
+    async fn call_view_fixture(
+        &self,
+        engine: crate::mcp::registry::EngineHandle,
+        caller: crate::mcp::Caller,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> crate::Result<serde_json::Value>;
+}
+impl PreparedViewFixture for crate::mcp::registry::ToolRegistry {
+    async fn call_view_fixture(
+        &self,
+        engine: crate::mcp::registry::EngineHandle,
+        caller: crate::mcp::Caller,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        if let crate::mcp::registry::EngineHandle::KernelV2(db) = &engine {
+            if tool == "manage_named_views"
+                && caller.write_plan_execution().is_some()
+                && matches!(
+                    args["action"].as_str(),
+                    Some("activate_view" | "unpublish_view")
+                )
+            {
+                let actor = crate::mcp::kernel_v2::principal(db, &caller).await?;
+                let prepared = crate::mcp::kernel_v2::writes::named_views::prepare_commit(
+                    db, &actor, &caller, &args,
+                )
+                .await?;
+                return crate::mcp::kernel_v2::writes::named_views::with_prevalidated(
+                    prepared,
+                    self.call_engine(engine, caller, tool, args),
+                )
+                .await;
+            }
+        }
+        self.call_engine(engine, caller, tool, args).await
+    }
+}
+
 #[tokio::test]
 async fn named_view_validation_caches_success_and_failure_by_exact_closure() {
     use crate::query::sql::view_validation;
@@ -426,7 +470,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .fetch_one(db.pool())
             .await
             .unwrap();
-        let error=registry.call_engine(EngineHandle::KernelV2(db.clone()),Caller::authenticated("acct:editor"),"manage_named_views",json!({"action":"record_view_revision","id":id,"definition":invalid,"idempotency_key":"self-invalidating"})).await.unwrap_err().to_string();
+        let error=registry.call_view_fixture(EngineHandle::KernelV2(db.clone()),Caller::authenticated("acct:editor"),"manage_named_views",json!({"action":"record_view_revision","id":id,"definition":invalid,"idempotency_key":"self-invalidating"})).await.unwrap_err().to_string();
         assert!(error.contains("view_source_invalidated"), "{error}");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
@@ -442,7 +486,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .unwrap();
         assert!(
             registry
-                .call_engine(
+                .call_view_fixture(
                     EngineHandle::KernelV2(db.clone()),
                     Caller::authenticated("acct:reader"),
                     "manage_named_views",
@@ -460,7 +504,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             before_deny
         );
         let draft = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 Caller::authenticated("acct:editor"),
                 "manage_named_views",
@@ -475,7 +519,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             }
             assert!(
                 registry
-                    .call_engine(
+                    .call_view_fixture(
                         EngineHandle::KernelV2(db.clone()),
                         Caller::authenticated("acct:outsider"),
                         "manage_named_views",
@@ -486,7 +530,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
                 "metadata requires current bearer View"
             );
             registry
-                .call_engine(
+                .call_view_fixture(
                     EngineHandle::KernelV2(db.clone()),
                     Caller::authenticated("acct:editor"),
                     "manage_named_views",
@@ -496,7 +540,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
                 .unwrap();
         }
         let retry = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 Caller::authenticated("acct:editor"),
                 "manage_named_views",
@@ -508,7 +552,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
         assert_eq!(retry["replayed"], true);
         let activate = json!({"action":"activate_view","id":id,"pin":draft["pin"],"name":"view_operation","expected_binding_event_id":null,"idempotency_key":"activate"});
         assert!(registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 admin_caller.clone(),
                 "manage_named_views",
@@ -527,7 +571,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             })
         };
         assert!(registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(
                     Caller::authenticated("acct:editor")
@@ -541,7 +585,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .await
             .is_err());
         let published = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "activate_view"),
                 "manage_named_views",
@@ -550,7 +594,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .await
             .unwrap();
         let retry = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "activate_view"),
                 "manage_named_views",
@@ -562,7 +606,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
         let mut stale = activate;
         stale["idempotency_key"] = json!("different-plan");
         assert!(registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "activate_view"),
                 "manage_named_views",
@@ -574,7 +618,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .contains("binding_conflict"));
         let unpublish = json!({"action":"unpublish_view","id":id,"expected_binding_event_id":published["event_id"],"idempotency_key":"unpublish"});
         let unpublished = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "unpublish_view"),
                 "manage_named_views",
@@ -588,7 +632,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .unwrap();
         let noop = json!({"action":"unpublish_view","id":id,"expected_binding_event_id":unpublished["event_id"],"idempotency_key":"inactive-noop"});
         assert!(registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "unpublish_view"),
                 "manage_named_views",
@@ -609,13 +653,13 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
         let mut right = left.clone();
         right["idempotency_key"] = json!("race-right");
         let (left, right) = tokio::join!(
-            registry.call_engine(
+            registry.call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "activate_view"),
                 "manage_named_views",
                 left
             ),
-            registry.call_engine(
+            registry.call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller(admin_caller.clone(), "activate_view"),
                 "manage_named_views",
@@ -651,7 +695,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
                 .unwrap();
         assert!(
             registry
-                .call_engine(
+                .call_view_fixture(
                     EngineHandle::KernelV2(db.clone()),
                     Caller::authenticated("acct:editor"),
                     "manage_named_views",
@@ -668,7 +712,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
         );
         denied_tx.rollback().await.unwrap();
         let first = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 admin_caller.clone(),
                 "manage_named_views",
@@ -678,7 +722,7 @@ async fn named_view_operations_record_cas_retry_unpublish_and_prepare_are_atomic
             .unwrap();
         assert_eq!(first["already_prepared"], false);
         let second = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 admin_caller,
                 "manage_named_views",
@@ -888,7 +932,14 @@ async fn named_view_static_catalogs_survive_legacy_and_invalid_history() {
             if relation != "catalog_view_definitions" {
                 assert!(reply["row_count"].as_u64().unwrap() > 0);
             }
-            assert_eq!(reply["notices"][0]["code"], "view_catalog_incomplete");
+            if kind == LEGACY {
+                assert_eq!(reply["notices"][0]["code"], "view_catalog_incomplete");
+            } else {
+                assert!(
+                    reply.get("notices").is_none(),
+                    "unreferenced corrupt bodies are not inspected live"
+                );
+            }
             assert!(reply["rows"]
                 .as_array()
                 .unwrap()
@@ -963,7 +1014,7 @@ async fn named_view_drifted_definitions_remain_readable_and_unpublishable() {
     let draft_args = json!({"action":"record_view_revision","id":id,"definition":def,"idempotency_key":"drift-draft"});
     let draft = gate::testing(
         true,
-        registry.call_engine(
+        registry.call_view_fixture(
             EngineHandle::KernelV2(db.clone()),
             caller.clone(),
             "manage_named_views",
@@ -976,7 +1027,7 @@ async fn named_view_drifted_definitions_remain_readable_and_unpublishable() {
     let activation_args = json!({"action":"activate_view","id":id,"pin":pin,"name":"view_drifted","expected_binding_event_id":null,"idempotency_key":"drift-publish"});
     let activation = gate::testing(
         true,
-        registry.call_engine(
+        registry.call_view_fixture(
             EngineHandle::KernelV2(db.clone()),
             plan_caller("activate_view"),
             "manage_named_views",
@@ -1043,7 +1094,7 @@ async fn named_view_drifted_definitions_remain_readable_and_unpublishable() {
     gate::testing(true, async {
         for (args, original) in [(&draft_args, &draft), (&activation_args, &activation)] {
             let retry = registry
-                .call_engine(
+                .call_view_fixture(
                     EngineHandle::KernelV2(db.clone()),
                     plan_caller(args["action"].as_str().unwrap()),
                     "manage_named_views",
@@ -1062,7 +1113,7 @@ async fn named_view_drifted_definitions_remain_readable_and_unpublishable() {
     let args = json!({"action":"unpublish_view","id":id,"expected_binding_event_id":binding_id,"idempotency_key":"broken-unpublish"});
     gate::testing(true, async {
         let receipt = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller("unpublish_view"),
                 "manage_named_views",
@@ -1072,7 +1123,7 @@ async fn named_view_drifted_definitions_remain_readable_and_unpublishable() {
             .unwrap();
         assert!(receipt.get("pin").is_none());
         let retry = registry
-            .call_engine(
+            .call_view_fixture(
                 EngineHandle::KernelV2(db.clone()),
                 plan_caller("unpublish_view"),
                 "manage_named_views",
@@ -1313,4 +1364,188 @@ async fn named_view_retained_isolation_and_body_only_columns_precede_execution()
     );
     assert_eq!(view_validation::builds(&good_plan.digest), 1);
     assert_eq!(view_validation::builds(&bad_plan.digest), 1);
+}
+
+// Independent roots exercise the real catalog registry, validators and staging.
+async fn catalog_fixture(nodes_per_root: usize) -> (crate::db::Db, String) {
+    use crate::{events::KERNEL_ROOT_ID, kernel};
+    let (db, admin) = kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+        .await
+        .unwrap();
+    let home = kernel::create_home(&db, KERNEL_ROOT_ID, Some(&[]), &admin)
+        .await
+        .unwrap();
+    for i in 0..8 {
+        let mut records = Vec::new();
+        for _ in 0..nodes_per_root {
+            records.push(kernel::create_record_as(&db, &admin, &home).await.unwrap());
+        }
+        let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+        let (mut pin, def) = planned(&records[0], "SELECT id FROM records", static_records());
+        insert_retained_definition(&mut tx, &pin, &def, None).await;
+        for record in records.iter().skip(1) {
+            let (parent, def) = planned(
+                record,
+                "SELECT id FROM view_child",
+                BTreeMap::from([("view_child".into(), contract::Dependency::View(pin))]),
+            );
+            insert_retained_definition(&mut tx, &parent, &def, None).await;
+            pin = parent;
+        }
+        let transition = Transition {
+            v: 1,
+            view_id: pin.view_id.clone(),
+            expected: None,
+            action: Action::Activate {
+                name: format!("view_catalog_{i}"),
+                pin,
+            },
+        };
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,created_at,causal_envelope_version,causal_status) VALUES(?,?,?,?,?,1,'legacy_unknown')")
+            .bind(uuid::Uuid::new_v4().to_string()).bind(records.last().unwrap()).bind(TRANSITION).bind(serde_json::to_string(&transition).unwrap()).bind("2026-10-26").execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    (db, admin)
+}
+
+#[tokio::test]
+async fn named_view_cold_eight_root_catalog_and_static_reserve() {
+    use crate::{kernel, mcp::kernel_v2};
+    let (static_db, actor) =
+        kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+            .await
+            .unwrap();
+    let mut samples = Vec::new();
+    for _ in 0..7 {
+        let started = Instant::now();
+        let result = kernel_v2::sql::query_sql(
+            &static_db,
+            &actor,
+            json!({"sql":"SELECT * FROM catalog_columns"}),
+        )
+        .await
+        .unwrap();
+        assert!(result["row_count"].as_u64().unwrap() > 0);
+        samples.push(started.elapsed().as_millis());
+    }
+    samples.sort();
+    eprintln!("ordinary empty catalog_columns total milliseconds={samples:?}; reserve=500ms (outer deadline unchanged at2s)");
+    // Fresh immutable revision IDs make these eight validation keys cold.
+    let (db, actor) = catalog_fixture(1).await;
+    let started = Instant::now();
+    let result = kernel_v2::sql::query_sql(
+        &db,
+        &actor,
+        json!({"sql":"SELECT relation_name FROM catalog_view_definitions ORDER BY relation_name"}),
+    )
+    .await
+    .unwrap();
+    eprintln!(
+        "cold eight-root catalog elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    assert_eq!(result["row_count"], 8, "{result}");
+    assert!(result.get("notices").is_none(), "{result}");
+}
+
+#[tokio::test]
+async fn named_view_catalog_shared_sixteen_node_budget_is_honestly_partial() {
+    let (db, actor) = catalog_fixture(3).await;
+    // This fixture isolates the shared distinct-pin cap, not cold validator
+    // throughput (qualified separately by the eight-root cold test). Warm only
+    // real schema results, with the normal two-second deadline on each read.
+    let mut tx = db.pool().begin().await.unwrap();
+    let state = storage::load_live(&mut tx, i64::MAX, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    for binding in state.bindings().values() {
+        let (name, pin) = binding.active.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let plan = closure::resolve_on(
+            &mut tx,
+            &actor,
+            &BTreeMap::from([(name.clone(), pin.clone())]),
+            deadline,
+        )
+        .await
+        .unwrap();
+        crate::query::sql::view_validation::analyze(&plan, deadline)
+            .await
+            .unwrap();
+    }
+    tx.rollback().await.unwrap();
+    let result = crate::mcp::kernel_v2::sql::query_sql(
+        &db,
+        &actor,
+        json!({"sql":"SELECT relation_name FROM catalog_view_definitions ORDER BY relation_name"}),
+    )
+    .await
+    .unwrap();
+    // Five independent three-node closures fit; the sixth exceeds 16 unique
+    // pins. Already certified rows survive, accompanied by a generic notice.
+    assert_eq!(result["row_count"], 5, "{result}");
+    assert_eq!(result["notices"][0]["code"], "view_catalog_incomplete");
+}
+
+#[tokio::test]
+async fn named_view_cap_history_draft_and_activation_read_only_referenced_bodies() {
+    use crate::{
+        events::KERNEL_ROOT_ID,
+        kernel,
+        mcp::{
+            kernel_v2,
+            registry::{Caller, EngineHandle, ToolRegistry, WritePlanExecution},
+        },
+    };
+    let (db, actor) = kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+        .await
+        .unwrap();
+    let home = kernel::create_home(&db, KERNEL_ROOT_ID, Some(&[]), &actor)
+        .await
+        .unwrap();
+    let record = kernel::create_record_as(&db, &actor, &home).await.unwrap();
+    let leaf_record = kernel::create_record_as(&db, &actor, &home).await.unwrap();
+    let (leaf, leaf_def) = planned(&leaf_record, "SELECT id FROM records", static_records());
+    let (_, definition) = planned(
+        &record,
+        "SELECT id FROM view_leaf",
+        BTreeMap::from([("view_leaf".into(), contract::Dependency::View(leaf.clone()))]),
+    );
+    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+    insert_retained_definition(&mut tx, &leaf, &leaf_def, None).await;
+    let mut historical = BTreeSet::new();
+    // Leave exactly one revision slot for the real draft operation. The
+    // activation then reconstructs all256 historical revision identities.
+    for i in 0..254 {
+        let (pin, def) = planned(
+            &format!("history-{}", i / 128),
+            "SELECT id FROM records",
+            static_records(),
+        );
+        historical.insert(pin.revision_id.clone());
+        insert_retained_definition(&mut tx, &pin, &def, None).await;
+    }
+    tx.commit().await.unwrap();
+    let mut registry = ToolRegistry::new();
+    crate::mcp::register_builtin_tools(&mut registry).unwrap();
+    crate::mcp::tools::register_surface_tools(&mut registry).unwrap();
+    kernel_v2::register_kernel_v2_tools(&mut registry).unwrap();
+    let caller = Caller::authenticated("acct:admin")
+        .with_hosting_context("admin", "workspace")
+        .with_hosting_owner(true);
+    crate::named_views::gate::testing(true, async {
+        let (draft, reads) = measured_revision_ids(registry.call_view_fixture(EngineHandle::KernelV2(db.clone()), caller.clone(), "manage_named_views", json!({"action":"record_view_revision","id":record,"definition":definition,"idempotency_key":"cap-draft"}))).await;
+        let draft = draft.unwrap();
+        let revision = draft["pin"]["revision_id"].as_str().unwrap().to_owned();
+        assert_eq!(reads.keys().cloned().collect::<BTreeSet<_>>(), BTreeSet::from([revision.clone(), leaf.revision_id.clone()]), "draft read unrelated historical bodies: {reads:?}");
+        assert!(!reads.is_empty(), "post-append executable check must read the new revision");
+        let caller = caller.with_write_plan_execution(WritePlanExecution {plan_id:"cap-plan".into(),effect_digest:"cap-effect".into(),executor:"records_write".into(),operation:"activate_view".into()});
+        let (published, reads) = measured_revision_ids(registry.call_view_fixture(EngineHandle::KernelV2(db.clone()), caller, "manage_named_views", json!({"action":"activate_view","id":record,"pin":draft["pin"],"name":"view_cap","expected_binding_event_id":null,"idempotency_key":"cap-activate"}))).await;
+        published.unwrap();
+        assert_eq!(reads.keys().cloned().collect::<BTreeSet<_>>(), BTreeSet::from([revision, leaf.revision_id]));
+        assert!(reads.values().sum::<usize>() >= 3, "exercise validate_on, admission and live projection plus preflight: {reads:?}");
+        assert!(reads.keys().all(|id| !historical.contains(id)));
+        assert_eq!(sqlx::query_scalar::<_,i64>("SELECT count(*) FROM content_events WHERE type=?").bind(REVISION).fetch_one(db.pool()).await.unwrap(),256);
+        eprintln!("cap256 activation exact referenced revision reads={reads:?}");
+    }).await;
 }

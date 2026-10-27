@@ -1057,3 +1057,156 @@ mod execution_tests;
 
 #[path = "v2_tests.rs"]
 pub(super) mod v2_tests;
+
+#[tokio::test]
+async fn named_view_live_namespace_skips_cap_sized_historical_bodies() {
+    for active in [0, 8] {
+        let mut conn = connection().await;
+        sqlx::query(INDEX_DDL).execute(&mut conn).await.unwrap();
+        let mut roots = Vec::new();
+        for seq in 1..=256 {
+            let mut r = revision(seq);
+            r.record_id = format!("bearer-{seq}");
+            let mut payload: Revision = decode(&r, MAX_CARRIER_BYTES).unwrap();
+            payload.view_id = format!("native.named-view:{}", r.record_id);
+            payload.definition_sha256 = payload.digest();
+            r.payload = Some(serde_json::to_string(&payload).unwrap());
+            if seq <= active {
+                roots.push(r.clone());
+            } else {
+                // Near carrier byte cap, deliberately not JSON. Any historical
+                // JSON extraction or body certification would refuse this log.
+                r.payload = Some("!".repeat(MAX_CARRIER_BYTES - 1));
+            }
+            insert(&mut conn, &r).await;
+        }
+        for (i, r) in roots.iter().enumerate() {
+            let revision: Revision = decode(r, MAX_CARRIER_BYTES).unwrap();
+            let mut a = event(
+                257 + i as i64,
+                TRANSITION,
+                json!({"v":1,"view_id":revision.view_id,"expected":null,"action":"activate","name":format!("view_root_{i}"),"pin":{"view_id":revision.view_id,"revision_id":r.id,"definition_sha256":revision.definition_sha256,"schema_sha256":schema_digest()}}),
+            );
+            a.record_id = r.record_id.clone();
+            insert(&mut conn, &a).await;
+        }
+        let started = Instant::now();
+        let (result, reads) = measured_revision_reads(storage::load_live(
+            &mut conn,
+            i64::MAX,
+            Instant::now() + Duration::from_secs(2),
+        ))
+        .await;
+        let state = result.unwrap();
+        eprintln!("live indexed: revisions=256 roots={active} inactive_bytes={} elapsed_ms={} historical_revision_reads={reads}",(256-active) as usize*(MAX_CARRIER_BYTES-1),started.elapsed().as_millis());
+        assert_eq!(state.bindings().len(), active as usize);
+        assert_eq!(reads, 0, "historical revision bodies must not be opened");
+        assert!(
+            load_prefix(&mut conn, i64::MAX, None).await.is_err(),
+            "canonical prefix remains strict"
+        );
+    }
+}
+
+#[tokio::test]
+async fn named_view_live_namespace_checks_new_references_and_transition_structure() {
+    let mut conn = connection().await;
+    sqlx::query(INDEX_DDL).execute(&mut conn).await.unwrap();
+    let r = revision(1);
+    insert(&mut conn, &r).await;
+    let mut a = activation(2, &r, None);
+    let mut live = storage::load_live(&mut conn, 1, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    live.apply_new_on(&mut conn, &a, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE content_events SET payload='not json' WHERE id=?")
+        .bind(&r.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let mut live = storage::load_live(&mut conn, 1, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(live
+        .apply_new_on(&mut conn, &a, Instant::now() + Duration::from_secs(2))
+        .await
+        .is_err());
+    let mut unknown: Revision = decode(&r, MAX_CARRIER_BYTES).unwrap();
+    unknown.v = 99;
+    sqlx::query("UPDATE content_events SET payload=? WHERE id=?")
+        .bind(serde_json::to_string(&unknown).unwrap())
+        .bind(&r.id)
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    assert!(live
+        .apply_new_on(&mut conn, &a, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("view_revision_unavailable"));
+    a.payload = Some("{}".into());
+    insert(&mut conn, &a).await;
+    assert!(
+        storage::load_live(&mut conn, 2, Instant::now() + Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn named_view_governed_import_refuses_historic_mismatched_pin_canonically() {
+    // This established kernel constructor includes the governed-import source
+    // provenance tables; owned hosted-v2 files deliberately omit them.
+    let db = crate::kernel::create_kernel_database(":memory:")
+        .await
+        .unwrap();
+    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+    let r = revision(1);
+    // Existing indexed identities are trusted by live reconstruction, but an
+    // imported event must go through canonical history verification instead.
+    for e in [&r, &{
+        let mut a = activation(2, &r, None);
+        let mut t: Transition = decode(&a, 2048).unwrap();
+        if let Action::Activate { pin, .. } = &mut t.action {
+            pin.definition_sha256 = "f".repeat(64);
+        }
+        a.payload = Some(serde_json::to_string(&t).unwrap());
+        a
+    }] {
+        sqlx::query("INSERT INTO content_events(id,record_id,type,payload,created_at,causal_envelope_version,causal_status) VALUES(?,?,?,?,?,1,'legacy_unknown')")
+            .bind(&e.id).bind(&e.record_id).bind(&e.event_type).bind(&e.payload).bind(&e.created_at).execute(&mut *tx).await.unwrap();
+    }
+    let head = sqlx::query_scalar::<_, i64>("SELECT max(seq) FROM content_events")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(
+        storage::load_live(&mut tx, head, Instant::now() + Duration::from_secs(2))
+            .await
+            .is_ok()
+    );
+    tx.commit().await.unwrap();
+    let imported = revision(head + 1);
+    let id = imported.id.clone();
+    let error = gate::testing(
+        true,
+        crate::store::exercise_named_view_import(&db, imported),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("revision pin mismatch"),
+        "{error}"
+    );
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM content_events WHERE id=?)"
+    )
+    .bind(id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap());
+}

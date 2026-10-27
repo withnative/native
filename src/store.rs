@@ -90,6 +90,8 @@ struct PreparedEvent {
 }
 
 struct SqliteContentPorts<'transaction> {
+    // Set only by ordinary locally computed append, never import/replay.
+    live_named_view: bool,
     transaction: &'transaction mut sqlx::Transaction<'static, sqlx::Sqlite>,
     native_source: Option<NativeEventSource>,
     act: i64,
@@ -249,7 +251,14 @@ impl crate::domain_transaction::ProjectorPort for SqliteContentPorts<'_> {
         Box::pin(async move {
             control
                 .run_domain(crate::portable_sql::ExecutionPhase::Statement, async {
-                    Ok(crate::projector::project_intent(self.transaction, event, intent).await)
+                    if self.live_named_view && crate::named_views::is_new_event(&event.event_type) {
+                        Ok(
+                            crate::named_views::storage::project_live(self.transaction, event)
+                                .await,
+                        )
+                    } else {
+                        Ok(crate::projector::project_intent(self.transaction, event, intent).await)
+                    }
                 })
                 .await
                 .map_err(|error| {
@@ -1049,6 +1058,7 @@ async fn append_prepared_admitted(
     let act = act_alloc.get_or_allocate(tx).await?;
     prepared.event.act = Some(act);
     let mut ports = SqliteContentPorts {
+        live_named_view: matches!(causal_admission, CausalAdmission::LocalComputed),
         transaction: tx,
         native_source: prepared.native_source.clone(),
         act,
@@ -1820,6 +1830,7 @@ mod causal_admission_tests {
         let mut event = imported_event(rejected_id.clone());
         let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
         let mut ports = SqliteContentPorts {
+            live_named_view: false,
             transaction: &mut tx,
             native_source: Some(source(2)),
             act,
@@ -1862,6 +1873,7 @@ mod causal_admission_tests {
         {
             let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
             let mut ports = SqliteContentPorts {
+                live_named_view: false,
                 transaction: &mut tx,
                 native_source: Some(source(7)),
                 act,
@@ -1881,6 +1893,7 @@ mod causal_admission_tests {
         let mut second = imported_event(second_id.clone());
         let act = act_alloc.get_or_allocate(&mut tx).await.unwrap();
         let mut ports = SqliteContentPorts {
+            live_named_view: false,
             transaction: &mut tx,
             native_source: Some(source(8)),
             act,
@@ -1920,6 +1933,7 @@ mod causal_admission_tests {
         let act = acts.get_or_allocate(&mut tx).await.unwrap();
         let control = crate::portable_sql::ExecutionControl::default();
         let mut ports = SqliteContentPorts {
+            live_named_view: false,
             transaction: &mut tx,
             native_source: None,
             act,
@@ -2451,6 +2465,7 @@ pub(crate) async fn exercise_provider_projector_port(db: &Db, event: &EventRow) 
     let mut tx = db.write_pool().begin().await?;
     let intent = crate::domain_transaction::ProjectorIntent::from_event(event)?;
     let mut ports = SqliteContentPorts {
+        live_named_view: false,
         transaction: &mut tx,
         native_source: None,
         act: 0,
@@ -2462,4 +2477,28 @@ pub(crate) async fn exercise_provider_projector_port(db: &Db, event: &EventRow) 
             &crate::portable_sql::ExecutionControl::default(),
         )
         .await
+}
+
+/// Exercise the authenticated import append branch, including its canonical
+/// projector. This does not let tests select the production live/canonical flag.
+#[cfg(all(test, feature = "v2-kernel-probe"))]
+pub(crate) async fn exercise_named_view_import(db: &Db, event: EventRow) -> Result<()> {
+    let payload = serde_json::from_str(event.payload.as_deref().unwrap())?;
+    let prepared = PreparedEvent {
+        event,
+        payload,
+        native_source: Some(NativeEventSource {
+            origin_database_id: "ndb_named_view_import_fixture".into(),
+            source_seq: 1,
+            source_record_id: "bearer".into(),
+            source_principal: "native:principal:fixture".into(),
+            fingerprint: [7; 32],
+        }),
+        governed_causal_envelope: None,
+    };
+    let mut tx = crate::db::begin_write(db.write_pool()).await?;
+    let mut acts = crate::act::ActAllocation::new();
+    append_prepared_in(db, &mut tx, prepared, &mut acts).await?;
+    tx.commit().await?;
+    Ok(())
 }

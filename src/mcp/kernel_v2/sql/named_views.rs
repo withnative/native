@@ -6,6 +6,18 @@ use crate::kernel::named_views::Binding;
 use crate::mcp::tools::querying::SavedSqlDefinition;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+tokio::task_local! { static CATALOG_STATIC_RESERVE: std::time::Duration; }
+// Leave static staging time within the original outer deadline. This is a
+// reserve, not a fresh deadline starting when registry discovery begins.
+fn catalog_static_reserve() -> std::time::Duration {
+    #[cfg(test)]
+    if let Ok(budget) = CATALOG_STATIC_RESERVE.try_with(|budget| *budget) {
+        return budget;
+    }
+    std::time::Duration::from_millis(500)
+}
+
 pub(super) fn map_setup_error(error: Error) -> Error {
     match error {
         Error::Sqlx(error) => guard::map_stream_error(error),
@@ -108,6 +120,17 @@ impl Registry {
             )
         });
         let catalog_only = catalog && !requested.iter().any(|name| name.starts_with("view_"));
+        let outer_deadline = deadline;
+        let deadline = if catalog_only {
+            deadline
+                .checked_sub(catalog_static_reserve())
+                .unwrap_or_else(Instant::now)
+        } else {
+            deadline
+        };
+        let incomplete = || {
+            Self::omitted("Dynamic named-view catalog rows omitted: view_catalog_incomplete; retry on the hosted writer.")
+        };
         let roots = if let Some(pins) = pins {
             pins
         } else {
@@ -120,12 +143,18 @@ impl Registry {
             let head: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
                 .fetch_one(&mut *tx)
                 .await?;
-            let state = match retained::load_prefix(tx, head, deadline).await {
+            let state = match retained::storage::load_live(tx, head, deadline).await {
                 Ok(state) => state,
-                Err(_) if catalog_only => return Ok(Self::omitted("Dynamic named-view catalog rows omitted: retained history is unavailable; ask the workspace operator to inspect named-view history.")),
+                Err(error) if catalog_only => {
+                    retained::storage::check_deadline(outer_deadline)?;
+                    if matches!(error, Error::Sqlx(_)) {
+                        return Err(error);
+                    }
+                    return Ok(incomplete());
+                }
                 Err(error) => return Err(error),
             };
-            if state.legacy {
+            if state.legacy() {
                 if catalog_only {
                     return Ok(Self::omitted("Dynamic named-view catalog rows omitted: legacy admissions need re-authoring as retained revisions."));
                 }
@@ -137,7 +166,7 @@ impl Registry {
                 ));
             }
             state
-                .bindings
+                .bindings()
                 .values()
                 .filter_map(|b| b.active.as_ref())
                 .filter(|(name, _)| catalog || requested.contains(name))
@@ -151,6 +180,7 @@ impl Registry {
             return Err(Error::engine(retained::MISSING));
         }
         let mut registry = Self::default();
+        let mut budget = closure::CertificationBudget::default();
         if roots.is_empty() {
             return Ok(registry);
         }
@@ -160,18 +190,21 @@ impl Registry {
             .map(|(n, p)| (n.clone(), p.clone()))
             .collect();
         if !execution_roots.is_empty() {
-            let plan = closure::resolve_on(tx, actor, &execution_roots, deadline).await?;
+            let plan =
+                closure::resolve_budgeted_on(tx, actor, &execution_roots, deadline, &mut budget)
+                    .await?;
             // Executable roots are combined first. Only a failed combined
             // analysis pays for isolation; no partial result executes.
             match crate::query::sql::view_validation::analyze(&plan, deadline).await {
                 Ok(reads) => registry.body_reads = reads,
                 Err(error) => {
                     for (name, pin) in &execution_roots {
-                        let isolated = closure::resolve_on(
+                        let isolated = closure::resolve_budgeted_on(
                             tx,
                             actor,
                             &BTreeMap::from([(name.clone(), pin.clone())]),
                             deadline,
+                            &mut budget,
                         )
                         .await?;
                         crate::query::sql::view_validation::analyze(&isolated, deadline).await?;
@@ -192,15 +225,21 @@ impl Registry {
             // A catalog-only read never constructs a combined validator.
             // Independent metadata candidates do not consume execution-union
             // staging budgets, and hidden/broken closures contribute no rows.
+            let mut candidates = Vec::new();
             for (name, pin) in &roots {
+                retained::storage::check_deadline(outer_deadline)?;
+                if catalog_only && Instant::now() >= deadline {
+                    return Ok(incomplete());
+                }
                 if registry.views.contains_key(name) {
                     continue;
                 }
-                let resolved = closure::resolve_on(
+                let resolved = closure::resolve_budgeted_on(
                     tx,
                     actor,
                     &BTreeMap::from([(name.clone(), pin.clone())]),
                     deadline,
+                    &mut budget,
                 )
                 .await;
                 if resolved
@@ -210,18 +249,47 @@ impl Registry {
                 {
                     registry.omission = Some("Dynamic named-view catalog rows omitted: a retained revision is unavailable on this serving version.");
                 }
-                if let Ok(plan) = resolved {
-                    if crate::query::sql::view_validation::analyze(&plan, deadline)
-                        .await
-                        .is_ok()
-                    {
-                        let node = plan.nodes.iter().find(|n| &n.pin == pin).unwrap();
-                        registry
-                            .views
-                            .insert(name.clone(), Self::retained_view(name, pin, node));
-                    }
+                let resolved_budget_exhausted = resolved
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.to_string().contains("view_budget_exceeded"));
+                if let Err(Error::Sqlx(error)) = resolved {
+                    return Err(Error::Sqlx(error));
                 }
-                retained::storage::check_deadline(deadline)?;
+                if let Ok(plan) = resolved {
+                    candidates.push((name, pin, plan));
+                }
+                retained::storage::check_deadline(outer_deadline)?;
+                if catalog_only && Instant::now() >= deadline {
+                    return Ok(incomplete());
+                }
+                if resolved_budget_exhausted {
+                    // Retain already certified rows, with an honest partial-catalog notice.
+                    registry.omission = incomplete().omission;
+                    break;
+                }
+            }
+            // At most eight independent candidates, sharing the existing
+            // process-wide eight-worker limit. Serial worker waits spend the
+            // catalog deadline repeatedly under concurrent read traffic. This
+            // still constructs no combined catalog validator.
+            let valid = futures::future::join_all(candidates.iter().map(|(_, _, plan)| async {
+                crate::query::sql::view_validation::analyze(plan, deadline)
+                    .await
+                    .is_ok()
+            }))
+            .await;
+            retained::storage::check_deadline(outer_deadline)?;
+            if catalog_only && Instant::now() >= deadline {
+                return Ok(incomplete());
+            }
+            for ((name, pin, plan), valid) in candidates.into_iter().zip(valid) {
+                if valid {
+                    let node = plan.nodes.iter().find(|n| &n.pin == pin).unwrap();
+                    registry
+                        .views
+                        .insert(name.clone(), Self::retained_view(name, pin, node));
+                }
             }
         }
         Ok(registry)
@@ -589,5 +657,46 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod live_catalog_tests {
+    use super::*;
+    #[tokio::test]
+    async fn named_view_catalog_child_expiry_keeps_static_rows_and_outer_timeout() {
+        let (db, actor) =
+            crate::kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+                .await
+                .unwrap();
+        // This exercises the real registry + staging path, not a stand-in timer.
+        let reply = CATALOG_STATIC_RESERVE
+            .scope(
+                std::time::Duration::from_secs(2),
+                super::super::query_sql(
+                    &db,
+                    &actor,
+                    json!({"sql":"SELECT relation_name FROM catalog_relations"}),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(reply["row_count"].as_u64().unwrap() > 0);
+        assert_eq!(reply["notices"][0]["code"], "view_catalog_incomplete");
+        let mut tx = db.pool().begin().await.unwrap();
+        let error = match Registry::load_retained(
+            &mut tx,
+            &actor,
+            &json!({"sql":"SELECT * FROM catalog_relations"}),
+            None,
+            Instant::now(),
+        )
+        .await
+        {
+            Ok(_) => panic!("an expired outer deadline must propagate"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("deadline"), "{error}");
+        tx.rollback().await.unwrap();
     }
 }

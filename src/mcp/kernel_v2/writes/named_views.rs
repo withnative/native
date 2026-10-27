@@ -46,9 +46,9 @@ fn expected(args: &Value) -> Result<Option<String>> {
         )),
     }
 }
-fn check_cas(state: &views::ReplayChecker, args: &Value, id: &str) -> Result<()> {
+fn check_cas(state: &views::storage::LiveNamespace, args: &Value, id: &str) -> Result<()> {
     if state
-        .bindings
+        .bindings()
         .get(&format!("native.named-view:{id}"))
         .map(|b| b.event_id.clone())
         != expected(args)?
@@ -93,9 +93,59 @@ fn mutation_shape(args: &Value) -> Result<()> {
 
 #[derive(Clone)]
 pub(crate) struct PreparedCommit {
+    database: Db,
+    actor: String,
+    certificates: Vec<EventCertificate>,
     fingerprint: String,
     evidence: Option<Value>,
     deadline: Instant,
+}
+// Request-local certificates carry no permission grant. Immutable body identity
+// is rechecked on the same enrolled database handle inside BEGIN IMMEDIATE.
+#[derive(Clone)]
+struct EventCertificate {
+    id: String,
+    seq: i64,
+    bytes: i64,
+}
+async fn certificates_on(
+    tx: &mut sqlx::SqliteConnection,
+    evidence: &Value,
+) -> Result<Vec<EventCertificate>> {
+    let ids: Vec<String> =
+        serde_json::from_value(evidence.get("certified_ids").cloned().unwrap_or(json!([])))?;
+    let mut result = Vec::new();
+    for id in ids {
+        let (seq, bytes): (i64, i64) = sqlx::query_as(
+            "SELECT seq,length(CAST(payload AS BLOB)) FROM content_events WHERE id=? AND type=?",
+        )
+        .bind(&id)
+        .bind(REVISION)
+        .fetch_one(&mut *tx)
+        .await?;
+        result.push(EventCertificate { id, seq, bytes });
+    }
+    Ok(result)
+}
+async fn recheck_certificates_on(
+    tx: &mut sqlx::SqliteConnection,
+    certificates: &[EventCertificate],
+) -> Result<()> {
+    for c in certificates {
+        let actual: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT seq,length(CAST(payload AS BLOB)) FROM content_events WHERE id=? AND type=?",
+        )
+        .bind(&c.id)
+        .bind(REVISION)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if actual != Some((c.seq, c.bytes)) {
+            return Err(Error::conflict(
+                "view_validation_changed: immutable event unavailable; prepare again",
+            ));
+        }
+    }
+    Ok(())
 }
 tokio::task_local! { static PREVALIDATED: PreparedCommit; }
 #[cfg(test)]
@@ -206,24 +256,21 @@ pub(crate) async fn prepare_commit(
     } else {
         Some(validate_on(&mut tx, actor, args, deadline, caller, None).await?)
     };
+    let certificates = match &evidence {
+        Some(e) => certificates_on(&mut tx, e).await?,
+        None => Vec::new(),
+    };
     tx.rollback().await?;
     Ok(PreparedCommit {
+        database: db.clone(),
+        actor: actor.to_owned(),
+        certificates,
         fingerprint,
         evidence,
         deadline,
     })
 }
-async fn analyze_before_commit(
-    plan: &closure::Closure,
-    deadline: Instant,
-    prepared: Option<&Value>,
-) -> Result<()> {
-    if let Some(proof) = prepared {
-        if proof["analysis_digest"].as_str() != Some(plan.digest.as_str()) {
-            return Err(Error::conflict("view_validation_changed: prepare again"));
-        }
-        return Ok(());
-    }
+async fn analyze_before_commit(plan: &closure::Closure, deadline: Instant) -> Result<()> {
     crate::query::sql::view_validation::analyze(plan, deadline).await?;
     Ok(())
 }
@@ -242,14 +289,14 @@ async fn validate_on(
     let head: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
         .fetch_one(&mut *tx)
         .await?;
-    let mut state = views::load_prefix(tx, head, deadline).await?;
-    if state.legacy {
+    let mut state = views::storage::load_live(tx, head, deadline).await?;
+    if state.legacy() {
         return Err(Error::engine(
             "view_legacy_format: re-author retained revisions",
         ));
     }
     let current_name = state
-        .bindings
+        .bindings()
         .get(&format!("native.named-view:{id}"))
         .and_then(|b| b.active.as_ref())
         .map(|(name, _)| name);
@@ -261,7 +308,11 @@ async fn validate_on(
             if !matches!(definition.origin, contract::Origin::Authored) {
                 return Err(Error::engine("generated revision authoring is reserved"));
             }
-            definition.validate_for_preparation()?;
+            if prepared.is_none() {
+                definition.validate_for_preparation()?;
+            } else {
+                definition.validate_retained()?;
+            }
             let mut revision = Revision {
                 v: 1,
                 view_id: format!("native.named-view:{id}"),
@@ -282,11 +333,31 @@ async fn validate_on(
             if serde_json::to_vec(&revision)?.len() > views::MAX_CARRIER_BYTES {
                 return Err(Error::engine("view_budget_exceeded: revision carrier"));
             }
-            let plan =
-                closure::resolve_candidate_on(tx, actor, pin.clone(), definition, deadline).await?;
-            analyze_before_commit(&plan, deadline, prepared).await?;
-            evidence["analysis_digest"] = json!(plan.digest);
-            if serde_json::to_vec(&json!({"pin":pin,"definition":plan.nodes.last().unwrap().definition,"closure_digest":plan.digest}))?.len()>256*1024 {return Err(Error::engine("view_budget_exceeded: revision response"));}
+            if let Some(proof) = prepared {
+                closure::inspect_executable_on(
+                    tx,
+                    actor,
+                    &BTreeMap::from([("view_candidate".into(), pin.clone())]),
+                    deadline,
+                    Some((pin.clone(), definition)),
+                )
+                .await?;
+                evidence["analysis_digest"] = proof["analysis_digest"].clone();
+                evidence["certified_ids"] = proof["certified_ids"].clone();
+            } else {
+                let plan =
+                    closure::resolve_candidate_on(tx, actor, pin.clone(), definition, deadline)
+                        .await?;
+                analyze_before_commit(&plan, deadline).await?;
+                evidence["analysis_digest"] = json!(plan.digest);
+                evidence["certified_ids"] = json!(plan
+                    .nodes
+                    .iter()
+                    .filter(|n| n.pin != pin)
+                    .map(|n| &n.pin.revision_id)
+                    .collect::<Vec<_>>());
+                if serde_json::to_vec(&json!({"pin":pin,"definition":plan.nodes.last().unwrap().definition,"closure_digest":plan.digest}))?.len()>256*1024 {return Err(Error::engine("view_budget_exceeded: revision response"));}
+            }
             evidence["event_id"] = json!(event_id);
             evidence["pin"] = json!(pin);
             evidence["payload"] = serde_json::to_value(revision)?;
@@ -299,15 +370,21 @@ async fn validate_on(
             if pin.view_id != format!("native.named-view:{id}") {
                 return Err(Error::engine("view_revision_unavailable"));
             }
-            let plan = closure::resolve_on(
-                tx,
-                actor,
-                &BTreeMap::from([(name.into(), pin.clone())]),
-                deadline,
-            )
-            .await?;
-            analyze_before_commit(&plan, deadline, prepared).await?;
-            evidence["analysis_digest"] = json!(plan.digest);
+            let roots = BTreeMap::from([(name.into(), pin.clone())]);
+            if let Some(proof) = prepared {
+                closure::inspect_executable_on(tx, actor, &roots, deadline, None).await?;
+                evidence["analysis_digest"] = proof["analysis_digest"].clone();
+                evidence["certified_ids"] = proof["certified_ids"].clone();
+            } else {
+                let plan = closure::resolve_on(tx, actor, &roots, deadline).await?;
+                analyze_before_commit(&plan, deadline).await?;
+                evidence["analysis_digest"] = json!(plan.digest);
+                evidence["certified_ids"] = json!(plan
+                    .nodes
+                    .iter()
+                    .map(|n| &n.pin.revision_id)
+                    .collect::<Vec<_>>());
+            }
             evidence["pin"] = json!(pin);
             evidence["payload"] = serde_json::to_value(Transition {
                 v: 1,
@@ -322,7 +399,7 @@ async fn validate_on(
         "unpublish_view" => {
             check_cas(&state, args, id)?;
             if state
-                .bindings
+                .bindings()
                 .get(&format!("native.named-view:{id}"))
                 .and_then(|b| b.active.as_ref())
                 .is_none()
@@ -363,7 +440,7 @@ async fn validate_on(
         causal_envelope: crate::events::CausalEnvelopeV1::legacy_unknown(),
         act: None,
     };
-    state.apply(&proposed)?;
+    state.apply_new_on(tx, &proposed, deadline).await?;
     evidence["event_id"] = json!(event_id);
     // Bind approval to this namespace transition, rather than
     // invalidate it on unrelated workspace writes. Live permissions, source
@@ -476,8 +553,18 @@ pub(super) async fn execute(
     }
     let prepared = match PREVALIDATED.try_with(Clone::clone) {
         Ok(prepared) => prepared,
+        Err(_) if publication(&args) => {
+            return Err(Error::conflict(
+                "view_validation_changed: publication preflight missing; prepare again",
+            ))
+        }
         Err(_) => prepare_commit(db, actor, caller, &args).await?,
     };
+    if prepared.actor != actor || !prepared.database.same_handle(db) {
+        return Err(Error::conflict(
+            "view_validation_changed: database handle changed",
+        ));
+    }
     if prepared.fingerprint != intent_fingerprint("manage_named_views", args.clone(), Value::Null)?
     {
         return Err(Error::conflict("view_validation_changed: request changed"));
@@ -545,6 +632,7 @@ pub(super) async fn execute(
         let builds_before = crate::query::sql::view_validation::builds(
             proof["analysis_digest"].as_str().unwrap_or_default(),
         );
+        recheck_certificates_on(&mut tx, &prepared.certificates).await?;
         let evidence = validate_on(&mut tx, actor, &args, deadline, caller, Some(proof)).await?;
         #[cfg(test)]
         if EVICT_BEFORE_COMMIT.try_with(|_| ()).is_ok() {
@@ -605,11 +693,12 @@ pub(super) async fn execute(
         // either the event or its retry receipt can commit.
         if let Some(pin) = receipt.get("pin").filter(|_| action != "unpublish_view") {
             let pin: Pin = serde_json::from_value(pin.clone())?;
-            closure::resolve_on(
+            closure::inspect_executable_on(
                 &mut tx,
                 actor,
                 &BTreeMap::from([("view_committed".into(), pin)]),
                 deadline,
+                None,
             )
             .await?;
         }
@@ -652,4 +741,88 @@ pub(crate) async fn authorize_retry(
     }
     tx.rollback().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod live_preflight_tests {
+    use super::*;
+    use sqlx::Connection;
+    #[tokio::test]
+    async fn named_view_publication_without_carried_preflight_never_prepares_or_writes() {
+        let (db, actor) =
+            crate::kernel::create_v2_database(":memory:", "account", "Admin", "acct:admin")
+                .await
+                .unwrap();
+        let caller = crate::mcp::Caller::authenticated("acct:admin")
+            .with_hosting_context("admin", "workspace")
+            .with_hosting_owner(true);
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for action in ["activate_view", "unpublish_view"] {
+            let mut args = json!({"action":action,"id":"bearer","idempotency_key":action,"expected_binding_event_id":null});
+            if action == "activate_view" {
+                args["name"] = json!("view_missing_proof");
+                args["pin"] = json!({});
+            }
+            let (result, trace) = trace_commit(gate::testing(
+                true,
+                execute(&db, &actor, &caller, args.clone()),
+            ))
+            .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("publication preflight missing"));
+            assert!(
+                trace.is_empty(),
+                "must not prepare under a potentially held guard"
+            );
+            assert_eq!(preparation_count(&db, &args), 0);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            before
+        );
+    }
+    #[tokio::test]
+    async fn named_view_preflight_certificates_require_original_event_coordinates() {
+        let mut conn = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE content_events(id TEXT PRIMARY KEY,seq INTEGER,type TEXT,payload TEXT)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO content_events VALUES('immutable',7,?,'{}')")
+            .bind(REVISION)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let certs = certificates_on(&mut conn, &json!({"certified_ids":["immutable"]}))
+            .await
+            .unwrap();
+        recheck_certificates_on(&mut conn, &certs).await.unwrap();
+        // Corrupt/replacement fixture only; production append-only triggers
+        // prohibit this mutation. Identity metadata must still fail closed.
+        sqlx::query("UPDATE content_events SET seq=8")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(recheck_certificates_on(&mut conn, &certs).await.is_err());
+        sqlx::query("UPDATE content_events SET seq=7,payload='longer'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(recheck_certificates_on(&mut conn, &certs).await.is_err());
+        sqlx::query("DELETE FROM content_events")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert!(recheck_certificates_on(&mut conn, &certs).await.is_err());
+    }
 }

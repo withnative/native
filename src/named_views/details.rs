@@ -27,6 +27,17 @@ async fn pin_on(
     head: i64,
     _deadline: Instant,
 ) -> Result<Pin> {
+    pin_on_in(conn, actor, view, id, head, _deadline, false).await
+}
+async fn pin_on_in(
+    conn: &mut SqliteConnection,
+    actor: &str,
+    view: &str,
+    id: &str,
+    head: i64,
+    _deadline: Instant,
+    retained_only: bool,
+) -> Result<Pin> {
     // Metadata stays readable on archived bearers with current View.
     closure::require_accessible_bearer_on(
         conn,
@@ -46,7 +57,11 @@ async fn pin_on(
     }
     let event = read_event(conn, id, head).await?;
     let rev: Revision = decode(&event, MAX_CARRIER_BYTES)?;
-    let def = rev.validate(&event)?;
+    let def = if retained_only {
+        rev.validate_retained(&event)?
+    } else {
+        rev.validate(&event)?
+    };
     let pin = Pin {
         view_id: view.into(),
         revision_id: id.into(),
@@ -174,23 +189,22 @@ pub(crate) async fn list_on(
     let head: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
         .fetch_one(&mut *conn)
         .await?;
-    let state = load_prefix(conn, head, deadline).await?;
-    if state.legacy {
+    let state = storage::load_live(conn, head, deadline).await?;
+    if state.legacy() {
         return Err(invalid("view_legacy_format: re-author retained revisions"));
     }
     let mut headers: Vec<_> = state
-        .revisions
-        .iter()
-        .filter(|(id, r)| {
-            r.record_id == bearer(view).unwrap_or_default()
-                && (r.seq, id.as_str()) > (after.0, after.1.as_str())
+        .revision_ids()
+        .filter(|(id, record, seq)| {
+            *record == bearer(view).unwrap_or_default()
+                && (*seq, id.as_str()) > (after.0, after.1.as_str())
         })
         .collect();
-    headers.sort_by_key(|(id, r)| (r.seq, id.as_str()));
+    headers.sort_by_key(|(id, _, seq)| (*seq, id.as_str()));
     let more = headers.len() > limit;
     let mut items = Vec::new();
     let mut last = after;
-    for (id, h) in headers.into_iter().take(limit) {
+    for (id, _, seq) in headers.into_iter().take(limit) {
         let metadata = metadata_on(conn, actor, view, id, deadline).await;
         match metadata {
             Ok(detail) => {
@@ -224,10 +238,13 @@ pub(crate) async fn list_on(
                 // Root headers belong to the already-authorized bearer. Do
                 // not return SQL, semantics, source pins or dependency IDs
                 // for a closure the caller cannot currently read.
-                items.push(json!({"view_id":view,"revision_id":id,"definition_sha256":h.digest,"schema_sha256":h.schema_digest,"available":false,"diagnostic":diagnostic}));
+                let root_pin = pin_on_in(conn, actor, view, id, head, deadline, true)
+                    .await
+                    .ok();
+                items.push(json!({"view_id":view,"revision_id":id,"definition_sha256":root_pin.as_ref().map(|p| &p.definition_sha256),"schema_sha256":root_pin.as_ref().map(|p| &p.schema_sha256),"available":false,"diagnostic":diagnostic}));
             }
         }
-        last = (h.seq, id.clone());
+        last = (seq, id.clone());
     }
     let next = if more {
         Some(encode(&Cursor {
@@ -240,7 +257,7 @@ pub(crate) async fn list_on(
     } else {
         None
     };
-    let binding = state.bindings.get(view);
+    let binding = state.bindings().get(view);
     let active = binding.and_then(|b| b.active.as_ref());
     let reply = json!({"revisions":items,"cursor":next,"binding":{"event_id":binding.map(|b|&b.event_id),"active":active.is_some(),"name":active.map(|(name,_)|name),"pin":active.map(|(_,pin)|pin)}});
     if serde_json::to_vec(&reply)?.len() > 256 * 1024 {

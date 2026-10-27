@@ -283,6 +283,16 @@ async fn named_view_v2_unconditional_mixed_prefix_tail_parser_and_projector() {
             }
             assert_eq!(full.revisions, tail.revisions);
             assert_eq!(full.bindings, tail.bindings);
+            let live =
+                storage::load_live(&mut conn, split, Instant::now() + Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            let canonical_prefix = load_prefix(&mut conn, split, None).await.unwrap();
+            assert_eq!(
+                live.bindings(),
+                &canonical_prefix.bindings,
+                "live reduction preserves canonical mixed-version namespace"
+            );
         }
     }
     // The old header-only query can see these fields despite payload version 2.
@@ -387,6 +397,37 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
         .iter()
         .any(|r| r["relation_name"] == name));
     assert_eq!(result["notices"][0]["code"], "view_catalog_incomplete");
+    let visitor = kernel::create_principal(&db, "account", "Visitor", "acct:visitor", &actor)
+        .await
+        .unwrap();
+    let hidden_catalog = kernel_v2::sql::query_sql(
+        &db,
+        &visitor,
+        json!({"sql":"SELECT relation_name FROM catalog_relations"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        hidden_catalog.get("notices").is_none(),
+        "a hidden v2 root must not create a version-specific notice"
+    );
+    let hidden = kernel_v2::sql::query_sql(
+        &db,
+        &visitor,
+        json!({"sql":format!("SELECT id FROM {name}")}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    let missing = kernel_v2::sql::query_sql(
+        &db,
+        &visitor,
+        json!({"sql":"SELECT id FROM view_nonexistent"}),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert_eq!(hidden, missing);
     let error =
         kernel_v2::sql::query_sql(&db, &actor, json!({"sql":format!("SELECT id FROM {name}")}))
             .await

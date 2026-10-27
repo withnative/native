@@ -64,43 +64,7 @@ pub(crate) async fn load_prefix(
     let deadline = deadline.into();
     let check = || deadline.map(check_deadline).transpose().map(|_| ());
     check()?;
-    let mut headers = Vec::new();
-    if verify_index_on(conn).await? {
-        let query = prefix_query();
-        headers = sqlx::query_as::<_, (i64, String, String, String)>(&query)
-            .bind(head)
-            .fetch_all(&mut *conn)
-            .await?;
-        check_history_counts(&headers)?;
-    } else {
-        let mut after = 0;
-        let mut inspected = 0;
-        let mut bytes = 0;
-        while after < head {
-            check()?;
-            let rows:Vec<(i64,String,String,String)>=sqlx::query_as("SELECT seq,id,record_id,type FROM content_events WHERE seq>? AND seq<=? ORDER BY seq LIMIT 512").bind(after).bind(head).fetch_all(&mut *conn).await?;
-            if rows.is_empty() {
-                break;
-            }
-            for (seq, id, record, kind) in rows {
-                #[cfg(all(test, feature = "v2-kernel-probe"))]
-                let _ = FALLBACK_HEADERS.try_with(|n| n.set(n.get() + 1));
-                inspected += 1;
-                bytes += serde_json::to_vec(&(seq, &id, &record, &kind))?.len();
-                if inspected > 65_536 || bytes > 8 * 1024 * 1024 {
-                    return Err(invalid("view_registry_scan_budget_exceeded; ask a workspace administrator to run records_write.prepare_named_views on an upgraded hosted writer after reader rollout, then refresh read-only copies"));
-                }
-                check()?;
-                after = seq;
-                if is_new_event(&kind) || kind == LEGACY {
-                    headers.push((seq, id, record, kind));
-                }
-                check_history_counts(&headers)?;
-            }
-        }
-    }
-    check()?;
-    headers.sort_by_key(|h| h.0);
+    let headers = load_headers(conn, head, deadline).await?;
     let mut checker = ReplayChecker::default();
     for (seq, id, record, kind) in &headers {
         check()?;
@@ -115,6 +79,9 @@ pub(crate) async fn load_prefix(
             {
                 return Err(invalid("revision history limit"));
             }
+            // Count SQL-side JSON parsing as body access as well as read_event.
+            #[cfg(test)]
+            record_revision_access(id);
             let (version_kind, version, bytes): (Option<String>, Option<i64>, i64) = sqlx::query_as(
                 "SELECT json_type(payload,'$.v'),json_extract(payload,'$.v'),length(CAST(payload AS BLOB)) FROM content_events WHERE id=? AND seq<=?")
                 .bind(id).bind(head).fetch_one(&mut *conn).await?;
@@ -163,6 +130,55 @@ pub(crate) async fn load_prefix(
     Ok(checker)
 }
 
+// No revision payload/JSON paths are read here. Both consumers share the same
+// optional-index and bounded fallback policy; only canonical load_prefix may
+// certify the historical bodies.
+async fn load_headers(
+    conn: &mut SqliteConnection,
+    head: i64,
+    deadline: Option<Instant>,
+) -> Result<Vec<(i64, String, String, String)>> {
+    let check = || deadline.map(check_deadline).transpose().map(|_| ());
+    let mut headers = Vec::new();
+    if verify_index_on(conn).await? {
+        let query = prefix_query();
+        headers = sqlx::query_as::<_, (i64, String, String, String)>(&query)
+            .bind(head)
+            .fetch_all(&mut *conn)
+            .await?;
+        check_history_counts(&headers)?;
+    } else {
+        let mut after = 0;
+        let mut inspected = 0;
+        let mut bytes = 0;
+        while after < head {
+            check()?;
+            let rows:Vec<(i64,String,String,String)>=sqlx::query_as("SELECT seq,id,record_id,type FROM content_events WHERE seq>? AND seq<=? ORDER BY seq LIMIT 512").bind(after).bind(head).fetch_all(&mut *conn).await?;
+            if rows.is_empty() {
+                break;
+            }
+            for (seq, id, record, kind) in rows {
+                #[cfg(all(test, feature = "v2-kernel-probe"))]
+                let _ = FALLBACK_HEADERS.try_with(|n| n.set(n.get() + 1));
+                inspected += 1;
+                bytes += serde_json::to_vec(&(seq, &id, &record, &kind))?.len();
+                if inspected > 65_536 || bytes > 8 * 1024 * 1024 {
+                    return Err(invalid("view_registry_scan_budget_exceeded; ask a workspace administrator to run records_write.prepare_named_views on an upgraded hosted writer after reader rollout, then refresh read-only copies"));
+                }
+                check()?;
+                after = seq;
+                if is_new_event(&kind) || kind == LEGACY {
+                    headers.push((seq, id, record, kind));
+                }
+                check_history_counts(&headers)?;
+            }
+        }
+    }
+    check()?;
+    headers.sort_by_key(|h| h.0);
+    Ok(headers)
+}
+
 // Slice 1 admitted at most eight bindings. Its legacy carriers consume their
 // own budget and cannot take slots from retained revision/transition history.
 fn check_history_counts(headers: &[(i64, String, String, String)]) -> Result<()> {
@@ -191,33 +207,12 @@ pub(crate) async fn admit_on(conn: &mut SqliteConnection, event: &EventRow) -> R
     if !is_new_event(&event.event_type) {
         return Ok(());
     }
-    // Reader support is not producer authority, even with the old gate open.
-    if event.event_type == REVISION {
-        let revision: Revision = decode(event, MAX_CARRIER_BYTES)?;
-        if revision.v != 1 {
-            return Err(invalid("view_revision_unavailable"));
-        }
-    } else {
-        let transition: Transition = decode(event, 2048)?;
-        if let Action::Activate { pin, .. } = transition.action {
-            let version: Option<Option<i64>> = sqlx::query_scalar(
-                "SELECT json_extract(payload,'$.v') FROM content_events WHERE id=? AND type=?",
-            )
-            .bind(&pin.revision_id)
-            .bind(REVISION)
-            .fetch_optional(&mut *conn)
-            .await?;
-            if version != Some(Some(1)) {
-                return Err(invalid("view_revision_unavailable"));
-            }
-        }
-    }
     #[cfg(feature = "v2-kernel-probe")]
     let deadline = super::gate::deadline();
     #[cfg(not(feature = "v2-kernel-probe"))]
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut state = load_prefix(conn, i64::MAX, deadline).await?;
-    if state.legacy {
+    let mut state = load_live(conn, i64::MAX, deadline).await?;
+    if state.legacy() {
         return Err(invalid("legacy_named_view_format_unsupported"));
     }
     // Append admission occurs before SQLite assigns seq; use the next prefix
@@ -227,6 +222,175 @@ pub(crate) async fn admit_on(conn: &mut SqliteConnection, event: &EventRow) -> R
         .await?;
     let mut proposed = event.clone();
     proposed.local_seq = head + 1;
-    state.last_seq = head;
-    state.apply(&proposed)
+    state.apply_new_on(conn, &proposed, deadline).await
+}
+
+/// Deliberately not a ReplayChecker: indexed historical identities and namespace
+/// transitions are trusted only on an already canonically admitted database.
+/// These provisional entries must never certify an executable definition.
+#[derive(Default)]
+pub(crate) struct LiveNamespace {
+    state: ReplayChecker,
+}
+impl LiveNamespace {
+    #[cfg(feature = "v2-kernel-probe")]
+    pub(crate) fn revision_ids(&self) -> impl Iterator<Item = (&String, &str, i64)> {
+        self.state
+            .revisions
+            .iter()
+            .map(|(id, h)| (id, h.record_id.as_str(), h.seq))
+    }
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    pub(crate) fn bindings(&self) -> &BTreeMap<String, Binding> {
+        &self.state.bindings
+    }
+    pub(crate) fn legacy(&self) -> bool {
+        self.state.legacy
+    }
+    /// New effects validate their bounded direct/reference closure, never SQL.
+    pub(crate) async fn apply_new_on(
+        &mut self,
+        conn: &mut SqliteConnection,
+        event: &EventRow,
+        deadline: Instant,
+    ) -> Result<()> {
+        let mut pending = Vec::new();
+        if event.event_type == REVISION {
+            let revision: Revision = decode(event, MAX_CARRIER_BYTES)?;
+            if revision.v != 1 {
+                return Err(invalid("view_revision_unavailable"));
+            }
+            let definition = revision.validate_retained(event)?;
+            pending.extend(definition.query.relations.values().filter_map(|d| match d {
+                contract::Dependency::View(p) => Some(p.clone()),
+                _ => None,
+            }));
+        } else if event.event_type == TRANSITION {
+            let transition: Transition = decode(event, 2048)?;
+            if let Action::Activate { pin, .. } = transition.action {
+                pending.push(pin);
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut bytes = if event.event_type == REVISION {
+            event.payload.as_ref().map_or(0, String::len)
+        } else {
+            0
+        };
+        while let Some(pin) = pending.pop() {
+            check_deadline(deadline)?;
+            if !seen.insert(pin.clone()) {
+                continue;
+            }
+            if seen.len() + usize::from(event.event_type == REVISION) > 16 {
+                return Err(invalid("view_budget_exceeded: nodes"));
+            }
+            let (seq, record, kind, len): (i64,String,String,i64) = sqlx::query_as("SELECT seq,record_id,type,coalesce(length(CAST(payload AS BLOB)),0) FROM content_events WHERE id=?")
+                .bind(&pin.revision_id).fetch_optional(&mut *conn).await?.ok_or_else(|| invalid("revision unavailable"))?;
+            let len = usize::try_from(len).map_err(|_| invalid("payload exceeds bound"))?;
+            if kind != REVISION
+                || len > MAX_CARRIER_BYTES
+                || len > (512 * 1024usize).saturating_sub(bytes)
+            {
+                return Err(invalid("view_budget_exceeded: closure bytes"));
+            }
+            bytes += len;
+            let reference = read_event(conn, &pin.revision_id, event.local_seq - 1).await?;
+            let revision: Revision = decode(&reference, MAX_CARRIER_BYTES)?;
+            if revision.v != 1 {
+                return Err(invalid("view_revision_unavailable"));
+            }
+            let definition = revision.validate_retained(&reference)?;
+            if pin.view_id != revision.view_id
+                || pin.definition_sha256 != revision.definition_sha256
+                || pin.schema_sha256 != definition.query.output.schema_sha256
+            {
+                return Err(invalid("revision pin mismatch"));
+            }
+            pending.extend(definition.query.relations.values().filter_map(|d| match d {
+                contract::Dependency::View(p) => Some(p.clone()),
+                _ => None,
+            }));
+            let generated_name = revision.generated_name();
+            self.state.revisions.insert(
+                pin.revision_id,
+                RevisionHeader {
+                    record_id: record,
+                    seq,
+                    digest: revision.definition_sha256,
+                    schema_digest: definition.query.output.schema_sha256,
+                    generated: matches!(definition.origin, contract::Origin::Generated { .. }),
+                    generated_name,
+                },
+            );
+        }
+        self.state.apply(event)
+    }
+}
+
+/// Reconstruct only the live namespace. Never use for FULL/tail replay/import.
+pub(crate) async fn load_live(
+    conn: &mut SqliteConnection,
+    head: i64,
+    deadline: Instant,
+) -> Result<LiveNamespace> {
+    let headers = load_headers(conn, head, Some(deadline)).await?;
+    let mut state = ReplayChecker::default();
+    for (seq, id, record, kind) in headers {
+        check_deadline(deadline)?;
+        if kind == REVISION {
+            if state.revisions.len() >= MAX_REVISIONS
+                || state
+                    .revisions
+                    .values()
+                    .filter(|h| h.record_id == record)
+                    .count()
+                    >= 128
+            {
+                return Err(invalid("revision history limit"));
+            }
+            state.revisions.insert(
+                id,
+                RevisionHeader {
+                    record_id: record,
+                    seq,
+                    digest: String::new(),
+                    schema_digest: String::new(),
+                    generated: false,
+                    generated_name: None,
+                },
+            );
+            state.last_seq = seq;
+        } else if kind == LEGACY {
+            state.legacy = true;
+            state.last_seq = seq;
+        } else {
+            let len: i64 = sqlx::query_scalar(
+                "SELECT coalesce(length(CAST(payload AS BLOB)),0) FROM content_events WHERE id=?",
+            )
+            .bind(&id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if !(0..=2048).contains(&len) {
+                return Err(invalid("payload exceeds bound"));
+            }
+            state.apply_with_headers(&read_event(conn, &id, head).await?, false)?;
+        }
+    }
+    // Retain the last actual lifecycle coordinate, including when the caller
+    // asks for i64::MAX. It is not an executable-prefix certificate.
+    Ok(LiveNamespace { state })
+}
+
+/// Ordinary local append only. Generic projector/import and canonical tail
+/// replay continue through named_views::project / ReplayChecker::apply.
+pub(crate) async fn project_live(conn: &mut SqliteConnection, event: &EventRow) -> Result<()> {
+    #[cfg(feature = "v2-kernel-probe")]
+    let deadline = super::gate::deadline();
+    #[cfg(not(feature = "v2-kernel-probe"))]
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut state = load_live(conn, event.local_seq - 1, deadline).await?;
+    state.apply_new_on(conn, event, deadline).await?;
+    verify_retained_sources_on(conn, event).await?;
+    touch_metadata(conn, event).await
 }

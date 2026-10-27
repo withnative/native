@@ -344,7 +344,26 @@ pub(crate) mod tests {
                             operation: "activate_view".into(),
                         },
                     );
-                    registry.call_engine(EngineHandle::KernelV2(db.clone()), publication, "manage_named_views", json!({"action":"activate_view","id":id,"pin":draft["pin"],"name":"view_racer","expected_binding_event_id":null,"idempotency_key":"racing-activation"})).await.unwrap();
+                    let racer = json!({"action":"activate_view","id":id,"pin":draft["pin"],"name":"view_racer","expected_binding_event_id":null,"idempotency_key":"racing-activation"});
+                    let preflight = crate::mcp::kernel_v2::writes::named_views::prepare_commit(
+                        &db,
+                        &admin,
+                        &publication,
+                        &racer,
+                    )
+                    .await
+                    .unwrap();
+                    crate::mcp::kernel_v2::writes::named_views::with_prevalidated(
+                        preflight,
+                        registry.call_engine(
+                            EngineHandle::KernelV2(db.clone()),
+                            publication,
+                            "manage_named_views",
+                            racer,
+                        ),
+                    )
+                    .await
+                    .unwrap();
                 }
                 let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
                     .fetch_one(db.pool())

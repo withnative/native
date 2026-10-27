@@ -329,6 +329,10 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(result.to_string().contains("deadline or cancellation"));
+        assert!(
+            result.to_string().contains("deadline or cancellation")
+                || result.to_string().contains("validator queue deadline"),
+            "{result}"
+        );
     }
 }

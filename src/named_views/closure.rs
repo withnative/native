@@ -162,6 +162,30 @@ pub(crate) fn build(
     })
 }
 
+/// Shared request work cap for catalog certification, charged before payloads
+/// are fetched. Exact references are reused only within this read snapshot.
+#[cfg(feature = "v2-kernel-probe")]
+#[derive(Default)]
+pub(crate) struct CertificationBudget {
+    nodes: usize,
+    bytes: usize,
+    certified: BTreeMap<Pin, Definition>,
+}
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn resolve_budgeted_on(
+    tx: &mut SqliteConnection,
+    actor: &str,
+    roots: &BTreeMap<String, Pin>,
+    deadline: Instant,
+    budget: &mut CertificationBudget,
+) -> Result<Closure> {
+    let inspected = inspect_on(tx, actor, roots, deadline, None, true, budget).await?;
+    storage::check_deadline(deadline)?;
+    let plan = build(roots, &inspected.definitions)?;
+    storage::check_deadline(deadline)?;
+    Ok(plan)
+}
+
 #[cfg(feature = "v2-kernel-probe")]
 #[allow(dead_code)] // Snapshot execution is wired by PR 2b.
 pub(crate) async fn resolve_on(
@@ -170,7 +194,16 @@ pub(crate) async fn resolve_on(
     roots: &BTreeMap<String, Pin>,
     deadline: Instant,
 ) -> Result<Closure> {
-    let inspected = inspect_on(tx, actor, roots, deadline, None, true).await?;
+    let inspected = inspect_on(
+        tx,
+        actor,
+        roots,
+        deadline,
+        None,
+        true,
+        &mut CertificationBudget::default(),
+    )
+    .await?;
     build(roots, &inspected.definitions)
 }
 #[cfg(feature = "v2-kernel-probe")]
@@ -182,13 +215,44 @@ pub(crate) async fn resolve_candidate_on(
     deadline: Instant,
 ) -> Result<Closure> {
     let roots = BTreeMap::from([("view_candidate".into(), pin.clone())]);
-    let inspected = inspect_on(tx, actor, &roots, deadline, Some((pin, definition)), true).await?;
+    let inspected = inspect_on(
+        tx,
+        actor,
+        &roots,
+        deadline,
+        Some((pin, definition)),
+        true,
+        &mut CertificationBudget::default(),
+    )
+    .await?;
     build(&roots, &inspected.definitions)
 }
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) struct Inspection {
     pub definitions: BTreeMap<Pin, Definition>,
     pub drifted: bool,
+}
+
+/// Commit-time visibility and strict current-source checks. The SQL/graph
+/// contract was certified outside the writer on these immutable event bodies.
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) async fn inspect_executable_on(
+    tx: &mut SqliteConnection,
+    actor: &str,
+    roots: &BTreeMap<String, Pin>,
+    deadline: Instant,
+    candidate: Option<(Pin, Definition)>,
+) -> Result<Inspection> {
+    inspect_on(
+        tx,
+        actor,
+        roots,
+        deadline,
+        candidate,
+        true,
+        &mut CertificationBudget::default(),
+    )
+    .await
 }
 
 /// Authorize every retained bearer and source before returning immutable SQL.
@@ -200,7 +264,16 @@ pub(crate) async fn inspect_metadata_on(
     roots: &BTreeMap<String, Pin>,
     deadline: Instant,
 ) -> Result<Inspection> {
-    inspect_on(tx, actor, roots, deadline, None, false).await
+    inspect_on(
+        tx,
+        actor,
+        roots,
+        deadline,
+        None,
+        false,
+        &mut CertificationBudget::default(),
+    )
+    .await
 }
 #[cfg(feature = "v2-kernel-probe")]
 async fn inspect_on(
@@ -210,6 +283,7 @@ async fn inspect_on(
     deadline: Instant,
     candidate: Option<(Pin, Definition)>,
     executable: bool,
+    budget: &mut CertificationBudget,
 ) -> Result<Inspection> {
     if roots.len() > 8 {
         return Err(invalid("view_budget_exceeded: roots"));
@@ -245,7 +319,7 @@ async fn inspect_on(
             drifted |= archived;
         }
         let budget_pins = || std::iter::once(&pin).chain(pending.iter());
-        if definitions.len() >= 16 {
+        if definitions.len() >= 16 || (budget.nodes >= 16 && !budget.certified.contains_key(&pin)) {
             return Err(budget_error_on(
                 tx,
                 actor,
@@ -261,7 +335,10 @@ async fn inspect_on(
         // Count before allocating either the EventRow payload or decoded JSON.
         let def = if let Some((_, definition)) = candidate.as_ref().filter(|(p, _)| p == &pin) {
             let len = serde_json::to_vec(definition)?.len() + 256;
-            if len > MAX_CARRIER_BYTES || len > 512 * 1024 - bytes {
+            if len > MAX_CARRIER_BYTES
+                || len > 512 * 1024 - bytes
+                || len > 512 * 1024 - budget.bytes
+            {
                 return Err(budget_error_on(
                     tx,
                     actor,
@@ -272,6 +349,15 @@ async fn inspect_on(
                     "view_budget_exceeded: closure bytes",
                 )
                 .await?);
+            }
+            bytes += len;
+            budget.nodes += 1;
+            budget.bytes += len;
+            definition.clone()
+        } else if let Some(definition) = budget.certified.get(&pin) {
+            let len = serde_json::to_vec(definition)?.len() + 256;
+            if len > 512 * 1024 - bytes {
+                return Err(invalid("view_budget_exceeded: closure bytes"));
             }
             bytes += len;
             definition.clone()
@@ -286,7 +372,10 @@ async fn inspect_on(
             }
             let payload_bytes =
                 usize::try_from(payload_bytes).map_err(|_| invalid("invalid revision length"))?;
-            if payload_bytes > MAX_CARRIER_BYTES || payload_bytes > 512 * 1024 - bytes {
+            if payload_bytes > MAX_CARRIER_BYTES
+                || payload_bytes > 512 * 1024 - bytes
+                || payload_bytes > 512 * 1024 - budget.bytes
+            {
                 return Err(budget_error_on(
                     tx,
                     actor,
@@ -299,6 +388,8 @@ async fn inspect_on(
                 .await?);
             }
             bytes += payload_bytes;
+            budget.nodes += 1;
+            budget.bytes += payload_bytes;
             let event = read_event(tx, &pin.revision_id, head).await?;
             let revision: Revision = decode(&event, MAX_CARRIER_BYTES)?;
             let def = revision.validate(&event)?;
@@ -344,6 +435,7 @@ async fn inspect_on(
             Dependency::View(pin) => Some(pin.clone()),
             _ => None,
         }));
+        budget.certified.insert(pin.clone(), def.clone());
         definitions.insert(pin, def);
     }
     storage::check_deadline(deadline)?;
