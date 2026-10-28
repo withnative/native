@@ -11,7 +11,7 @@
 
 <p align="center">
   <a href="https://www.loom.com/share/c030c0b34b7a4465b610c4e40d303f31">
-    <img src="https://raw.githubusercontent.com/withnative/native/main/docs/figures/readme/demo-video.jpg" width="946" alt="Native demo: a shared document open in Native, with Codex working alongside">
+    <img src="https://raw.githubusercontent.com/withnative/native/main/docs/figures/readme/demo-video.png" width="946" alt="Native demo: a shared document open in Native, with Codex working alongside">
   </a>
 </p>
 
