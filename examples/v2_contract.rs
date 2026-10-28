@@ -1,6 +1,7 @@
 //! Fresh-agent harness for the v2 kernel generic contract.
 //!
-//! Requires `--features v2-kernel-probe`. No ontology knowledge lives here:
+//! Requires `--features v2-kernel-probe`; executable CEL packages require
+//! the explicit `--features package-cel-dev` instead. No ontology knowledge lives here:
 //! fixtures arrive as JSON files at runtime. Stdout carries JSON only —
 //! every failure (usage or engine, including the uniform refusal) prints
 //! `{"error": "<message>"}` and exits nonzero.

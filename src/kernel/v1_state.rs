@@ -40,20 +40,9 @@ pub struct ImportedState {
     pub observed_at: String,
     pub snapshot: Value,
 }
-fn validate(row: &ImportedState) -> Result<()> {
-    let value = row
-        .value_json
-        .as_ref()
-        .map(|v| serde_json::from_str::<Value>(v))
-        .transpose()?;
-    if row.value_json.is_none() && matches!(row.section.as_str(), "runs" | "run_intents" | "claims")
-    {
-        return Err(Error::engine(
-            "historical coordination evidence cannot be erased",
-        ));
-    }
-    if !matches!(
-        row.section.as_str(),
+pub(crate) fn is_section(section: &str) -> bool {
+    matches!(
+        section,
         "member_contexts"
             | "member_context_capture"
             | "identity_directory_capture"
@@ -73,7 +62,22 @@ fn validate(row: &ImportedState) -> Result<()> {
             | "runs"
             | "run_intents"
             | "claims"
-    ) || row.source_id.is_empty()
+    )
+}
+fn validate(row: &ImportedState) -> Result<()> {
+    let value = row
+        .value_json
+        .as_ref()
+        .map(|v| serde_json::from_str::<Value>(v))
+        .transpose()?;
+    if row.value_json.is_none() && matches!(row.section.as_str(), "runs" | "run_intents" | "claims")
+    {
+        return Err(Error::engine(
+            "historical coordination evidence cannot be erased",
+        ));
+    }
+    if !is_section(&row.section)
+        || row.source_id.is_empty()
         || row.origin.is_empty()
         || value.as_ref().is_some_and(|v| !v.is_object())
         || chrono::DateTime::parse_from_rfc3339(&row.observed_at).is_err()

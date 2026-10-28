@@ -1,57 +1,109 @@
 {
-  "provisional": true,
-  "generator": "native.declared-relational-defaults",
-  "version": "facet-spike-1",
-  "workspace": "workspace",
-  "bearer": "bearer",
-  "source_identity": "hq-tasks",
+  "format": "native.generated-facets.v1",
+  "workspace_id": "workspace",
   "context": {
     "type": "WorkItem",
     "kind": "task",
-    "logical_home": "H",
-    "membership": "direct members; kind null means kindless"
+    "logical_home_id": "H"
   },
   "selection": {
-    "mode": "keys",
+    "kind": "keys",
     "keys": [
       "area"
     ]
   },
-  "declarations": {
-    "area": {
-      "description": "Area"
-    }
-  },
-  "context_evidence": [
+  "sources": [
     {
-      "id": "base",
-      "layer": "pack",
-      "home": null,
-      "lineage": "fixture-source-revision",
-      "created_at": "2026-10-26T00:00:00Z",
-      "shape_key": "WorkItem",
-      "selected": {
-        "area": {
-          "description": "Area"
-        }
-      }
+      "section": "schema_config",
+      "source_id": "[\"base\"]",
+      "origin": "fixture",
+      "row_id": "base",
+      "event_id": "275cc8a5-20ab-5154-b083-6a36f694fed4",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": null
+    },
+    {
+      "section": "schema_config",
+      "source_id": "[\"local\"]",
+      "origin": "fixture",
+      "row_id": "local",
+      "event_id": "63bdb9a0-dacb-5fe3-aefe-3ca06dfe78e2",
+      "event_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "anchor": "H"
     }
   ],
-  "vocabularies": [],
-  "inclusion": "all visible matching records, including archived/superseded; no inferred defaults",
+  "slots": [
+    {
+      "scope": "global",
+      "layer": "pack",
+      "shape_key": "WorkItem",
+      "fragments": [
+        {
+          "source": 0,
+          "key": "area",
+          "decl": {
+            "type": null,
+            "description": "Area",
+            "required": null,
+            "vocab": null,
+            "vocab_ref": null,
+            "unit": null
+          },
+          "lineage": "fixture-source-revision",
+          "created_at": "2026-10-26T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "scope": "global",
+      "layer": "user",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "global",
+      "layer": "pack",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "global",
+      "layer": "user",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "pack",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "user",
+      "shape_key": "WorkItem",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "pack",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    },
+    {
+      "scope": "home",
+      "layer": "user",
+      "shape_key": "WorkItem:task",
+      "fragments": []
+    }
+  ],
   "governance_basis": [
     {
-      "id": "local",
-      "layer": "user",
-      "home": "H",
-      "lineage": "fixture-source-revision",
-      "created_at": "2026-10-26T00:00:00Z",
+      "source": 1,
       "shape_key": "WorkItem:task",
-      "context": {
-        "type": "WorkItem",
-        "kind": "task",
-        "logical_home": "H"
-      }
+      "lineage": "fixture-source-revision",
+      "created_at": "2026-10-26T00:00:00Z"
     }
-  ]
+  ],
+  "vocabularies": []
 }

@@ -14,6 +14,10 @@ members = [
     "crates/artifact-html",
     "crates/artifact-runtime",
     "crates/cel-subset",
+    # Development guest integration; deliberately absent from default-members.
+    "crates/package-cel-wire",
+    "crates/package-cel-guest",
+    "crates/package-cel-host",
     # Test-only core/SDK bridge; deliberately absent from default-members.
     "crates/coedit-core-fixture",
     "crates/native-federation",
@@ -132,6 +136,11 @@ path = "examples/standby_admit.rs"
 required-features = ["dev-tools"]
 test = true
 
+[[bin]]
+name = "named-view-export"
+path = "src/bin/named_view_export.rs"
+required-features = ["dev-tools", "v2-kernel-probe"]
+
 [features]
 default = ["experimental-agent-intents", "mcp-executor-prototype"]
 # Named v2 engine surface (also built into the hosted image): enables the
@@ -141,6 +150,8 @@ default = ["experimental-agent-intents", "mcp-executor-prototype"]
 # set still excludes v2; production `EVENT_TYPES`, frozen v1 DDL, and the
 # `cfg!(test)` store skip remain unchanged.
 v2-kernel-probe = []
+# Checked guest CEL is an explicit local development opt-in, never a shipping closure.
+package-cel-dev = ["v2-kernel-probe", "dep:native-package-cel-host", "dep:native-package-cel-wire"]
 # Read-only observation of existing body jobs for inter-crate fixture lifecycle
 # proofs. Enabled by Held's dev-dependency only, never a production default.
 body-read-test-support = []
@@ -191,6 +202,9 @@ dev-tools = []
 mcp-executor-prototype = []
 
 [dependencies]
+# Local package-CEL development proof only; excluded from the default product graph.
+native-package-cel-host = { path = "crates/package-cel-host", optional = true }
+native-package-cel-wire = { path = "crates/package-cel-wire", optional = true }
 # Shared HTTP types for root hosting/relay surfaces. The held hosting package
 # separately owns authenticated MCP Streamable HTTP at `/mcp` and the
 # workbench's plain-JSON `/tools/:name` adapter. The MCP protocol itself is

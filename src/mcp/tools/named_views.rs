@@ -54,7 +54,7 @@ pub(crate) fn register(registry: &mut ToolRegistry) -> Result<()> {
         branches.push(serde_json::json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}));
     }
     registry.register(super::super::ToolKind::ManageNamedViews,
-        "Hosted v2 only; operations gated off by default. Draft: member + bearer Edit. Publish/unpublish: workspace owner + bearer Edit + executor plan. Activate: closure View. Unpublish broken views. Meanings: catalog_view_definitions",
+        "Named views; hosted v2; gated off by default. Draft: member + bearer Edit. Publish/unpublish: workspace owner + bearer Edit + executor plan. Activate: closure View. Unpublish broken views. See catalog_view_definitions",
         serde_json::json!({"type":"object","oneOf":branches}),
         |_db,_caller,_args|async {Err::<serde_json::Value,_>(crate::Error::engine("view_profile_unsupported: named view operations require hosted v2"))})
 }

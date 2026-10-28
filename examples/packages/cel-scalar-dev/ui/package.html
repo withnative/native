@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Package operation reader</title>
+<style>
+body{font:16px system-ui,sans-serif;background:#f5f4ef;color:#202c2b;margin:0}main{max-width:760px;margin:auto;padding:24px}h1{font-size:28px}label{display:block;margin:12px 0}input,select{display:block;width:95%;padding:8px;font:inherit}button{padding:10px 16px;margin:8px 8px 8px 0;font:inherit}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:16px;border:1px solid #c5ceca}p{line-height:1.5}
+</style>
+</head>
+<body>
+<main>
+<h1>Package operation reader</h1>
+<p>Local development, interim P1. Discover applicable installed operations, then explicitly ask the server to compute it. This app contains no evaluator.</p>
+<label>Record ID<input id="record"></label>
+<button id="discover" type="button" disabled>Discover for record</button>
+<label>Package and operation<select id="choice" disabled></select></label>
+<button id="compute" type="button" disabled>Compute / explicitly retry</button>
+<p id="status" role="status" aria-live="polite">Waiting for the installed Native bridge.</p>
+<h2>Selected package and result</h2><pre id="result">No computation requested.</pre>
+<h2>Server receipt</h2><pre id="receipt">No receipt.</pre>
+</main>
+<script>
+const el = id => document.getElementById(id);
+let busy = false, bridge = false, describedRecord = null, choices = [];
+const selected = () => describedRecord === el("record").value ? (el("choice").value === "" ? undefined : choices[Number(el("choice").value)]) : undefined;
+function controls() {
+  el("discover").disabled = !bridge || busy;
+  el("record").disabled = busy;
+  el("choice").disabled = busy || !choices.length;
+  el("compute").disabled = busy || !bridge || !selected();
+}
+function clearSelection() {
+  choices = []; describedRecord = null; el("choice").replaceChildren(new Option("Discover and choose an operation", ""));
+  el("result").textContent = "No computation requested."; el("receipt").textContent = "No receipt."; controls();
+}
+async function request(discover) {
+  if (busy || (!discover && !selected())) return;
+  const record = el("record").value, choice = selected();
+  busy = true; controls();
+  el("status").textContent = "Waiting for the server.";
+  el("result").textContent = "No result delivered for this request.";
+  el("receipt").textContent = "No receipt delivered for this request.";
+  try {
+    const answer = await window.native.call(discover ? "describe_package_operations" : "call_package_operation",
+      discover ? {record_id:record} : {namespace:choice.namespace,name:choice.name,package_operation:choice.operation,record_id:record}).confirmed;
+    if (discover) {
+      if (answer.complete !== true || answer.record_id !== record || !Array.isArray(answer.packages)) throw new Error("Incomplete discovery response; nothing selected");
+      clearSelection(); describedRecord = record;
+      for (const pkg of answer.packages) for (const op of pkg.operations) {
+        const index = choices.length;
+        choices.push({namespace:pkg.namespace,name:pkg.name,operation:op.name});
+        el("choice").append(new Option(`${pkg.namespace}/${pkg.name} @${pkg.version} — ${op.name}`,String(index)));
+      }
+      el("result").textContent = JSON.stringify(answer,null,2);
+      el("status").textContent = choices.length ? "Discovery received. Choose an operation, then explicitly compute." : "No applicable operations. Nothing computed.";
+    } else {
+      el("result").textContent = JSON.stringify({package:answer.receipt.namespace + "/" + answer.receipt.name,
+        package_version:answer.receipt.package_version,package_digest:answer.receipt.package_digest,
+        record_revision:answer.receipt.record_revision,result:answer.result},null,2);
+      el("receipt").textContent = JSON.stringify(answer.receipt,null,2);
+      el("status").textContent = "Server response received. Any further computation requires another click.";
+    }
+  } catch (error) {
+    if (discover) clearSelection();
+    el("status").textContent = "Refused: " + String(error.message || error).slice(0,1000) + ". Explicitly retry when appropriate.";
+  } finally { busy = false; controls(); }
+}
+el("record").addEventListener("input", clearSelection);
+el("choice").addEventListener("change", controls);
+el("discover").addEventListener("click", () => request(true));
+el("compute").addEventListener("click", () => request(false));
+clearSelection();
+window.nativeArtifact.ready.then(() => {
+  if (!window.native || typeof window.native.call !== "function") {
+    el("status").textContent = "The host did not offer installed app calls. Nothing was sent."; return;
+  }
+  bridge = true; controls(); el("status").textContent = "Installed bridge ready. No computation requested.";
+});
+</script>
+</body>
+</html>

@@ -834,7 +834,7 @@ fn local_list_and_describe_are_discovered_live() {
         );
 
         let filtered = local(Command::Call, &db, &["--list", "sql_read", "--text"]).await;
-        assert_eq!(filtered.exit, 0);
+        assert_eq!(filtered.exit, 0, "{filtered:#?}");
         assert!(
             filtered.stdout.contains("sql_read.query_sql"),
             "{}",

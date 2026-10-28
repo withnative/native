@@ -98,6 +98,8 @@ pub(crate) struct PreparedCommit {
     certificates: Vec<EventCertificate>,
     fingerprint: String,
     evidence: Option<Value>,
+    generated: Option<std::sync::Arc<views::generated::Prepared>>,
+    referenced: Option<std::sync::Arc<views::generated::Referenced>>,
     deadline: Instant,
 }
 // Request-local certificates carry no permission grant. Immutable body identity
@@ -226,6 +228,12 @@ pub(crate) async fn prepare_commit(
             .or_default() += 1;
     }
     gate::require()?;
+    if db.open_mode() != crate::db::DatabaseOpenMode::ReadWrite {
+        return Err(Error::engine(
+            "view_profile_unsupported: named view preparation requires the hosted writer",
+        ));
+    }
+
     mutation_shape(args)?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let fingerprint = intent_fingerprint("manage_named_views", args.clone(), Value::Null)?;
@@ -249,24 +257,60 @@ pub(crate) async fn prepare_commit(
     } else {
         false
     };
+    let generated = if !old
+        && args["action"] == "record_view_revision"
+        && args["definition"]["origin"]["kind"] == "generated"
+    {
+        Some(std::sync::Arc::new(
+            views::generated::prepare(db, actor, record_id(args)?, &args["definition"], deadline)
+                .await?,
+        ))
+    } else {
+        None
+    };
     // Receipt identity includes the dispatched app and is checked under the
     // real dispatch context in the writer. Preflight carries schema proof only.
     let evidence = if old {
         None
     } else {
-        Some(validate_on(&mut tx, actor, args, deadline, caller, None).await?)
+        Some(
+            validate_on(
+                &mut tx,
+                actor,
+                args,
+                deadline,
+                caller,
+                None,
+                generated.as_deref(),
+            )
+            .await?,
+        )
     };
     let certificates = match &evidence {
         Some(e) => certificates_on(&mut tx, e).await?,
         None => Vec::new(),
     };
     tx.rollback().await?;
+    let ids: Vec<String> = evidence
+        .as_ref()
+        .map(|e| serde_json::from_value(e.get("certified_ids").cloned().unwrap_or(json!([]))))
+        .transpose()?
+        .unwrap_or_default();
+    let referenced = if generated.is_none() {
+        views::generated::prepare_referenced(db, actor, &ids, deadline)
+            .await?
+            .map(std::sync::Arc::new)
+    } else {
+        None
+    };
     Ok(PreparedCommit {
         database: db.clone(),
         actor: actor.to_owned(),
         certificates,
         fingerprint,
         evidence,
+        generated,
+        referenced,
         deadline,
     })
 }
@@ -282,6 +326,7 @@ async fn validate_on(
     deadline: Instant,
     caller: &crate::mcp::Caller,
     prepared: Option<&Value>,
+    generated: Option<&views::generated::Prepared>,
 ) -> Result<Value> {
     mutation_shape(args)?;
     let id = record_id(args)?;
@@ -301,11 +346,35 @@ async fn validate_on(
         .and_then(|b| b.active.as_ref())
         .map(|(name, _)| name);
     let mut evidence = json!({"current_name":current_name});
+    if args["action"] == "record_view_revision" && generated.is_some() {
+        let latest = state
+            .revision_ids()
+            .filter(|(_, record, _)| *record == id)
+            .max_by_key(|(_, _, seq)| *seq)
+            .map(|(id, _, _)| id);
+        evidence["revision_head"] = json!(latest);
+        if prepared.is_some_and(|p| p["revision_head"] != evidence["revision_head"]) {
+            return Err(Error::conflict(
+                "view_validation_changed: bearer revision history changed; prepare again",
+            ));
+        }
+    }
     match text(args, "action")? {
         "record_view_revision" => {
-            let definition: contract::Definition =
-                serde_json::from_value(args["definition"].clone())?;
-            if !matches!(definition.origin, contract::Origin::Authored) {
+            let definition: contract::Definition = if let Some(candidate) = generated {
+                if candidate.revision().definition != args["definition"] {
+                    return Err(Error::conflict(
+                        "view_validation_changed: generated request changed",
+                    ));
+                }
+                serde_json::from_value::<views::v2::Definition>(
+                    candidate.revision().definition.clone(),
+                )?
+                .common()
+            } else {
+                serde_json::from_value(args["definition"].clone())?
+            };
+            if generated.is_none() && !matches!(definition.origin, contract::Origin::Authored) {
                 return Err(Error::engine("generated revision authoring is reserved"));
             }
             if prepared.is_none() {
@@ -313,16 +382,40 @@ async fn validate_on(
             } else {
                 definition.validate_retained()?;
             }
-            let mut revision = Revision {
-                v: 1,
-                view_id: format!("native.named-view:{id}"),
-                definition_sha256: String::new(),
-                definition: serde_json::to_value(&definition)?,
+            let mut revision = if let Some(candidate) = generated {
+                candidate.revision().clone()
+            } else {
+                Revision {
+                    v: 1,
+                    view_id: format!("native.named-view:{id}"),
+                    definition_sha256: String::new(),
+                    definition: serde_json::to_value(&definition)?,
+                }
             };
             revision.definition_sha256 = revision.digest();
+            let reused = if let Some(candidate) = generated {
+                if let Some(proof) = prepared {
+                    if proof["reused"] == true {
+                        Some(serde_json::from_value::<Pin>(proof["pin"].clone())?)
+                    } else {
+                        None
+                    }
+                } else {
+                    let mut revisions: Vec<_> = state
+                        .revision_ids()
+                        .filter(|(_, record, _)| *record == id)
+                        .collect();
+                    revisions.sort_by_key(|(_, _, seq)| std::cmp::Reverse(*seq));
+                    let ids: Vec<_> = revisions.into_iter().map(|(id, _, _)| id.clone()).collect();
+                    views::generated::identical_on(tx, &ids, candidate.revision(), deadline).await?
+                }
+            } else {
+                None
+            };
             let event_id = prepared
                 .and_then(|e| e["event_id"].as_str())
                 .map(str::to_owned)
+                .or_else(|| reused.as_ref().map(|p| p.revision_id.clone()))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let pin = Pin {
                 view_id: revision.view_id.clone(),
@@ -333,7 +426,18 @@ async fn validate_on(
             if serde_json::to_vec(&revision)?.len() > views::MAX_CARRIER_BYTES {
                 return Err(Error::engine("view_budget_exceeded: revision carrier"));
             }
-            if let Some(proof) = prepared {
+            if let Some(candidate) = generated {
+                // Trusted preflight already ran SavedSQL and both validators.
+                // Under the writer only the owned B proof and structural event
+                // checks run; a cold/evicted schema cache cannot start a worker.
+                evidence["analysis_digest"] = json!(candidate.revision().definition_sha256);
+                evidence["certified_ids"] = json!(reused
+                    .as_ref()
+                    .map(|p| vec![p.revision_id.clone()])
+                    .unwrap_or_default());
+                evidence["reused"] = json!(reused.is_some());
+                evidence["generated_name"] = json!(candidate.name());
+            } else if let Some(proof) = prepared {
                 closure::inspect_executable_on(
                     tx,
                     actor,
@@ -365,16 +469,20 @@ async fn validate_on(
         "activate_view" => {
             check_cas(&state, args, id)?;
             let name = text(args, "name")?;
-            contract::authored_name(name)?;
             let pin = exact(args)?;
             if pin.view_id != format!("native.named-view:{id}") {
                 return Err(Error::engine("view_revision_unavailable"));
             }
             let roots = BTreeMap::from([(name.into(), pin.clone())]);
-            if let Some(proof) = prepared {
-                closure::inspect_executable_on(tx, actor, &roots, deadline, None).await?;
+            let generated_name = if let Some(proof) = prepared {
+                let inspection =
+                    closure::inspect_executable_on(tx, actor, &roots, deadline, None).await?;
                 evidence["analysis_digest"] = proof["analysis_digest"].clone();
                 evidence["certified_ids"] = proof["certified_ids"].clone();
+                inspection
+                    .retained
+                    .get(&pin)
+                    .and_then(Revision::generated_name)
             } else {
                 let plan = closure::resolve_on(tx, actor, &roots, deadline).await?;
                 analyze_before_commit(&plan, deadline).await?;
@@ -384,6 +492,16 @@ async fn validate_on(
                     .iter()
                     .map(|n| &n.pin.revision_id)
                     .collect::<Vec<_>>());
+                plan.retained.get(&pin).and_then(Revision::generated_name)
+            };
+            if let Some(expected_name) = generated_name {
+                if name != expected_name {
+                    return Err(Error::engine(
+                        "generated view name must match its deterministic identity",
+                    ));
+                }
+            } else {
+                contract::authored_name(name)?;
             }
             evidence["pin"] = json!(pin);
             evidence["payload"] = serde_json::to_value(Transition {
@@ -440,7 +558,9 @@ async fn validate_on(
         causal_envelope: crate::events::CausalEnvelopeV1::legacy_unknown(),
         act: None,
     };
-    state.apply_new_on(tx, &proposed, deadline).await?;
+    if evidence["reused"] != true {
+        state.apply_new_on(tx, &proposed, deadline).await?;
+    }
     evidence["event_id"] = json!(event_id);
     // Bind approval to this namespace transition, rather than
     // invalidate it on unrelated workspace writes. Live permissions, source
@@ -466,6 +586,10 @@ pub(crate) async fn preview(
     args: &Value,
 ) -> Result<Value> {
     gate::require()?;
+    // A plan preview validates on a read snapshot but does not own a commit
+    // proof. Dispatch obtains that proof exactly once before the owner guard.
+    // In particular, plan revalidation must not construct/discard a second
+    // owned source snapshot immediately before guarded publication preflight.
     let mut tx = db.pool().begin().await?;
     kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
     let evidence = validate_on(
@@ -474,6 +598,7 @@ pub(crate) async fn preview(
         args,
         Instant::now() + Duration::from_secs(2),
         caller,
+        None,
         None,
     )
     .await?;
@@ -581,7 +706,22 @@ pub(super) async fn execute(
             crate::query::sql::view_validation::evict_cache_entry(digest);
         }
     }
-    let mut tx = begin_write(db.write_pool()).await?;
+    let mut writer = views::source_proof::Writer::begin(db, deadline).await?;
+    if let Some(generated) = &prepared.generated {
+        generated.recheck(db, &mut writer, actor).await?;
+    }
+    if let Some(referenced) = &prepared.referenced {
+        referenced.recheck(db, &mut writer, actor).await?;
+    }
+    let mut certified = prepared
+        .referenced
+        .as_ref()
+        .map(|p| p.digests.clone())
+        .unwrap_or_default();
+    if let Some(generated) = &prepared.generated {
+        certified.insert(generated.revision().definition_sha256.clone());
+    }
+    let mut tx = writer.into_transaction();
     let work = async {
         kernel::app_installs::admit_dispatched_on(&mut tx, actor).await?;
         let id = record_id(&args)?;
@@ -633,7 +773,16 @@ pub(super) async fn execute(
             proof["analysis_digest"].as_str().unwrap_or_default(),
         );
         recheck_certificates_on(&mut tx, &prepared.certificates).await?;
-        let evidence = validate_on(&mut tx, actor, &args, deadline, caller, Some(proof)).await?;
+        let evidence = validate_on(
+            &mut tx,
+            actor,
+            &args,
+            deadline,
+            caller,
+            Some(proof),
+            prepared.generated.as_deref(),
+        )
+        .await?;
         #[cfg(test)]
         if EVICT_BEFORE_COMMIT.try_with(|_| ()).is_ok() {
             assert_eq!(
@@ -656,6 +805,27 @@ pub(super) async fn execute(
             &mut acts,
         )
         .await?;
+        if evidence["reused"] == true {
+            let mut receipt = json!({"id":id,"operation":action,"event_id":evidence["event_id"],"pin":evidence["pin"],"replayed":false,"reused":true,
+                "write_receipt":{"kind":"kernel_content_event","event_id":evidence["event_id"]}});
+            if let Some(app) =
+                kernel::app_installs::finish_app_action_in(db, &mut tx, actor, pending, &mut acts)
+                    .await?
+            {
+                receipt["app_attribution"] = app;
+            }
+            sqlx::query("INSERT INTO kernel_mcp_write_receipts VALUES(?,?,?,?,?)")
+                .bind(actor)
+                .bind(format!("manage_named_views.{action}"))
+                .bind(key)
+                .bind(fingerprint)
+                .bind(serde_json::to_string(&receipt)?)
+                .execute(&mut *tx)
+                .await?;
+            views::storage::check_deadline(deadline)?;
+            db.commit_kernel_content(tx).await?;
+            return Ok(receipt);
+        }
         let kind = if action == "record_view_revision" {
             REVISION
         } else {
@@ -714,7 +884,7 @@ pub(super) async fn execute(
         db.commit_kernel_content(tx).await?;
         Ok(receipt)
     };
-    gate::scope(deadline, work).await
+    gate::scope(deadline, views::generated::certified(certified, work)).await
 }
 
 /// The shared executor can replay a terminal plan without calling its source.

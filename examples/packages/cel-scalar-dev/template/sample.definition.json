@@ -1,0 +1,25 @@
+{
+  "family": "example.scalar.sample",
+  "version": 1,
+  "interpreter": "native.defn/3",
+  "primary_type": "ScalarSample",
+  "kinds": [
+    {
+      "token": "sample",
+      "description": "Copyable scalar source record structure.",
+      "maturity": "current",
+      "identity": {
+        "mode": "record"
+      },
+      "fields": [
+        {
+          "name": "inputs_json",
+          "type": "text",
+          "required": true,
+          "description": "JSON object encoded as text, matching executable bindings."
+        }
+      ],
+      "links": []
+    }
+  ]
+}

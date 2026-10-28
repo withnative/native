@@ -8,8 +8,9 @@
 //! validation evidence waits for PR 2's guest codec/session/backstop composition.
 //!
 //! Both entry points take a `&Policy`, and both run worker logic on
-//! an internal thread with a stack of at least 8 MiB (see
-//! [`run_on_pool`]): callers cannot supply their own stack.
+//! an internal native thread with a stack of at least 8 MiB (see
+//! [`run_on_pool`]): callers cannot supply their own stack. On wasm32 the same
+//! checked worker runs inline; the containing guest host owns stack/trap bounds.
 //!
 //! No unbudgeted entry point is exported (design §7.2 "Must test:
 //! Public API"). These doctests fail to compile — and so pass —
@@ -30,13 +31,16 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
+#[cfg(not(target_arch = "wasm32"))]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::context::Context;
 use crate::objects::Value;
 use crate::regexes::{self, PreparedRegex};
-use crate::{Declarations, ExecutionError, ParseError, ParseErrors, Policy, Program, STACK_8MIB};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::STACK_8MIB;
+use crate::{Declarations, ExecutionError, ParseError, ParseErrors, Policy, Program};
 
 /// A checked expression, ready for [`evaluate`]. Only [`check`] builds one.
 ///
@@ -550,6 +554,7 @@ pub(crate) fn context_for(
 /// back to the caller. Unwinding worker panics become `Err`; `catch_unwind`
 /// cannot recover process aborts such as stack overflow. Native 4/8 MiB probes
 /// exercise the tested source/value/shape boundary fixtures on this closure.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn run_on_pool<T, F>(f: F) -> Result<T, String>
 where
     T: Send,
@@ -588,6 +593,17 @@ where
             Err(e) => Err(format!("cel-subset worker failed to spawn: {e}")),
         }
     })
+}
+
+/// Execute the identical checked worker inside a single-threaded wasm guest.
+/// Guest panic-abort becomes a host trap; no unchecked engine path is exposed.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn run_on_pool<T, F>(f: F) -> Result<T, String>
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    Ok(f())
 }
 
 /// A check-time refusal (parse error, or an inadmissible `matches`

@@ -16,6 +16,7 @@ pub(crate) const AUDIT_DDL: &str = "CREATE TABLE kernel_hcp_audit (principal_id 
 pub(crate) const ENTRIES_DDL: &str = "CREATE TABLE kernel_hcp_entries (principal_id TEXT NOT NULL, entry_id TEXT NOT NULL, entry TEXT NOT NULL CHECK(json_valid(entry)), PRIMARY KEY(principal_id,entry_id))";
 pub(crate) const DISCLOSURES_DDL: &str = "CREATE TABLE kernel_hcp_disclosures (principal_id TEXT NOT NULL, client_id TEXT NOT NULL, entry_id TEXT NOT NULL, PRIMARY KEY(principal_id,client_id,entry_id))";
 pub(crate) const RESOLUTIONS_DDL: &str = "CREATE TABLE kernel_hcp_resolutions (principal_id TEXT NOT NULL,suggestion_id TEXT NOT NULL,receipt_id TEXT NOT NULL,nonce TEXT NOT NULL,event_id TEXT NOT NULL UNIQUE,payload TEXT NOT NULL CHECK(json_valid(payload)),event_seq INTEGER NOT NULL,PRIMARY KEY(principal_id,suggestion_id),UNIQUE(principal_id,nonce),UNIQUE(principal_id,receipt_id))";
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) const TYPES: &[&str] = &[
     "kernel.hcp_entry_versioned.v1",
     "kernel.hcp_entry_status_set.v1",

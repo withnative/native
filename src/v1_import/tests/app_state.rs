@@ -6404,3 +6404,7 @@ async fn native_app_sql_separates_only_admitted_staging_from_the_caller_vm_bound
     );
     db.close().await;
 }
+
+#[cfg(feature = "package-cel-dev")]
+#[path = "app_state/package_delivery.rs"]
+mod package_delivery;

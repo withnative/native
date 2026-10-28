@@ -7,8 +7,8 @@
 //! A manifest is one immutable namespaced package carrying a definition set,
 //! and optionally one fixed host-owned read-only behaviour descriptor plus one
 //! declarative surface descriptor. A definitions-only package (K5) omits both
-//! and declares no reads. There is no executable code and no effect: behaviour
-//! `reads` name scopes the host may serve; `effects` must stay empty.
+//! and declares no reads. The gated CEL development provider may additionally
+//! carry a host-interpreted expression; no effects are accepted.
 //!
 //! Digest separation (deliberate, not redundant):
 //! - each definition entry preserves `digest` = lowercase hex SHA-256 over
@@ -152,11 +152,11 @@ pub struct SurfaceDescriptor {
 
 /// One callable host-owned operation a package advertises.
 ///
-/// The descriptor is closed and declarative: it names a trusted host provider
-/// (no code travels in the manifest), the record family and kind it serves,
+/// The descriptor names a host provider, the record family and kind it serves,
 /// the text source field it reads (or an optional any-record target), and the read scopes it needs. Effects must
 /// stay empty. The provider's concrete request/result schema is owned by the
-/// host, not described here.
+/// host. Only the gated CEL development provider accepts an executable
+/// declaration; other providers must omit it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationDescriptor {
     pub name: String,
@@ -167,6 +167,8 @@ pub struct OperationDescriptor {
     pub source_field: String,
     pub reads: Vec<String>,
     pub effects: Vec<String>,
+    /// Host-interpreted CEL for the gated local development provider only.
+    pub executable: Option<crate::package_cel_dev::ExecutableDeclaration>,
 }
 
 /// The S1 canonical manifest: a namespaced triple plus a definition set, and
@@ -289,6 +291,17 @@ impl SurfaceDescriptor {
 }
 
 impl OperationDescriptor {
+    /// Availability never participates in retained canonical identity.
+    pub(crate) fn available_in_build(&self) -> bool {
+        self.provider != crate::package_cel_dev::PROVIDER || cfg!(feature = "package-cel-dev")
+    }
+
+    pub(crate) fn require_available(&self) -> Result<()> {
+        if self.provider == crate::package_cel_dev::PROVIDER {
+            crate::package_cel_dev::require_enabled()?;
+        }
+        Ok(())
+    }
     /// Additive wire target: any LIVE kernel record. Empty legacy selectors
     /// represent this variant internally, preserving retained struct literals
     /// and semantic source bytes. Only exact compiled claims packages admit it.
@@ -302,6 +315,7 @@ impl OperationDescriptor {
             source_field: String::new(),
             reads: vec![OPERATION_READ_RECORD_VIEW.into()],
             effects: vec![],
+            executable: None,
         }
     }
     pub fn targets_any_record(&self) -> bool {
@@ -323,10 +337,25 @@ impl OperationDescriptor {
         if self.provider != OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC
             && self.provider != crate::v2_standard::relates_to::PROVIDER
             && self.provider != crate::v2_standard::claims_v1::PROVIDER
+            && self.provider != crate::package_cel_dev::PROVIDER
         {
-            return Err(Error::engine(format!(
-                "package manifest operation provider must be a supported compiled provider ('{OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC}' or 'host.relates-to/1')"
-            )));
+            return Err(Error::engine(
+                "package manifest operation provider must be a supported host provider",
+            ));
+        }
+        match (&self.executable, self.provider.as_str()) {
+            (Some(executable), crate::package_cel_dev::PROVIDER) => executable.validate_shape()?,
+            (None, crate::package_cel_dev::PROVIDER) => {
+                return Err(Error::engine(
+                    "CEL development provider requires executable declaration",
+                ))
+            }
+            (Some(_), _) => {
+                return Err(Error::engine(
+                    "executable declaration requires CEL development provider",
+                ))
+            }
+            (None, _) => {}
         }
         if self.targets_any_record() {
             if self.provider != crate::v2_standard::claims_v1::PROVIDER {
@@ -390,6 +419,13 @@ fn definition_declares_text_field(definition: &DefinitionEntry, kind: &str, fiel
 }
 
 impl PackageManifest {
+    /// Live install/activation policy; structural reads and replay do not call it.
+    pub(crate) fn require_available_operations(&self) -> Result<()> {
+        for operation in &self.operations {
+            operation.require_available()?;
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<()> {
         validate_part("namespace", &self.namespace)?;
         validate_part("name", &self.name)?;
@@ -632,7 +668,7 @@ impl PackageManifest {
                         return serde_json::json!({"name":operation.name,"description":operation.description,
                             "provider":operation.provider,"target":"any-record","reads":reads,"effects":effects});
                     }
-                    serde_json::json!({
+                    let mut value = serde_json::json!({
                         "description": operation.description,
                         "effects": effects,
                         "family": operation.family,
@@ -641,7 +677,11 @@ impl PackageManifest {
                         "provider": operation.provider,
                         "reads": reads,
                         "source_field": operation.source_field,
-                    })
+                    });
+                    if let Some(executable) = &operation.executable {
+                        value["executable"] = serde_json::to_value(executable).expect("executable JSON");
+                    }
+                    value
                 })
                 .collect();
             obj.insert(
@@ -827,6 +867,14 @@ impl PackageManifest {
                         },
                         reads: str_list(o, "reads")?,
                         effects: str_list(o, "effects")?,
+                        executable: o
+                            .get("executable")
+                            .map(|v| {
+                                serde_json::from_value(v.clone()).map_err(|e| {
+                                    Error::engine(format!("invalid executable declaration: {e}"))
+                                })
+                            })
+                            .transpose()?,
                     })
                 })
                 .collect::<Result<Vec<OperationDescriptor>>>()?,

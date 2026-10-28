@@ -32,28 +32,31 @@ fn vocabulary() -> Vec<Vocabulary> {
     vec![Vocabulary {
         id: "priority".into(),
         reference: "rec:priority".into(),
-        evidence: json!({"revision":"fixture-v1"}),
-        required_anchors: vec!["vocab-anchor".into()],
+        source: source(v2::Section::Vocabularies, "priority", None),
         values: vec![
             VocabularyValue {
+                source: source(v2::Section::VocabularyValues, "p1", None),
                 id: "p1".into(),
                 value: "high".into(),
                 status: "active".into(),
                 alias_of: None,
             },
             VocabularyValue {
+                source: source(v2::Section::VocabularyValues, "p2", None),
                 id: "p2".into(),
                 value: "urgent".into(),
                 status: "active".into(),
                 alias_of: Some("p1".into()),
             },
             VocabularyValue {
+                source: source(v2::Section::VocabularyValues, "p3", None),
                 id: "p3".into(),
                 value: "low".into(),
                 status: "deprecated".into(),
                 alias_of: None,
             },
             VocabularyValue {
+                source: source(v2::Section::VocabularyValues, "p4", None),
                 id: "p4".into(),
                 value: "maybe".into(),
                 status: "proposed".into(),
@@ -72,6 +75,19 @@ fn input<'a>(rows: &'a [SchemaConfigRow], vocabs: &'a [Vocabulary], keys: &[&str
         home: "H",
         selection: Selection::Keys(keys.iter().map(|s| s.to_string()).collect()),
         schema: rows,
+        schema_sources: rows
+            .iter()
+            .map(|r| {
+                (
+                    r.id.clone(),
+                    source(
+                        v2::Section::SchemaConfig,
+                        &r.id,
+                        r.applies_to_collection_id.as_deref(),
+                    ),
+                )
+            })
+            .collect(),
         vocabularies: vocabs,
     }
 }
@@ -113,12 +129,28 @@ fn text(s: &str) -> rusqlite::types::Value {
 #[test]
 fn facet_compiler_text_sql_golden_and_portable_contract() {
     let proposal = run(input(&schema(), &[], &["area"])).unwrap();
+    if std::env::var_os("UPDATE_NAMED_FACET_FIXTURES").is_some() {
+        std::fs::write(
+            "src/query/generated_facets/fixtures/area.sql",
+            format!("{}\n", proposal.sql),
+        )
+        .unwrap();
+        std::fs::write(
+            "src/query/generated_facets/fixtures/area.manifest.json",
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&proposal.manifest).unwrap()
+            ),
+        )
+        .unwrap();
+        return;
+    }
     assert_eq!(
         proposal.sql.trim(),
         include_str!("fixtures/area.sql").trim()
     );
     assert_eq!(
-        proposal.manifest,
+        serde_json::to_value(&proposal.manifest).unwrap(),
         serde_json::from_str::<Value>(include_str!("fixtures/area.manifest.json")).unwrap()
     );
     assert_eq!(
@@ -126,12 +158,13 @@ fn facet_compiler_text_sql_golden_and_portable_contract() {
         "Area; raw stored text; original JSON type unspecified"
     );
     assert_eq!(
-        proposal.manifest["declarations"],
+        declarations(&proposal),
         json!({"area":{"description":"Area"}})
     );
+    assert_eq!(proposal.manifest.slots[0].fragments.len(), 1);
     assert_eq!(
-        proposal.manifest["context_evidence"],
-        json!([{"id":"base","layer":"pack","home":null,"lineage":"fixture-source-revision","created_at":"2026-10-26T00:00:00Z","shape_key":"WorkItem","selected":{"area":{"description":"Area"}}}])
+        proposal.manifest.sources[proposal.manifest.slots[0].fragments[0].source].row_id,
+        "base"
     );
     super::super::sql::validate(&proposal.sql).unwrap();
     let mut columns: Vec<_> = proposal.columns.keys().cloned().collect();
@@ -149,7 +182,10 @@ fn facet_compiler_text_sql_golden_and_portable_contract() {
         proposal.output["schema_sha256"],
         digest(&proposal.output["columns"])
     );
-    assert_eq!(proposal.manifest_sha256, digest(&proposal.manifest));
+    assert_eq!(
+        proposal.manifest_sha256,
+        digest(&serde_json::to_value(&proposal.manifest).unwrap())
+    );
     assert_eq!(
         proposal.relations.keys().collect::<Vec<_>>(),
         vec!["facet_values", "records"]
@@ -185,10 +221,11 @@ fn facet_compiler_deterministic_rows_maps_and_frozen_vocabulary() {
         vec![
             rusqlite::types::Value::Null,
             text("future"),
-            text("invalid")
+            text("unclassified")
         ]
     );
     vocabs[0].values.push(VocabularyValue {
+        source: source(v2::Section::VocabularyValues, "p5", None),
         id: "p5".into(),
         value: "future".into(),
         status: "active".into(),
@@ -200,7 +237,7 @@ fn facet_compiler_deterministic_rows_maps_and_frozen_vocabulary() {
     assert_eq!(cells(&db, &new, "one", &["priority"]), vec![text("future")]);
     assert_eq!(
         cells(&db, &p, "one", &["priority__status"]),
-        vec![text("invalid")]
+        vec![text("unclassified")]
     );
 }
 #[test]
@@ -216,7 +253,7 @@ fn facet_compiler_selected_absence_overrides_and_all_fields() {
     let mut all = input(&rows, &vocabs, &[]);
     all.selection = Selection::All;
     let all = run(all).unwrap();
-    assert!(all.manifest["declarations"].get("unrelated").is_some());
+    assert!(declarations(&all).get("unrelated").is_some());
     rows.push(row(
         "override",
         "user",
@@ -226,11 +263,8 @@ fn facet_compiler_selected_absence_overrides_and_all_fields() {
     let q = run(input(&rows, &[], &["area"])).unwrap();
     assert_eq!(p.name, q.name);
     assert_ne!(p.manifest_sha256, q.manifest_sha256);
-    assert_eq!(
-        p.manifest["declarations"]["area"],
-        json!({"description":"Area"})
-    );
-    assert_eq!(q.manifest["declarations"]["area"], json!({"type":"number"}));
+    assert_eq!(declarations(&p)["area"], json!({"description":"Area"}));
+    assert_eq!(declarations(&q)["area"], json!({"type":"number"}));
     assert_eq!(
         run(input(&rows, &[], &["absent"])).unwrap_err(),
         CompileError::MissingDeclaration("absent".into())
@@ -258,10 +292,7 @@ fn facet_compiler_eight_slot_precedence_and_direct_home_membership() {
         ));
     }
     let p = run(input(&rows, &[], &["area"])).unwrap();
-    assert_eq!(
-        p.manifest["declarations"]["area"],
-        json!({"description":"slot7"})
-    );
+    assert_eq!(declarations(&p)["area"], json!({"description":"slot7"}));
     let db = database();
     let count: i64 = db
         .query_row(&format!("SELECT count(*) FROM ({})", p.sql), [], |r| {
@@ -351,8 +382,8 @@ fn facet_compiler_vocabulary_alias_status_and_reference_conflicts() {
         ("urgent", None, Some("high"), "valid"),
         ("low", Some("priority"), Some("low"), "valid"),
         ("high", Some("rec:other"), None, "invalid"),
-        ("maybe", None, None, "invalid"),
-        ("unknown", None, None, "invalid"),
+        ("maybe", None, None, "unclassified"),
+        ("unknown", None, None, "unclassified"),
     ] {
         db.execute(
             "INSERT OR REPLACE INTO facet_values VALUES('one','priority',?1,NULL,?2)",
@@ -401,6 +432,17 @@ fn facet_compiler_refuses_unsupported_malformed_and_ambiguous_inputs() {
     rows.push(rows[0].clone());
     assert!(run(input(&rows, &[], &["area"])).is_err());
     assert!(run(input(&schema(), &[], &["priority"])).is_err());
+    let long = "v".repeat(128);
+    let mut rows = schema();
+    rows[1].data["shapes"]["WorkItem:task"]["facets"]["priority"]["vocab_ref"] = json!(long);
+    let mut vocabs = vocabulary();
+    vocabs[0].id = long.clone();
+    vocabs[0].reference = long.clone();
+    vocabs[0].source = source(v2::Section::Vocabularies, &long, None);
+    assert!(
+        run(input(&rows, &vocabs, &["priority"])).is_ok(),
+        "a 128-byte bare reference need not gain a rec: prefix in the retained contract"
+    );
     assert!(run(input(&schema(), &[], &["lifecycle"])).is_err());
 }
 #[test]
@@ -439,6 +481,7 @@ fn facet_compiler_budgets_deadline_and_structure_are_bounded() {
     let mut vocab = vocabulary();
     vocab[0].values = (0..64)
         .map(|n| VocabularyValue {
+            source: source(v2::Section::VocabularyValues, &format!("p{n}"), None),
             id: format!("p{n}"),
             value: format!("{n:03}{}", "x".repeat(509)),
             status: "active".into(),
@@ -531,10 +574,7 @@ fn facet_compiler_missing_facets_map_is_empty_but_present_nonobject_refuses() {
         json!({"shapes":{"WorkItem:task":{"description":"Only metadata"}}}),
     ));
     let p = run(input(&rows, &[], &["area"])).unwrap();
-    assert_eq!(
-        p.manifest["declarations"]["area"],
-        json!({"description":"Area"})
-    );
+    assert_eq!(declarations(&p)["area"], json!({"description":"Area"}));
     for invalid in [Value::Null, json!(false), json!([]), json!("facets")] {
         rows.last_mut().unwrap().data["shapes"]["WorkItem:task"]["facets"] = invalid;
         assert_eq!(
@@ -549,19 +589,18 @@ fn facet_compiler_retains_governance_even_when_selected_keys_are_inherited() {
     let mut rows = schema();
     rows[1].data = json!({"shapes":{"WorkItem:task":{"description":"Governs direct members"}}});
     let p = run(input(&rows, &[], &["area"])).unwrap();
-    let basis = &p.manifest["governance_basis"];
+    let basis = serde_json::to_value(&p.manifest.governance_basis).unwrap();
     assert_eq!(basis.as_array().unwrap().len(), 1);
-    assert_eq!(
-        basis[0],
-        json!({"id":"local","layer":"user","home":"H",
-        "lineage":"fixture-source-revision","created_at":"2026-10-26T00:00:00Z",
-        "shape_key":"WorkItem:task","context":{"type":"WorkItem","kind":"task","logical_home":"H"}})
-    );
-    assert!(p.manifest["context_evidence"]
-        .as_array()
-        .unwrap()
+    let row = &p.manifest.governance_basis[0];
+    assert_eq!(p.manifest.sources[row.source].row_id, "local");
+    assert_eq!(row.shape_key, "WorkItem:task");
+    assert_eq!(row.lineage.as_deref(), Some("fixture-source-revision"));
+    assert!(p
+        .manifest
+        .slots
         .iter()
-        .all(|v| v["id"] != "local"));
+        .flat_map(|s| &s.fragments)
+        .all(|f| p.manifest.sources[f.source].row_id != "local"));
     rows.reverse();
     assert_eq!(
         p.manifest_sha256,
@@ -572,5 +611,80 @@ fn facet_compiler_retains_governance_even_when_selected_keys_are_inherited() {
         run(input(&rows, &[], &["area"])).unwrap_err(),
         CompileError::Invalid("home has no governing declaration")
     );
-    assert_eq!(p.manifest["governance_basis"][0]["id"], "local");
+    assert_eq!(
+        p.manifest.sources[p.manifest.governance_basis[0].source].row_id,
+        "local"
+    );
+}
+
+fn source(section: v2::Section, id: &str, anchor: Option<&str>) -> v2::Source {
+    v2::Source {
+        section,
+        row_id: id.into(),
+        source_id: json!([id]).to_string(),
+        origin: "fixture".into(),
+        event_id: uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, id.as_bytes()).to_string(),
+        event_sha256: "0".repeat(64),
+        anchor: anchor.map(str::to_owned),
+    }
+}
+fn declarations(p: &Proposal) -> Value {
+    let mut output = serde_json::Map::new();
+    for f in p.manifest.slots.iter().flat_map(|s| &s.fragments) {
+        let mut decl = serde_json::to_value(&f.decl).unwrap();
+        decl.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+        output.insert(f.key.clone(), decl);
+    }
+    Value::Object(output)
+}
+#[test]
+fn facet_compiler_explicit_null_refuses_but_absent_fragment_preserves_global() {
+    let mut rows = schema();
+    assert!(run(input(&rows, &[], &["area"])).is_ok());
+    rows[1].data["shapes"]["WorkItem:task"]["facets"]["area"] = Value::Null;
+    assert_eq!(
+        run(input(&rows, &[], &["area"])).unwrap_err(),
+        CompileError::Invalid("explicit declaration must be object")
+    );
+    rows[0].data["shapes"]["WorkItem"]["facets"]["area"] = Value::Null;
+    rows[1].data["shapes"]["WorkItem:task"]["facets"]["area"] = json!({});
+    assert!(
+        run(input(&rows, &[], &["area"])).is_err(),
+        "an explicit null is refused even if later replaced"
+    );
+}
+
+#[test]
+fn facet_compiler_boolean_unknowns_and_deprecated_alias_chains_are_explicit() {
+    let mut vocab = vocabulary();
+    vocab[0].values[1].alias_of = Some("p3".into()); // canonical token is deprecated, still usable.
+    let p = run(input(&schema(), &vocab, &["priority"])).unwrap();
+    assert_eq!(p.output["columns"][5]["type"], "boolean");
+    assert_eq!(p.output["columns"][7]["type"], "boolean");
+    assert_eq!(p.output["columns"][5]["nullable"], true);
+    assert!(matches!(
+        p.manifest.vocabularies[0]
+            .values
+            .iter()
+            .find(|v| v.id == "p3")
+            .unwrap()
+            .status,
+        v2::Status::Deprecated
+    ));
+    let db = database();
+    db.execute_batch("UPDATE records SET archived=NULL,is_current=2 WHERE id='one'; INSERT INTO facet_values VALUES('one','priority','urgent',NULL,NULL);").unwrap();
+    assert_eq!(
+        cells(
+            &db,
+            &p,
+            "one",
+            &["archived", "is_current", "priority", "priority__raw"]
+        ),
+        vec![
+            rusqlite::types::Value::Null,
+            rusqlite::types::Value::Null,
+            text("low"),
+            text("urgent")
+        ]
+    );
 }

@@ -119,7 +119,9 @@ pub fn verify_package_payload(
     })
 }
 
-/// Install one immutable package revision inside the caller's transaction.
+/// Store one structurally valid immutable revision inside the caller's transaction.
+/// Live provider availability/admission is owned by kernel::install_package_as;
+/// retained reads and replay remain independent of this binary's runtime set.
 ///
 /// Validates the manifest, installs every embedded definition through the
 /// registry seam, then appends the single package-installed event. Exact

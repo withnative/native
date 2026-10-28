@@ -38,7 +38,7 @@ async fn proof(db: &Db) -> k::app_installs::VerifiedFrozenApps {
         )
     }
 }
-async fn fixture(declaration: &Value) -> (Fixture, Db, super::super::super::Report) {
+pub(super) async fn fixture(declaration: &Value) -> (Fixture, Db, super::super::super::Report) {
     fixture_with(declaration, None, 5).await
 }
 async fn fixture_with(
@@ -752,6 +752,17 @@ async fn hosted_review_with_format(format: u32) {
         )
         .await
         .unwrap();
+        if cfg!(feature = "package-cel-dev") {
+            assert_eq!(
+                list["development_package_operations"],
+                "native.package-cel-dev.reads/1"
+            );
+        } else {
+            assert!(
+                list.get("development_package_operations").is_none(),
+                "shipping v2 must not offer development bridge admission"
+            );
+        }
         assert_eq!(
             list["installs"][0]["launch_binding"]["reason"],
             "readopt_required_on_v2"

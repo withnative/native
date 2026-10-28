@@ -21,7 +21,7 @@ The direct query flag is not part of saved-query v0.2 and rejects non-record ter
 Exact compact UTF-8 `result.tools` descriptor arrays:
 
 - `focused`: 27 tools, 71592 bytes
-- `complete`: 84 tools, 212737 bytes
+- `complete`: 84 tools, 212728 bytes
 
 ## Complete production registry
 
@@ -64,7 +64,7 @@ Exact compact UTF-8 `result.tools` descriptor arrays:
 | `manage_messages` | `messaging` | yes | no | yes | `atomicity` | 5579 |
 | `manage_participants` | `messaging` | no | no | yes | `atomicity` | 2050 |
 | `manage_interventions` | `messaging` | no | no | yes | `atomicity` | 1553 |
-| `manage_named_views` | `records` | no | no | yes | `atomicity` | 2990 |
+| `manage_named_views` | `records` | no | no | yes | `atomicity` | 2981 |
 | `instantiate_artifact` | `artifacts` | no | no | yes | `atomicity` | 1504 |
 | `manage_renderer_binding` | `artifacts` | no | no | yes | `correctness-under-ignorance` | 1585 |
 | `manage_mdx_modules` | `artifacts` | no | no | yes | `atomicity` | 1394 |

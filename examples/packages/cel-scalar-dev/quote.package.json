@@ -1,0 +1,46 @@
+{
+  "format": "native.package-manifest@1",
+  "namespace": "example.sales",
+  "name": "quote",
+  "version": 1,
+  "definitions": [
+    {
+      "family": "example.sales.quote",
+      "version": 1,
+      "artifact_bytes": "{\n  \"family\": \"example.sales.quote\",\n  \"version\": 1,\n  \"interpreter\": \"native.defn/3\",\n  \"primary_type\": \"Quote\",\n  \"kinds\": [\n    {\n      \"token\": \"quote\",\n      \"description\": \"Independent scalar computation example.\",\n      \"maturity\": \"current\",\n      \"identity\": {\n        \"mode\": \"record\"\n      },\n      \"fields\": [\n        {\n          \"name\": \"inputs_json\",\n          \"type\": \"text\",\n          \"required\": true,\n          \"description\": \"Closed JSON scalar bindings for the operation.\"\n        }\n      ],\n      \"links\": []\n    }\n  ]\n}\n",
+      "digest": "221594d506800b0a298a182a8a5fc8275541eb49328121513db69ff98f5c3b83"
+    }
+  ],
+  "declared_reads": [
+    "record:view"
+  ],
+  "operations": [
+    {
+      "name": "compute",
+      "description": "Compute a discounted quote.",
+      "provider": "host.cel-scalar-dev/1",
+      "family": "example.sales.quote",
+      "kind": "quote",
+      "source_field": "inputs_json",
+      "reads": [
+        "record:view"
+      ],
+      "effects": [],
+      "executable": {
+        "language": "cel-subset@1",
+        "profile": "native.cel-scalar-dev/1",
+        "expression": "subtotal * (100 - discount_pct) / 100",
+        "bindings": [
+          {
+            "name": "subtotal",
+            "type": "int"
+          },
+          {
+            "name": "discount_pct",
+            "type": "int"
+          }
+        ]
+      }
+    }
+  ]
+}

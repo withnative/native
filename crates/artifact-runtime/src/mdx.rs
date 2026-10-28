@@ -1785,8 +1785,11 @@ fn validate_governed_sql_execution_receipt(
     receipt: &Value,
     relation: &Value,
 ) -> Result<(), Failure> {
-    let pinned = receipt.get("version").and_then(Value::as_str)
-        == Some("native.governed-sql-port-receipt.v2");
+    let generated = receipt.get("version").and_then(Value::as_str)
+        == Some("native.governed-sql-port-receipt.v3");
+    let pinned = generated
+        || receipt.get("version").and_then(Value::as_str)
+            == Some("native.governed-sql-port-receipt.v2");
     let mut fields = vec![
         "version",
         "observed_at",
@@ -1816,7 +1819,11 @@ fn validate_governed_sql_execution_receipt(
         }
         let provenance = exact_input_object(
             &receipt["view_provenance"],
-            &["roots", "closure_digest"],
+            if generated {
+                &["roots", "closure_digest", "generated_diagnostics"]
+            } else {
+                &["roots", "closure_digest"]
+            },
             "view provenance",
         )?;
         if !digest(&provenance["closure_digest"]) {
@@ -1867,6 +1874,46 @@ fn validate_governed_sql_execution_receipt(
                 || !digest(&pin["schema_sha256"])
             {
                 return Err(input_failure("view exact pin is invalid"));
+            }
+        }
+    }
+    if generated {
+        let provenance = &receipt["view_provenance"];
+        let diagnostics = provenance["generated_diagnostics"]
+            .as_array()
+            .filter(|d| !d.is_empty() && d.len() <= 8)
+            .ok_or_else(|| input_failure("generated root diagnostics are invalid"))?;
+        let roots = provenance["roots"]
+            .as_object()
+            .expect("validated pinned roots");
+        let mut previous: Option<&str> = None;
+        for diagnostic in diagnostics {
+            let d = exact_input_object(
+                diagnostic,
+                &["root", "drift", "unknown_reason"],
+                "generated root diagnostic",
+            )?;
+            let root = d["root"]
+                .as_str()
+                .filter(|r| {
+                    roots.contains_key(*r) && previous.is_none_or(|p| p.as_bytes() < r.as_bytes())
+                })
+                .ok_or_else(|| {
+                    input_failure("generated root diagnostic order or root is invalid")
+                })?;
+            previous = Some(root);
+            match d["drift"].as_str() {
+                Some("unchanged" | "changed") if d["unknown_reason"].is_null() => {}
+                Some("unknown")
+                    if matches!(
+                        d["unknown_reason"].as_str(),
+                        Some("budget" | "unsupported" | "integrity")
+                    ) => {}
+                _ => {
+                    return Err(input_failure(
+                        "generated root diagnostic state or reason is invalid",
+                    ))
+                }
             }
         }
     }
@@ -4335,6 +4382,104 @@ const Child=()=>globalThis.__nativeBridge.jsx("BarChart",{label:"Clone",data:{..
         );
         assert!(failure.message.contains(&expected), "{failure:?}");
         assert!(failure.message.contains(&"0".repeat(64)), "{failure:?}");
+    }
+
+    #[test]
+    fn generated_receipt_v3_root_summaries_are_closed_ordered_and_bounded() {
+        let mut valid = governed_relation_envelope(false, "complete");
+        let receipt = &mut valid["source"]["execution_receipt"];
+        receipt["version"] = json!("native.governed-sql-port-receipt.v3");
+        receipt["query_sha256"] = json!("a".repeat(64));
+        receipt["view_provenance"] = json!({"roots":{"view_alias":{"view_id":"native.named-view:bearer","revision_id":"11111111-1111-4111-8111-111111111111","definition_sha256":"b".repeat(64),"schema_sha256":"c".repeat(64)}},"closure_digest":"d".repeat(64),"generated_diagnostics":[{"root":"view_alias","drift":"unknown","unknown_reason":"budget"}]});
+        validate_relation_envelope(&valid).unwrap();
+        for reason in ["budget", "unsupported", "integrity"] {
+            let mut v = valid.clone();
+            v["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"][0]
+                ["unknown_reason"] = json!(reason);
+            validate_relation_envelope(&v).unwrap();
+        }
+        let mut invalid = Vec::new();
+        for diagnostics in [
+            json!([]),
+            json!(vec![
+                valid["source"]["execution_receipt"]["view_provenance"]
+                    ["generated_diagnostics"][0]
+                    .clone();
+                9
+            ]),
+            json!([{"root":"view_absent","drift":"unchanged","unknown_reason":null}]),
+        ] {
+            let mut v = valid.clone();
+            v["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"] =
+                diagnostics;
+            invalid.push(v);
+        }
+        for (state, reason) in [
+            ("unknown", Value::Null),
+            ("unknown", json!("new-label")),
+            ("changed", json!("budget")),
+            ("unchanged", json!("integrity")),
+            ("wrong", Value::Null),
+        ] {
+            let mut v = valid.clone();
+            let d = &mut v["source"]["execution_receipt"]["view_provenance"]
+                ["generated_diagnostics"][0];
+            d["drift"] = json!(state);
+            d["unknown_reason"] = reason;
+            invalid.push(v);
+        }
+        let mut v = valid.clone();
+        v["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"][0]["extra"] =
+            json!(true);
+        invalid.push(v);
+        let mut v = valid.clone();
+        v["source"]["execution_receipt"]["view_provenance"]["closure"] = json!([]);
+        invalid.push(v);
+        for v in invalid {
+            assert!(validate_relation_envelope(&v).is_err(), "{v}");
+        }
+        // Preserve the exact older shapes: v2 does not accept v3's extension;
+        // removing it restores valid v2. Static v1 is independently unchanged.
+        let mut v2 = valid.clone();
+        v2["source"]["execution_receipt"]["version"] = json!("native.governed-sql-port-receipt.v2");
+        assert!(validate_relation_envelope(&v2).is_err());
+        v2["source"]["execution_receipt"]["view_provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("generated_diagnostics");
+        validate_relation_envelope(&v2).unwrap();
+        validate_relation_envelope(&governed_relation_envelope(false, "complete")).unwrap();
+        let mut roots = Map::new();
+        let mut diagnostics = Vec::new();
+        for n in 0..8 {
+            let name = format!("view_{n}{}", "a".repeat(122));
+            assert_eq!(name.len(), 128);
+            roots.insert(name.clone(),json!({"view_id":format!("native.named-view:{}","b".repeat(142)),"revision_id":format!("{n:08x}-0000-4000-8000-000000000000"),"definition_sha256":"b".repeat(64),"schema_sha256":"c".repeat(64)}));
+            diagnostics.push(json!({"root":name,"drift":"unknown","unknown_reason":"unsupported"}));
+        }
+        let p = &mut valid["source"]["execution_receipt"]["view_provenance"];
+        p["roots"] = Value::Object(roots);
+        p["generated_diagnostics"] = json!(diagnostics);
+        validate_relation_envelope(&valid).unwrap();
+        let provenance_bytes = crate::mdx_v2::canonical_json_bytes(
+            &valid["source"]["execution_receipt"]["view_provenance"],
+        )
+        .len();
+        assert_eq!(provenance_bytes, 5865);
+        let bytes = crate::mdx_v2::canonical_json_bytes(&valid).len();
+        assert!(bytes < MAX_INPUT_BYTES);
+        eprintln!("max root-only v3 provenance={provenance_bytes} envelope={bytes} bytes; input cap={MAX_INPUT_BYTES}");
+        let mut reversed = valid.clone();
+        reversed["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"]
+            .as_array_mut()
+            .unwrap()
+            .reverse();
+        assert!(validate_relation_envelope(&reversed).is_err());
+        let mut duplicate = valid;
+        duplicate["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"][1] =
+            duplicate["source"]["execution_receipt"]["view_provenance"]["generated_diagnostics"][0]
+                .clone();
+        assert!(validate_relation_envelope(&duplicate).is_err());
     }
 
     #[test]

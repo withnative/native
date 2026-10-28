@@ -199,6 +199,32 @@ async fn open_current_read_only(path: &Path, require_retained_wal: bool) -> Resu
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub async fn open_marked_v2_database_read_only_at(path: &Path) -> Result<Db> {
     let (path, options) = literal_options(path, false)?;
+    open_marked_v2_with_options(path, options).await
+}
+
+/// Developer export only. The operator owns a quiescent, self-contained copy;
+/// immutable mode is never appropriate for an active writer or retained WAL.
+#[cfg(all(feature = "v2-kernel-probe", any(test, feature = "dev-tools")))]
+pub(crate) async fn open_offline_v2_export_at(path: &Path) -> Result<Db> {
+    let (path, options) = literal_options(path, false)?;
+    let mut header = [0_u8; 20];
+    readable_regular_file(&path)?.read_exact(&mut header)?;
+    if header[18..20] != [1, 1] {
+        return Err(refusal(
+            "export requires a closed rollback-journal copy, not WAL",
+        ));
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        match std::fs::symlink_metadata(sidecar(&path, suffix)) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(refusal("export refuses journal/sidecar files")),
+        }
+    }
+    open_marked_v2_with_options(path, options.immutable(true)).await
+}
+
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+async fn open_marked_v2_with_options(path: PathBuf, options: SqliteConnectOptions) -> Result<Db> {
     let mut connection = SqliteConnection::connect_with(&options).await?;
     let marker: Result<i64> = sqlx::query_scalar("PRAGMA application_id")
         .fetch_one(&mut connection)

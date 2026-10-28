@@ -12,7 +12,7 @@ pub(crate) const V3_SOURCE_SHA: &str =
 pub(crate) const V1: Entry = Entry {
     pins: v1::pins,
     package: v1::package,
-    source: include_str!("relates_to_v1.rs"),
+    source: include_str!("relates_to_v1.pre-cel.rs.txt"),
     source_sha256: "2958fe1ea0d8ee573141de2a87778bb9ea3db6ab381b27ae5fc4249e86a02bc9",
     validate_recorded: crate::kernel::relates_to_port::validate_recorded,
     admit: crate::kernel::relates_to_port::admit_recorded,
@@ -24,7 +24,7 @@ pub(crate) const V1: Entry = Entry {
 pub(crate) const V2: Entry = Entry {
     pins: v2::pins,
     package: v2::package,
-    source: include_str!("relates_to_v2.rs"),
+    source: include_str!("relates_to_v2.pre-cel.rs.txt"),
     source_sha256: "09989e90e55b8a65987e043cc520e529226b34aae5e6c4b29f693e672a1d95c2",
     validate_recorded: crate::kernel::relates_to_port::validate_recorded,
     admit: crate::kernel::relates_to_port::admit_recorded,
@@ -36,7 +36,7 @@ pub(crate) const V2: Entry = Entry {
 pub(crate) const V3: Entry = Entry {
     pins: v3::pins,
     package: v3::package,
-    source: include_str!("relates_to_v3.rs"),
+    source: include_str!("relates_to_v3.pre-cel.rs.txt"),
     source_sha256: V3_SOURCE_SHA,
     validate_recorded: crate::kernel::relates_to_port::validate_recorded,
     admit: crate::kernel::relates_to_port::admit_recorded,

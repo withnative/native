@@ -1,0 +1,50 @@
+{
+  "format": "native.package-manifest@1",
+  "namespace": "example.shipping",
+  "name": "dispatch",
+  "version": 1,
+  "definitions": [
+    {
+      "family": "example.shipping.dispatch",
+      "version": 1,
+      "artifact_bytes": "{\n  \"family\": \"example.shipping.dispatch\",\n  \"version\": 1,\n  \"interpreter\": \"native.defn/3\",\n  \"primary_type\": \"Dispatch\",\n  \"kinds\": [\n    {\n      \"token\": \"dispatch\",\n      \"description\": \"Independent scalar computation example.\",\n      \"maturity\": \"current\",\n      \"identity\": {\n        \"mode\": \"record\"\n      },\n      \"fields\": [\n        {\n          \"name\": \"inputs_json\",\n          \"type\": \"text\",\n          \"required\": true,\n          \"description\": \"Closed JSON scalar bindings for the operation.\"\n        }\n      ],\n      \"links\": []\n    }\n  ]\n}\n",
+      "digest": "a1ed3ca64d9e0af1707c655ac9625301ae9805019cc9eadb8d87e7e62e1a272e"
+    }
+  ],
+  "declared_reads": [
+    "record:view"
+  ],
+  "operations": [
+    {
+      "name": "compute",
+      "description": "Check prepaid parcel dispatch eligibility.",
+      "provider": "host.cel-scalar-dev/1",
+      "family": "example.shipping.dispatch",
+      "kind": "dispatch",
+      "source_field": "inputs_json",
+      "reads": [
+        "record:view"
+      ],
+      "effects": [],
+      "executable": {
+        "language": "cel-subset@1",
+        "profile": "native.cel-scalar-dev/1",
+        "expression": "country == \"GB\" && weight_kg <= 20.0 && prepaid",
+        "bindings": [
+          {
+            "name": "country",
+            "type": "string"
+          },
+          {
+            "name": "weight_kg",
+            "type": "double"
+          },
+          {
+            "name": "prepaid",
+            "type": "bool"
+          }
+        ]
+      }
+    }
+  ]
+}

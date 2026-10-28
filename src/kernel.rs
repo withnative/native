@@ -5563,6 +5563,9 @@ pub async fn describe_world_as(db: &Db, principal_id: &str) -> Result<serde_json
             continue;
         };
         for operation in &manifest.operations {
+            if !operation.available_in_build() {
+                continue;
+            }
             let key = (
                 scope_home.clone(),
                 namespace.clone(),
@@ -5574,11 +5577,7 @@ pub async fn describe_world_as(db: &Db, principal_id: &str) -> Result<serde_json
             if !seen.insert(key) {
                 continue;
             }
-            let mut descriptor = serde_json::json!({
-                "name":operation.name,"description":operation.description,"provider":operation.provider,
-                "family":operation.family,"kind":operation.kind,"source_field":operation.source_field,
-                "reads":operation.reads,"effects":operation.effects,
-            });
+            let mut descriptor = crate::package_operations::operation_json(operation);
             if operation.targets_any_record() {
                 let object = descriptor.as_object_mut().expect("descriptor object");
                 for selector in ["family", "kind", "source_field"] {
@@ -5713,6 +5712,26 @@ pub async fn install_package_as(
     actor_principal_id: &str,
     manifest: &crate::package_manifest::PackageManifest,
 ) -> Result<crate::package_manifest::ManifestIdentity> {
+    if manifest
+        .operations
+        .iter()
+        .any(|operation| operation.executable.is_some())
+    {
+        // Refuse unauthorized callers before parsing expressions or taking
+        // evaluator slots. Close the read snapshot before off-runtime work;
+        // the writer transaction below independently rechecks authority.
+        let mut read = db.pool().begin().await?;
+        let authority = kernel_require(
+            &mut read,
+            actor_principal_id,
+            KERNEL_ROOT_ID,
+            Capability::Manage,
+        )
+        .await;
+        read.rollback().await?;
+        authority?;
+        crate::package_cel_dev::admit(manifest).await?;
+    }
     let mut tx = begin_write(db.write_pool()).await?;
     kernel_require(
         &mut tx,
@@ -5721,6 +5740,7 @@ pub async fn install_package_as(
         Capability::Manage,
     )
     .await?;
+    manifest.require_available_operations()?;
     let mut acts = crate::act::ActAllocation::new();
     let outcome = crate::meta::package::install_package_in(
         &mut tx,
@@ -5782,6 +5802,9 @@ pub async fn adopt_package_at(
         return Err(Error::engine(HIDDEN_OR_MISSING));
     }
     kernel_require(&mut tx, actor_principal_id, scope_home, Capability::Manage).await?;
+    if selected.is_some() {
+        manifest.require_available_operations()?;
+    }
     let stored = crate::meta::package::read_package_in(
         &mut tx,
         &manifest.namespace,
@@ -6221,6 +6244,43 @@ async fn resolve_effective_package_selection_before(
     }
 }
 
+/// Bounded home path for development discovery; shares activation's depth
+/// limit and refuses cycles/missing policy homes rather than returning partials.
+#[cfg(feature = "package-cel-dev")]
+pub(crate) async fn package_discovery_ancestors_in(
+    conn: &mut SqliteConnection,
+    home: &str,
+) -> Result<Vec<String>> {
+    let mut homes = Vec::new();
+    let mut next = Some(home.to_owned());
+    while let Some(home) = next {
+        if homes.len() > MAX_HOME_DEPTH || homes.contains(&home) {
+            return Err(Error::engine(HIDDEN_OR_MISSING));
+        }
+        next = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT parent_id FROM kernel_roots WHERE root_id=?",
+        )
+        .bind(&home)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| Error::engine(HIDDEN_OR_MISSING))?;
+        homes.push(home);
+    }
+    Ok(homes)
+}
+
+pub(crate) enum PackageActivation {
+    Missing,
+    Disabled,
+    Displaced(String),
+    Active(
+        Box<(
+            StoredPackageSelection,
+            crate::package_manifest::PackageManifest,
+        )>,
+    ),
+}
+
 /// Fail-closed activation gate for future execution (and present reads): a
 /// selection that is missing, tombstoned, or whose embedded definition pins
 /// were displaced by another package refuses instead of running against a
@@ -6236,11 +6296,27 @@ pub(crate) async fn require_package_active_in(
     StoredPackageSelection,
     crate::package_manifest::PackageManifest,
 )> {
-    let stored = resolve_effective_package_selection(conn, scope_home, namespace, name)
-        .await?
-        .ok_or_else(|| Error::engine("package is not adopted in this scope"))?;
+    match inspect_package_active_in(conn, scope_home, namespace, name).await? {
+        PackageActivation::Active(active) => Ok(*active),
+        PackageActivation::Missing => Err(Error::engine("package is not adopted in this scope")),
+        PackageActivation::Disabled => Err(Error::engine("package is disabled in this scope")),
+        PackageActivation::Displaced(message) => Err(Error::engine(message)),
+    }
+}
+
+pub(crate) async fn inspect_package_active_in(
+    conn: &mut SqliteConnection,
+    scope_home: &str,
+    namespace: &str,
+    name: &str,
+) -> Result<PackageActivation> {
+    let Some(stored) =
+        resolve_effective_package_selection(conn, scope_home, namespace, name).await?
+    else {
+        return Ok(PackageActivation::Missing);
+    };
     let Some(selection) = &stored.selected else {
-        return Err(Error::engine("package is disabled in this scope"));
+        return Ok(PackageActivation::Disabled);
     };
     let manifest = crate::meta::package::read_package_in(
         conn,
@@ -6258,13 +6334,13 @@ pub(crate) async fn require_package_active_in(
             Some(ScopedAdoption::Adopted(pin))
                 if pin.version == entry.version && pin.digest == entry.digest);
         if !matches {
-            return Err(Error::engine(format!(
+            return Ok(PackageActivation::Displaced(format!(
                 "package definition '{}@{}' was displaced; refusing closed",
                 entry.family, entry.version
             )));
         }
     }
-    Ok((stored, manifest))
+    Ok(PackageActivation::Active(Box::new((stored, manifest))))
 }
 
 /// Fallback view when no package manifest is known. Named and static: it

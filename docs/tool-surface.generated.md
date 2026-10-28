@@ -7,7 +7,7 @@ This inventory covers only the legacy transport that advertises each registered 
 **90 tools** are registered in the legacy complete surface; 78 have a text renderer. The legacy default complete profile advertises all of them. Focused and custom filtering are intentionally lossy: hidden tools can be undiscoverable and visible workflows can lose dependencies. Filtering does not change exact-name dispatch or authorization.
 
 - **focused**: 27 tools, 71592 compact UTF-8 bytes
-- **complete**: 90 tools, 225386 compact UTF-8 bytes
+- **complete**: 90 tools, 225377 compact UTF-8 bytes
 
 Totals are the exact compact JSON `result.tools` arrays. Per-tool bytes below are descriptor deltas before array commas/brackets.
 
@@ -18,9 +18,9 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 | Surface | Tools | Name/title | Tool descriptions | Schema structure | Schema annotations | App metadata | Envelope | Total |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | legacy ordinary focused | 27 | 592 | 10185 | 33330 | 27403 | 0 | 82 | 71592 |
-| legacy ordinary complete | 90 | 2243 | 39904 | 111677 | 70973 | 318 | 271 | 225386 |
+| legacy ordinary complete | 90 | 2243 | 39895 | 111677 | 70973 | 318 | 271 | 225377 |
 | legacy lens focused | 28 | 619 | 10556 | 33830 | 26054 | 0 | 85 | 71144 |
-| legacy lens complete | 90 | 2247 | 39902 | 112435 | 64645 | 318 | 271 | 219818 |
+| legacy lens complete | 90 | 2247 | 39893 | 112435 | 64645 | 318 | 271 | 219809 |
 
 ## Largest exact repetitions
 
@@ -107,7 +107,7 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 | `manage_messages` | messaging | atomicity | yes | 5579 | 5579 | yes | Direct/Collection send/read/classify/share; reactions/👍 ack; Inbox/destinations; awareness/routing/preferences. |
 | `manage_participants` | messaging | atomicity | — | 2050 | — | yes | Register, retire or list owner-only Entity/persona profiles. |
 | `manage_interventions` | messaging | atomicity | — | 1553 | — | yes | Get/query viewer-relative Message-rooted interventions, cancel one, or atomically deliver and resume a blocked Message using exact target-authored authority evidence. |
-| `manage_named_views` | records | atomicity | — | 2990 | — | — | Hosted v2 only; operations gated off by default. |
+| `manage_named_views` | records | atomicity | — | 2981 | — | — | Named views; hosted v2; gated off by default. |
 | `instantiate_artifact` | artifacts | atomicity | — | 1504 | — | yes | Copy one live artifact into a standalone governed Document kind:artifact, preserving its body, name (unless title overrides it), and governed runtime facet, with exactly one immediate-source instantiated_from edge. |
 | `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1585 | — | yes | Read, bind, or unbind the exact zero-or-one outgoing renders edge of a governed Document kind:artifact. |
 | `manage_mdx_modules` | artifacts | atomicity | — | 1394 | — | yes | Publish, inspect, deprecate, withdraw, or inspect reverse impact for immutable native.mdx.v2 module releases. |
@@ -166,7 +166,7 @@ Schema annotations are the recursively removed JSON Schema annotation keywords `
 Lens discovery overlays composite references and routing arguments, then adds the explicitly classified lens-only `materialize_record` capability. These are the actual lens `result.tools` bytes.
 
 - **focused**: 28 tools, 71144 compact UTF-8 bytes
-- **complete**: 90 tools, 219818 compact UTF-8 bytes
+- **complete**: 90 tools, 219809 compact UTF-8 bytes
 
 | Tool | Family | Admission | Focused | Complete bytes | Focused bytes |
 |---|---|---|---:|---:|---:|
@@ -206,7 +206,7 @@ Lens discovery overlays composite references and routing arguments, then adds th
 | `manage_messages` | messaging | atomicity | yes | 5488 | 5488 |
 | `manage_participants` | messaging | atomicity | — | 1983 | — |
 | `manage_interventions` | messaging | atomicity | — | 1462 | — |
-| `manage_named_views` | records | atomicity | — | 3062 | — |
+| `manage_named_views` | records | atomicity | — | 3053 | — |
 | `instantiate_artifact` | artifacts | atomicity | — | 1413 | — |
 | `manage_renderer_binding` | artifacts | correctness-under-ignorance | — | 1494 | — |
 | `manage_mdx_modules` | artifacts | atomicity | — | 1303 | — |

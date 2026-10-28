@@ -525,7 +525,7 @@ where
     .await
 }
 
-#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn append_and_project_kernel_hcp<T>(
     transaction: &mut T,
     event: &mut EventRow,

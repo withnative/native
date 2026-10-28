@@ -269,7 +269,13 @@ pub(crate) fn admit_kernel_v2<'a>(
                         | "unmark_no_longer_relevant"
                 )
             );
+        let package_read = cfg!(feature = "package-cel-dev")
+            && matches!(
+                operation,
+                "describe_package_operations" | "call_package_operation"
+            );
         if !messaging
+            && !package_read
             && !matches!(
                 operation,
                 "get_record"

@@ -11,12 +11,22 @@ pub(crate) mod closure;
 pub(crate) mod contract;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod details;
+#[cfg(all(feature = "v2-kernel-probe", any(test, feature = "dev-tools")))]
+pub mod export;
+#[cfg(feature = "v2-kernel-probe")]
+mod facet_resolver;
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) mod gate;
 #[cfg(feature = "v2-kernel-probe")]
-mod source_proof;
+pub(crate) mod generated;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod receipt;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod retained_facets;
+#[cfg(feature = "v2-kernel-probe")]
+pub(crate) mod source_proof;
 pub(crate) mod storage;
-mod v2;
+pub(crate) mod v2;
 pub(crate) use storage::load_prefix;
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub(crate) use storage::INDEX_DDL;
@@ -75,7 +85,7 @@ pub(crate) struct Revision {
 }
 
 impl Revision {
-    fn generated_name(&self) -> Option<String> {
+    pub(crate) fn generated_name(&self) -> Option<String> {
         if self.v != 2 {
             return None;
         }
@@ -103,14 +113,6 @@ impl Revision {
                 &value
             ))
         )
-    }
-
-    #[cfg(any(test, feature = "v2-kernel-probe"))]
-    fn validate(&self, event: &EventRow) -> Result<contract::Definition> {
-        if self.v != 1 {
-            return Err(invalid("view_revision_unavailable"));
-        }
-        self.validate_retained(event)
     }
 
     fn validate_retained(&self, event: &EventRow) -> Result<contract::Definition> {

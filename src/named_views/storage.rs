@@ -222,7 +222,7 @@ pub(crate) async fn admit_on(conn: &mut SqliteConnection, event: &EventRow) -> R
         .await?;
     let mut proposed = event.clone();
     proposed.local_seq = head + 1;
-    state.apply_new_on(conn, &proposed, deadline).await
+    state.apply_new_inner(conn, &proposed, deadline, true).await
 }
 
 /// Deliberately not a ReplayChecker: indexed historical identities and namespace
@@ -248,19 +248,39 @@ impl LiveNamespace {
         self.state.legacy
     }
     /// New effects validate their bounded direct/reference closure, never SQL.
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
     pub(crate) async fn apply_new_on(
         &mut self,
         conn: &mut SqliteConnection,
         event: &EventRow,
         deadline: Instant,
     ) -> Result<()> {
+        self.apply_new_inner(conn, event, deadline, false).await
+    }
+    async fn apply_new_inner(
+        &mut self,
+        conn: &mut SqliteConnection,
+        event: &EventRow,
+        deadline: Instant,
+        admission: bool,
+    ) -> Result<()> {
+        #[cfg(not(feature = "v2-kernel-probe"))]
+        let _ = admission;
         let mut pending = Vec::new();
         if event.event_type == REVISION {
             let revision: Revision = decode(event, MAX_CARRIER_BYTES)?;
-            if revision.v != 1 {
-                return Err(invalid("view_revision_unavailable"));
-            }
             let definition = revision.validate_retained(event)?;
+            #[cfg(feature = "v2-kernel-probe")]
+            if revision.v == 2 && (admission || super::generated::is_writer(conn).await?) {
+                if !super::generated::is_writer(conn).await? {
+                    return Err(invalid("generated admission requires enrolled writer"));
+                }
+                super::generated::require_certified(&revision)?;
+            }
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            if revision.v == 2 {
+                return Err(invalid("view_profile_unsupported"));
+            }
             pending.extend(definition.query.relations.values().filter_map(|d| match d {
                 contract::Dependency::View(p) => Some(p.clone()),
                 _ => None,
@@ -297,10 +317,20 @@ impl LiveNamespace {
             bytes += len;
             let reference = read_event(conn, &pin.revision_id, event.local_seq - 1).await?;
             let revision: Revision = decode(&reference, MAX_CARRIER_BYTES)?;
-            if revision.v != 1 {
-                return Err(invalid("view_revision_unavailable"));
+            let definition = revision
+                .validate_retained(&reference)
+                .map_err(|_| invalid("view_revision_unavailable"))?;
+            #[cfg(feature = "v2-kernel-probe")]
+            if revision.v == 2 && (admission || super::generated::is_writer(conn).await?) {
+                if !super::generated::is_writer(conn).await? {
+                    return Err(invalid("generated admission requires enrolled writer"));
+                }
+                super::generated::require_certified(&revision)?;
             }
-            let definition = revision.validate_retained(&reference)?;
+            #[cfg(not(feature = "v2-kernel-probe"))]
+            if revision.v == 2 {
+                return Err(invalid("view_profile_unsupported"));
+            }
             if pin.view_id != revision.view_id
                 || pin.definition_sha256 != revision.definition_sha256
                 || pin.schema_sha256 != definition.query.output.schema_sha256
@@ -390,7 +420,7 @@ pub(crate) async fn project_live(conn: &mut SqliteConnection, event: &EventRow) 
     #[cfg(not(feature = "v2-kernel-probe"))]
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut state = load_live(conn, event.local_seq - 1, deadline).await?;
-    state.apply_new_on(conn, event, deadline).await?;
+    state.apply_new_inner(conn, event, deadline, true).await?;
     verify_retained_sources_on(conn, event).await?;
     touch_metadata(conn, event).await
 }

@@ -73,6 +73,30 @@
         },
         {
           "kind": "tree",
+          "source": "crates/package-cel-wire"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/package-cel-guest"
+        },
+        {
+          "kind": "tree",
+          "source": "crates/package-cel-host"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/build-package-cel-guest.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/package-cel-guest-guard.py"
+        },
+        {
+          "kind": "file",
+          "source": "scripts/package-cel-guest-receipt.py"
+        },
+        {
+          "kind": "tree",
           "source": "crates/coedit-core-fixture"
         },
         {
@@ -178,6 +202,10 @@
         {
           "kind": "file",
           "source": "src/mcp/named_view_executor_tests.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/mcp/package_delivery_tests.rs"
         },
         {
           "kind": "file",
@@ -969,6 +997,18 @@
         },
         {
           "kind": "file",
+          "source": "src/package_cel_dev.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/package_cel_dev"
+        },
+        {
+          "kind": "tree",
+          "source": "examples/packages/cel-scalar-dev"
+        },
+        {
+          "kind": "file",
           "source": "src/definition_shape.rs"
         },
         {
@@ -1170,6 +1210,14 @@
         {
           "kind": "file",
           "source": "src/bin/native.rs"
+        },
+        {
+          "kind": "file",
+          "source": "src/bin/named_view_export.rs"
+        },
+        {
+          "kind": "tree",
+          "source": "src/bin/named_view_export"
         },
         {
           "kind": "file",

@@ -73,6 +73,8 @@ use crate::write_contention::WriteDomain;
 mod candidate_read_only;
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub use candidate_read_only::open_marked_v2_database_read_only_at;
+#[cfg(all(feature = "v2-kernel-probe", any(test, feature = "dev-tools")))]
+pub(crate) use candidate_read_only::open_offline_v2_export_at;
 pub use candidate_read_only::{
     open_current_database_read_only_at, open_current_database_wal_read_only_at,
 };

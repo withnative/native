@@ -1,0 +1,3648 @@
+{
+  "stage": 3,
+  "base_reviewed_stage2": "6f9be45b12f38eee76bdcca14a98d0b4e04baf42",
+  "source_digest": "283d491409015721edd5d0e0b0457142365f57795a37cdf450f439c5df285a7c",
+  "source_digest_algorithm": "sha256 of sorted relative-path + NUL + file-sha256 + LF",
+  "root_lock_sha256": "c3906e75c3e993a0af551dae58b991bbc0882b24739bd5af7c2818d6430223fb",
+  "all_existing_root_package_selections_preserved": true,
+  "added_packages": [
+    [
+      "addr2line",
+      "0.26.1"
+    ],
+    [
+      "arbitrary",
+      "1.5.0"
+    ],
+    [
+      "cobs",
+      "0.3.0"
+    ],
+    [
+      "cpp_demangle",
+      "0.5.1"
+    ],
+    [
+      "cranelift-assembler-x64",
+      "0.136.4"
+    ],
+    [
+      "cranelift-assembler-x64-meta",
+      "0.136.4"
+    ],
+    [
+      "cranelift-bforest",
+      "0.136.1"
+    ],
+    [
+      "cranelift-bitset",
+      "0.136.1"
+    ],
+    [
+      "cranelift-codegen",
+      "0.136.1"
+    ],
+    [
+      "cranelift-codegen-meta",
+      "0.136.1"
+    ],
+    [
+      "cranelift-codegen-shared",
+      "0.136.4"
+    ],
+    [
+      "cranelift-control",
+      "0.136.4"
+    ],
+    [
+      "cranelift-entity",
+      "0.136.1"
+    ],
+    [
+      "cranelift-frontend",
+      "0.136.1"
+    ],
+    [
+      "cranelift-isle",
+      "0.136.1"
+    ],
+    [
+      "cranelift-native",
+      "0.136.1"
+    ],
+    [
+      "cranelift-srcgen",
+      "0.136.4"
+    ],
+    [
+      "embedded-io",
+      "0.4.0"
+    ],
+    [
+      "embedded-io",
+      "0.6.1"
+    ],
+    [
+      "gimli",
+      "0.33.0"
+    ],
+    [
+      "leb128fmt",
+      "0.1.0"
+    ],
+    [
+      "mach2",
+      "0.6.0"
+    ],
+    [
+      "memfd",
+      "0.6.6"
+    ],
+    [
+      "native-package-cel-guest",
+      "0.1.0"
+    ],
+    [
+      "native-package-cel-host",
+      "0.1.0"
+    ],
+    [
+      "native-package-cel-wire",
+      "0.1.0"
+    ],
+    [
+      "object",
+      "0.40.0"
+    ],
+    [
+      "postcard",
+      "1.1.3"
+    ],
+    [
+      "pulley-interpreter",
+      "49.0.1"
+    ],
+    [
+      "pulley-macros",
+      "49.0.1"
+    ],
+    [
+      "regalloc2",
+      "0.15.2"
+    ],
+    [
+      "target-lexicon",
+      "0.13.5"
+    ],
+    [
+      "termcolor",
+      "1.4.1"
+    ],
+    [
+      "unicode-width",
+      "0.2.2"
+    ],
+    [
+      "wasm-encoder",
+      "0.258.3"
+    ],
+    [
+      "wasmparser",
+      "0.258.3"
+    ],
+    [
+      "wasmprinter",
+      "0.258.3"
+    ],
+    [
+      "wasmtime",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-environ",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-component-util",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-core",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-cranelift",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-fiber",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-jit-debug",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-jit-icache-coherence",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-unwinder",
+      "49.0.1"
+    ],
+    [
+      "wasmtime-internal-versioned-export-macros",
+      "49.0.1"
+    ],
+    [
+      "wast",
+      "258.0.3"
+    ],
+    [
+      "wat",
+      "1.258.3"
+    ]
+  ],
+  "guest_build": {
+    "format": "native.cel-guest-build/2",
+    "abi": "native.cel-scalar-guest/2",
+    "target": "wasm32-unknown-unknown",
+    "flags": "-C panic=abort -C debuginfo=0 -C link-arg=--stack-first -C link-arg=-zstack-size=1048576",
+    "extra_rustflags": [
+      "-C",
+      "panic=abort",
+      "-C",
+      "debuginfo=0",
+      "-C",
+      "link-arg=--stack-first",
+      "-C",
+      "link-arg=-zstack-size=1048576"
+    ],
+    "wrapper_policy": "disabled for guest only",
+    "flags_scope": "prescribed extra target flags; Cargo-generated arguments/profiles are not an exhaustive compiler argv attestation",
+    "cargo_configuration": [
+      {
+        "path": "/home/richard/.cargo/config.toml",
+        "sha256": "42d139b2078b10bca672776daef8db4c59f38a433caa078442b2e1f98f42699c"
+      },
+      {
+        "path": "workspace:.cargo/config.toml",
+        "sha256": "3db7f43007663a7f628fcaaa7e67addc107b8c700325040db1ed6388a49fb6b6"
+      }
+    ],
+    "compiler": {
+      "command": "/home/richard/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu/bin/rustc",
+      "version": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8"
+    },
+    "crate_type": "cdylib",
+    "build_mode": "cargo rustc --lib --crate-type cdylib --locked",
+    "inputs": [
+      {
+        "path": ".cargo/config.toml",
+        "sha256": "3db7f43007663a7f628fcaaa7e67addc107b8c700325040db1ed6388a49fb6b6"
+      },
+      {
+        "path": "Cargo.lock",
+        "sha256": "c3906e75c3e993a0af551dae58b991bbc0882b24739bd5af7c2818d6430223fb"
+      },
+      {
+        "path": "Cargo.toml",
+        "sha256": "e53420dfab3b013dbcf9d1b8b0fc8df65fca3ec0c88a6d05e57756f80b016a4c"
+      },
+      {
+        "path": "crates/cel-subset/.cargo-ok",
+        "sha256": "afbf9d0f3560b0fd7795e81c42a0a79ee6b6fc67e064f77826aee642cad28d91"
+      },
+      {
+        "path": "crates/cel-subset/.cargo_vcs_info.json",
+        "sha256": "e0437d858f494767a292a903e9c6a74bbc46868e6d92598d2deb4bcb0eda5d0d"
+      },
+      {
+        "path": "crates/cel-subset/CHANGELOG.md",
+        "sha256": "9312dcde362404db75509a4eb297d0e7090d406207509b0606f535f0cfdc986b"
+      },
+      {
+        "path": "crates/cel-subset/Cargo.lock",
+        "sha256": "5b12b17422c06e7becc0a673dbe45ac9df68a78a8e043962606a03b9453c70d6"
+      },
+      {
+        "path": "crates/cel-subset/Cargo.toml",
+        "sha256": "489e0df2296713c195bba41ecdae255f62d77c69cd5a16edf63c7eb74745bb72"
+      },
+      {
+        "path": "crates/cel-subset/Cargo.toml.orig",
+        "sha256": "bf084974f30bba639c13f04be30c57693dacc5ed28209bacd592e0a9e4d00a81"
+      },
+      {
+        "path": "crates/cel-subset/FORK-CHANGES.md",
+        "sha256": "b81d40b0aae2450f63a971a1f93c997c64866dbe03de142cf44d00c099b6fe26"
+      },
+      {
+        "path": "crates/cel-subset/GOLDENS.md",
+        "sha256": "66a1b0370fb54bdf30a59440b6d02356d543f9ee2580e7a13aaf7e1df8c3381c"
+      },
+      {
+        "path": "crates/cel-subset/LICENSE-MIT",
+        "sha256": "112aa0da14657d4c0e525139b697553d77a2cf19259bf98e98dbdbf270de2ad0"
+      },
+      {
+        "path": "crates/cel-subset/README.md",
+        "sha256": "3f539c2667ec8af7f9eb06ba8aaed809769f9cfb6a886ddcc3eb1a952ff76af4"
+      },
+      {
+        "path": "crates/cel-subset/VENDORED.md",
+        "sha256": "299d496290d3e2db704cd8308866c1af7d88141ee4071a7aeedec456aa39bda5"
+      },
+      {
+        "path": "crates/cel-subset/benches/parser.rs",
+        "sha256": "7c913ec779d518afd3b934bd7bd627c977cb632eb96cf42342b2d26a363c35ff"
+      },
+      {
+        "path": "crates/cel-subset/benches/runtime.rs",
+        "sha256": "b9fb958ccc2a780fd499437f3ca30e3f6936dba80ad3b6a09d660d8a3e7583f8"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/README.md",
+        "sha256": "c3c6b203530a0bf9a6b8157d8c9617634986690b38e8d4be64f2941a8903f1ae"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/build-certificate.json",
+        "sha256": "3a280382bc74f87c490d041b6e4b9771972a083fc18ee45b9141770eaa3e01ce"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/build.log",
+        "sha256": "911094018a8284efceef69ef1e13665734c1f8023281de8e487dd40f6f3fdfaf"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate3-calibrate.json",
+        "sha256": "7b6c71bb3c5dfff8da19cec45649e1478640e22a665780d2c38c3f1f60284e86"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate3-fixtures.json",
+        "sha256": "136c86c697c5b6971d5f7fa398dbf27b37c0202114e9c28954f0a607cf1767d1"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate3-regex.json",
+        "sha256": "c2c710d34e709a963264e366fcb9e1a9f4af997bdcd34aee5f9ffeaeea048214"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate4-calibrate.json",
+        "sha256": "48b9a618251c7278b63322050d0e6bab57a553672ec8785c9f542976bc1d00b0"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate4-fixtures.json",
+        "sha256": "946ed9e0110b68c887588d0c4013999710b2e28a9bb5e45a37cac458342a2395"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/candidate4-regex.json",
+        "sha256": "ff5f1268ffb51345faff118eec2d15fd5341230b24d1b824cb590c3ad0355c72"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/charge-table.md",
+        "sha256": "3aa8e594806d620c818fb4572b895bbd16d8c15cc42bb8641615ddf5b87bab59"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/checks.json",
+        "sha256": "82b520cbc846bced9881649564eab013b69ff6447b3efe04e4768cbc51ff97c0"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/combined-matrix.json",
+        "sha256": "a22ce7cc643a1e889458e1f8a3a8243aa35ae97b35a12b7e1383889fd3ef43e3"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-clippy-default-final-tree.log",
+        "sha256": "79458e429fb70d643e498f4c5a672f0c77190a0c9b3d9e0dd7ea2588f31a52c9"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-clippy-default.log",
+        "sha256": "f1d2b9ea414ba8d6ef625dc5b1db3615b71fb61d8f3cecd5381819c86728a930"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-clippy-tools-final-tree.log",
+        "sha256": "a69ee01c867f6163e7966fa400057380bf4d5e3864318e45846d106a179fd8d6"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-clippy-tools.log",
+        "sha256": "5f5a8eaff30192e8689b1a5d0e0834fc896753bc6641a097ae436f9749f6616f"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-combined-debug-final.log",
+        "sha256": "45fb2ef49387d7c399d157de1817748370f5f5c0b672180c57c2a6f318d7d50a"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-combined-release.log",
+        "sha256": "e01bf664d2e01be363806d1054184a8c6c0fb56659d159f77dd579f4dbe2fb4f"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-default-tests.log",
+        "sha256": "3c08936725047cb0be0c28a05648b6e9fef8b2215d49b4aef62d42df0cae90bd"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-format-check.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-format-final-tree.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-inventory-check.log",
+        "sha256": "4b7426768ac38b8726ebaaf3eba84ff13bea934950c17d192247743d3472d3ee"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-inventory-final-tree.log",
+        "sha256": "4b7426768ac38b8726ebaaf3eba84ff13bea934950c17d192247743d3472d3ee"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-l0-debug-final.log",
+        "sha256": "4205b666c8322ddfc41b9c88ff0d1bdef9037ffa8f4ef0293f339187816ed979"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-l0-release.log",
+        "sha256": "f7a3ef938681012709c227d8a9d7a1ed6e313dd8ef230f07d71a695bba79bd4f"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-regex-debug-final.log",
+        "sha256": "2cd4d537621e4c10c82c8a66c16ca0fb175fcc2ad489ef8fd9440eb12d2b8c8a"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/logs/p1-regex-release.log",
+        "sha256": "0e04655486fd2e707a37b5412bb381524f76a7ea7097649f0a816a5e03f94137"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/p1-calibrate.json",
+        "sha256": "ef4578ea91fc5c1ce78bf783971eb36f64353bcec96f59152ff23b77a1078e6b"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/p1-fixtures.json",
+        "sha256": "39755cca5276f6609011b55b98913843c5212bf14aba7ce6d543ee3db743ab9c"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/p1-generated.json",
+        "sha256": "024febad3cb50bd2124c08b1ced4fd8b15e2150817267c75889b091537feee9c"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/p1-regex.json",
+        "sha256": "36dd9f21c5b888eede18ff5945d5c6767704365607889507d8992ff86747a4bd"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/parser-calibration.md",
+        "sha256": "b9399aaba0c94f6a0b6bb84225551e9e01f90020e3f998f42eafce2d47cdf999"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/parser-sequencing-review.txt",
+        "sha256": "8f6ee08982f7cb9d73382772d36c7bd77e84ae8dbe85fe487a445c1df7d7f56a"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/run-certificate.json",
+        "sha256": "ba83995c2d61d5a21e360b912f7b17bebeb4da43f855e0f64152a6f232bc392f"
+      },
+      {
+        "path": "crates/cel-subset/results/native-policy-proof/sha256-manifest.json",
+        "sha256": "48c9ef6d450efc8bb7d09093d49d3700a3af470cbd80b5ec5f4f141e167dba26"
+      },
+      {
+        "path": "crates/cel-subset/src/api.rs",
+        "sha256": "55a577204a16743b74b9fb34ed58668c9998dc4e2ab50b4182eef28bc1dc683d"
+      },
+      {
+        "path": "crates/cel-subset/src/bin/native_evidence.rs",
+        "sha256": "5b4ed894b012e59e69106019fc4e11024b42ecc540638036bc88dbbca11ef811"
+      },
+      {
+        "path": "crates/cel-subset/src/charges.rs",
+        "sha256": "f45e0385826376510d9e0bc2018d4aaf78357b9e27f8de7ff0ecd8ea6062128f"
+      },
+      {
+        "path": "crates/cel-subset/src/common/ast/mod.rs",
+        "sha256": "84061447d8b209953b1d42ede9ca7b439f7fc3119a8cadf44c1ff8f89167e161"
+      },
+      {
+        "path": "crates/cel-subset/src/common/ast/operators.rs",
+        "sha256": "c5755b2f084d026d058040686e821ac7be8862392964fcc41b3df8e2102a94e5"
+      },
+      {
+        "path": "crates/cel-subset/src/common/decls.rs",
+        "sha256": "ecf3896f112afffd3e801b0f0415b084332e2dca4daf1dc7ee3096408f2e9369"
+      },
+      {
+        "path": "crates/cel-subset/src/common/functions.rs",
+        "sha256": "f7eb05dcca6cc64aac94e7f53ed03779e60818ec6e0140cf2124f6864c267495"
+      },
+      {
+        "path": "crates/cel-subset/src/common/mod.rs",
+        "sha256": "6e41474eb6f5d0e930b760cb5cc78cd2692f8556bd9ef0baa3f58c7890347a69"
+      },
+      {
+        "path": "crates/cel-subset/src/common/traits.rs",
+        "sha256": "c8d0f14bcc225f024772500422fb5b9c0a56214dec40b0dac6a914f3bbe59ae1"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/bool.rs",
+        "sha256": "eda3ae552a5645df99c68543e41b9c01e663c373075d56297fb46eb02da02250"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/bytes.rs",
+        "sha256": "c94b099be6d2db6065bad368908782b0011c4c26006ab121cb9a33d6866132d2"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/double.rs",
+        "sha256": "f371aa219c5d2ddc1e2e41710cf171b3b780a0f115c1365b9d3e98d6b7febd4c"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/duration.rs",
+        "sha256": "c9a4e0a5fad0226ac5fe62940d42d81b4d1b5f1f5917eb5233f002f7f1f5d6f7"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/dyn.rs",
+        "sha256": "826eab9db1b6616c9f99ecdc8b3478b39728fc7484dd2f5baa80facfa8b779a3"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/int.rs",
+        "sha256": "a91c98e43573485a2b56f7f5b3114988df04948f9fea3c31edc2bdfd479613d7"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/list.rs",
+        "sha256": "3e7387b857a0c35533c4a38862ffda5e1f7b590826f5cfbc6ad59e0d4092af6a"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/map.rs",
+        "sha256": "92f88e0750e1372e11d2b0fffb3808aa9086a944988be115fe92d42c0e52a70d"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/mod.rs",
+        "sha256": "a7927fa4ca041643402fd0e7a5979c6a7a46d3e82c55d791cb40f0e03bfcf4e1"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/null.rs",
+        "sha256": "046332714d3a5b4da579d3ac0cf1581b64aa442a11b33a8ff2c7208783a1d1c7"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/optional.rs",
+        "sha256": "d4d97848fdc28da03c66978976ee966c006dbc795f3130de16b7277bdfcdebdb"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/string.rs",
+        "sha256": "5b7aea63d03c5fca8a311472da226dea6008dd5be82941e660600d4c8b798d3d"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/struct.rs",
+        "sha256": "fea0e75246899183d850b2c50607aabbc869f108f94428599fdef8e917a5b404"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/timestamp.rs",
+        "sha256": "8b3cc7575ab3331f467604fc4935d60a267cdf237535dd1e6fe033b3b7596fdf"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/type_val.rs",
+        "sha256": "1cbe3df087e4c00bb701d64fffcbba572772c79065d291169490575f679797b7"
+      },
+      {
+        "path": "crates/cel-subset/src/common/types/uint.rs",
+        "sha256": "598c59c862b49214a4f0afbb36371bf6e3fd9f09596964c1f47bd76716195790"
+      },
+      {
+        "path": "crates/cel-subset/src/common/value.rs",
+        "sha256": "3a84a2d5ceb844f293bab07df83659f1ee4e2f10f56ee567e248b42d9bdbdfce"
+      },
+      {
+        "path": "crates/cel-subset/src/comprehension.rs",
+        "sha256": "c8f722a6c25b488fb709337adefe82cb6c66e827d3fcf22ed9c8d1b48e6033fd"
+      },
+      {
+        "path": "crates/cel-subset/src/context.rs",
+        "sha256": "bd4c63e4b594c41c5953ab4db45d6d36639b272d468b00f82fe1f5f224110a56"
+      },
+      {
+        "path": "crates/cel-subset/src/copy_tests.rs",
+        "sha256": "0d59931dd3c955598692b606c60883a646e55f9c953e1e1637ad95fb4fe6a686"
+      },
+      {
+        "path": "crates/cel-subset/src/corpus_tests.rs",
+        "sha256": "01bc72392b3a8fd45c9be02afc0a8c672d2c0b0b16cb2c645ed843906d4999af"
+      },
+      {
+        "path": "crates/cel-subset/src/duration.rs",
+        "sha256": "2ab8f10a34a561e542b11823d0311dd7fff9c0eefe487938a4946dc3ac0561ec"
+      },
+      {
+        "path": "crates/cel-subset/src/env.rs",
+        "sha256": "b2366557b7bc4400b424b8cd8ddeff415be4b2691b5f576f30b9437690f6e014"
+      },
+      {
+        "path": "crates/cel-subset/src/estimate.rs",
+        "sha256": "0ca1666c6e6631a8d8efd4491a7571fca3b856575079d2534c77ff4042e2fb96"
+      },
+      {
+        "path": "crates/cel-subset/src/extrema.rs",
+        "sha256": "50f638d0b342882a85d0e90692f0260d24c2f3d5330a66895f8ddb46a18f862c"
+      },
+      {
+        "path": "crates/cel-subset/src/functions.rs",
+        "sha256": "e824e9b09ab0505ec07a58313092647d9aec873cf22e2dc6a8a2ab67784bd329"
+      },
+      {
+        "path": "crates/cel-subset/src/guard.rs",
+        "sha256": "002409647dec2c377f7358fc0b729d5aa2403b8c064b2124b00cd6849ce2dacc"
+      },
+      {
+        "path": "crates/cel-subset/src/input.rs",
+        "sha256": "7f16c564f8dec3a14d9697c1cf16da2410a00e496d1e6a399b4c9e62d3dc4f5f"
+      },
+      {
+        "path": "crates/cel-subset/src/json.rs",
+        "sha256": "68917393206ead7d236eb517f6390b085f8780be3c68999df6ec5c381568deb4"
+      },
+      {
+        "path": "crates/cel-subset/src/lib.rs",
+        "sha256": "db9885c87603a41f3c747145f4271a734b393bac534917af9b9aad4808bb2019"
+      },
+      {
+        "path": "crates/cel-subset/src/limits.rs",
+        "sha256": "7accee90d996dcc394f0c56129f43df7220230f531cf789edfb8890e64e51066"
+      },
+      {
+        "path": "crates/cel-subset/src/load.rs",
+        "sha256": "f0d641cfdf9087d77af382379d1ded8340452db23e4a3130cf302a080bbb4016"
+      },
+      {
+        "path": "crates/cel-subset/src/macros.rs",
+        "sha256": "bc357403f839a92cb9508cc1b6442ae850267ad438a3ab08ef6b86dcdfd48b58"
+      },
+      {
+        "path": "crates/cel-subset/src/magic.rs",
+        "sha256": "5fec0b65271dab73a9bb25b2590805b39d0d12333147e10c66d30d2c4c8a0e91"
+      },
+      {
+        "path": "crates/cel-subset/src/meter.rs",
+        "sha256": "c2ef1f69931913539ff5136dcc8d47beaed35e42dd6173c28dec02fa4fabab7f"
+      },
+      {
+        "path": "crates/cel-subset/src/metrics.rs",
+        "sha256": "d54816a48baa08dd3dad561b89e145875ae3b50966d456867f9b1e92fdba5670"
+      },
+      {
+        "path": "crates/cel-subset/src/native_fixture_sets.rs",
+        "sha256": "598c0ba0cc881e931f4c368bc278385be487ddb3d264c6c6cb81bf338e5a2f07"
+      },
+      {
+        "path": "crates/cel-subset/src/native_measure.rs",
+        "sha256": "e26342f2866c806ccadbb5fb5df56ee460fbc7988716c42fd675c91a8a04f703"
+      },
+      {
+        "path": "crates/cel-subset/src/native_proof_harness.rs",
+        "sha256": "e35dc44ed3d6067eabe5d018de7b4b5f52fab5ba1e7ff43b6510684965bcd90c"
+      },
+      {
+        "path": "crates/cel-subset/src/native_regex_measure.rs",
+        "sha256": "6b3d7e57bf4b98433ceccb8e3527ba08097a38ddcda609d1d526686dd29a9db6"
+      },
+      {
+        "path": "crates/cel-subset/src/native_rule_generator.rs",
+        "sha256": "96763a476296b9dbed8a366c8daf363d3428a39a4fd9446ffbe218cb88fbac41"
+      },
+      {
+        "path": "crates/cel-subset/src/objects.rs",
+        "sha256": "d9908047655cfbe7bdc0fa5ee670d1c238b23a97a16b205abb69aa5d03ff3cff"
+      },
+      {
+        "path": "crates/cel-subset/src/parse_proof_tests.rs",
+        "sha256": "d7a9bd55edd4de6d2b688e3e3f2fef274e02737c7a195f1763f0648eccc4fa5a"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/CEL.g4",
+        "sha256": "e2b7e9eb939fe2101d9f44aa757dcc1ab25a1108c32b2d2b07075c04fd7521b8"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/CEL.interp",
+        "sha256": "c76875c6c4b315650f39dcf524b31b041d96ec6eeaeff9e9722bd1cbd4ab27cd"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/CEL.tokens",
+        "sha256": "a1d9013ea8dbc4716b2f41a8346c0098146632c226b892f5e618aceadb373652"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/CELLexer.interp",
+        "sha256": "b1b276b41454ab802e21d3288ab4cc2df00f8369510eae40bb9e67333d2a3530"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/CELLexer.tokens",
+        "sha256": "a1d9013ea8dbc4716b2f41a8346c0098146632c226b892f5e618aceadb373652"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/cellexer.rs",
+        "sha256": "835e89caf376723c999a6ee63509df90c25b4a81bd688677521d605a3f089f11"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/cellistener.rs",
+        "sha256": "ea744fa03bd8e9c23e7b0020dec54ab6aefee8b5a3580590912d3150ef28bdc6"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/celparser.rs",
+        "sha256": "bd552d1c3c9ca31d387a05406b81b31aceedb998dff5555e38a6cfaa87d2b21f"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/celvisitor.rs",
+        "sha256": "7af08e3d3d7717d87bc3771e23b396666672e5274c236bd1a5490f780eaffcaa"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/gen/mod.rs",
+        "sha256": "d1703cc7bb96d88ff7e072542856c6bfd96ef10ed782d2ad50feb671bad4c4b9"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/l0.rs",
+        "sha256": "509286425d45e45e3a68d35d999ad939fcab7c72b200128303a4e9d88da233b6"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/macros.rs",
+        "sha256": "1b198049abf3b40c4ca6987cc4452de380c5e1808f0b6368936a7289b7c9ebb4"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/mod.rs",
+        "sha256": "3a4bf923d49951ef7b8272e24e2905d954de4db89d7e522d08cc60287ce7bb82"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/parse.rs",
+        "sha256": "a1772ece83392eb9f055a9dc535f1ab1c65b8274f94c1c270e134416f4d26278"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/parser.rs",
+        "sha256": "97146217fa2999c96bf83ece630ca5199917f6f73bacc291306b136338841fc8"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/pratt_parser.rs",
+        "sha256": "0db2a1d6a186efa5d7f3cda9cbee139093cdacea1d40b140edd6049fa295548b"
+      },
+      {
+        "path": "crates/cel-subset/src/parser/references.rs",
+        "sha256": "69d9b049c1c9a1a7d2971b595f204c1489f36ec41bbffa8ef5ba4bae9bda8be6"
+      },
+      {
+        "path": "crates/cel-subset/src/policy.rs",
+        "sha256": "f1762908f3599b4ce37d4f0e22f87b4bcd830f3a8b8362a4542e274087813609"
+      },
+      {
+        "path": "crates/cel-subset/src/quantity.rs",
+        "sha256": "7b5a9d752143f91beb07ce9b2b1ead0875eff0ce8337569650ad9226eb8b2b42"
+      },
+      {
+        "path": "crates/cel-subset/src/regexes.rs",
+        "sha256": "2d27668297f7f91834f91d33e443fdb30777d94cca55f04f02d5f5511d2585a4"
+      },
+      {
+        "path": "crates/cel-subset/src/resolvers.rs",
+        "sha256": "ee641fb2e684e10e081a659dcbd2bd30b6e957cdbc1afdfb3f53526c5ce229bf"
+      },
+      {
+        "path": "crates/cel-subset/src/rule.rs",
+        "sha256": "5aa483513f7b98ca13ccaca5dda225b0547c361affe80d22eed0c43b8ef04331"
+      },
+      {
+        "path": "crates/cel-subset/src/ser.rs",
+        "sha256": "6e8bfb22cc64596409dfe6bcad5a131a597143dc5c27bf9fbd272e369842886f"
+      },
+      {
+        "path": "crates/cel-subset/src/subset.rs",
+        "sha256": "874e9d675270a867ef687ebc91592fd331c1082ff8fa603f955cc822a46da4a5"
+      },
+      {
+        "path": "crates/cel-subset/src/symbolic_control.rs",
+        "sha256": "ac3271acb585bdd4d7475f6934d89d56e1ad3daf457171a046aed5fc43039a2a"
+      },
+      {
+        "path": "crates/cel-subset/src/u3_alloc_tests.rs",
+        "sha256": "6880ac98e3ad0521de0c10c36cd3b62d447392af58b80e41d1b64a5c6519570a"
+      },
+      {
+        "path": "crates/cel-subset/src/val_desc.rs",
+        "sha256": "53826ce56143896739915926cc3d1ffd27353829ddc8a3d770b085cbdf9867d7"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/README.md",
+        "sha256": "91e6d465c39b2d7e819c3c30a9ea820015452a084c4d69a98610249a58b1628b"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/aggregates.json",
+        "sha256": "133ab5b1cf5ebbefa271bb7eb472c89e7604a1186d3adcea8abf4a90b80254d4"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/arith.json",
+        "sha256": "c620267344f0041801af525becae79992b1b89dc63cf14c0aa0863d3abf912d4"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/compare.json",
+        "sha256": "d0b046e361758bdc27552884fc1fa3aa949a93b538baff241ae6804283ec3151"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/double_special.json",
+        "sha256": "3d22d064e53b02a84c833298372e47227b72861e8dc2d75faa70c043868b16b8"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/logic.json",
+        "sha256": "e19acf06062e416b0fb5d1103e499171203fd5a8a4660dd588a121ea5e0d1936"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/macros.json",
+        "sha256": "26a197c0c1e9a2a79362b992ae2d3236ecdc6b4cf0f74043c7c20957098a040a"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/macros_rows.json",
+        "sha256": "3162d239c21827fd80164e40f39b69b1c640d69eefb23139e05e7a75d00bfaf1"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/map_keys.json",
+        "sha256": "57633a118ed4d9659b077c9c1203eda5cf6162bdff9a89bbd05ad66160e8f397"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/null.json",
+        "sha256": "7f58883cd4d7971b9c101ce8c09a30b89abfb8cfd1b99f4a5918f899f974b758"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/numeric_edges.json",
+        "sha256": "e86ea2c8eddcb48ae106274bb68596b71f28fd8d3e865899949d9c2c760eaacf"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/policy/m1/bands.cel.json",
+        "sha256": "18e7e42235becd8c06375d871c5f6ad8d243a13e1a8ed5842877e21909b67222"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/policy/m1/capacity.cel.json",
+        "sha256": "6c2cc8e3ce5cd94a35121674e2d69d4955a165da850ee473bdb177f9e9d6facf"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/policy/m1/eu.cel.json",
+        "sha256": "150eb20e704045e02f4e4b2002f5df8c4cb2404ee893003a548bd7eff016caee"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/policy/m1/full-deal.cel.json",
+        "sha256": "097c89f948aa98d764771b43217d92d3779e9bafdd834763dce7de74bf0d3a77"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/policy/m1/sheet.cel.json",
+        "sha256": "a80d20b06c524de3536b83b581d3043fa7af9cc24504361e45a702f808212482"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/strings.json",
+        "sha256": "bf7c8038fa8aa0cc5c3237b0cc50fdf600ffa353405a6ef87326146e3cb39a52"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/strings_astral.json",
+        "sha256": "5283605d0d07e2e853ea3eda7e07a7729d85ca920929fa50b3db7a507fc31c2d"
+      },
+      {
+        "path": "crates/cel-subset/tests/corpus/time.json",
+        "sha256": "7024ba87c25dc7a24a0bdf8f72e5f0312f139363119db988eb9bc31419b4f8ab"
+      },
+      {
+        "path": "crates/cel-subset/tests/map_order.rs",
+        "sha256": "87cb98aeededea5769337ed374415f6bb2c96ad731f69fec9b3c477dd9191602"
+      },
+      {
+        "path": "crates/package-cel-guest/Cargo.toml",
+        "sha256": "6794a0d774a01a62990385034d1aad1d5208c83d8e4d493bddc2500596477823"
+      },
+      {
+        "path": "crates/package-cel-guest/src/lib.rs",
+        "sha256": "11fd81807e2ab1f35bc47f2c876e8460c4360d6ae4d7c0ca85ab4343db5490ee"
+      },
+      {
+        "path": "crates/package-cel-wire/Cargo.toml",
+        "sha256": "08dd274bf6fe6b1ab04983399b4eb14e1c59cc5f1d2e04e6fa10f650733cb5b7"
+      },
+      {
+        "path": "crates/package-cel-wire/src/lib.rs",
+        "sha256": "2045e3a9e48fd342774a4ca9627b8abfb5e5a1466fbbd7320b6b7d11245e758b"
+      },
+      {
+        "path": "rust-toolchain.toml",
+        "sha256": "b4ea3c94c934d96a2772b7878c12ccbf3e486313d0988a9c960e0bd87bafc8fe"
+      },
+      {
+        "path": "scripts/build-package-cel-guest.py",
+        "sha256": "21193ee07f8190168b83f110f089621512ab2db1625d13a9c17ad8795b98547d"
+      }
+    ],
+    "module_length": 7942761,
+    "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+    "inventory": {
+      "imports": [],
+      "exports": {
+        "memory": 2,
+        "guest_abi_version": 0,
+        "guest_allocate": 0,
+        "guest_evaluate": 0
+      }
+    }
+  },
+  "guest_build_manifest_sha256": "1321b89d0db324f65bc7e6b336bb06aa286d8491aa379b8af1fb0bddf02ef8b1",
+  "embedding_correction": {
+    "previous_head": "b0921526852aea98ca1930b3e3873aa3fe26e2a8",
+    "prior_boundary_refusal": "target/package-cel-guest-stage3/source-boundary.log",
+    "first_symbol_refusal": "target/package-cel-guest-stage3/embedding-host-first-symbol-refusal.log",
+    "development_cases": 20,
+    "shipping_cases": 1,
+    "additional_lint_finding": {
+      "receipt": "target/package-cel-guest-stage3/embedding-host-clippy.json",
+      "status": "original failure preserved; resolved by private ExecutionLimits grouping",
+      "scope": "dispatch fuel/timeout grouped without changing values/order/test hooks/permit semantics",
+      "runtime_unchanged_by_embedding": true,
+      "resolution_clippy": "target/package-cel-guest-stage3/cleanup-host-clippy.json",
+      "resolution_host_matrix": "target/package-cel-guest-stage3/cleanup-host-proof.json"
+    },
+    "mechanism": "verified read-only native object in static archive; fixed extern array; no dynamic Rust includes",
+    "cross_platform_execution": "Linux x86_64 executed; six object encodings/readbacks only"
+  },
+  "review_corrections": {
+    "reviewed_head": "db74b20ffa57f233d6644a3f832aac25d3699541",
+    "findings": [
+      "Docker member/build-script stubs",
+      "effective compiler selection",
+      "single validated manifest snapshot"
+    ],
+    "compiler_probe": {
+      "reviewed_old_head": "db74b20ffa57f233d6644a3f832aac25d3699541",
+      "compiler_before": {
+        "command": "/home/richard/.rustup/toolchains/1.98.0-x86_64-unknown-linux-gnu/bin/rustc",
+        "version": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22.1.8"
+      },
+      "compiler_override": {
+        "command": "/home/richard/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
+        "version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1"
+      },
+      "pins_changed": true,
+      "mismatched_compiler_snapshot_refused": true,
+      "cargo_command_compiler": "/home/richard/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/rustc",
+      "cargo_executed": false,
+      "live_artifacts_modified": false
+    },
+    "normalization_probe": {
+      "supplied_parent_controls": {
+        "RUSTC_WORKSPACE_WRAPPER": "/nonexistent/guest-workspace-wrapper",
+        "RUSTFLAGS": "--invalid-inherited-flag",
+        "CARGO_ENCODED_RUSTFLAGS": "--invalid-inherited-encoded-flag",
+        "CARGO_BUILD_RUSTC_WRAPPER": "/nonexistent/config-wrapper"
+      },
+      "note": "guard independently clears RUSTC_WRAPPER; other conflicting controls reach prescribed guest recipe",
+      "actual_cargo_build_exit": 0,
+      "guest_result": {
+        "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+        "source_sha256": "cf2873cb2f48c0368c62f92846fa3d56d18eaf4dd41f0a5cff1a152c672e8714",
+        "build_manifest_sha256": "1321b89d0db324f65bc7e6b336bb06aa286d8491aa379b8af1fb0bddf02ef8b1",
+        "inventory": {
+          "imports": [],
+          "exports": {
+            "memory": 2,
+            "guest_abi_version": 0,
+            "guest_allocate": 0,
+            "guest_evaluate": 0
+          }
+        }
+      }
+    },
+    "held_lock": {
+      "old_count": 733,
+      "new_count": 733,
+      "removed_selections": [],
+      "added_selections": [],
+      "old_dependency_edges_removed": [],
+      "old_dependency_edges_added": [],
+      "commands": [
+        "cargo metadata --manifest-path held/Cargo.toml --features native-ce/package-cel-dev --offline --format-version 1",
+        "same with --locked",
+        "cargo tree --manifest-path held/Cargo.toml -p native-held-runtime --features v2-kernel-probe,native-ce/package-cel-dev --offline -e normal,build",
+        "(cwd held) cargo metadata --features native-ce/package-cel-dev --offline --format-version 1"
+      ],
+      "all_exit_zero": true,
+      "resolved_features": {
+        "native-ce": [
+          "body-read-test-support",
+          "default",
+          "experimental-agent-intents",
+          "mcp-executor-prototype",
+          "package-cel-dev",
+          "v2-kernel-probe"
+        ],
+        "native-package-cel-host": [],
+        "wasmtime": [
+          "anyhow",
+          "cranelift",
+          "once_cell",
+          "runtime",
+          "std",
+          "wasmtime-jit-icache-coherence"
+        ]
+      },
+      "held_build_proof": false,
+      "lock_bytes_unchanged": true,
+      "disposition": "No lock delta generated by ordinary resolver; no forced update/empty lock commit. Actual held integration build deferred until review.",
+      "byte_sha256_before": "2076e09264048cb66cb808afee55f022f8db3895c9110e30dca133a5f6f73691",
+      "byte_sha256_after": "2076e09264048cb66cb808afee55f022f8db3895c9110e30dca133a5f6f73691"
+    }
+  },
+  "validation_scope": {
+    "current": "fresh 20 development +1 shipping cases against new format2 provenance/guest pins; fresh96 host rows and all-target Clippy",
+    "prior_evidence": "db74/dbd/b092 logs and original independent failed probes preserved separately",
+    "qualification": "no held host build/UI proof, image build, full local gate or review clearance"
+  },
+  "host_matrix": {
+    "stage": 3,
+    "embedding": {
+      "objects": [
+        {
+          "os": "linux",
+          "arch": "x86_64",
+          "endian": "little",
+          "object_sha256": "4f6ac88b91e98fa704de2f35bb17beee5bead313c690f864225e49e9f6bf7095",
+          "object_bytes": 7943296,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        },
+        {
+          "os": "linux",
+          "arch": "aarch64",
+          "endian": "little",
+          "object_sha256": "08516236c95a5f6e8f7d66e7340c89faf74ef0868e3924556c19af19f2dd15bf",
+          "object_bytes": 7943296,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        },
+        {
+          "os": "macos",
+          "arch": "x86_64",
+          "endian": "little",
+          "object_sha256": "4beac125c18a0a71a74a945d7e223fd74a837fdf6fb8fe140526f3188c9b6031",
+          "object_bytes": 7943128,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        },
+        {
+          "os": "macos",
+          "arch": "aarch64",
+          "endian": "little",
+          "object_sha256": "c0c688a926ae9de09dfba1a2a6a894fd1544634bb668c65478fd362f1e285ce7",
+          "object_bytes": 7943128,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        },
+        {
+          "os": "windows",
+          "arch": "x86_64",
+          "endian": "little",
+          "object_sha256": "ed1f4485635893fd81267236651fb659ad4f4a1270b0f3bac38dbacc3cc5b918",
+          "object_bytes": 7942911,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        },
+        {
+          "os": "windows",
+          "arch": "aarch64",
+          "endian": "little",
+          "object_sha256": "eb361748c92fbc19809ad336e5159b9d67a83a1c12a768e696fbccdf5b13c49b",
+          "object_bytes": 7942911,
+          "module_bytes": 7942761,
+          "symbol": "native_package_cel_guest_v2_verified_data_7e43a1",
+          "alignment": 16,
+          "length_hash_negatives_refused": true
+        }
+      ],
+      "linked_module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+      "linked_length": 7942761,
+      "startup_pins_verified": true,
+      "negative_pins_refused": true
+    },
+    "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+    "rows": [
+      {
+        "after": "initial",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "import",
+        "failure": {
+          "phase": "Module",
+          "stop": "Contract"
+        },
+        "module_sha256": "25a7e937efdcbf17d450cec7ac18ea204e997db91454d1d490c4e82d4c8f988c"
+      },
+      {
+        "after": "import",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "extra-export",
+        "failure": {
+          "phase": "Module",
+          "stop": "Contract"
+        },
+        "module_sha256": "16779a1488ae3282e165135cb6618936198078b578f9d8cceb0bf2c603cb63b1"
+      },
+      {
+        "after": "extra-export",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "wrong-function-type",
+        "failure": {
+          "phase": "Module",
+          "stop": "Contract"
+        },
+        "module_sha256": "b950db50d6336cb91d3aeea474523bc153b3eabe0954e83b12fa02c2dbe75cb8"
+      },
+      {
+        "after": "wrong-function-type",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "memory64",
+        "failure": {
+          "phase": "Module",
+          "stop": "Module"
+        },
+        "module_sha256": "ebfd911d1fd0e209d06730026354db2dffa2ab88f0db685e5358807327884208"
+      },
+      {
+        "after": "memory64",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "shared-memory",
+        "failure": {
+          "phase": "Module",
+          "stop": "Module"
+        },
+        "module_sha256": "e54ae18ff764841b8d9785f47db124cb6e6620e2e83e9fee083d419356faf623"
+      },
+      {
+        "after": "shared-memory",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "initial-memory-over-limit",
+        "failure": {
+          "phase": "Module",
+          "stop": "Contract"
+        },
+        "module_sha256": "2d64d4275f54571c8fdbfcb7c3b38438d65081a0e4216099630e3f315b414ec6"
+      },
+      {
+        "after": "initial-memory-over-limit",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "wrong-ABI-version",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Version",
+            "stop": "Contract"
+          },
+          "fuel_used": 2,
+          "module_sha256": "97d5036f60f9edec506b02e3b7b8f6e9539f0dfd5c9f1bb348c7b40ac546b37a",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Version",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "wrong-ABI-version",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "bad-allocation-pointer",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Write",
+            "stop": "Pointer"
+          },
+          "fuel_used": 4,
+          "module_sha256": "8202b285408afc86419403d64dbe523b8fc09b3e05a1c531edebce6428404331",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Write",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "bad-allocation-pointer",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "input-expression-cap",
+        "failure": {
+          "phase": "Encode",
+          "stop": "Input"
+        }
+      },
+      {
+        "after": "input-expression-cap",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "input-serialized-byte-cap",
+        "failure": {
+          "phase": "Encode",
+          "stop": "Input"
+        }
+      },
+      {
+        "after": "input-serialized-byte-cap",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "fuel-evaluate",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "Fuel"
+          },
+          "fuel_used": 1000,
+          "module_sha256": "11dd6ec084f81630417991708792bf81be0ab777064f25ed321a1b7011daa75d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": null,
+          "fuel_budget": 1000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "fuel-evaluate",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "fuel-start",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Instantiate",
+            "stop": "Fuel"
+          },
+          "fuel_used": 1000,
+          "module_sha256": "83b973d85b46d60d03235304e754f83727c1c3d505c8a2eb061485909f3d7bd4",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Instantiate",
+          "delivery_stop": null,
+          "fuel_budget": 1000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "fuel-start",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "call-stack",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "CallStack"
+          },
+          "fuel_used": 43664,
+          "module_sha256": "bf926ec825623a3ffcdbba9898f1febd915d69d910ef5691b8ac6d543726b431",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "call-stack",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "linear-stack-underflow",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "MemoryBounds"
+          },
+          "fuel_used": 4,
+          "module_sha256": "3de0e999dcbd2022ca0d2c134f2d6f3b02e5735dcdda59798f35c6ca0f35b59f",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "linear-stack-underflow",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "memory-growth",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "MemoryLimit"
+          },
+          "fuel_used": 4,
+          "module_sha256": "ce913352373a6820b860933a0d828c574856cbed539fe495322a258ad62f2a4d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "memory-growth",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "table-growth",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "TableLimit"
+          },
+          "fuel_used": 4,
+          "module_sha256": "5aee7e2dc8e01f50868618b7bfb9a667cff4b2b67eb172614b2ed0a062dfbf70",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "table-growth",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "epoch-only-deadline",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "Deadline"
+          },
+          "fuel_used": 4,
+          "module_sha256": "11dd6ec084f81630417991708792bf81be0ab777064f25ed321a1b7011daa75d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": "Deadline",
+          "fuel_budget": 18446744073709551615,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "epoch-only-deadline",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "epoch-only-start-deadline",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Instantiate",
+            "stop": "Deadline"
+          },
+          "fuel_used": 2,
+          "module_sha256": "83b973d85b46d60d03235304e754f83727c1c3d505c8a2eb061485909f3d7bd4",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Instantiate",
+          "delivery_stop": "Deadline",
+          "fuel_budget": 18446744073709551615,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "epoch-only-start-deadline",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "cancel-before-delivery",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Deliver",
+            "stop": "Cancelled"
+          },
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": "Cancelled",
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "after": "cancel-before-delivery",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "after": "independent-job-while-loop-paused",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "epoch-cancel",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "Cancelled"
+          },
+          "fuel_used": 4,
+          "module_sha256": "11dd6ec084f81630417991708792bf81be0ab777064f25ed321a1b7011daa75d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": "Cancelled",
+          "fuel_budget": 18446744073709551615,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "epoch-cancel",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "after": "Busy-after-two-admissions",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "after": "Busy-and-dropped-handle-after-Store-drop",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "two-slots-drop-cancel-lifetime",
+        "permit_released_after_Store_drop": true,
+        "no_pending_queue": true
+      },
+      {
+        "case": "zero-length",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Length"
+          },
+          "fuel_used": 6,
+          "module_sha256": "d987ecff9a014867f231fdf8ba17de68f6ec672e6158996dd4cb07842d1e3380",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "zero-length",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "oversize-output",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Length"
+          },
+          "fuel_used": 6,
+          "module_sha256": "c320687e86f843aaa2d5c2d6205890ae412136e67bbb74ef1285bf9f169234e1",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "oversize-output",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "invalid-pointer",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Pointer"
+          },
+          "fuel_used": 6,
+          "module_sha256": "20800d1737a2afa6d67ab0037bdaec31bef10e56447fc9030387540898096378",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "invalid-pointer",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "invalid-UTF8",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Utf8"
+          },
+          "fuel_used": 6,
+          "module_sha256": "043d43bf888747129ba03fbb12839741106b9911276fa6e134e9b5fcdfaece5e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "invalid-UTF8",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "invalid-JSON",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "5f44768a2e6c9561429ccc8d3985e1a6ce2fa73187cf0f38ea2bb42928c33ecd",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "invalid-JSON",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "missing-eval_policy",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "b14ca574221080ceefaf95b9c00c5b4f2da379fc3577c813d2cd1fe6e373d6d9",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "missing-eval_policy",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "missing-eval_interim",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "02f155d88afc751cf4012d856b0abd182c302fb74f94d676ecd9940902680b19",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "missing-eval_interim",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "missing-error_stage",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "f6e6f3c0a8032d82f5a326b404bfe2cb6287dd202b8a009b15655f33fd13fe53",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "missing-error_stage",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "missing-error",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "351daf21f0a7212c6b81f3b7c3ab06b27d2ec68281f6dcaf7312d25d0dc83567",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "missing-error",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "unknown-field",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "91b46d3cedc7af3624702942eda3b43885075614de6fe7eb74b735db5c76d826",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "unknown-field",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "duplicate-field",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "Json"
+          },
+          "fuel_used": 6,
+          "module_sha256": "386d4fc6310826a98af76954ad49ab8790baeed33498f0612dc229352682eb7d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "duplicate-field",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "nested-result",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "ReportScalar"
+          },
+          "fuel_used": 6,
+          "module_sha256": "078a060f824aa3aacf1701ce8ebe00e26e8a67c5e03597d296f1d5b3840f886f",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "nested-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "long-result",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "ReportScalar"
+          },
+          "fuel_used": 6,
+          "module_sha256": "c1cb3eddf027071503bc268163fd6afb1d9f9e8e4e71107256eb09aa6e759218",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "long-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "unsafe-number",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "ReportScalar"
+          },
+          "fuel_used": 6,
+          "module_sha256": "ebfe776d4198f5d87fbef7cf35de807349b3bf0815ff9279d473ce5260dfb230",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "unsafe-number",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "false-interim",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "ReportMetadata"
+          },
+          "fuel_used": 6,
+          "module_sha256": "117dedb31ef40a29bf53d8a8eec68f28df770038e82e65babacc60ac8c874545",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "false-interim",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "bad-policy",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Decode",
+            "stop": "ReportMetadata"
+          },
+          "fuel_used": 6,
+          "module_sha256": "23ab4859efe1b41f0f92697005503d09b06b5ad6e7126abe768bcaa0235c3128",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Decode",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "bad-policy",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "double-result",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2.5,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7307879,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "double-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "string-result",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": "ab",
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7467682,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "string-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "null-result",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": null,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 6059463,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "null-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "regex",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": true,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 8644879,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "regex",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "timestamp",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": true,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 13000261,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "timestamp",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "wrong-scalar-type",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": null,
+            "eval_interim": null,
+            "value": null,
+            "error_stage": "bindings",
+            "error": "wrong scalar type/range/length"
+          },
+          "failure": null,
+          "fuel_used": 7615234,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "wrong-scalar-type",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "duplicate-binding",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": false,
+            "eval_policy": null,
+            "eval_interim": null,
+            "value": null,
+            "error_stage": "request",
+            "error": "invalid/duplicate binding name"
+          },
+          "failure": null,
+          "fuel_used": 154488,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "duplicate-binding",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "unsafe-result",
+        "parity": "all fields of reduced protocol report: status, policy/interim, scalar value/error; excludes checked API caps/load cost/budget scope/cost/input cost",
+        "outcome": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": null,
+            "error_stage": "result",
+            "error": "expected bounded JSON scalar"
+          },
+          "failure": null,
+          "fuel_used": 8074312,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "unsafe-result",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      },
+      {
+        "case": "shutdown-active-epoch",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "Shutdown"
+          },
+          "fuel_used": 4,
+          "module_sha256": "11dd6ec084f81630417991708792bf81be0ab777064f25ed321a1b7011daa75d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": "Shutdown",
+          "fuel_budget": 18446744073709551615,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "case": "shutdown-active-epoch",
+        "outcome": {
+          "report": null,
+          "failure": {
+            "phase": "Evaluate",
+            "stop": "Shutdown"
+          },
+          "fuel_used": 4,
+          "module_sha256": "11dd6ec084f81630417991708792bf81be0ab777064f25ed321a1b7011daa75d",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Evaluate",
+          "delivery_stop": "Shutdown",
+          "fuel_budget": 18446744073709551615,
+          "deadline_ms": 5000,
+          "test_controls": true
+        }
+      },
+      {
+        "after": "shutdown-then-new-runtime",
+        "fresh_CEL_recovery": {
+          "report": {
+            "abi": "native.cel-scalar-guest/2",
+            "mode": "evaluate",
+            "check_policy": "cel-subset@1/p1",
+            "check_interim": true,
+            "check_ok": true,
+            "eval_policy": "cel-subset@1/p1",
+            "eval_interim": true,
+            "value": 2,
+            "error_stage": null,
+            "error": null
+          },
+          "failure": null,
+          "fuel_used": 7176695,
+          "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+          "config": "native.cel-guest-dev-host/3",
+          "phase": "Deliver",
+          "delivery_stop": null,
+          "fuel_budget": 50000000,
+          "deadline_ms": 1000,
+          "test_controls": false
+        }
+      }
+    ],
+    "owned_threads_after_shutdown": 0,
+    "guest_stack_audit": {
+      "stack_pointer_global": 0,
+      "initial_stack_pointer": 1048576,
+      "lowest_active_data_offset": 1048576,
+      "active_data_segments": 2
+    },
+    "limits": "targeted backstops only; host compilation outside guest bounds; no production qualification or full checked-API accounting parity"
+  },
+  "cli_receipts": [
+    {
+      "namespace": "example.sales",
+      "package": "quote",
+      "outcome": {
+        "result": {
+          "value": 900,
+          "error": null
+        },
+        "receipt": {
+          "scope_home": "b10308bc-7af5-4315-9e20-7bc210979f6f",
+          "namespace": "example.sales",
+          "name": "quote",
+          "package_version": 1,
+          "package_digest": "9ad72239cde1a153f678d413b373bc3255ad1a4155425b4354ada70a207ee147",
+          "family": "example.sales.quote",
+          "kind": "quote",
+          "definition_version": 1,
+          "definition_digest": "221594d506800b0a298a182a8a5fc8275541eb49328121513db69ff98f5c3b83",
+          "operation": "compute",
+          "provider": "host.cel-scalar-dev/1",
+          "record_id": "533fc8dd-94fd-497e-b549-b76c3cf5586a",
+          "record_revision": 9,
+          "input_digest": "5baace7c2c8b9eb11b338075453664c1510a8614c4699c1795fb972b1effd3a2",
+          "ack_event_seq": 7,
+          "execution": {
+            "language": "cel-subset@1",
+            "interpreter": "cel-subset@0.14.5/wasmtime-checked-dev/1",
+            "policy": "cel-subset@1/p1",
+            "interim": true,
+            "profile": "native.cel-scalar-dev/1",
+            "expression_digest": "87daaf85176b6759b20a4581ee071ade791cf6aa9e49b391502d7ce5aead3e93",
+            "guest": {
+              "abi": "native.cel-scalar-guest/2",
+              "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+              "source_sha256": "cf2873cb2f48c0368c62f92846fa3d56d18eaf4dd41f0a5cff1a152c672e8714",
+              "build_manifest_sha256": "1321b89d0db324f65bc7e6b336bb06aa286d8491aa379b8af1fb0bddf02ef8b1",
+              "runtime": "wasmtime@49.0.1",
+              "configuration": "native.cel-guest-dev-host/3",
+              "fuel_budget": 50000000,
+              "fuel_used": 11248000,
+              "deadline_ms": 1000,
+              "phase": "Deliver",
+              "limits": {
+                "fuel": 50000000,
+                "memory_bytes": 67108864,
+                "table_elements": 16384,
+                "wasm_call_stack_bytes": 1048576,
+                "host_worker_stack_bytes": 8388608,
+                "workers": 2,
+                "tick_ms": 10,
+                "deadline_ms": 1000,
+                "request_bytes": 32768,
+                "response_bytes": 8192,
+                "host_compilation_and_native_allocations_guest_bounded": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "namespace": "example.shipping",
+      "package": "dispatch",
+      "outcome": {
+        "result": {
+          "value": true,
+          "error": null
+        },
+        "receipt": {
+          "scope_home": "b10308bc-7af5-4315-9e20-7bc210979f6f",
+          "namespace": "example.shipping",
+          "name": "dispatch",
+          "package_version": 1,
+          "package_digest": "1c8a594514637c849aea4eed15dbba613d00520d68028ffb7c743d6c9213e195",
+          "family": "example.shipping.dispatch",
+          "kind": "dispatch",
+          "definition_version": 1,
+          "definition_digest": "a1ed3ca64d9e0af1707c655ac9625301ae9805019cc9eadb8d87e7e62e1a272e",
+          "operation": "compute",
+          "provider": "host.cel-scalar-dev/1",
+          "record_id": "274115a6-4d77-4806-928e-1a144f04b90e",
+          "record_revision": 12,
+          "input_digest": "98a76c26474efc0abf875e1d999b34795dfe803be16d0e42a7abdabe66f45115",
+          "ack_event_seq": 10,
+          "execution": {
+            "language": "cel-subset@1",
+            "interpreter": "cel-subset@0.14.5/wasmtime-checked-dev/1",
+            "policy": "cel-subset@1/p1",
+            "interim": true,
+            "profile": "native.cel-scalar-dev/1",
+            "expression_digest": "06d8581688ef583c986039c0149f86d1bd1974e18650a3fc907559b919bb36bb",
+            "guest": {
+              "abi": "native.cel-scalar-guest/2",
+              "module_sha256": "ce9231643393008e0650ed8adf593634b3267dc3b1ccc9461bc78ac927a5fe7e",
+              "source_sha256": "cf2873cb2f48c0368c62f92846fa3d56d18eaf4dd41f0a5cff1a152c672e8714",
+              "build_manifest_sha256": "1321b89d0db324f65bc7e6b336bb06aa286d8491aa379b8af1fb0bddf02ef8b1",
+              "runtime": "wasmtime@49.0.1",
+              "configuration": "native.cel-guest-dev-host/3",
+              "fuel_budget": 50000000,
+              "fuel_used": 12466665,
+              "deadline_ms": 1000,
+              "phase": "Deliver",
+              "limits": {
+                "fuel": 50000000,
+                "memory_bytes": 67108864,
+                "table_elements": 16384,
+                "wasm_call_stack_bytes": 1048576,
+                "host_worker_stack_bytes": 8388608,
+                "workers": 2,
+                "tick_ms": 10,
+                "deadline_ms": 1000,
+                "request_bytes": 32768,
+                "response_bytes": 8192,
+                "host_compilation_and_native_allocations_guest_bounded": false
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "commands": [
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-wire-proof.json",
+      "receipt_sha256": "bcb7b696a81e027310084420738eadf5c6e3ac4b8af6eb553b1f623ae71884e7",
+      "log_sha256": "7cbb31474946be8f784051cc60138b6cc41a5e0c446ed5068a6079074325ec12",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_package_cel_wire-14177f2c0376dd84",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:40:15.767423+00:00",
+      "initial_free_bytes": 249219624960,
+      "minimum_free_bytes": 249219624960,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3415477,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:16.768404+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-guest-native-proof.json",
+      "receipt_sha256": "1d3132b173a81f05ed7b8578e050aa92d4dac5e6642ebff72b2b6eaad8db9523",
+      "log_sha256": "c83fe7c593f73fcbcab1bac5d32c822d50dc159882924869a279b9c05f662556",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_package_cel_guest-3ec03aabf3883b72",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:40:16.802090+00:00",
+      "initial_free_bytes": 249056669696,
+      "minimum_free_bytes": 249056243712,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3415510,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:17.802781+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-guest-profile-build.json",
+      "receipt_sha256": "875ffd1b6580c2f7bc6f68cd0f629933e8bb48332a2f4d775a2a17ae139fd3d0",
+      "log_sha256": "bcc27e48c597476d7a4cf36a9807569bd516a68988045ba7ce0500753e1f590c",
+      "command": [
+        "python3",
+        "scripts/build-package-cel-guest.py"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:30:30.532601+00:00",
+      "initial_free_bytes": 233235660800,
+      "minimum_free_bytes": 233235660800,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {},
+      "owned_pgid": 3399990,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:30:31.533202+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-normalized-final-build.json",
+      "receipt_sha256": "e32ddf242c5077118896c088235244f5acfd63de074c7a2bc2a96ef6fcabbb02",
+      "log_sha256": "81d7f1cffd94423f0708048653f86496a2520cadfbdcf815e904c045dbd2c1b7",
+      "command": [
+        "python3",
+        "scripts/build-package-cel-guest.py"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:46:50.635534+00:00",
+      "initial_free_bytes": 242779222016,
+      "minimum_free_bytes": 242779222016,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {},
+      "owned_pgid": 3463229,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:46:51.636291+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-root-check.json",
+      "receipt_sha256": "bff18ad70d728a554ea4d923bb3b8465661bb7506eed80f0149bb7f010f5c5ca",
+      "log_sha256": "df3b30bec93d1533a213194706dba7b85554019f646b84e1a66d87dcfb120d1b",
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "native-ce",
+        "--features",
+        "package-cel-dev",
+        "--lib"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:18:06.115115+00:00",
+      "initial_free_bytes": 108948213760,
+      "minimum_free_bytes": 106248777728,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {},
+      "owned_pgid": 3377603,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:20:18.133639+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-libraries-current-compile.json",
+      "receipt_sha256": "973c7bc15a33333f6faa05d7883f328ee8b3a3327cf947f3b7f2fc6de1489060",
+      "log_sha256": "508b53e74e9447392f43bf30cbd516865fd1ccc2d556553d8d6b53f71a09e7e8",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "native-package-cel-wire",
+        "-p",
+        "native-package-cel-guest",
+        "-p",
+        "native-package-cel-host",
+        "-p",
+        "native-ce",
+        "--features",
+        "package-cel-dev",
+        "--lib",
+        "--no-run"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:32:38.629848+00:00",
+      "initial_free_bytes": 246355566592,
+      "minimum_free_bytes": 244238946304,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3402494,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:05.692421+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-host-current-proof.json",
+      "receipt_sha256": "fa8b0df3295105d68c68fd4ae37ac8a604a5bf88f50d1d6dd4af4034b72ef518",
+      "log_sha256": "91551bb74a4e5e7a61d5ab58e28dffdb590407eeba47c38a0bfb53e43fefb5b8",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_package_cel_host-b3263eeeaa423d17",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:40:05.726079+00:00",
+      "initial_free_bytes": 249209106432,
+      "minimum_free_bytes": 249209106432,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3415323,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:15.728025+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-host-clippy-final.json",
+      "receipt_sha256": "568e4a521c072e3bcfa46eeade60409bdd93da8f611ab7bc5eeb95e3191cd37f",
+      "log_sha256": "9c741899efc8c63bcb8074d1bc4da0984ecd4749db5621e107cb84c16931095d",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "-p",
+        "native-package-cel-host",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:31:46.168825+00:00",
+      "initial_free_bytes": 233218654208,
+      "minimum_free_bytes": 233218654208,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {},
+      "owned_pgid": 3401186,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:31:47.169427+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-root-runtime-proof.json",
+      "receipt_sha256": "43f09fae0a24c7e2e481a1343dad2a37246ece7bb0f73c840b0e834e154de598",
+      "log_sha256": "124660cb337ba4aba27f6586cb47f8c8d1fc2a5d06de665eaeff849deb617039",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_ce-e0f7121aea3f311b",
+        "package_cel_dev::runtime::tests::",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:40:17.834975+00:00",
+      "initial_free_bytes": 249219588096,
+      "minimum_free_bytes": 249162256384,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3415582,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:27.836867+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-delivery-proof.json",
+      "receipt_sha256": "22ced660851b310a1635a1f34c60f8edb8690689e2e7eaa0808f31be794fa9f8",
+      "log_sha256": "7bf2b613399c74c2676a5f17fd397089ac86d1d836dc57e1d14fc83c5b8e9d1c",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_ce-e0f7121aea3f311b",
+        "development_package_",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:40:27.871680+00:00",
+      "initial_free_bytes": 249191473152,
+      "minimum_free_bytes": 249171304448,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3415860,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:40:41.874290+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-shipping-proof.json",
+      "receipt_sha256": "8c8e1bf60cb36296058c42dcb4665ea3058ed4ce3f33a5589dad61e65c009a0d",
+      "log_sha256": "1efa53d9f786f5f1a6b70e309b2e2c09841a4ea1f3861dd38c9fdd6a65f99df5",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "target/debug/deps/native_ce-189c0999d3186a6b",
+        "package_cel_dev::shipping_tests::",
+        "--nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:45:41.116688+00:00",
+      "initial_free_bytes": 243031867392,
+      "minimum_free_bytes": 243031867392,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3461628,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:45:42.117767+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-cli-build.json",
+      "receipt_sha256": "19ee9649961091cd459b1f7d753fa986b86bcd48b179ad175ef094af4cbf8ac4",
+      "log_sha256": "a3ecbe7744d8f4f5261b74f9c02099c8dde61341d6ac932e042d01d788f45969",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "native-ce",
+        "--features",
+        "package-cel-dev",
+        "--example",
+        "v2_contract"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:45:07.006148+00:00",
+      "initial_free_bytes": 241069170688,
+      "minimum_free_bytes": 239598301184,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3459945,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:45:11.007257+00:00"
+    },
+    {
+      "receipt": "target/package-cel-guest-stage3/corrections-cli-proof.json",
+      "receipt_sha256": "30d97ecec8091a52ca17de17ee135d5df8a6115fd547f5ddfd31a6cd9adf767e",
+      "log_sha256": "50a1d8dfcb52afaccd02fcba858521af6022b7f9bffad18737e0026409850afd",
+      "command": [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=10s",
+        "300s",
+        "bash",
+        "-c",
+        "ulimit -s 65536\nexec target/debug/deps/kernel-20e42f14d8a62a1d v2_contract_smoke_cel_scalar_packages --nocapture"
+      ],
+      "cwd": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design",
+      "started_at": "2026-10-27T18:45:11.042762+00:00",
+      "initial_free_bytes": 240610328576,
+      "minimum_free_bytes": 240555311104,
+      "target_dir": "/home/richard/.local/share/paseo-pilot/worktrees/26c7awvi/backend-extension-design/target",
+      "CARGO_INCREMENTAL": "0",
+      "jobs": 2,
+      "environment": {
+        "RUST_MIN_STACK": "67108864"
+      },
+      "owned_pgid": 3460043,
+      "exit_code": 0,
+      "finished_at": "2026-10-27T18:45:40.047174+00:00"
+    }
+  ],
+  "known_harness_timeout": {
+    "receipt": "s3-final-libraries-proof.json",
+    "cause": "300s wrapper expired before test execution while Cargo waited for own shipping build directory lock",
+    "test_executed": false,
+    "runtime_hang_or_backstop_failure": false,
+    "correction": "compile sequentially without invocation timeout; execute compiled test binary separately with same300s outer watchdog; runtime1000ms limits unchanged",
+    "preserved": true
+  },
+  "qualification": "Explicit local development only; P1 interim, reduced protocol parity excludes checked API caps/load cost/budget scope/cost/input cost. Host compilation/native allocations outside guest caps. No native CEL fallback, production containment qualification, new browser proof, hosted activation, full local gate or publication. Stage1/2 proof/history preserved."
+}

@@ -1,5 +1,101 @@
 use super::*;
 
+#[cfg(not(feature = "v2-kernel-probe"))]
+#[tokio::test]
+async fn named_view_v2_nonprobe_live_profile_refuses_but_canonical_reader_accepts() {
+    let mut conn = connection().await;
+    let event = v2_revision_for("bearer", 1);
+    ReplayChecker::default().apply(&event).unwrap();
+    let mut live = storage::load_live(&mut conn, 0, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap();
+    let error = live
+        .apply_new_on(&mut conn, &event, Instant::now() + Duration::from_secs(2))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "named view: view_profile_unsupported");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(&mut conn)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[cfg(feature = "v2-kernel-probe")]
+#[tokio::test]
+async fn named_view_v2_authenticated_import_is_canonical_not_live_emission() {
+    let db = crate::kernel::create_kernel_database(":memory:")
+        .await
+        .unwrap();
+    let revision = v2_revision_for("bearer", 1);
+    let active = v2_activation(2, &revision, None);
+    for e in [&revision, &active] {
+        gate::testing(
+            false,
+            crate::store::exercise_named_view_import(&db, e.clone()),
+        )
+        .await
+        .unwrap();
+    }
+    let mut conn = db.pool().acquire().await.unwrap();
+    let state = storage::load_prefix(&mut conn, i64::MAX, None)
+        .await
+        .unwrap();
+    assert_eq!(state.bindings.len(), 1);
+    assert!(state.revisions.contains_key(&revision.id));
+    drop(conn);
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let mut bad = v2_activation(3, &revision, Some(active.id.clone()));
+    let mut transition: Transition = decode(&bad, 2048).unwrap();
+    if let Action::Activate { pin, .. } = &mut transition.action {
+        pin.definition_sha256 = "f".repeat(64);
+    }
+    bad.payload = Some(serde_json::to_string(&transition).unwrap());
+    let error = gate::testing(false, crate::store::exercise_named_view_import(&db, bad))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("revision pin mismatch"),
+        "{error}"
+    );
+    let candidate = v2_revision_for("bearer", 4);
+    let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
+    let mut acts = crate::act::ActAllocation::new();
+    let error = gate::testing(
+        true,
+        crate::store::append_in(
+            &db,
+            &mut tx,
+            crate::store::AppendSpec {
+                record_id: "bearer".into(),
+                event_type: REVISION.into(),
+                payload: serde_json::from_str(candidate.payload.as_ref().unwrap()).unwrap(),
+                actor: None,
+            },
+            &mut acts,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("view_validation_changed"),
+        "{error}"
+    );
+    tx.rollback().await.unwrap();
+    assert_eq!(
+        before,
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM content_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    );
+}
+
 pub(in crate::named_views) fn v2_revision_for(record: &str, seq: i64) -> EventRow {
     let manifest: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/facet-manifest-v1.json")).unwrap();
@@ -62,11 +158,8 @@ fn named_view_v2_closed_roundtrip_digest_and_cross_references() {
         "old v1 body decoder cannot certify this definition"
     );
 
-    assert!(r
-        .validate(&e)
-        .unwrap_err()
-        .to_string()
-        .contains("view_revision_unavailable"));
+    r.validate_retained(&e).unwrap(); // Current readers understand the closed body.
+                                      // Older v1 decoders still refuse above; no rollback parity is implied.
     let mut bad_digest = r.clone();
     bad_digest.v = 1;
     assert_ne!(
@@ -367,7 +460,7 @@ pub(in crate::named_views) async fn inject_v2_reader_fixture(db: &crate::Db, bea
 
 #[cfg(feature = "v2-kernel-probe")]
 #[tokio::test]
-async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
+async fn named_view_v2_untrusted_context_refuses_reads_and_appends_require_generated_preflight() {
     use crate::{kernel, mcp::kernel_v2, store};
     let (db, actor) = kernel::create_v2_database(":memory:", "account", "Owner", "acct:owner")
         .await
@@ -396,7 +489,10 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
         .unwrap()
         .iter()
         .any(|r| r["relation_name"] == name));
-    assert_eq!(result["notices"][0]["code"], "view_catalog_incomplete");
+    assert!(
+        result.get("notices").is_none(),
+        "inaccessible fixture anchors must not disclose a retained view"
+    );
     let visitor = kernel::create_principal(&db, "account", "Visitor", "acct:visitor", &actor)
         .await
         .unwrap();
@@ -433,7 +529,7 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
             .await
             .unwrap_err()
             .to_string();
-    assert!(error.contains("view_revision_unavailable"), "{error}");
+    assert!(error.contains("view_missing"), "{error}");
     let (_, outer) = planned(
         "outer",
         &format!("SELECT id FROM {name}"),
@@ -443,21 +539,18 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("view_revision_unavailable"));
+        .contains("view_missing"));
     let mut tx = db.pool().begin().await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     let error = details::get_on(&mut tx, &actor, &pin.view_id, &pin.revision_id, deadline)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("view_revision_unavailable"));
+    assert!(error.to_string().contains("view_missing"));
     let list = details::list_on(&mut tx, &actor, &pin.view_id, 8, None, deadline)
         .await
         .unwrap();
     assert_eq!(list["revisions"][0]["available"], false);
-    assert_eq!(
-        list["revisions"][0]["diagnostic"],
-        "view_revision_unavailable"
-    );
+    assert_eq!(list["revisions"][0]["diagnostic"], "view_missing");
     assert!(list["revisions"][0].get("definition").is_none());
     tx.rollback().await.unwrap();
     let before: i64 = sqlx::query_scalar("SELECT count(*) FROM content_events")
@@ -478,11 +571,11 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
         );
         let mut tx = crate::db::begin_write(db.write_pool()).await.unwrap();
         let mut acts = crate::act::ActAllocation::new();
-        assert!(store::append_in(&db, &mut tx, spec(), &mut acts)
+        let error = store::append_in(&db, &mut tx, spec(), &mut acts)
             .await
             .unwrap_err()
-            .to_string()
-            .contains("view_revision_unavailable"));
+            .to_string();
+        assert!(error.contains("view_validation_changed"), "{error}");
         assert!(store::append_migration_on(
             &mut tx,
             uuid::Uuid::new_v4().to_string(),
@@ -492,7 +585,7 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
         .await
         .unwrap_err()
         .to_string()
-        .contains("view_revision_unavailable"));
+        .contains("view_validation_changed"));
         let activation = v2_activation(
             1,
             &read_event(&mut tx, &pin.revision_id, i64::MAX)
@@ -504,7 +597,7 @@ async fn named_view_v2_readers_refuse_serving_details_and_all_emission_seams() {
             .await
             .unwrap_err()
             .to_string()
-            .contains("view_revision_unavailable"));
+            .contains("view_validation_changed"));
         tx.rollback().await.unwrap();
     })
     .await;

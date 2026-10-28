@@ -699,6 +699,22 @@ fn build_ordinary_catalogue_projection(
             candidate_plan_policy: "direct".into(),
         });
     }
+    // Source-owned development contracts exist only with the opt-in runtime
+    // and real KernelV2 handlers. Frozen stable audit evidence stays unchanged.
+    #[cfg(feature = "package-cel-dev")]
+    if engine_kind == super::registry::EngineKind::KernelV2 {
+        for name in ["describe_package_operations", "call_package_operation"] {
+            audit.audit_rows.push(AuditRow {
+                legacy_tool: name.into(),
+                legacy_action: "call".into(),
+                stability: "stable".into(),
+                availability: vec!["ordinary".into()],
+                candidate_executor: "records_read".into(),
+                candidate_operation: name.into(),
+                candidate_plan_policy: "direct".into(),
+            });
+        }
+    }
     let BuiltContracts {
         contracts,
         operations_by_executor,
@@ -20483,3 +20499,7 @@ mod tests {
 #[cfg(all(test, feature = "v2-kernel-probe"))]
 #[path = "named_view_executor_tests.rs"]
 pub(crate) mod named_views;
+
+#[cfg(all(test, feature = "package-cel-dev"))]
+#[path = "package_delivery_tests.rs"]
+mod package_delivery_tests;

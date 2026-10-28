@@ -44,6 +44,9 @@ pub(super) struct Registry {
     pub retained: Option<crate::named_views::closure::Closure>,
     pub pins: BTreeMap<String, crate::named_views::Pin>,
     pub omission: Option<&'static str>,
+    pub generated_drift: BTreeMap<String, crate::named_views::retained_facets::Drift>,
+    pub generated_unknown_reason:
+        BTreeMap<String, crate::named_views::source_proof::ComparisonReason>,
 }
 
 pub(super) fn needed(
@@ -67,6 +70,48 @@ pub(super) fn needed(
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(super) fn generated_checkpoint(
+        name: &str,
+        definition: &crate::named_views::contract::Definition,
+        pin: &crate::named_views::Pin,
+    ) -> Result<Self> {
+        use crate::named_views::closure::{self, Closure, Node};
+        use sha2::{Digest, Sha256};
+        let alias = closure::alias(pin)?;
+        let node = Node {
+            pin: pin.clone(),
+            definition: definition.clone(),
+            alias: alias.clone(),
+            sql: definition.query.sql.clone(),
+        };
+        let mut view = Self::retained_view(name, pin, &node);
+        view.binding.origin = "generated".into();
+        view.detail = None; // This fixture does not qualify public v2 catalog serving.
+        let plan = Closure {
+            nodes: vec![node],
+            roots: BTreeMap::from([(name.into(), alias)]),
+            retained: BTreeMap::new(),
+            generated_drift: BTreeMap::new(),
+            generated_unknown_reason: BTreeMap::new(),
+            digest: format!(
+                "{:x}",
+                Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
+                    &json!([pin])
+                ))
+            ),
+        };
+        let body_reads = plan.validate_schema()?;
+        let validators = guard::NamedViewValidators::from_closure(&plan)?;
+        Ok(Self {
+            views: BTreeMap::from([(name.into(), view)]),
+            validators: Some(validators),
+            body_reads,
+            retained: Some(plan),
+            pins: BTreeMap::from([(name.into(), pin.clone())]),
+            ..Self::default()
+        })
+    }
     fn omitted(reason: &'static str) -> Self {
         Self {
             omission: Some(reason),
@@ -88,7 +133,15 @@ impl Registry {
                 v: 1,
                 name: name.into(),
                 definition_sha256: pin.definition_sha256.clone(),
-                origin: "authored".into(),
+                origin: if matches!(
+                    node.definition.origin,
+                    crate::named_views::contract::Origin::Generated { .. }
+                ) {
+                    "generated"
+                } else {
+                    "authored"
+                }
+                .into(),
             },
             revision: 0,
             definition: node.definition.query.static_shape(),
@@ -214,6 +267,16 @@ impl Registry {
             }
             for (name, pin) in &execution_roots {
                 let node = plan.nodes.iter().find(|n| &n.pin == pin).unwrap();
+                for (p, reason) in &plan.generated_unknown_reason {
+                    registry
+                        .generated_unknown_reason
+                        .insert(p.revision_id.clone(), *reason);
+                }
+                for (p, drift) in &plan.generated_drift {
+                    registry
+                        .generated_drift
+                        .insert(p.revision_id.clone(), *drift);
+                }
                 registry
                     .views
                     .insert(name.clone(), Self::retained_view(name, pin, node));
@@ -222,6 +285,7 @@ impl Registry {
             registry.retained = Some(plan);
         }
         if catalog {
+            budget.skip_advisory = true;
             // A catalog-only read never constructs a combined validator.
             // Independent metadata candidates do not consume execution-union
             // staging budgets, and hidden/broken closures contribute no rows.
@@ -242,11 +306,11 @@ impl Registry {
                     &mut budget,
                 )
                 .await;
-                if resolved
-                    .as_ref()
-                    .err()
-                    .is_some_and(|e| e.to_string().contains("view_revision_unavailable"))
-                {
+                if resolved.as_ref().err().is_some_and(|e| {
+                    let message = e.to_string();
+                    message.contains("view_revision_unavailable")
+                        || message.contains("view_profile_unsupported")
+                }) {
                     registry.omission = Some("Dynamic named-view catalog rows omitted: a retained revision is unavailable on this serving version.");
                 }
                 let resolved_budget_exhausted = resolved
@@ -269,16 +333,21 @@ impl Registry {
                     break;
                 }
             }
-            // At most eight independent candidates, sharing the existing
-            // process-wide eight-worker limit. Serial worker waits spend the
+            // At most three concurrent candidate analyses per request, sharing
+            // the existing process-wide eight-worker limit. Serial worker waits spend the
             // catalog deadline repeatedly under concurrent read traffic. This
             // still constructs no combined catalog validator.
-            let valid = futures::future::join_all(candidates.iter().map(|(_, _, plan)| async {
-                crate::query::sql::view_validation::analyze(plan, deadline)
-                    .await
-                    .is_ok()
-            }))
-            .await;
+            let mut valid = Vec::with_capacity(candidates.len());
+            for batch in candidates.chunks(3) {
+                valid.extend(
+                    futures::future::join_all(batch.iter().map(|(_, _, plan)| async {
+                        crate::query::sql::view_validation::analyze(plan, deadline)
+                            .await
+                            .is_ok()
+                    }))
+                    .await,
+                );
+            }
             retained::storage::check_deadline(outer_deadline)?;
             if catalog_only && Instant::now() >= deadline {
                 return Ok(incomplete());

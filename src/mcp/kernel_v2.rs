@@ -20,6 +20,8 @@ mod interventions;
 mod member_configuration;
 mod messaging;
 mod metadata_reads;
+#[cfg(feature = "package-cel-dev")]
+mod package_operations;
 mod policy;
 mod read_surface;
 pub mod record_images;
@@ -81,6 +83,8 @@ pub fn register_hosted_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()
 
 /// Install alternate handlers on the ordinary tool descriptors.
 pub fn register_kernel_v2_tools(registry: &mut ToolRegistry) -> Result<()> {
+    #[cfg(feature = "package-cel-dev")]
+    package_operations::register(registry)?;
     apps::register(registry)?;
     intents::register(registry)?;
     deletion::register(registry)?;

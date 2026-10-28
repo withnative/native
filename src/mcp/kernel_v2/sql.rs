@@ -1107,6 +1107,9 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
     }
     let execution_started = Instant::now();
     let mut result = execute_prepared(&mut tx, prepared, as_of_seq, caller_started).await?;
+    if !registry.generated_drift.is_empty() {
+        result["view_provenance"] = json!({"generated_source_drift":registry.generated_drift,"generated_unknown_reason":registry.generated_unknown_reason});
+    }
     if let Some(message) = registry.omission {
         result["notices"] = json!([{"code":"view_catalog_incomplete","message":message}]);
     }
@@ -1125,7 +1128,21 @@ async fn execute(db: &Db, actor: &str, args: Value, stored: bool) -> Result<Valu
                     })
             })
             .collect();
-        result["view_provenance"] = json!({"roots":registry.pins,"closure_digest":plan.digest,"static_relations":static_relations});
+        // Catalog candidates are discovery metadata, never dependencies of the
+        // executed statement. Version/diagnostics come only from this closure.
+        let drift: std::collections::BTreeMap<_, _> = plan
+            .generated_drift
+            .iter()
+            .map(|(p, d)| (p.revision_id.clone(), *d))
+            .collect();
+        let reasons: std::collections::BTreeMap<_, _> = plan
+            .generated_unknown_reason
+            .iter()
+            .map(|(p, r)| (p.revision_id.clone(), *r))
+            .collect();
+        let generated = plan.retained.values().any(|revision| revision.v == 2);
+        let summaries = crate::named_views::receipt::generated_summaries(plan)?;
+        result["view_provenance"] = json!({"roots":registry.pins,"closure_digest":plan.digest,"static_relations":static_relations,"has_generated_nodes":generated,"generated_diagnostics":summaries,"generated_source_drift":drift,"generated_unknown_reason":reasons});
     }
     tracing::debug!(target: "native_ce::read_staging", phase = "sql_caller", elapsed_us = execution_started.elapsed().as_micros() as u64);
     let cleanup_started = Instant::now();
@@ -3352,4 +3369,55 @@ pub(crate) async fn with_named_registered_pause<T>(
     work: impl std::future::Future<Output = T>,
 ) -> T {
     NAMED_REGISTER_PAUSE.scope((arrived, resume), work).await
+}
+
+/// Test-only connection adapter into the real caller-relative installer,
+/// registry expansion/registration and result executor. It neither loads nor
+/// enables a v2 revision. The fixture owns the snapshot and rolls it back.
+#[cfg(test)]
+pub(crate) async fn generated_checkpoint_on(
+    conn: &mut sqlx::SqliteConnection,
+    actor: &str,
+    name: &str,
+    definition: &crate::named_views::contract::Definition,
+    outer: &crate::named_views::contract::SavedSqlV12,
+    deadline: Instant,
+) -> Result<Value> {
+    outer.validate_current()?;
+    let started = deadline - Duration::from_millis(contract::QUERY_DEADLINE_MS);
+    conn.lock_handle()
+        .await?
+        .set_progress_handler(guard::PROGRESS_OPS, move || Instant::now() < deadline);
+    let roots = outer.roots();
+    let pin = roots
+        .get(name)
+        .ok_or_else(|| Error::engine("checkpoint root missing"))?;
+    let mut registry = named_views::Registry::generated_checkpoint(name, definition, pin)?;
+    let (mut prepared, mut reads) = prepare_read_with_views(
+        actor,
+        json!({"sql":outer.sql,"parameters":outer.parameters}),
+        true,
+        Some(&registry),
+    )?;
+    registry.expand(&mut reads)?;
+    prepared.persistent = false;
+    install_relations(
+        conn,
+        actor,
+        &reads,
+        LinkScope::All,
+        None,
+        None,
+        None,
+        None,
+        None,
+        chrono::Utc::now().timestamp_millis(),
+        false,
+    )
+    .await?;
+    registry.register(conn).await?;
+    let head: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM main.content_events")
+        .fetch_one(&mut *conn)
+        .await?;
+    execute_prepared(conn, prepared, head, started).await
 }

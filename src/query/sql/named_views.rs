@@ -29,7 +29,7 @@ pub(crate) struct NamedViewValidators {
 }
 
 impl NamedViewValidators {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "v2-kernel-probe"))]
     pub(crate) fn new(definitions: &[(String, String)]) -> Result<Self> {
         Self::build(definitions, false)
     }

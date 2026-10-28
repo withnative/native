@@ -199,12 +199,14 @@ async fn named_view_index_and_fallback_agree_and_refuse_partial_prefixes() {
         .await
         .unwrap();
     sqlx::query("WITH RECURSIVE n(x) AS (SELECT 3 UNION ALL SELECT x+1 FROM n WHERE x<65537) INSERT INTO content_events(seq,id,record_id,type,payload,created_at) SELECT x,'unrelated-'||x,'r','record.updated','{}','2026-10-25' FROM n").execute(&mut conn).await.unwrap();
+    // Canonical replay has no wall-clock deadline. Test its exact scan cap
+    // independently of host contention; deadline refusal is checked below.
+    let error = load_prefix(&mut conn, 65537, None).await.unwrap_err();
     assert!(
-        load_prefix(&mut conn, 65537, Instant::now() + Duration::from_secs(5))
-            .await
-            .unwrap_err()
+        error
             .to_string()
-            .contains("scan_budget")
+            .contains("view_registry_scan_budget_exceeded"),
+        "{error}"
     );
     sqlx::query(INDEX_DDL).execute(&mut conn).await.unwrap();
     assert_eq!(
@@ -693,7 +695,7 @@ fn revision_rejects_omitted_round_trip_fields() {
         r.definition_sha256 = r.digest();
         let e = event(1, REVISION, serde_json::to_value(&r).unwrap());
         assert!(r
-            .validate(&e)
+            .validate_retained(&e)
             .unwrap_err()
             .to_string()
             .contains("non-canonical"));

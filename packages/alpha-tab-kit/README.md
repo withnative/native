@@ -171,7 +171,9 @@ completeness* below).
 
 `catalog_view_definitions` is present in the engine relation inventory, but
 requires standalone hosted read-write v2 SQL. Saved SQL and alpha-tab SQL needs
-refuse it with `view_profile_unsupported`; v1 and read-only copies also refuse.
+refuse it as caller-relative detail, through their saved-SQL admission errors.
+Unsupported serving profiles (v1 and read-only copies) refuse with
+`view_profile_unsupported`. These are different refusal categories.
 The kit rejects direct references before install. An unrelated same-named CTE
 remains a CTE, not a read of that detail catalog.
 

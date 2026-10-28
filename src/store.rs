@@ -381,7 +381,7 @@ pub(crate) async fn append_kernel_v1_state_in(
 
 /// Feature-owned account preference admission. No generic event/import caller
 /// can acquire this route; the projector validates the account aggregate.
-#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn append_kernel_notification_preference_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
@@ -438,7 +438,7 @@ pub(crate) async fn append_kernel_provider_in(
 }
 
 /// Typed HCP admission. The seal cannot be constructed outside HCP handlers.
-#[cfg(any(test, feature = "v2-kernel-probe"))]
+#[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn append_kernel_hcp_in(
     db: &Db,
     tx: &mut sqlx::Transaction<'static, sqlx::Sqlite>,
@@ -844,7 +844,7 @@ async fn append_prepared_engine_seed_in(
 enum PreparedAdmission {
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelProvider,
-    #[cfg(any(test, feature = "v2-kernel-probe"))]
+    #[cfg(feature = "v2-kernel-probe")]
     KernelHcp,
     #[cfg(any(test, feature = "v2-kernel-probe"))]
     KernelSlot,
@@ -879,7 +879,14 @@ async fn append_prepared_admitted(
     act_alloc: &mut crate::act::ActAllocation,
 ) -> Result<EventRow> {
     crate::db::enrolled::require_content_connection(tx, Some(db)).await?;
-    crate::named_views::storage::admit_on(tx, &prepared.event).await?;
+    // Authenticated incoming events are not local effects. Their projector
+    // below is canonical (live_named_view=false) and checks the full prefix,
+    // regardless of the producer flag or local compiler/owner certificates.
+    // Native source facts are private authenticated-ingest provenance, never
+    // a field accepted from AppendSpec. Ordinary/local appends remain gated.
+    if prepared.native_source.is_none() {
+        crate::named_views::storage::admit_on(tx, &prepared.event).await?;
+    }
     // The hosted image also compiles kernel intents. Refuse an ordinary v1
     // destination explicitly before allocating an act or appending anything,
     // including events admitted through import/replication's shared seam.
@@ -1079,7 +1086,7 @@ async fn append_prepared_admitted(
             )
             .await?;
         }
-        #[cfg(any(test, feature = "v2-kernel-probe"))]
+        #[cfg(feature = "v2-kernel-probe")]
         PreparedAdmission::KernelHcp => {
             if !matches!(causal_admission, CausalAdmission::LocalComputed) {
                 return Err(Error::engine("HCP events cannot carry imported causality"));
@@ -2484,13 +2491,15 @@ pub(crate) async fn exercise_provider_projector_port(db: &Db, event: &EventRow) 
 #[cfg(all(test, feature = "v2-kernel-probe"))]
 pub(crate) async fn exercise_named_view_import(db: &Db, event: EventRow) -> Result<()> {
     let payload = serde_json::from_str(event.payload.as_deref().unwrap())?;
+    let source_seq = event.local_seq;
+    let source_record_id = event.record_id.clone();
     let prepared = PreparedEvent {
         event,
         payload,
         native_source: Some(NativeEventSource {
             origin_database_id: "ndb_named_view_import_fixture".into(),
-            source_seq: 1,
-            source_record_id: "bearer".into(),
+            source_seq,
+            source_record_id,
             source_principal: "native:principal:fixture".into(),
             fingerprint: [7; 32],
         }),

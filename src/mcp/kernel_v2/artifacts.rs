@@ -1199,6 +1199,9 @@ async fn governed_sql_input(
         transient_watermark: None,
         transient_available: false,
     };
+    // Retained reads are independent of the producer gate. Every supported
+    // consumer must already read v3 before a generated revision is introduced.
+    let generated = response["view_provenance"]["has_generated_nodes"] == true;
     let mut execution = crate::mcp::tools::querying::finish_saved_sql(
         &definition,
         &definition.parameters,
@@ -1209,13 +1212,34 @@ async fn governed_sql_input(
     // Imported relations have no public replay endpoint on v2 yet.
     execution["receipt"]["replayable"] = json!(false);
     if let Some(pinned) = pinned.as_ref().filter(|p| !p.roots().is_empty()) {
-        let provenance = json!({"roots":response["view_provenance"]["roots"],"closure_digest":response["view_provenance"]["closure_digest"]});
+        if response["view_provenance"]["has_generated_nodes"]
+            .as_bool()
+            .is_none()
+        {
+            return Err(Error::engine(
+                "view_revision_unavailable: executed closure version evidence missing",
+            ));
+        }
+        let mut provenance = json!({"roots":response["view_provenance"]["roots"],"closure_digest":response["view_provenance"]["closure_digest"]});
+        if generated {
+            let summaries = response["view_provenance"]["generated_diagnostics"]
+                .as_array()
+                .filter(|s| !s.is_empty() && s.len() <= 8)
+                .ok_or_else(|| {
+                    Error::engine("view_revision_unavailable: generated root summaries missing")
+                })?;
+            provenance["generated_diagnostics"] = json!(summaries);
+        }
         let query_sha256 = mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&json!([
             "native.saved-sql.v1.2",
             pinned
         ])));
         let snapshot = mdx::sha256_hex(&mdx_v2::canonical_json_bytes(&json!([
-            "native.pinned-sql-snapshot.v1",
+            if generated {
+                "native.pinned-sql-snapshot.v2"
+            } else {
+                "native.pinned-sql-snapshot.v1"
+            },
             execution["receipt"]["snapshot"],
             query_sha256,
             provenance
@@ -1272,8 +1296,11 @@ async fn governed_sql_input(
         }
     });
     if execution["receipt"]["view_provenance"].is_object() {
-        envelope["source"]["execution_receipt"]["version"] =
-            json!("native.governed-sql-port-receipt.v2");
+        envelope["source"]["execution_receipt"]["version"] = json!(if generated {
+            "native.governed-sql-port-receipt.v3"
+        } else {
+            "native.governed-sql-port-receipt.v2"
+        });
         envelope["source"]["execution_receipt"]["view_provenance"] =
             execution["receipt"]["view_provenance"].clone();
         envelope["source"]["execution_receipt"]["query_sha256"] =

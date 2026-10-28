@@ -25,19 +25,9 @@ async fn pin_on(
     view: &str,
     id: &str,
     head: i64,
-    _deadline: Instant,
+    deadline: Instant,
 ) -> Result<Pin> {
-    pin_on_in(conn, actor, view, id, head, _deadline, false).await
-}
-async fn pin_on_in(
-    conn: &mut SqliteConnection,
-    actor: &str,
-    view: &str,
-    id: &str,
-    head: i64,
-    _deadline: Instant,
-    retained_only: bool,
-) -> Result<Pin> {
+    storage::check_deadline(deadline)?;
     // Metadata stays readable on archived bearers with current View.
     closure::require_accessible_bearer_on(
         conn,
@@ -57,11 +47,7 @@ async fn pin_on_in(
     }
     let event = read_event(conn, id, head).await?;
     let rev: Revision = decode(&event, MAX_CARRIER_BYTES)?;
-    let def = if retained_only {
-        rev.validate_retained(&event)?
-    } else {
-        rev.validate(&event)?
-    };
+    let def = rev.validate_retained(&event)?;
     let pin = Pin {
         view_id: view.into(),
         revision_id: id.into(),
@@ -70,12 +56,17 @@ async fn pin_on_in(
     };
     Ok(pin)
 }
+// Owned by one metadata read and caller snapshot, never a permission cache.
+type MetadataContexts = BTreeMap<String, Option<(i64, super::source_proof::Work)>>;
+
 async fn metadata_on(
     conn: &mut SqliteConnection,
     actor: &str,
     view: &str,
     id: &str,
     deadline: Instant,
+    advisory: bool,
+    contexts: &mut MetadataContexts,
 ) -> Result<Value> {
     let head: i64 = sqlx::query_scalar("SELECT coalesce(max(seq),0) FROM content_events")
         .fetch_one(&mut *conn)
@@ -83,21 +74,99 @@ async fn metadata_on(
     let pin = pin_on(conn, actor, view, id, head, deadline).await?;
     let roots = BTreeMap::from([("view_detail".into(), pin.clone())]);
     let inspected = closure::inspect_metadata_on(conn, actor, &roots, deadline).await?;
+    if let Some(revision) = inspected.retained.get(&pin).filter(|r| r.v == 2) {
+        let definition: v2::Definition = serde_json::from_value(revision.definition.clone())?;
+        let workspace = super::generated::workspace_on(conn).await?;
+        if definition.generated.workspace_id != workspace {
+            return Err(Error::engine(MISSING));
+        }
+        super::retained_facets::required_presence_on(conn, &definition, deadline).await?;
+        if definition.query.validate_for_preparation().is_err() {
+            return Ok(
+                json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_source_invalidated"}),
+            );
+        }
+        // Archival prevents execution but does not revoke metadata visibility.
+        // A carrier move alone says nothing about retained source context H;
+        // normalize that actual context below, as execution does.
+        storage::check_deadline(deadline)?;
+        if inspected.drifted {
+            return Ok(
+                json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_context_unavailable"}),
+            );
+        }
+        // View and required presence were checked independently above for this
+        // revision. Reuse only context normalization within this read: versions
+        // sharing H/anchors must not repeat a historical home-witness scan.
+        let anchors: std::collections::BTreeSet<_> = definition
+            .generated
+            .sources
+            .iter()
+            .filter_map(|source| source.anchor.as_deref())
+            .collect();
+        let key =
+            serde_json::to_string(&(head, &definition.generated.context.logical_home_id, anchors))?;
+        let context = if let Some(context) = contexts.get(&key) {
+            *context
+        } else {
+            let result = super::source_proof::retained_context_on(
+                conn,
+                actor,
+                bearer(view)?,
+                &definition.generated,
+                deadline,
+            )
+            .await;
+            storage::check_deadline(deadline)?;
+            let context = match result {
+                Ok(context) => Some(context),
+                // These are context failures only after same-snapshot current
+                // View and required presence; SQL/IO and deadline still refuse.
+                Err(Error::Engine(message))
+                    if message == MISSING || message == "named view: view_missing" =>
+                {
+                    None
+                }
+                Err(Error::Conflict(_)) => None,
+                Err(error) => return Err(error),
+            };
+            contexts.insert(key, context);
+            context
+        };
+        let Some(context) = context else {
+            return Ok(
+                json!({"pin":pin,"definition":revision.definition,"diagnostic":"view_context_unavailable"}),
+            );
+        };
+        if !advisory {
+            return Ok(
+                json!({"pin":pin,"definition":revision.definition,"diagnostic":null,"advisory_comparison":"not_requested"}),
+            );
+        }
+        let checked =
+            super::retained_facets::compare_metadata_on(conn, definition, context, deadline)
+                .await?;
+        return Ok(json!({"pin":pin,"definition":checked.definition,
+            "diagnostic":null,"source_drift":checked.drift,"source_drift_unknown_reason":checked.unknown_reason}));
+    }
     // No immutable payload leaves this function until every discovered bearer
     // and source is authorized. Drift never prevents retrieving SQL to repair it.
-    let plan = closure::build(&roots, &inspected.definitions);
+    let plan = inspected.build(&roots);
     let diagnostic = if inspected.drifted {
         Some("view_source_invalidated")
     } else if let Ok(plan) = &plan {
-        match crate::query::sql::view_validation::analyze(plan, deadline).await {
-            Ok(_) => None,
-            Err(_) => Some("view_source_invalidated"),
+        match crate::query::sql::view_validation::analyze_diagnostic(plan, deadline).await {
+            Ok(crate::query::sql::view_validation::Outcome::Valid(_)) => None,
+            Ok(crate::query::sql::view_validation::Outcome::Invalid(_)) => {
+                Some("view_source_invalidated")
+            }
+            Err(_) => Some("view_validation_unavailable"),
         }
     } else {
         Some("view_source_invalidated")
     };
     Ok(json!({"pin":pin,"definition":inspected.definitions[&pin],
-        "closure_digest":plan.as_ref().ok().map(|p| &p.digest),"diagnostic":diagnostic}))
+        "closure_digest":plan.as_ref().ok().map(|p| &p.digest),"diagnostic":diagnostic,"diagnostic_retryable":diagnostic==Some("view_validation_unavailable")}))
 }
 pub(crate) async fn get_on(
     conn: &mut SqliteConnection,
@@ -106,7 +175,16 @@ pub(crate) async fn get_on(
     id: &str,
     deadline: Instant,
 ) -> Result<Value> {
-    let reply = metadata_on(conn, actor, view, id, deadline).await?;
+    let reply = metadata_on(
+        conn,
+        actor,
+        view,
+        id,
+        deadline,
+        true,
+        &mut MetadataContexts::new(),
+    )
+    .await?;
     if serde_json::to_vec(&reply)?.len() > 256 * 1024 {
         return Err(invalid("view_budget_exceeded: revision response"));
     }
@@ -203,15 +281,29 @@ pub(crate) async fn list_on(
     headers.sort_by_key(|(id, _, seq)| (*seq, id.as_str()));
     let more = headers.len() > limit;
     let mut items = Vec::new();
+    let mut contexts = MetadataContexts::new();
     let mut last = after;
     for (id, _, seq) in headers.into_iter().take(limit) {
-        let metadata = metadata_on(conn, actor, view, id, deadline).await;
+        let metadata = metadata_on(conn, actor, view, id, deadline, false, &mut contexts).await;
         match metadata {
             Ok(detail) => {
                 let pin: Pin = serde_json::from_value(detail["pin"].clone())?;
                 let definition: contract::Definition =
-                    serde_json::from_value(detail["definition"].clone())?;
+                    if detail["definition"].get("generated").is_some() {
+                        serde_json::from_value::<v2::Definition>(detail["definition"].clone())?
+                            .common()
+                    } else {
+                        serde_json::from_value(detail["definition"].clone())?
+                    };
                 let mut item = summary("", &pin, &definition);
+                if let Some(mode) = detail.get("advisory_comparison") {
+                    item["advisory_comparison"] = mode.clone();
+                }
+                if let Some(drift) = detail.get("source_drift") {
+                    item["source_drift"] = drift.clone();
+                    item["source_drift_unknown_reason"] =
+                        detail["source_drift_unknown_reason"].clone();
+                }
                 item["available"] = json!(detail["diagnostic"].is_null());
                 if !detail["diagnostic"].is_null() {
                     item["diagnostic"] = detail["diagnostic"].clone();
@@ -238,9 +330,7 @@ pub(crate) async fn list_on(
                 // Root headers belong to the already-authorized bearer. Do
                 // not return SQL, semantics, source pins or dependency IDs
                 // for a closure the caller cannot currently read.
-                let root_pin = pin_on_in(conn, actor, view, id, head, deadline, true)
-                    .await
-                    .ok();
+                let root_pin = pin_on(conn, actor, view, id, head, deadline).await.ok();
                 items.push(json!({"view_id":view,"revision_id":id,"definition_sha256":root_pin.as_ref().map(|p| &p.definition_sha256),"schema_sha256":root_pin.as_ref().map(|p| &p.schema_sha256),"available":false,"diagnostic":diagnostic}));
             }
         }

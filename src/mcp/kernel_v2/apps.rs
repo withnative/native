@@ -211,6 +211,12 @@ async fn execute(
             include_removed,
         } => {
             let mut result = installs::list_as(db, actor, view, include_removed).await?;
+            // A host-owned development contract, never app-supplied admission.
+            // Keep ordinary shipping responses and tool-name lists unchanged.
+            #[cfg(feature = "package-cel-dev")]
+            {
+                result["development_package_operations"] = json!("native.package-cel-dev.reads/1");
+            }
             if let Some(entries) = result["installs"].as_array_mut() {
                 for entry in entries {
                     availability(entry, delivery);

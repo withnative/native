@@ -68,6 +68,10 @@ mod write_path;
 #[path = "kernel/v2_contract_smoke.rs"]
 mod v2_contract_smoke;
 
+#[cfg(feature = "package-cel-dev")]
+#[path = "kernel/package_cel_dev_smoke.rs"]
+mod package_cel_dev_smoke;
+
 #[path = "kernel/workspace_rule_storage.rs"]
 mod workspace_rule_storage;
 

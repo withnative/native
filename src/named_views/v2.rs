@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Definition {
+pub(crate) struct Definition {
     pub query: contract::SavedSqlV12,
     pub origin: contract::Origin,
     pub description: String,
@@ -15,7 +15,7 @@ pub(super) struct Definition {
     pub generated: Manifest,
 }
 impl Definition {
-    pub(super) fn common(&self) -> contract::Definition {
+    pub(crate) fn common(&self) -> contract::Definition {
         contract::Definition {
             query: self.query.clone(),
             origin: self.origin.clone(),
@@ -25,7 +25,7 @@ impl Definition {
             source_pins: self.source_pins.clone(),
         }
     }
-    pub(super) fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.common().validate_retained()?;
         self.generated.validate()?;
         let contract::Origin::Generated {
@@ -53,7 +53,7 @@ impl Definition {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Manifest {
+pub(crate) struct Manifest {
     pub format: String,
     pub workspace_id: String,
     pub context: Context,
@@ -65,27 +65,27 @@ pub(super) struct Manifest {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Context {
+pub(crate) struct Context {
     pub r#type: String,
     pub kind: Option<String>,
     pub logical_home_id: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum Selection {
+pub(crate) enum Selection {
     Keys { keys: Vec<String> },
     All,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Section {
+pub(crate) enum Section {
     SchemaConfig,
     Vocabularies,
     VocabularyValues,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Source {
+pub(crate) struct Source {
     pub section: Section,
     pub source_id: String,
     pub origin: String,
@@ -96,19 +96,19 @@ pub(super) struct Source {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Scope {
+pub(crate) enum Scope {
     Global,
     Home,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Layer {
+pub(crate) enum Layer {
     Pack,
     User,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Slot {
+pub(crate) struct Slot {
     pub scope: Scope,
     pub layer: Layer,
     pub shape_key: String,
@@ -116,7 +116,7 @@ pub(super) struct Slot {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Fragment {
+pub(crate) struct Fragment {
     pub source: usize,
     pub key: String,
     pub decl: Declaration,
@@ -125,7 +125,7 @@ pub(super) struct Fragment {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Declaration {
+pub(crate) struct Declaration {
     pub r#type: Option<FieldType>,
     pub description: Option<String>,
     pub required: Option<bool>,
@@ -135,13 +135,13 @@ pub(super) struct Declaration {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum FieldType {
+pub(crate) enum FieldType {
     Number,
     Date,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Governance {
+pub(crate) struct Governance {
     pub source: usize,
     pub shape_key: String,
     pub lineage: Option<String>,
@@ -149,21 +149,21 @@ pub(super) struct Governance {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Vocabulary {
+pub(crate) struct Vocabulary {
     pub field: String,
     pub source: usize,
     pub values: Vec<VocabularyValue>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Status {
+pub(crate) enum Status {
     Active,
     Proposed,
     Deprecated,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct VocabularyValue {
+pub(crate) struct VocabularyValue {
     pub source: usize,
     pub id: String,
     pub token: String,
@@ -188,7 +188,7 @@ impl Manifest {
             .filter(|s| s.section == section)
             .ok_or_else(|| invalid("v2 source cross-reference mismatch"))
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.format != "native.generated-facets.v1"
             || self.sources.len() > 288
             || self.slots.len() != 8

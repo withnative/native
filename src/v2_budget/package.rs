@@ -60,6 +60,7 @@ pub fn budget_package() -> PackageManifest {
                 "Evaluate every budget cell from cells_json and return each cell's value, or a named error."
                     .to_string(),
             provider: OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC.to_string(),
+            executable: None,
             family: BUDGET_FAMILY.to_string(),
             kind: BUDGET_KIND.to_string(),
             source_field: BUDGET_SOURCE_FIELD.to_string(),

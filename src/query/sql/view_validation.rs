@@ -205,6 +205,17 @@ pub(crate) async fn analyze(
     analyze_with(closure, deadline, move || retained.analyze_schema()).await
 }
 
+pub(crate) enum Outcome {
+    Valid(Reads),
+    Invalid(Error),
+}
+pub(crate) async fn analyze_diagnostic(
+    closure: &crate::named_views::closure::Closure,
+    deadline: Instant,
+) -> Result<Outcome> {
+    let retained = closure.clone();
+    analyze_classified(closure, deadline, move || retained.analyze_schema()).await
+}
 pub(crate) async fn analyze_with(
     closure: &crate::named_views::closure::Closure,
     deadline: Instant,
@@ -212,6 +223,18 @@ pub(crate) async fn analyze_with(
         + Send
         + 'static,
 ) -> Result<Reads> {
+    match analyze_classified(closure, deadline, work).await? {
+        Outcome::Valid(reads) => Ok(reads),
+        Outcome::Invalid(error) => Err(error),
+    }
+}
+async fn analyze_classified(
+    closure: &crate::named_views::closure::Closure,
+    deadline: Instant,
+    work: impl FnOnce() -> std::result::Result<Reads, super::named_views::SchemaFailure>
+        + Send
+        + 'static,
+) -> Result<Outcome> {
     if Instant::now() >= deadline {
         return Err(sql_contract::categorized_error(
             QuerySqlErrorCategory::Timeout,
@@ -235,7 +258,10 @@ pub(crate) async fn analyze_with(
             let entry = c.entries.remove(position).unwrap();
             let result = entry.value.clone().map_err(Error::engine);
             c.entries.push_back(entry);
-            return result;
+            return Ok(match result {
+                Ok(reads) => Outcome::Valid(reads),
+                Err(error) => Outcome::Invalid(error),
+            });
         }
     }
     #[cfg(test)]
@@ -261,7 +287,7 @@ pub(crate) async fn analyze_with(
     let (result, cacheable) = match outcome {
         Ok(reads) => (Ok(reads), true),
         Err(super::named_views::SchemaFailure::Rule(error)) => (Err(error), true),
-        Err(super::named_views::SchemaFailure::Infrastructure(error)) => (Err(error), false),
+        Err(super::named_views::SchemaFailure::Infrastructure(error)) => return Err(error),
     };
     if Instant::now() < deadline
         && cacheable
@@ -286,7 +312,10 @@ pub(crate) async fn analyze_with(
             .insert(Entry { key, value, bytes });
     }
 
-    result
+    Ok(match result {
+        Ok(reads) => Outcome::Valid(reads),
+        Err(error) => Outcome::Invalid(error),
+    })
 }
 
 #[cfg(test)]

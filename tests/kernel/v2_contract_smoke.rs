@@ -23,6 +23,7 @@ fn custom_model_package() -> native_ce::package_manifest::PackageManifest {
             name: "recalculate".to_string(),
             description: "Evaluate the model_json field with the generic provider.".to_string(),
             provider: OPERATION_PROVIDER_HOST_TABLE_ARITHMETIC.to_string(),
+            executable: None,
             family: "demo.custom.model".to_string(),
             kind: "model".to_string(),
             source_field: "model_json".to_string(),
@@ -46,14 +47,14 @@ fn custom_model_package() -> native_ce::package_manifest::PackageManifest {
     }
 }
 
-struct World {
+pub(super) struct World {
     dir: tempfile::TempDir,
     db: String,
     bin: PathBuf,
 }
 
 impl World {
-    fn fresh() -> Self {
+    pub(super) fn fresh() -> Self {
         // Parallel tests can observe the same clock timestamp. Reserve the
         // directory atomically so their init subprocesses cannot share a DB.
         let dir = tempfile::Builder::new()
@@ -73,7 +74,7 @@ impl World {
         World { dir, db, bin }
     }
 
-    fn write(&self, name: &str, bytes: &[u8]) -> String {
+    pub(super) fn write(&self, name: &str, bytes: &[u8]) -> String {
         let path = self.dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         path.to_str().unwrap().to_string()
@@ -94,7 +95,7 @@ impl World {
         (out.status.success(), value)
     }
 
-    fn run_ok(&self, as_binding: &str, args: &[&str]) -> serde_json::Value {
+    pub(super) fn run_ok(&self, as_binding: &str, args: &[&str]) -> serde_json::Value {
         let (ok, value) = self.run(as_binding, args);
         assert!(ok, "command failed: {args:?} -> {value}");
         assert!(value.get("error").is_none(), "{value}");
@@ -971,7 +972,7 @@ fn v2_contract_smoke_consumer_blocks_disable_until_retired() {
 }
 
 /// Initialize a blank v2 database and a child home the genesis admin can use.
-fn init_admin_world(w: &World) -> (String, String) {
+pub(super) fn init_admin_world(w: &World) -> (String, String) {
     let out = std::process::Command::new(&w.bin)
         .arg("--db")
         .arg(&w.db)

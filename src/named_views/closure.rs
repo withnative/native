@@ -19,9 +19,14 @@ pub(crate) struct Closure {
     pub roots: BTreeMap<String, String>,
     #[allow(dead_code)] // Consumed by the PR 2b validation cache.
     pub digest: String,
+    pub retained: BTreeMap<Pin, Revision>,
+    #[cfg(feature = "v2-kernel-probe")]
+    pub generated_drift: BTreeMap<Pin, super::retained_facets::Drift>,
+    #[cfg(feature = "v2-kernel-probe")]
+    pub generated_unknown_reason: BTreeMap<Pin, super::source_proof::ComparisonReason>,
 }
 #[allow(dead_code)] // Tuple aliases are consumed by the dormant closure builder.
-fn alias(pin: &Pin) -> Result<String> {
+pub(crate) fn alias(pin: &Pin) -> Result<String> {
     Ok(format!(
         "_native_view_{:x}",
         Sha256::digest(native_artifact_runtime::mdx_v2::canonical_json_bytes(
@@ -32,6 +37,7 @@ fn alias(pin: &Pin) -> Result<String> {
 #[allow(dead_code)] // Admission remains closed until PR 2b.
 struct Builder<'a> {
     definitions: &'a BTreeMap<Pin, Definition>,
+    retained: &'a BTreeMap<Pin, Revision>,
     nodes: Vec<Node>,
     heights: BTreeMap<Pin, usize>,
     descendants: BTreeMap<Pin, BTreeSet<String>>,
@@ -71,11 +77,15 @@ impl Builder<'_> {
         if def.query.output.schema_sha256 != pin.schema_sha256 {
             return Err(invalid("view_source_invalidated: schema digest"));
         }
-        let revision = Revision {
-            v: 1,
-            view_id: pin.view_id.clone(),
-            definition_sha256: pin.definition_sha256.clone(),
-            definition: serde_json::to_value(&def)?,
+        let revision = if let Some(revision) = self.retained.get(pin) {
+            revision.clone()
+        } else {
+            Revision {
+                v: 1,
+                view_id: pin.view_id.clone(),
+                definition_sha256: pin.definition_sha256.clone(),
+                definition: serde_json::to_value(&def)?,
+            }
         };
         if revision.digest() != pin.definition_sha256 {
             return Err(invalid("view_source_invalidated: definition digest"));
@@ -127,11 +137,19 @@ pub(crate) fn build(
     roots: &BTreeMap<String, Pin>,
     definitions: &BTreeMap<Pin, Definition>,
 ) -> Result<Closure> {
+    build_retained(roots, definitions, &BTreeMap::new())
+}
+fn build_retained(
+    roots: &BTreeMap<String, Pin>,
+    definitions: &BTreeMap<Pin, Definition>,
+    retained: &BTreeMap<Pin, Revision>,
+) -> Result<Closure> {
     if roots.len() > 8 {
         return Err(invalid("view_budget_exceeded: roots"));
     }
     let mut builder = Builder {
         definitions,
+        retained,
         nodes: Vec::new(),
         heights: BTreeMap::new(),
         descendants: BTreeMap::new(),
@@ -159,6 +177,11 @@ pub(crate) fn build(
         nodes: builder.nodes,
         roots: bound_roots,
         digest,
+        retained: retained.clone(),
+        #[cfg(feature = "v2-kernel-probe")]
+        generated_drift: BTreeMap::new(),
+        #[cfg(feature = "v2-kernel-probe")]
+        generated_unknown_reason: BTreeMap::new(),
     })
 }
 
@@ -170,6 +193,11 @@ pub(crate) struct CertificationBudget {
     nodes: usize,
     bytes: usize,
     certified: BTreeMap<Pin, Definition>,
+    retained: BTreeMap<Pin, Revision>,
+    drift: BTreeMap<Pin, super::retained_facets::Drift>,
+    unknown_reason: BTreeMap<Pin, super::source_proof::ComparisonReason>,
+    comparison: super::retained_facets::ComparisonSnapshot,
+    pub(crate) skip_advisory: bool,
 }
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn resolve_budgeted_on(
@@ -181,7 +209,7 @@ pub(crate) async fn resolve_budgeted_on(
 ) -> Result<Closure> {
     let inspected = inspect_on(tx, actor, roots, deadline, None, true, budget).await?;
     storage::check_deadline(deadline)?;
-    let plan = build(roots, &inspected.definitions)?;
+    let plan = inspected.build(roots)?;
     storage::check_deadline(deadline)?;
     Ok(plan)
 }
@@ -204,7 +232,7 @@ pub(crate) async fn resolve_on(
         &mut CertificationBudget::default(),
     )
     .await?;
-    build(roots, &inspected.definitions)
+    inspected.build(roots)
 }
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) async fn resolve_candidate_on(
@@ -225,12 +253,25 @@ pub(crate) async fn resolve_candidate_on(
         &mut CertificationBudget::default(),
     )
     .await?;
-    build(&roots, &inspected.definitions)
+    inspected.build(&roots)
 }
 #[cfg(feature = "v2-kernel-probe")]
 pub(crate) struct Inspection {
     pub definitions: BTreeMap<Pin, Definition>,
     pub drifted: bool,
+    pub retained: BTreeMap<Pin, Revision>,
+    pub generated_drift: BTreeMap<Pin, super::retained_facets::Drift>,
+    #[cfg(feature = "v2-kernel-probe")]
+    pub generated_unknown_reason: BTreeMap<Pin, super::source_proof::ComparisonReason>,
+}
+#[cfg(feature = "v2-kernel-probe")]
+impl Inspection {
+    pub(crate) fn build(&self, roots: &BTreeMap<String, Pin>) -> Result<Closure> {
+        let mut plan = build_retained(roots, &self.definitions, &self.retained)?;
+        plan.generated_drift = self.generated_drift.clone();
+        plan.generated_unknown_reason = self.generated_unknown_reason.clone();
+        Ok(plan)
+    }
 }
 
 /// Commit-time visibility and strict current-source checks. The SQL/graph
@@ -392,7 +433,42 @@ async fn inspect_on(
             budget.bytes += payload_bytes;
             let event = read_event(tx, &pin.revision_id, head).await?;
             let revision: Revision = decode(&event, MAX_CARRIER_BYTES)?;
-            let def = revision.validate(&event)?;
+            let def = revision.validate_retained(&event)?;
+            if revision.v == 2 {
+                let generated: super::v2::Definition =
+                    serde_json::from_value(revision.definition.clone())?;
+                if !executable {
+                    super::generated::authorize_metadata_on(tx, actor, &generated, deadline)
+                        .await?;
+                } else if super::generated::is_writer(tx).await? {
+                    super::generated::require_certified(&revision)?;
+                } else {
+                    let workspace = super::generated::workspace_on(tx).await?;
+                    if budget.skip_advisory {
+                        super::retained_facets::mandatory_on(
+                            tx, actor, &workspace, record, &generated, deadline,
+                        )
+                        .await?;
+                    } else {
+                        let checked = super::retained_facets::inspect_definition_shared_on(
+                            tx,
+                            actor,
+                            &workspace,
+                            record,
+                            generated,
+                            deadline,
+                            super::source_proof::ScanLimits::default(),
+                            &mut budget.comparison,
+                        )
+                        .await?;
+                        budget.drift.insert(pin.clone(), checked.drift);
+                        if let Some(reason) = checked.unknown_reason {
+                            budget.unknown_reason.insert(pin.clone(), reason);
+                        }
+                    }
+                }
+            }
+            budget.retained.insert(pin.clone(), revision.clone());
             if revision.definition_sha256 != pin.definition_sha256 {
                 return Err(invalid("view_revision_unavailable"));
             }
@@ -440,6 +516,18 @@ async fn inspect_on(
     }
     storage::check_deadline(deadline)?;
     Ok(Inspection {
+        retained: definitions
+            .keys()
+            .filter_map(|p| budget.retained.get(p).map(|r| (p.clone(), r.clone())))
+            .collect(),
+        generated_drift: definitions
+            .keys()
+            .filter_map(|p| budget.drift.get(p).map(|d| (p.clone(), *d)))
+            .collect(),
+        generated_unknown_reason: definitions
+            .keys()
+            .filter_map(|p| budget.unknown_reason.get(p).map(|r| (p.clone(), *r)))
+            .collect(),
         definitions,
         drifted,
     })

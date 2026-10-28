@@ -153,6 +153,8 @@ pub mod message_expectation;
 pub mod meta;
 pub mod migrations;
 pub(crate) mod named_views;
+#[cfg(all(feature = "dev-tools", feature = "v2-kernel-probe"))]
+pub use named_views::export as named_view_export;
 /// Shared local-CLI serving paths for the `mcp-stdio` and `native` binaries.
 pub mod native_cli;
 pub(crate) mod need_metrics;
@@ -160,6 +162,8 @@ pub(crate) mod need_metrics;
 pub mod need_subscriptions;
 #[cfg(test)]
 mod package_adopt_tests;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub mod package_cel_dev;
 #[cfg(any(test, feature = "v2-kernel-probe"))]
 pub mod package_manifest;
 #[cfg(any(test, feature = "v2-kernel-probe"))]

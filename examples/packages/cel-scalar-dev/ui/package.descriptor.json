@@ -1,0 +1,8 @@
+{
+  "package": "example.package-reader",
+  "version": "0.2.0",
+  "title": "Package operation reader",
+  "runtime": "native.html.v1",
+  "bundle": "package.html",
+  "declaration": { "contract": "native.app.v2", "needs": [], "effects": [] }
+}

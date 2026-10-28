@@ -37,8 +37,8 @@ pub(crate) mod error;
 pub mod events;
 pub mod field_definitions;
 pub mod fts;
-#[cfg(test)]
-mod generated_facets;
+#[cfg(any(test, feature = "v2-kernel-probe"))]
+pub(crate) mod generated_facets;
 pub mod lens;
 pub mod lifecycle;
 pub mod lineage;
